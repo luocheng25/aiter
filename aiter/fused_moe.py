@@ -110,6 +110,41 @@ def fused_moe(
     bias1=None,
     bias2=None,
 ):
+    if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 128 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
+        ((quant_type == QuantType.per_1x32 and w1.dtype == torch.float4_e2m1fn_x2)):
+        import pyhip
+        B = hidden_states.shape[0]
+        E, N1, K1 = w1.shape
+        N2, K2 = w2.shape[1], w2.shape[2]
+        TOPK = topk_ids.shape[1]
+        gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+        K1 *= 2
+        K2 *= 2
+        TILE_M = 16
+        TILE_N = 128
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+            topk_ids,
+            topk_weight,
+            E,
+            K1,     # reduce dim is same with output dim
+            hidden_states.dtype,
+            TILE_M,
+            None,
+            None,
+            0,
+        )
+        BLOCK_TILE_SIZE_M = TILE_M
+        BLOCK_TILE_SIZE_N = TILE_N
+        grid = sorted_expert_ids.shape[0]
+        if B * TOPK <= E:
+            grid = B * TOPK
+        pyhip.kernels.moe.moe_2stage_splitk([N1 // BLOCK_TILE_SIZE_N, grid], [256],
+                            w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                            hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
+        pyhip.kernels.moe.moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+                            w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                            gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+        return cur_out
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
