@@ -19,9 +19,11 @@ from __future__ import annotations
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.expr import arith, rocdl, vector
+from flydsl.expr import arith, rocdl
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .fmha_schedule import (
     GEMM1_SCHEDULE,
@@ -398,11 +400,6 @@ def _atom_wmma_init(ty, src_a, src_b, bank_dst):
         src_a,
         src_b,
         zero,
-        signA=False,
-        signB=False,
-        modC=0,
-        reuseA=False,
-        reuseB=False,
     )
     banked = set_vgpr_bank(result.result, bank_dst)
     _sched_barrier(0)
@@ -418,11 +415,6 @@ def _atom_wmma_accum(ty, src_a, src_b, acc, bank_dst):
         src_a,
         src_b,
         acc,
-        signA=False,
-        signB=False,
-        modC=0,
-        reuseA=False,
-        reuseB=False,
     )
     banked = set_vgpr_bank(result.result, bank_dst)
     _sched_barrier(0)
