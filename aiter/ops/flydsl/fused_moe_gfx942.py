@@ -27,9 +27,12 @@ class Config:
     BLOCK_N: int
     BLOCK_K: int
     use_prefill: bool
+    down_path: str = "default"
+    GATEUP_BLOCK_M: int | None = None
+    down_output_padding_bytes: int | None = None
 
     def to_string(self):
-        return (
+        base = (
             str(self.BLOCK_M)
             + "_"
             + str(self.BLOCK_N)
@@ -38,10 +41,26 @@ class Config:
             + "_"
             + str(self.use_prefill)
         )
+        gateup_block_m = self.GATEUP_BLOCK_M or self.BLOCK_M
+        if (
+            self.down_path == "default"
+            and gateup_block_m == self.BLOCK_M
+            and self.down_output_padding_bytes is None
+        ):
+            return base
+        padding = (
+            "none"
+            if self.down_output_padding_bytes is None
+            else str(self.down_output_padding_bytes)
+        )
+        return f"{base}:{self.down_path}:{gateup_block_m}:{padding}"
 
     @classmethod
     def from_string(cls, data: str):
-        parts = data.split("_")
+        extensions = data.split(":")
+        if len(extensions) not in (1, 4):
+            raise ValueError(f"Invalid config string: {data}")
+        parts = extensions[0].split("_")
         if len(parts) != 4:
             raise ValueError(f"Invalid config string: {data}")
 
@@ -52,12 +71,99 @@ class Config:
                 return False
             raise ValueError(f"Invalid boolean value in config string: {value}")
 
-        return cls(
+        config = cls(
             int(parts[0]),
             int(parts[1]),
             int(parts[2]),
             parse_bool(parts[3]),
         )
+        if len(extensions) == 1:
+            return config
+        down_path, gateup_block_m, padding = extensions[1:]
+        if down_path not in ("default", "1x4_64x256", "2x4", "1x8"):
+            raise ValueError(f"Invalid down path in config string: {data}")
+        return cls(
+            config.BLOCK_M,
+            config.BLOCK_N,
+            config.BLOCK_K,
+            config.use_prefill,
+            down_path=down_path,
+            GATEUP_BLOCK_M=int(gateup_block_m),
+            down_output_padding_bytes=(None if padding == "none" else int(padding)),
+        )
+
+    def unsupported_reason(self, problem: "_Problem") -> str | None:
+        if not self.use_prefill:
+            return (
+                None
+                if problem.batch <= 256
+                else f"decode path supports at most 256 tokens, got {problem.batch}"
+            )
+        gateup_block_m = self.GATEUP_BLOCK_M or self.BLOCK_M
+        if problem.gateup_dim % self.BLOCK_N != 0:
+            return f"gateup_dim={problem.gateup_dim} is not divisible by BLOCK_N={self.BLOCK_N}"
+        if problem.hidden_dim % self.BLOCK_K != 0:
+            return f"hidden_dim={problem.hidden_dim} is not divisible by BLOCK_K={self.BLOCK_K}"
+        if (problem.hidden_dim // self.BLOCK_K) % 2 != 0:
+            return "gateup requires an even number of BLOCK_K tiles"
+        if self.down_path == "default":
+            return None
+        if self.down_path == "1x8" and problem.quant_type != "per_tensor":
+            return "1x8 requires per-tensor weight and activation scales"
+        down_tile_n = {
+            "1x4_64x256": 256,
+            "2x4": 256,
+            "1x8": 512,
+        }[self.down_path]
+        if problem.model_dim % down_tile_n != 0:
+            return f"model_dim={problem.model_dim} is not divisible by down tile N={down_tile_n}"
+        if problem.inter_dim % 64 != 0:
+            return f"inter_dim={problem.inter_dim} is not divisible by 64"
+        if self.down_path == "1x4_64x256":
+            if self.BLOCK_M != 64 or gateup_block_m != 64:
+                return "1x4_64x256 requires down/gateup BLOCK_M=64"
+            scale_bytes = 256 * 4 if problem.quant_type == "ptpc" else 0
+            lds_bytes = 64 * problem.inter_dim + scale_bytes + 4 * 16 * 64 * 2
+        elif self.down_path == "2x4":
+            if self.BLOCK_M != 128 or gateup_block_m != 64:
+                return "2x4 requires down BLOCK_M=128 and gateup BLOCK_M=64"
+            lds_bytes = 2 * 64 * problem.inter_dim + 8 * 16 * 64 * 2
+        else:
+            if self.BLOCK_M != 64 or gateup_block_m != 64:
+                return "1x8 requires down/gateup BLOCK_M=64"
+            lds_bytes = 64 * problem.inter_dim + 8 * 16 * 64 * 2
+        if lds_bytes > 64 * 1024:
+            return f"down path requires {lds_bytes} bytes of LDS"
+        return None
+
+
+def get_tune_config_unsupported_reason(
+    config_string: str,
+    *,
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    quant_type: QuantType,
+) -> str | None:
+    quant_type_string = {
+        QuantType.per_Token: "ptpc",
+        QuantType.per_Tensor: "per_tensor",
+    }.get(quant_type)
+    if quant_type_string is None:
+        return f"unsupported quant_type: {quant_type}"
+    problem = _Problem(
+        batch=token,
+        experts=expert,
+        gateup_dim=inter_dim * 2,
+        hidden_dim=model_dim,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        topk=topk,
+        quant_type=quant_type_string,
+    )
+    return Config.from_string(config_string).unsupported_reason(problem)
 
 
 @dataclass(frozen=True)
@@ -96,18 +202,55 @@ class _Problem:
 
 
 def get_tune_space():
-    return [
+    configs = [
         # decoding ignored BLOCK_N/BLOCK_K
-        Config(16, 16, 16, False).to_string(),
+        Config(16, 16, 16, False),
         # Config(64, 256, 64, True).to_string(),
-        Config(64, 256, 128, True).to_string(),
-        Config(64, 128, 256, True).to_string(),
-        Config(64, 128, 128, True).to_string(),
+        Config(64, 256, 128, True),
+        Config(64, 128, 256, True),
+        Config(64, 128, 128, True),
     ]
+    for block_k in (128, 256):
+        for gateup_block_n in (128, 256):
+            configs.extend(
+                [
+                    Config(
+                        64,
+                        gateup_block_n,
+                        block_k,
+                        True,
+                        down_path="1x4_64x256",
+                        GATEUP_BLOCK_M=64,
+                        down_output_padding_bytes=128,
+                    ),
+                    Config(
+                        128,
+                        gateup_block_n,
+                        block_k,
+                        True,
+                        down_path="2x4",
+                        GATEUP_BLOCK_M=64,
+                        down_output_padding_bytes=0,
+                    ),
+                ]
+            )
+        configs.append(
+            Config(
+                64,
+                128,
+                block_k,
+                True,
+                down_path="1x8",
+                GATEUP_BLOCK_M=64,
+                down_output_padding_bytes=0,
+            )
+        )
+    return [config.to_string() for config in configs]
 
 
 @cache
-def _get_compiled_kernel(
+def _get_compiled_kernel_cached(
+    device,
     N,
     K,
     weight_dtype_str,
@@ -122,8 +265,13 @@ def _get_compiled_kernel(
     BLOCK_TILE_SIZE_K=None,
     activation_str="silu",
     swiglu_limit=None,
+    USE_ATOMIC_WRITE=True,
+    down_path="default",
+    down_output_padding_bytes=None,
+    METADATA_TILE_SIZE_M=None,
 ):
     """Cache-compiled flydsl kernel via compile_gemm."""
+    del device
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_gemm
 
     return compile_gemm(
@@ -138,11 +286,22 @@ def _get_compiled_kernel(
         stage=stage,
         alg=alg,
         E=E,
-        USE_ATOMIC_WRITE=True,
+        USE_ATOMIC_WRITE=USE_ATOMIC_WRITE,
         act_quant_type=act_quant_type_str,
         activation=activation_str,
         swiglu_limit=swiglu_limit,
+        down_path=down_path,
+        down_output_padding_bytes=down_output_padding_bytes,
+        METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
     )
+
+
+def _get_compiled_kernel(*args, **kwargs):
+    return _get_compiled_kernel_cached(torch.cuda.current_device(), *args, **kwargs)
+
+
+_get_compiled_kernel.cache_clear = _get_compiled_kernel_cached.cache_clear
+_get_compiled_kernel.cache_info = _get_compiled_kernel_cached.cache_info
 
 
 _TORCH_TO_FX = {
@@ -208,6 +367,7 @@ def _run_prefill(
     activation_str: str,
     swiglu_limit: float | None,
 ):
+    gateup_block_m = config.GATEUP_BLOCK_M or config.BLOCK_M
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
         topk_ids,
         topk_weight,
@@ -220,7 +380,7 @@ def _run_prefill(
         0,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    act_quant_type_str = "ptpc"
+    act_quant_type_str = problem.quant_type
     quant_func = (
         aiter.get_hip_quant(aiter.QuantType.per_Token)
         if quant_type == QuantType.per_Token
@@ -234,8 +394,6 @@ def _run_prefill(
             quant_dtype=w1.dtype,
             num_rows=None,
         )
-        if quant_type == QuantType.per_Tensor:
-            a_scale = a_scale.repeat(problem.batch, 1).contiguous()
         a_scale = a_scale.to(torch.float32).contiguous()
     else:
         gateup_in = hidden_states
@@ -248,7 +406,7 @@ def _run_prefill(
         weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
-        BLOCK_TILE_SIZE_M=config.BLOCK_M,
+        BLOCK_TILE_SIZE_M=gateup_block_m,
         BLOCK_TILE_SIZE_N=config.BLOCK_N,
         BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
@@ -257,6 +415,7 @@ def _run_prefill(
         act_quant_type_str=act_quant_type_str,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        METADATA_TILE_SIZE_M=config.BLOCK_M,
     )
     task_num = int(sorted_expert_ids.shape[0])
     _launch(
@@ -285,11 +444,23 @@ def _run_prefill(
         down_in = gemm1_out
         down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
+    output_padding_bytes = config.down_output_padding_bytes
+    output_row_size = problem.model_dim + (
+        output_padding_bytes // hidden_states.element_size()
+        if output_padding_bytes is not None
+        else 0
+    )
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, problem.model_dim],
+        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+    down_tile_n = {
+        "default": 128,
+        "1x4_64x256": 256,
+        "2x4": 256,
+        "1x8": 512,
+    }[config.down_path]
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
         K=problem.inter_dim,
@@ -297,11 +468,14 @@ def _run_prefill(
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=128,
-        # Down-prefill uses its own dtype-sized K chunk; Config.BLOCK_K tunes gateup.
+        BLOCK_TILE_SIZE_N=down_tile_n,
         stage="down",
         alg="prefill_1x4",
         E=problem.experts,
+        USE_ATOMIC_WRITE=False,
+        act_quant_type_str=problem.quant_type,
+        down_path=config.down_path,
+        down_output_padding_bytes=output_padding_bytes,
     )
     _launch(
         down_kernel,
@@ -330,7 +504,7 @@ def _run_prefill(
         sorted_ids.shape[0],
         problem.batch,
     )
-    sorted_sum(problem.topk, problem.model_dim)(
+    sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )
     return cur_out
@@ -527,6 +701,12 @@ def run_flydsl_moe_gfx942(
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    unsupported_reason = config.unsupported_reason(problem)
+    if unsupported_reason is not None:
+        raise RuntimeError(
+            f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
+            f"{unsupported_reason}"
+        )
     if config.use_prefill:
         return _run_prefill(
             hidden_states,

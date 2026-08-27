@@ -4584,6 +4584,31 @@ class FmoeTuner(TunerCommon):
                     kernel_us = float(row["us"])
                 except (TypeError, ValueError):
                     kernel_us = None
+            if config_string:
+                from aiter.ops.flydsl.fused_moe_gfx942 import (
+                    get_tune_config_unsupported_reason,
+                )
+
+                unsupported_reason = get_tune_config_unsupported_reason(
+                    config_string,
+                    token=token,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    expert=expert,
+                    topk=topk,
+                    quant_type=q_type,
+                )
+                if unsupported_reason is not None:
+                    results.append(
+                        {
+                            "shape": shape_str,
+                            "e2e_us": -1,
+                            "kernel_us": kernel_us,
+                            "status": f"error:Unsupported config: {unsupported_reason}",
+                            "err_ratio": 1.0,
+                        }
+                    )
+                    continue
             try:
                 torch.manual_seed(0)
                 hidden = (
