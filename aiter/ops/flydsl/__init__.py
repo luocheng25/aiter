@@ -62,10 +62,11 @@ if is_flydsl_available():
     from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
-    register_fused_moe_impl(
-        "flydsl_gfx942",
-        "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl",
+    _fused_moe_impl_path = (
+        "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
     )
+    register_fused_moe_impl("flydsl_gfx950", _fused_moe_impl_path)
+    register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
