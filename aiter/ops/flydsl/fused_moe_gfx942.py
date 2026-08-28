@@ -13,7 +13,6 @@ from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -21,6 +20,7 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.moe_common import GateMode
 
 
 @dataclass
@@ -341,9 +341,7 @@ def precompile_flydsl_moe(
         config.use_batch1_algorithm and 2 <= batch <= 8
     )
     if config.use_batch1_algorithm and not 2 <= batch <= 8:
-        raise ValueError(
-            f"The batch-1 algorithm is not valid for tuned batch {batch}"
-        )
+        raise ValueError(f"The batch-1 algorithm is not valid for tuned batch {batch}")
 
     if use_batch1_algorithm:
         force_batch1_path = batch > 1
@@ -522,9 +520,7 @@ def _run_prefill(
         a_scale,
         problem.batch,
         task_num,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
 
     if weight_dtype_str == "fp8":
@@ -568,9 +564,7 @@ def _run_prefill(
         down_in_scale,
         problem.batch,
         task_num,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
 
     loc_ids = torch.empty(
@@ -643,9 +637,7 @@ def _run_batch1(
         cur_out if fused_down_clear else topk_weight,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
         problem.batch,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
 
     down_kernel = _get_compiled_kernel(
@@ -669,9 +661,7 @@ def _run_batch1(
         topk_weight,
         w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
         problem.batch,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
     return cur_out
 
@@ -711,9 +701,7 @@ def _run_decode(
         grid = problem.batch * problem.topk
 
     gemm1_out = _gateup_output(hidden_states, problem)
-    weight_dtype_str = (
-        "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
-    )
+    weight_dtype_str = "fp4" if w1.dtype == torch.float4_e2m1fn_x2 else "fp8"
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -740,9 +728,7 @@ def _run_decode(
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
         problem.batch,
         grid,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
 
     down_kernel = _get_compiled_kernel(
@@ -769,9 +755,7 @@ def _run_decode(
         w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
         problem.batch,
         grid,
-        *_activation_scalars(
-            activation_str, situ_beta, situ_linear_beta, swiglu_limit
-        ),
+        *_activation_scalars(activation_str, situ_beta, situ_linear_beta, swiglu_limit),
     )
     return cur_out
 
@@ -811,8 +795,10 @@ def run_flydsl_moe_gfx942(
         in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
         and get_gfx() == "gfx950"
     )
-    if hidden_states.dtype != torch.bfloat16 or expert_mask is not None or not (
-        is_fp8 or is_mxfp4
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or expert_mask is not None
+        or not (is_fp8 or is_mxfp4)
     ):
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
     if w1_scale is None or w2_scale is None:
@@ -820,12 +806,11 @@ def run_flydsl_moe_gfx942(
     if config.use_prefill and is_mxfp4:
         raise RuntimeError("MXFP4 does not support the prefill algorithm")
     problem_batch = int(hidden_states.shape[0])
-    if config.use_batch1_algorithm:
-        if not 2 <= problem_batch <= 8:
-            raise RuntimeError(
-                "The direct algorithm requires an actual batch from 2 through 8, "
-                f"got {problem_batch}"
-            )
+    if config.use_batch1_algorithm and not 2 <= problem_batch <= 8:
+        raise RuntimeError(
+            "The direct algorithm requires an actual batch from 2 through 8, "
+            f"got {problem_batch}"
+        )
 
     activation_str = (
         "situv2"
@@ -850,9 +835,7 @@ def run_flydsl_moe_gfx942(
             situ_beta,
             situ_linear_beta,
         )
-    if problem.batch == 1 or (
-        config.use_batch1_algorithm and 2 <= problem.batch <= 8
-    ):
+    if problem.batch == 1 or (config.use_batch1_algorithm and 2 <= problem.batch <= 8):
         return _run_batch1(
             hidden_states,
             w1,
@@ -895,12 +878,18 @@ def run_flydsl_moe_gfx942_impl(
     request: FusedMoeRequest,
     config_string: str,
 ) -> torch.Tensor:
-    if request.doweight_stage1 or request.bias1 is not None or request.bias2 is not None:
+    if (
+        request.doweight_stage1
+        or request.bias1 is not None
+        or request.bias2 is not None
+    ):
         raise RuntimeError(
             "The FlyDSL whole-graph backend does not support bias or doweight_stage1"
         )
     if request.hidden_pad or request.intermediate_pad:
-        raise RuntimeError("The FlyDSL whole-graph backend does not support padded dimensions")
+        raise RuntimeError(
+            "The FlyDSL whole-graph backend does not support padded dimensions"
+        )
     if (
         request.q_dtype_w == torch.float4_e2m1fn_x2
         and request.q_dtype_a != torch.bfloat16

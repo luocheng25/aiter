@@ -5,7 +5,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.compiler.kernel_function import CompilationContext
@@ -13,8 +12,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
+from flydsl.runtime.device import get_rocm_arch
 
 from . import moe_gemm_2stage_gfx942_utils as fxh
+
 
 def compile_gemm(
     N,
@@ -72,13 +73,13 @@ def compile_gemm(
         "situv2",
     ], "activation must be 'silu', 'swiglu' or 'situv2'"
     if weight_dtype == "fp4":
-        assert weight_quant_type == "mxfp4" and act_quant_type == "no", (
-            "fp4 requires mxfp4 weights and bf16 activations"
-        )
+        assert (
+            weight_quant_type == "mxfp4" and act_quant_type == "no"
+        ), "fp4 requires mxfp4 weights and bf16 activations"
         k_alignment = 512 if stage == "gateup" else 128
-        assert K % k_alignment == 0, (
-            f"fp4 {stage} K must be a multiple of {k_alignment}, got {K}"
-        )
+        assert (
+            K % k_alignment == 0
+        ), f"fp4 {stage} K must be a multiple of {k_alignment}, got {K}"
     else:
         assert weight_quant_type != "mxfp4", "mxfp4 quantization requires fp4 weights"
     # Supported native-fp8 prefill (weight, act) combos: weight ptpc requires act ptpc;
@@ -408,10 +409,7 @@ def compile_gemm(
             group_n = grouped_n // (2 * gateup_contiguous_n)
             within_group = grouped_n % (2 * gateup_contiguous_n)
             gate_up_idx = within_group // gateup_contiguous_n
-            channel = (
-                group_n * gateup_contiguous_n
-                + within_group % gateup_contiguous_n
-            )
+            channel = group_n * gateup_contiguous_n + within_group % gateup_contiguous_n
             if const_expr(mxfp4_gate_up_interleaved):
                 # AITER A16W4 production layout pairs each channel's gate/up
                 # scales after shuffle_scale_a16w4(..., gate_up=True).
@@ -428,9 +426,8 @@ def compile_gemm(
             row_in_expert = channel + gate_up_idx * (N // 2)
             row = fx.Int64(expert_id) * N + fx.Int64(row_in_expert)
         else:
-            row = (
-                fx.Int64(expert_id) * N
-                + fx.Int64(blk_n * BLOCK_TILE_SIZE_N + local_n)
+            row = fx.Int64(expert_id) * N + fx.Int64(
+                blk_n * BLOCK_TILE_SIZE_N + local_n
             )
 
         group = fx.Int64(k_group)
@@ -462,11 +459,7 @@ def compile_gemm(
         if const_expr(gateup_contiguous_n is not None and tile_k_per_wg == 512):
             wave_id = tid // 64
             lane_group = tid % 64 // 16
-            k_group = (
-                wave_id * (K // 4 // 32)
-                + k_idx * (128 // 32)
-                + lane_group
-            )
+            k_group = wave_id * (K // 4 // 32) + k_idx * (128 // 32) + lane_group
         else:
             k_group = k_idx * (tile_k_per_wg // 32) + tid // 16
         scale_byte_ptr = fx.recast_iter(fx.Uint8, fxh._as_ptr(p_w_scale))
@@ -475,9 +468,7 @@ def compile_gemm(
         )
         scale_u32_ptr = fx.recast_iter(scale_u32_type, scale_byte_ptr)
         packed_scale_rows = [None] * n_rows
-        if const_expr(
-            gateup_contiguous_n is not None and mxfp4_gate_up_interleaved
-        ):
+        if const_expr(gateup_contiguous_n is not None and mxfp4_gate_up_interleaved):
             rows_per_half = n_rows // 2
             for channel_block in range_constexpr(rows_per_half):
                 local_n = tid % 16 + channel_block * 16
@@ -492,8 +483,7 @@ def compile_gemm(
                 packed_scale_rows[channel_block] = packed_scale
                 packed_scale_rows[channel_block + rows_per_half] = packed_scale
         elif const_expr(
-            n_rows >= 2
-            and (gateup_contiguous_n is None or BLOCK_TILE_SIZE_N >= 64)
+            n_rows >= 2 and (gateup_contiguous_n is None or BLOCK_TILE_SIZE_N >= 64)
         ):
             for row_pair in range_constexpr(n_rows // 2):
                 local_n = tid % 16 + row_pair * 32
@@ -539,11 +529,7 @@ def compile_gemm(
         if const_expr(gateup_contiguous_n is not None and tile_k_per_wg == 512):
             wave_id = tid // 64
             lane_group = tid % 64 // 16
-            k_group = (
-                wave_id * (K // 4 // 32)
-                + k_idx * (128 // 32)
-                + lane_group
-            )
+            k_group = wave_id * (K // 4 // 32) + k_idx * (128 // 32) + lane_group
         else:
             k_group = k_idx * (tile_k_per_wg // 32) + tid // 16
         n_rows = n_dwords // 4
@@ -569,9 +555,7 @@ def compile_gemm(
                 gateup_contiguous_n,
             )
             scales.append(
-                _mxfp4_scale_from_dword(
-                    packed_scale_rows[row], scale_idx % 4
-                )
+                _mxfp4_scale_from_dword(packed_scale_rows[row], scale_idx % 4)
             )
         return src_vec, scales, packed_scale_rows
 
@@ -652,9 +636,7 @@ def compile_gemm(
 
     def _tanh(value):
         abs_value = value.maximumf(-value)
-        exp_value = rocdl.exp2(
-            T.f32, _raw(abs_value * -2.8853900817779268)
-        )
+        exp_value = rocdl.exp2(T.f32, _raw(abs_value * -2.8853900817779268))
         tanh_abs = (1.0 - exp_value) * rocdl.rcp(T.f32, 1.0 + exp_value)
         return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
 
@@ -909,9 +891,7 @@ def compile_gemm(
             ((contiguous_n, 2, N // (contiguous_n * 2)), storage_k),
             ((1, N // 2, contiguous_n), N),
         )
-        if const_expr(
-            weight_dtype == fx.Float4E2M1FN and mxfp4_gate_up_interleaved
-        ):
+        if const_expr(weight_dtype == fx.Float4E2M1FN and mxfp4_gate_up_interleaved):
             return fx.make_view(
                 p_weight + fx.Int64(expert_id) * N * storage_k,
                 fx.composition(
@@ -1010,9 +990,7 @@ def compile_gemm(
         packed_per_dword = 8 if const_expr(weight_dtype == fx.Float4E2M1FN) else 4
         b_tile = fx.flat_divide(
             b_tensor_u32, fx.make_tile(TILE_N, tile_k_per_wg // packed_per_dword)
-        )[
-            None, None, blk_n, None
-        ]
+        )[None, None, blk_n, None]
         b_cp_atom_r = fx.make_copy_atom(
             (
                 fx.rocdl.BufferCopy128b(cache_modifier=3)
@@ -1037,9 +1015,7 @@ def compile_gemm(
         _s0 = _s0 if _s0 < packed_per_dword else _s0 // packed_per_dword
         _s1 = _s1 if _s1 < packed_per_dword else _s1 // packed_per_dword
         values_per_copy = 4
-        tv_u32 = fx.make_layout(
-            ((_n0, _n1), values_per_copy), ((_s0, _s1), n_mma)
-        )
+        tv_u32 = fx.make_layout(((_n0, _n1), values_per_copy), ((_s0, _s1), n_mma))
         tile_mn = fx.make_tile(
             fx.make_layout(n_mma, 1),
             fx.make_layout(tile_k_per_wg // packed_per_dword, 1),
@@ -1166,18 +1142,16 @@ def compile_gemm(
         def _a_k_offset(k_idx):
             if const_expr(fp4_jit_kmap):
                 wave_id = tid // 64
-                return (
-                    wave_id * (K // splitk_waves - tile_k_per_wave)
-                    + k_idx * (tile_k_per_wave - tile_k_per_wg)
+                return wave_id * (K // splitk_waves - tile_k_per_wave) + k_idx * (
+                    tile_k_per_wave - tile_k_per_wg
                 )
             return 0
 
         def _b_k_offset(k_idx):
             if const_expr(fp4_jit_kmap):
                 wave_id = tid // 64
-                return (
-                    wave_id * (K // 2 - 2 * tile_k_per_wave)
-                    + k_idx * (2 * tile_k_per_wave - 2 * tile_k_per_wg)
+                return wave_id * (K // 2 - 2 * tile_k_per_wave) + k_idx * (
+                    2 * tile_k_per_wave - 2 * tile_k_per_wg
                 )
             return 0
 
@@ -1231,9 +1205,7 @@ def compile_gemm(
                 )
             fx.copy(b_cp_atom_r, src, b_frag_retile[buf])
 
-        down_pair_scales = (
-            weight_dtype == fx.Float4E2M1FN and tile_k_per_wg == 128
-        )
+        down_pair_scales = weight_dtype == fx.Float4E2M1FN and tile_k_per_wg == 128
         if const_expr(down_pair_scales):
             _prefetch_b(fx.Int32(0), 0)
             _prefetch_a(fx.Int32(0), 0)
@@ -1256,9 +1228,7 @@ def compile_gemm(
                     )
                 )
 
-        gate_pair_scales = (
-            fp4_jit_kmap and BLOCK_TILE_SIZE_N == 32 and K % 1024 == 0
-        )
+        gate_pair_scales = fp4_jit_kmap and BLOCK_TILE_SIZE_N == 32 and K % 1024 == 0
         if const_expr(gate_pair_scales):
             _prefetch_b(fx.Int32(0), 0)
             _prefetch_a(fx.Int32(0), 0)
@@ -1356,8 +1326,7 @@ def compile_gemm(
                     rocdl.s_setprio(0)
                     rocdl.sched_barrier(0)
                     if const_expr(
-                        BLOCK_TILE_SIZE_N == 32
-                        and pair_idx + 1 < num_k_iters // 2
+                        BLOCK_TILE_SIZE_N == 32 and pair_idx + 1 < num_k_iters // 2
                     ):
                         gate_packed_scale_rows = next_gate_packed_scale_rows
             elif const_expr(fp4_jit_kmap):
@@ -1407,9 +1376,7 @@ def compile_gemm(
                             next_even_idx = even_idx + 2
                             _prefetch_b(next_even_idx, 0)
                             _prefetch_a(next_even_idx, 0)
-                            rocdl.s_waitcnt(
-                                _encode_waitcnt(vmcnt=vmcnt_per_prefetch)
-                            )
+                            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
                         else:
                             rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
                         rocdl.sched_barrier(0)
@@ -1564,10 +1531,7 @@ def compile_gemm(
                     c_frag_reduce[0, m, None].store(acc)
                 else:
                     c_frag_reduce[None, m, (None, n)].store(acc)
-                if const_expr(
-                    m * n_blocks + n + 1
-                    < (TILE_M // 16) * n_blocks
-                ):
+                if const_expr(m * n_blocks + n + 1 < (TILE_M // 16) * n_blocks):
                     gpu.barrier()
 
         return c_frag_reduce

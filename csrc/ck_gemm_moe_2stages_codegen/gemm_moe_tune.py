@@ -5990,9 +5990,7 @@ class FmoeTuner(TunerCommon):
                 moe_sorting_dispatch_policy,
                 config_string=config_string,
                 swiglu_limit=swiglu_limit,
-                situ_beta=(
-                    DEFAULT_SITUV2_BETA if beta is None else float(beta)
-                ),
+                situ_beta=(DEFAULT_SITUV2_BETA if beta is None else float(beta)),
                 situ_linear_beta=(
                     DEFAULT_SITUV2_LINEAR_BETA
                     if linear_beta is None
@@ -6018,22 +6016,18 @@ class FmoeTuner(TunerCommon):
                 else row["q_dtype_w"]
             )
             q_type = (
-                eval(row["q_type"])
-                if isinstance(row["q_type"], str)
-                else row["q_type"]
+                eval(row["q_type"]) if isinstance(row["q_type"], str) else row["q_type"]
             )
             is_mxfp4 = q_dtype_w == dtypes.fp4x2
             if is_mxfp4 and q_dtype_a != dtypes.bf16:
                 return []
-            is_supported_fp8 = (
-                q_dtype_w == torch.float8_e4m3fnuz
-                and q_type in (QuantType.per_Token, QuantType.per_Tensor)
+            is_supported_fp8 = q_dtype_w == torch.float8_e4m3fnuz and q_type in (
+                QuantType.per_Token,
+                QuantType.per_Tensor,
             )
             if not is_mxfp4 and not is_supported_fp8:
                 return []
-            return get_tune_space(
-                int(row["token"]), include_prefill=not is_mxfp4
-            )
+            return get_tune_space(int(row["token"]), include_prefill=not is_mxfp4)
 
         row_tune_spaces = [
             set(tune_space_for_row(self.untunedf.iloc[i]))
