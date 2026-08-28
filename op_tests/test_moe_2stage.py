@@ -99,6 +99,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    whole_graph_a16w4=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -228,7 +229,15 @@ def test_fmoe(
     # Match fused_moe's runtime activation dtype. SiTUv2 can be requested as
     # a16w4 by the caller but dispatched as a8w4 on gfx950.
     reference_aq_dtype = AQDType
-    if actType == aiter.ActivationType.Situv2:
+    if whole_graph_a16w4:
+        assert (
+            actType == aiter.ActivationType.Situv2
+            and qType == aiter.QuantType.per_1x32
+            and AQDType == dtypes.fp4x2
+            and WQDType == dtypes.fp4x2
+        )
+        reference_aq_dtype = dtypes.bf16
+    elif actType == aiter.ActivationType.Situv2:
         runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
         if runtime_aq_dtype is not None:
             reference_aq_dtype = runtime_aq_dtype
@@ -251,7 +260,7 @@ def test_fmoe(
     elif (
         (
             qType == aiter.QuantType.per_1x32
-            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and (reference_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
             and WQDType == dtypes.fp4x2
         )
         or is_mxfp8
@@ -431,7 +440,7 @@ def test_fmoe(
         )
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (reference_aq_dtype in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a2_qt = out1_ref
@@ -837,7 +846,7 @@ def _row_to_kwargs(row):
     }
 
 
-def _iter_csv_cases():
+def _iter_csv_cases(*, include_non_situv2=True):
     """Yield FlyDSL/Opus cases from every selected model CSV."""
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
@@ -875,6 +884,8 @@ def _iter_csv_cases():
             kwargs["linear_beta"] = (
                 25.0 if args.linear_beta is None else float(args.linear_beta)
             )
+        elif not include_non_situv2:
+            continue
         # The reference path below uses the CSV q_dtype_a directly, while
         # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
         # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
@@ -910,6 +921,11 @@ def _iter_csv_cases():
                 expected_aq_dtype,
             )
             continue
+        kwargs["whole_graph_a16w4"] = (
+            kwargs["AQDType"] == dtypes.fp4x2
+            and kwargs["WQDType"] == dtypes.fp4x2
+            and kernel_name1.startswith("impl__flydsl_")
+        )
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
         # AOT cache entry, so let those cases compile on demand.
@@ -1292,13 +1308,17 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     if not args.no_flydsl_csv:
-        _case_iters.append(
-            _iter_with_env(
-                _iter_csv_cases(),
-                AITER_SITUV2_A8W4="1",
-                AITER_SITUV2_A4W4=None,
+        for include_non_situv2, situv2_a8w4, situv2_a4w4 in (
+            (True, "1", None),
+            (False, None, "1"),
+        ):
+            _case_iters.append(
+                _iter_with_env(
+                    _iter_csv_cases(include_non_situv2=include_non_situv2),
+                    AITER_SITUV2_A8W4=situv2_a8w4,
+                    AITER_SITUV2_A4W4=situv2_a4w4,
+                )
             )
-        )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)

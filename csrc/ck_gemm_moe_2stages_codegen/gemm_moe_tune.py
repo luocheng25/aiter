@@ -4604,6 +4604,7 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
+            kernel_name1 = str(row.get("kernelName1", "") or "")
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -4624,6 +4625,15 @@ class FmoeTuner(TunerCommon):
                     eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
                 else:
                     eff_q_dtype_a = dtypes.fp4x2
+            if (
+                eff_q_dtype_a == dtypes.fp4x2
+                and q_dtype_w == dtypes.fp4x2
+                and act_type == ActivationType.Situv2
+                and kernel_name1.startswith("impl__flydsl_")
+            ):
+                # Whole-graph MXFP4 kernels consume BF16 activations even when
+                # an A4W4 tuned row selects the small-batch implementation.
+                eff_q_dtype_a = dtypes.bf16
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "

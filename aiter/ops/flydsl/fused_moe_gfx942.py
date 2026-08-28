@@ -66,6 +66,27 @@ class Config:
         )
 
 
+def _uses_batch1_path(config: Config, batch: int) -> bool:
+    return not config.use_prefill and (
+        batch == 1 or (config.use_batch1_algorithm and 2 <= batch <= 8)
+    )
+
+
+def _supports_mxfp4_activation_request(
+    q_dtype_a: torch.dtype,
+    activation: Any,
+    batch: int,
+    config: Config,
+) -> bool:
+    # This backend always computes BF16-A x MXFP4-W. An FP4 q_dtype_a is only a
+    # dispatch label allowing A4W4 SiTUv2 to select the small-batch fast path.
+    return q_dtype_a == torch.bfloat16 or (
+        q_dtype_a == torch.float4_e2m1fn_x2
+        and activation == ActivationType.Situv2
+        and _uses_batch1_path(config, batch)
+    )
+
+
 @dataclass(frozen=True)
 class _Problem:
     batch: int
@@ -835,7 +856,7 @@ def run_flydsl_moe_gfx942(
             situ_beta,
             situ_linear_beta,
         )
-    if problem.batch == 1 or (config.use_batch1_algorithm and 2 <= problem.batch <= 8):
+    if _uses_batch1_path(config, problem.batch):
         return _run_batch1(
             hidden_states,
             w1,
@@ -890,11 +911,20 @@ def run_flydsl_moe_gfx942_impl(
         raise RuntimeError(
             "The FlyDSL whole-graph backend does not support padded dimensions"
         )
+    config = Config.from_string(config_string)
     if (
         request.q_dtype_w == torch.float4_e2m1fn_x2
-        and request.q_dtype_a != torch.bfloat16
+        and not _supports_mxfp4_activation_request(
+            request.q_dtype_a,
+            request.activation,
+            int(request.hidden_states.shape[0]),
+            config,
+        )
     ):
-        raise RuntimeError("The MXFP4 whole-graph backend requires BF16 activations")
+        raise RuntimeError(
+            "The MXFP4 whole-graph backend requires BF16 activations; "
+            "FP4-tagged requests are supported only by the SiTUv2 Batch1 path"
+        )
     return run_flydsl_moe_gfx942(
         request.hidden_states,
         request.w1,
