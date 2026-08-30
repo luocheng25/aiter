@@ -15,6 +15,8 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from . import layout_helpers as fxh
 from .common import get_down_device_config as _get_down_device_config
 
@@ -316,7 +318,7 @@ def _build_moe_gemm2_1x4(
                 + e_offset * (block_m_per_4wave_group * output_row_stride),
                 (block_m_per_4wave_group, output_row_stride),
             )
-            output_store_rsrc = fx.buffer_ops.create_buffer_resource(
+            output_store_rsrc = buffer_ops.create_buffer_resource(
                 arg_p_output,
                 max_size=False,
                 num_records_bytes=block_m_per_4wave_group * output_row_stride * 2,
@@ -446,7 +448,7 @@ def _build_moe_gemm2_1x4(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
                     fx.make_layout(N, 1),
                 )
-                scale_global_rsrc = fx.buffer_ops.create_buffer_resource(
+                scale_global_rsrc = buffer_ops.create_buffer_resource(
                     scale_global,
                     max_size=False,
                     num_records_bytes=N * (fx.Float32.width // 8),
@@ -466,7 +468,7 @@ def _build_moe_gemm2_1x4(
                 scale_local_offset = wave_id * WAVE_N + lane_id * 4
                 scale_offset = fx.Int32(block_n) * BLOCK_N + scale_local_offset
                 scale_vec = fx.Vector(
-                    fx.buffer_ops.buffer_load(
+                    buffer_ops.buffer_load(
                         scale_global_rsrc,
                         scale_offset,
                         vec_width=4,
@@ -639,7 +641,7 @@ def _build_moe_gemm2_1x4(
 
                     # Consume the older read first without forcing the newer read complete.
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                    fx.buffer_ops.buffer_store(
+                    buffer_ops.buffer_store(
                         Vec(out_frags[0].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[0],
@@ -647,7 +649,7 @@ def _build_moe_gemm2_1x4(
                         offset_is_bytes=True,
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    fx.buffer_ops.buffer_store(
+                    buffer_ops.buffer_store(
                         Vec(out_frags[1].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[1],
@@ -748,7 +750,7 @@ def _build_moe_gemm2_1x4(
                                 ).to(fx.Int32)
                             )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                        fx.buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             Vec(out_frags[0].load()).bitcast(fx.Int32),
                             output_store_rsrc,
                             byte_offsets[0],
@@ -756,7 +758,7 @@ def _build_moe_gemm2_1x4(
                             offset_is_bytes=True,
                         )
                         fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                        fx.buffer_ops.buffer_store(
+                        buffer_ops.buffer_store(
                             Vec(out_frags[1].load()).bitcast(fx.Int32),
                             output_store_rsrc,
                             byte_offsets[1],

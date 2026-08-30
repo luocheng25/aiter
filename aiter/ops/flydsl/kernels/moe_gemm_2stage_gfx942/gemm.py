@@ -28,6 +28,8 @@ def _compile_gemm_cached(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    mxfp4_gate_up_interleaved=True,
+    fused_down_clear=False,
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
@@ -48,6 +50,8 @@ def _compile_gemm_cached(
             tile_k=tile_k,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+            fused_down_clear=fused_down_clear,
             METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
         )
     return compile_moe_gemm2(
@@ -65,6 +69,8 @@ def _compile_gemm_cached(
         tile_k=tile_k,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
+        fused_down_clear=fused_down_clear,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
@@ -90,7 +96,13 @@ def compile_gemm(
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
+    force_batch1_path=False,
+    mxfp4_gate_up_interleaved=True,
+    fused_down_clear=False,
 ):
+    if force_batch1_path:
+        alg = "batch1"
+
     return _compile_gemm_cached(
         get_device_cache_key(),
         N,
@@ -108,6 +120,8 @@ def compile_gemm(
         tile_k,
         activation,
         swiglu_limit,
+        mxfp4_gate_up_interleaved,
+        fused_down_clear,
         down_path,
         down_output_padding_bytes,
         METADATA_TILE_SIZE_M,

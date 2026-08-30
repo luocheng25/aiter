@@ -15,6 +15,8 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from . import layout_helpers as fxh
 from .common import get_down_device_config as _get_down_device_config
 
@@ -216,7 +218,7 @@ def _build_moe_gemm2_1x8(
                 ).bitcast(fx.BFloat16)
             )
 
-    down_ops = fxh.FlyObjCache()
+    down_ops = fxh.FlyObjCache(use_cache=False)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def moe_2stage_down_prefill_1x8(
@@ -255,7 +257,7 @@ def _build_moe_gemm2_1x8(
                 + e_offset * (BLOCK_M * output_row_stride),
                 (BLOCK_M, output_row_stride),
             )
-            output_store_rsrc = fx.buffer_ops.create_buffer_resource(
+            output_store_rsrc = buffer_ops.create_buffer_resource(
                 arg_p_output,
                 max_size=False,
                 num_records_bytes=BLOCK_M * output_row_stride * 2,
@@ -453,7 +455,7 @@ def _build_moe_gemm2_1x8(
                         )
 
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
-                    fx.buffer_ops.buffer_store(
+                    buffer_ops.buffer_store(
                         Vec(out_frags[0].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[0],
@@ -461,7 +463,7 @@ def _build_moe_gemm2_1x8(
                         offset_is_bytes=True,
                     )
                     fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-                    fx.buffer_ops.buffer_store(
+                    buffer_ops.buffer_store(
                         Vec(out_frags[1].load()).bitcast(fx.Int32),
                         output_store_rsrc,
                         byte_offsets[1],
@@ -630,7 +632,6 @@ def _build_moe_gemm2_1x8(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        down_ops.clear_all()
         generic_kernel = moe_2stage_down_prefill_1x8(
             p_input,
             p_weight,
@@ -651,7 +652,6 @@ def _build_moe_gemm2_1x8(
             },
         )
         if const_expr(topology_enabled):
-            down_ops.clear_all()
             topology_kernel = moe_2stage_down_prefill_1x8(
                 p_input,
                 p_weight,

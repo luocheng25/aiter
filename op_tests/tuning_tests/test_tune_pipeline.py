@@ -115,6 +115,165 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
         ) from None
 
 
+class TestFlydslGfx942MoeConfig(unittest.TestCase):
+    def test_legacy_and_extended_config_round_trip(self):
+        from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+        legacy = "64_128_256_True"
+        self.assertEqual(Config.from_string(legacy).to_string(), legacy)
+
+        direct = "16_16_16_False_True"
+        self.assertEqual(Config.from_string(direct).to_string(), direct)
+
+        extended = Config(
+            128,
+            256,
+            128,
+            True,
+            down_path="2x4",
+            GATEUP_BLOCK_M=64,
+            down_output_padding_bytes=0,
+        )
+        self.assertEqual(Config.from_string(extended.to_string()), extended)
+
+    def test_tune_space_is_unique_and_includes_new_down_paths(self):
+        from aiter.ops.flydsl.fused_moe_gfx942 import get_tune_space
+
+        tune_space = get_tune_space()
+        self.assertEqual(len(tune_space), len(set(tune_space)))
+        self.assertEqual(len(tune_space), 15)
+        self.assertIn("16_16_16_False_True", get_tune_space(4))
+        self.assertNotIn("16_16_16_False_True", get_tune_space(16))
+        for down_path in ("1x4_64x256", "2x4", "1x8"):
+            self.assertTrue(any(f":{down_path}:" in config for config in tune_space))
+        for block_n, block_k in ((128, 64),):
+            self.assertIn(f"16_{block_n}_{block_k}_False", tune_space)
+        self.assertNotIn("16_128_32_False", tune_space)
+        self.assertNotIn("16_128_128_False", tune_space)
+
+    def test_new_down_path_shape_gates(self):
+        from aiter import QuantType
+        from aiter.ops.flydsl.fused_moe_gfx942 import (
+            get_tune_config_unsupported_reason,
+        )
+
+        common = {
+            "token": 1024,
+            "expert": 192,
+            "topk": 8,
+        }
+        self.assertIsNone(
+            get_tune_config_unsupported_reason(
+                "64_128_128_True:1x8:64:0",
+                model_dim=4096,
+                inter_dim=192,
+                quant_type=QuantType.per_Tensor,
+                **common,
+            )
+        )
+        self.assertIn(
+            "per-tensor",
+            get_tune_config_unsupported_reason(
+                "64_128_128_True:1x8:64:0",
+                model_dim=6144,
+                inter_dim=384,
+                quant_type=QuantType.per_Token,
+                **common,
+            ),
+        )
+        self.assertIn(
+            "LDS",
+            get_tune_config_unsupported_reason(
+                "128_256_128_True:2x4:64:0",
+                model_dim=2048,
+                inter_dim=512,
+                quant_type=QuantType.per_Token,
+                **common,
+            ),
+        )
+
+    def test_bf16_default_paths_are_tunable(self):
+        from aiter import QuantType
+        from aiter.ops.flydsl.fused_moe_gfx942 import (
+            get_tune_config_unsupported_reason,
+        )
+
+        problem = {
+            "token": 32,
+            "model_dim": 2560,
+            "inter_dim": 192,
+            "expert": 513,
+            "topk": 11,
+            "quant_type": QuantType.No,
+        }
+        self.assertIsNone(
+            get_tune_config_unsupported_reason("16_16_16_False", **problem)
+        )
+        self.assertIsNone(
+            get_tune_config_unsupported_reason("64_128_128_True", **problem)
+        )
+        self.assertIn(
+            "81920 bytes of LDS",
+            get_tune_config_unsupported_reason(
+                "64_128_128_True", **{**problem, "inter_dim": 640}
+            ),
+        )
+        self.assertIn(
+            "require FP8 weights",
+            get_tune_config_unsupported_reason(
+                "64_128_128_True:1x4_64x256:64:128", **problem
+            ),
+        )
+
+    def test_decode_tile_shape_gates(self):
+        from aiter import QuantType
+        from aiter.ops.flydsl.fused_moe_gfx942 import (
+            get_tune_config_unsupported_reason,
+        )
+
+        problem = {
+            "token": 32,
+            "model_dim": 2560,
+            "inter_dim": 320,
+            "expert": 513,
+            "topk": 11,
+            "quant_type": QuantType.per_Token,
+        }
+        self.assertIsNone(
+            get_tune_config_unsupported_reason("16_128_64_False", **problem)
+        )
+        self.assertIn(
+            "batch1",
+            get_tune_config_unsupported_reason(
+                "16_128_64_False", **{**problem, "token": 1}
+            ),
+        )
+
+    def test_down_topology_uses_arch_and_cu_count(self):
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.common import (
+            down_device_config_from_properties,
+            get_down_device_config,
+        )
+
+        self.assertEqual(
+            down_device_config_from_properties("gfx942:sramecc+:xnack-", 80),
+            (True, 4),
+        )
+        self.assertEqual(
+            down_device_config_from_properties("gfx942", 304),
+            (False, 8),
+        )
+        self.assertEqual(
+            down_device_config_from_properties("gfx950", 256),
+            (False, 8),
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"FLYDSL_GPU_ARCH": "gfx942", "CU_NUM": "80"},
+        ):
+            self.assertEqual(get_down_device_config(), (True, 4))
+
+
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 class TestTunePipeline(unittest.TestCase):
     """Smoke test: run each tuner on 1 small shape, verify CSV output."""

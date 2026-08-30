@@ -401,9 +401,10 @@ def view_as_torch_tensor(ptr, shape, dtype=None):
 # and once defined, will stay unchanged in the rest life time, so they
 # can be used safely as cache key
 class FlyObjCache:
-    def __init__(self):
+    def __init__(self, use_cache=True):
         self._cached_methods = {}
-        self._register_methods()
+        if use_cache:
+            self._register_methods()
 
     def _register_methods(self):
         for name, attr in self.__class__.__dict__.items():

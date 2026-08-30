@@ -65,6 +65,7 @@ if is_flydsl_available():
     _fused_moe_impl_path = (
         "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
     )
+    register_fused_moe_impl("flydsl_gfx950", _fused_moe_impl_path)
     register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
 
     # from .linear_attention_kernels import flydsl_gdr_decode
