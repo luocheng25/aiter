@@ -38,6 +38,15 @@ class Config:
     GATEUP_BLOCK_M: int | None = None
     down_output_padding_bytes: int | None = None
 
+    def __post_init__(self):
+        if self.down_path not in (
+            "default",
+            "1x4_64x256",
+            "8x1",
+            "8x1_compact",
+        ):
+            raise ValueError(f"Invalid down path: {self.down_path}")
+
     def to_string(self):
         base = (
             str(self.BLOCK_M)
@@ -90,7 +99,7 @@ class Config:
         if len(extensions) == 1:
             return config
         down_path, gateup_block_m, padding = extensions[1:4]
-        if down_path not in ("default", "1x4_64x256", "2x4", "1x8"):
+        if down_path not in ("default", "1x4_64x256", "8x1", "8x1_compact"):
             raise ValueError(f"Invalid down path in config string: {data}")
         return cls(
             config.BLOCK_M,
@@ -170,6 +179,8 @@ class Config:
         if (problem.hidden_dim // self.BLOCK_K) % 2 != 0:
             return "gateup requires an even number of BLOCK_K tiles"
         if self.down_path == "default":
+            if self.down_output_padding_bytes is not None:
+                return "default down path does not support output padding"
             activation_bytes = (
                 self.BLOCK_M
                 * problem.inter_dim
@@ -180,30 +191,37 @@ class Config:
             return None
         if problem.quant_type not in ("ptpc", "per_tensor"):
             return "specialized down paths require FP8 weights"
-        if self.down_path == "1x8" and problem.quant_type != "per_tensor":
-            return "1x8 requires per-tensor weight and activation scales"
         down_tile_n = {
             "1x4_64x256": 256,
-            "2x4": 256,
-            "1x8": 512,
+            "8x1": 128,
+            "8x1_compact": 128,
         }[self.down_path]
         if problem.model_dim % down_tile_n != 0:
             return f"model_dim={problem.model_dim} is not divisible by down tile N={down_tile_n}"
-        if problem.inter_dim % 64 != 0:
-            return f"inter_dim={problem.inter_dim} is not divisible by 64"
+        if self.down_output_padding_bytes not in (0, 32, 64, 128):
+            return "specialized down paths require output padding of 0/32/64/128 bytes"
         if self.down_path == "1x4_64x256":
+            if problem.inter_dim % 64 != 0:
+                return f"inter_dim={problem.inter_dim} is not divisible by 64"
             if self.BLOCK_M != 64 or gateup_block_m != 64:
                 return "1x4_64x256 requires down/gateup BLOCK_M=64"
             scale_bytes = 256 * 4 if problem.quant_type == "ptpc" else 0
             lds_bytes = 64 * problem.inter_dim + scale_bytes + 4 * 16 * 64 * 2
-        elif self.down_path == "2x4":
-            if self.BLOCK_M != 128 or gateup_block_m != 64:
-                return "2x4 requires down BLOCK_M=128 and gateup BLOCK_M=64"
-            lds_bytes = 2 * 64 * problem.inter_dim + 8 * 16 * 64 * 2
         else:
-            if self.BLOCK_M != 64 or gateup_block_m != 64:
-                return "1x8 requires down/gateup BLOCK_M=64"
-            lds_bytes = 64 * problem.inter_dim + 8 * 16 * 64 * 2
+            if problem.inter_dim not in (192, 256, 320, 384, 512, 640):
+                return (
+                    "8x1 paths require inter_dim in "
+                    "{192, 256, 320, 384, 512, 640}"
+                )
+            expected_block_m = 256 if self.down_path == "8x1" else 64
+            if self.BLOCK_M != expected_block_m or gateup_block_m != 64:
+                return (
+                    f"{self.down_path} requires down BLOCK_M={expected_block_m} "
+                    "and gateup BLOCK_M=64"
+                )
+            if self.down_path == "8x1_compact" and not 0 < problem.experts <= 2048:
+                return "8x1_compact requires 1 to 2048 experts"
+            lds_bytes = 0
         if lds_bytes > 64 * 1024:
             return f"down path requires {lds_bytes} bytes of LDS"
         return None
@@ -335,27 +353,25 @@ def get_tune_space(batch: int | None = None, *, include_prefill: bool = True):
                             down_output_padding_bytes=128,
                         ),
                         Config(
-                            128,
+                            256,
                             gateup_block_n,
                             block_k,
                             True,
-                            down_path="2x4",
+                            down_path="8x1",
                             GATEUP_BLOCK_M=64,
-                            down_output_padding_bytes=0,
+                            down_output_padding_bytes=128,
+                        ),
+                        Config(
+                            64,
+                            gateup_block_n,
+                            block_k,
+                            True,
+                            down_path="8x1_compact",
+                            GATEUP_BLOCK_M=64,
+                            down_output_padding_bytes=128,
                         ),
                     ]
                 )
-            configs.append(
-                Config(
-                    64,
-                    128,
-                    block_k,
-                    True,
-                    down_path="1x8",
-                    GATEUP_BLOCK_M=64,
-                    down_output_padding_bytes=0,
-                )
-            )
     return [config.to_string() for config in configs]
 
 
@@ -376,6 +392,8 @@ def _get_compiled_kernel_cached(
     BLOCK_TILE_SIZE_K=None,
     activation_str="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     USE_ATOMIC_WRITE=True,
     down_path="default",
     down_output_padding_bytes=None,
@@ -403,6 +421,8 @@ def _get_compiled_kernel_cached(
         act_quant_type=act_quant_type_str,
         activation=activation_str,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
@@ -633,8 +653,8 @@ def precompile_flydsl_moe(
         down_block_n = {
             "default": 128,
             "1x4_64x256": 256,
-            "2x4": 256,
-            "1x8": 512,
+            "8x1": 128,
+            "8x1_compact": 128,
         }[config.down_path]
         down = compile_kernel(
             stage="down",
@@ -645,6 +665,7 @@ def precompile_flydsl_moe(
             act_quant_type_str=quant_type,
             down_path=config.down_path,
             down_output_padding_bytes=config.down_output_padding_bytes,
+            METADATA_TILE_SIZE_M=config.BLOCK_M,
         )
         down_args = (
             _ptr(byte if is_fp8 else bf16),
@@ -661,6 +682,30 @@ def precompile_flydsl_moe(
         )
         if config.down_path == "default":
             down_args += activation_scalars
+        elif config.down_path == "8x1_compact":
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
+                task_capacities,
+            )
+
+            metadata_capacity = (
+                batch * topk + experts * config.BLOCK_M - topk
+                + config.BLOCK_M
+                - 1
+            ) // config.BLOCK_M
+            full_capacity, tail_capacity = task_capacities(
+                metadata_capacity,
+                experts,
+            )
+            full_tasks = torch.empty((full_capacity, 2), dtype=torch.int32)
+            tail_tasks = torch.empty((tail_capacity, 2), dtype=torch.int32)
+            task_counts = torch.empty(2, dtype=torch.int32)
+            down_args += (
+                _ptr(full_tasks),
+                _ptr(tail_tasks),
+                _ptr(task_counts),
+                full_capacity,
+                tail_capacity,
+            )
         compile_launcher(down, *down_args, 0)
         return
 
@@ -825,6 +870,8 @@ def _run_prefill(
         act_quant_type_str=act_quant_type_str,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         METADATA_TILE_SIZE_M=config.BLOCK_M,
     )
     task_num = int(sorted_expert_ids.shape[0])
@@ -872,8 +919,8 @@ def _run_prefill(
     down_tile_n = {
         "default": 128,
         "1x4_64x256": 256,
-        "2x4": 256,
-        "1x8": 512,
+        "8x1": 128,
+        "8x1_compact": 128,
     }[config.down_path]
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
@@ -890,6 +937,7 @@ def _run_prefill(
         act_quant_type_str=problem.quant_type,
         down_path=config.down_path,
         down_output_padding_bytes=output_padding_bytes,
+        METADATA_TILE_SIZE_M=config.BLOCK_M,
     )
     down_args = (
         down_in,
@@ -906,6 +954,24 @@ def _run_prefill(
     )
     if config.down_path == "default":
         _launch(down_kernel, *down_args, *activation_scalars)
+    elif config.down_path == "8x1_compact":
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
+            allocate_task_buffers,
+        )
+
+        full_tasks, tail_tasks, task_counts = allocate_task_buffers(
+            sorted_expert_ids,
+            problem.experts,
+        )
+        _launch(
+            down_kernel,
+            *down_args,
+            full_tasks,
+            tail_tasks,
+            task_counts,
+            full_tasks.shape[0],
+            tail_tasks.shape[0],
+        )
     else:
         _launch(down_kernel, *down_args)
 
@@ -971,6 +1037,8 @@ def _run_batch1(
         E=None,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
         fused_down_clear=fused_down_clear,
     )
@@ -1071,6 +1139,8 @@ def _run_decode(
         E=problem.experts,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
     )
     activation_scalars = _activation_scalars(

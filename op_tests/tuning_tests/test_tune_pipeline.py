@@ -126,26 +126,33 @@ class TestFlydslGfx942MoeConfig(unittest.TestCase):
         self.assertEqual(Config.from_string(direct).to_string(), direct)
 
         extended = Config(
-            128,
+            256,
             256,
             128,
             True,
-            down_path="2x4",
+            down_path="8x1",
             GATEUP_BLOCK_M=64,
-            down_output_padding_bytes=0,
+            down_output_padding_bytes=128,
         )
         self.assertEqual(Config.from_string(extended.to_string()), extended)
+        for retired_path in ("1x8", "2x4"):
+            with self.assertRaisesRegex(ValueError, "Invalid down path"):
+                Config.from_string(
+                    f"128_256_128_True:{retired_path}:64:0"
+                )
 
     def test_tune_space_is_unique_and_includes_new_down_paths(self):
         from aiter.ops.flydsl.fused_moe_gfx942 import get_tune_space
 
         tune_space = get_tune_space()
         self.assertEqual(len(tune_space), len(set(tune_space)))
-        self.assertEqual(len(tune_space), 15)
+        self.assertEqual(len(tune_space), 17)
         self.assertIn("16_16_16_False_True", get_tune_space(4))
         self.assertNotIn("16_16_16_False_True", get_tune_space(16))
-        for down_path in ("1x4_64x256", "2x4", "1x8"):
+        for down_path in ("1x4_64x256", "8x1", "8x1_compact"):
             self.assertTrue(any(f":{down_path}:" in config for config in tune_space))
+        self.assertTrue(all(":2x4:" not in config for config in tune_space))
+        self.assertTrue(all(":1x8:" not in config for config in tune_space))
         for block_n, block_k in ((128, 64),):
             self.assertIn(f"16_{block_n}_{block_k}_False", tune_space)
         self.assertNotIn("16_128_32_False", tune_space)
@@ -164,31 +171,72 @@ class TestFlydslGfx942MoeConfig(unittest.TestCase):
         }
         self.assertIsNone(
             get_tune_config_unsupported_reason(
-                "64_128_128_True:1x8:64:0",
+                "256_128_128_True:8x1:64:128",
                 model_dim=4096,
                 inter_dim=192,
                 quant_type=QuantType.per_Tensor,
                 **common,
             )
         )
-        self.assertIn(
-            "per-tensor",
+        self.assertIsNone(
             get_tune_config_unsupported_reason(
-                "64_128_128_True:1x8:64:0",
+                "64_128_128_True:8x1_compact:64:128",
                 model_dim=6144,
                 inter_dim=384,
+                quant_type=QuantType.per_Token,
+                **common,
+            )
+        )
+        self.assertIn(
+            "inter_dim",
+            get_tune_config_unsupported_reason(
+                "256_256_128_True:8x1:64:128",
+                model_dim=2048,
+                inter_dim=768,
                 quant_type=QuantType.per_Token,
                 **common,
             ),
         )
         self.assertIn(
-            "LDS",
+            "BLOCK_M=256",
             get_tune_config_unsupported_reason(
-                "128_256_128_True:2x4:64:0",
+                "64_256_128_True:8x1:64:128",
                 model_dim=2048,
                 inter_dim=512,
                 quant_type=QuantType.per_Token,
                 **common,
+            ),
+        )
+        self.assertIn(
+            "FP8 weights",
+            get_tune_config_unsupported_reason(
+                "256_128_128_True:8x1:64:128",
+                model_dim=4096,
+                inter_dim=256,
+                quant_type=QuantType.No,
+                **common,
+            ),
+        )
+        self.assertIn(
+            "output padding",
+            get_tune_config_unsupported_reason(
+                "256_128_128_True:8x1:64:none",
+                model_dim=4096,
+                inter_dim=256,
+                quant_type=QuantType.per_Token,
+                **common,
+            ),
+        )
+        self.assertIn(
+            "2048 experts",
+            get_tune_config_unsupported_reason(
+                "64_128_128_True:8x1_compact:64:128",
+                token=1024,
+                model_dim=4096,
+                inter_dim=256,
+                expert=2049,
+                topk=8,
+                quant_type=QuantType.per_Token,
             ),
         )
 

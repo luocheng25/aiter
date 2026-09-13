@@ -9,7 +9,7 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from . import layout_helpers as fxh
+from . import common as fxh
 from .common import get_device_cache_key
 from .common import torch_tensor_to_pointer as _ptr
 

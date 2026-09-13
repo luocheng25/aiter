@@ -8,10 +8,12 @@ import types
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import range_constexpr
+from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import is_generic_address_space, is_target_address_space
 
 
 def div_up(x, y):
@@ -395,6 +397,112 @@ def torch_layout(*shape):
 def view_as_torch_tensor(ptr, shape, dtype=None):
     ptr = _as_ptr(ptr, dtype)
     return fx.make_view(ptr, torch_layout(*shape))
+
+
+def _offset_i32(value):
+    if isinstance(value, (fx.Int32, fx.Uint32)):
+        return value.ir_value()
+    if (
+        isinstance(value, ir.Value)
+        and isinstance(value.type, ir.IntegerType)
+        and value.type.width == 32
+    ):
+        return value
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and -(1 << 31) <= value < (1 << 32)
+    ):
+        return fx.Uint32(value & 0xFFFFFFFF).ir_value()
+    raise TypeError("offset requires a precomputed 32-bit SSA value or integer")
+
+
+class BufferTensor(fx.Tensor):
+    @dsl_loc_tracing
+    def __getitem__(self, coord):
+        result = super().__getitem__(coord)
+        return type(self)(result) if isinstance(result, fx.Tensor) else result
+
+    def _packet_bits(self):
+        if not is_target_address_space(
+            self.address_space, TargetAddressSpace.BufferDesc
+        ):
+            raise TypeError("explicit buffer access requires a BufferDesc tensor")
+        if (
+            not self.layout.is_static
+            or fx.rank(self.layout) != 1
+            or self.stride.to_py_value() not in (1, (1,))
+        ):
+            raise ValueError("explicit buffer access requires a contiguous 1D packet")
+        bits = fx.size(self).to_py_value() * self.dtype.width
+        if bits not in (32, 64, 128):
+            raise ValueError("buffer packets must be 32, 64, or 128 bits")
+        return bits
+
+    @dsl_loc_tracing
+    def load(self, *, voffset_bytes=None, soffset_bytes=0, aux=0):
+        if voffset_bytes is None:
+            if not isinstance(soffset_bytes, int) or soffset_bytes != 0 or aux != 0:
+                raise ValueError(
+                    "explicit soffset/aux requires an explicit voffset_bytes"
+                )
+            return super().load()
+        bits = self._packet_bits()
+        if not isinstance(aux, int):
+            raise TypeError("aux must be a compile-time integer")
+        resource = fx.rocdl.get_buffer_rsrc(fx.get_iter(self))
+        result = rocdl.RawPtrBufferLoadOp(
+            ir.VectorType.get([bits // 32], fx.Uint32.ir_type),
+            resource,
+            _offset_i32(voffset_bytes),
+            _offset_i32(soffset_bytes),
+            aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
+        ).result
+        return Vec(result).bitcast(self.dtype)
+
+
+class LdsTensor(fx.Tensor):
+    @dsl_loc_tracing
+    def __getitem__(self, coord):
+        result = super().__getitem__(coord)
+        return type(self)(result) if isinstance(result, fx.Tensor) else result
+
+    def _addressed(self, address_bytes, offset_bytes):
+        if not is_generic_address_space(
+            self.address_space, fx.AddressSpace.Shared
+        ):
+            raise TypeError("explicit LDS access requires a shared-memory tensor")
+        element_bytes = self.dtype.width // 8
+        if (
+            not element_bytes
+            or not isinstance(offset_bytes, int)
+            or offset_bytes % element_bytes
+        ):
+            raise ValueError("LDS offset must be a compile-time aligned byte count")
+        pointer = fx.get_iter(self)
+        if address_bytes is not None:
+            pointer = fx.inttoptr(pointer.type, fx.Int32(_offset_i32(address_bytes)))
+        if offset_bytes:
+            pointer = pointer + offset_bytes // element_bytes
+        return fx.make_view(pointer, self.layout)
+
+    @dsl_loc_tracing
+    def load(self, *, address_bytes=None, offset_bytes=0, into=None, copy_atom=None):
+        source = self._addressed(address_bytes, offset_bytes)
+        if into is None:
+            if copy_atom is not None:
+                raise ValueError("copy_atom requires an into fragment")
+            return source.load()
+        if copy_atom is None:
+            raise ValueError("into requires an explicit copy_atom")
+        fx.copy(copy_atom, source, into)
+
+    @dsl_loc_tracing
+    def store(self, vector, *, address_bytes=None, offset_bytes=0, copy_atom=None):
+        destination = self._addressed(address_bytes, offset_bytes)
+        if copy_atom is None:
+            return destination.store(vector)
+        fx.copy(copy_atom, vector, destination)
 
 
 # MLIR values are all SSA which is naturally different from each other

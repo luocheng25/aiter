@@ -16,7 +16,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch
 
-from . import layout_helpers as fxh
+from . import common as fxh
 from .common import get_device_cache_key
 
 
@@ -36,6 +36,8 @@ def _build_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     down_path="default",
     down_output_padding_bytes=None,
     METADATA_TILE_SIZE_M=None,
@@ -81,10 +83,15 @@ def _build_moe_gemm1(
     ], "activation must be 'silu', 'swiglu' or 'situv2'"
     if activation in ("swiglu", "situv2"):
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
+    if activation == "situv2":
+        situ_beta = float(situ_beta)
+        situ_linear_beta = float(situ_linear_beta)
+        assert situ_beta > 0.0, "situ_beta must be positive"
+        assert situ_linear_beta > 0.0, "situ_linear_beta must be positive"
     if weight_dtype == "fp4":
-        assert (
-            weight_quant_type == "mxfp4" and act_quant_type == "no"
-        ), "fp4 requires mxfp4 weights and bf16 activations"
+        assert weight_quant_type == "mxfp4" and act_quant_type == "no", (
+            "fp4 requires mxfp4 weights and bf16 activations"
+        )
         assert K % 512 == 0, f"fp4 gateup K must be a multiple of 512, got {K}"
     else:
         assert weight_quant_type != "mxfp4", "mxfp4 quantization requires fp4 weights"
@@ -2479,6 +2486,8 @@ def _compile_moe_gemm1_cached(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     mxfp4_gate_up_interleaved=True,
     fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
@@ -2499,6 +2508,8 @@ def _compile_moe_gemm1_cached(
         tile_k=tile_k,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         down_path="default",
         down_output_padding_bytes=None,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
@@ -2522,6 +2533,8 @@ def compile_moe_gemm1(
     tile_k=None,
     activation="silu",
     swiglu_limit=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     mxfp4_gate_up_interleaved=True,
     fused_down_clear=False,
     METADATA_TILE_SIZE_M=None,
@@ -2542,6 +2555,8 @@ def compile_moe_gemm1(
         tile_k=tile_k,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
         fused_down_clear=fused_down_clear,
         METADATA_TILE_SIZE_M=METADATA_TILE_SIZE_M,
