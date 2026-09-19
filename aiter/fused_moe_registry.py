@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Whole-graph fused MoE implementations selected by ``kernelName1``.
-
-Implementations receive a normalized request and an opaque config string. Code
-registers a stable name; tuned CSV rows select it with the convention
-``impl__<name>__<config>``.
-"""
-
 import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -52,18 +45,6 @@ FusedMoeImpl = Callable[[FusedMoeRequest, str], torch.Tensor]
 BoundFusedMoeImpl = Callable[[FusedMoeRequest], torch.Tensor]
 _IMPLEMENTATIONS: dict[str, FusedMoeImpl | str] = {}
 
-# ``kernelName1`` protocol: ``impl__<registered-name>__<opaque-config>``.
-# The name must be non-empty and cannot contain ``__``. Everything after the
-# second separator is passed to the implementation unchanged, so the config may
-# itself contain ``__``. Names without this prefix remain normal stage1 kernels.
-# Adding a new extension:
-# 1. In the backend module, implement ``run(request, config) -> Tensor``; see
-#    ``aiter/ops/flydsl/fused_moe_gfx942.py::run_flydsl_moe_gfx942_impl``.
-# 2. In the backend package initializer, call ``register_fused_moe_impl`` with a
-#    stable name and the function/import path; see ``aiter/ops/flydsl/__init__.py``.
-# 3. In the tuner/config writer, call ``make_fused_moe_impl_kernel_name`` and
-#    store its result in ``kernelName1``. ``aiter/fused_moe.py`` then resolves
-#    and runs the registered whole-graph implementation automatically.
 _KERNEL_NAME_PREFIX = "impl__"
 
 
@@ -72,7 +53,6 @@ class FusedMoeImplResolutionError(ValueError):
 
 
 def register_fused_moe_impl(name: str, impl: FusedMoeImpl | str) -> None:
-    """Register a whole-graph fused MoE implementation or lazy import path."""
     previous = _IMPLEMENTATIONS.get(name)
     if previous is not None and previous != impl:
         raise ValueError(f"Fused MoE implementation already registered: {name}")
@@ -86,7 +66,7 @@ def make_fused_moe_impl_kernel_name(name: str, config: str) -> str:
 
 
 def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
-    """Resolve ``impl__<name>__<config>`` and bind its opaque config."""
+    """Resolve a whole-graph backend while preserving safe import fallback."""
     if not kernel_name.startswith(_KERNEL_NAME_PREFIX):
         return None
 

@@ -8,14 +8,12 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value
-from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common as fxh
+from .common import _f32_to_bf16
 from .common import get_down_device_config as _get_down_device_config
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
@@ -136,33 +134,10 @@ def _build_moe_gemm2_1x4(
     elif weight_dtype == "fp8":
         weight_dtype = fx.Float8E4M3FNUZ
 
-    def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
-        """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
-        vm_lo = vmcnt & 0xF
-        vm_hi = (vmcnt >> 4) & 0x3
-        return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
-
     def _pack_scaled_bf16_pairs(values, scales):
-        # 0x8000在这里按f32位型参与FMA；v_perm只取高16位，因此不是BF16 RNE。
-        fma_bias = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-        scaled = fxh.eltwise_op("llvm.fma.f32", values, scales, fma_bias)
-        selector = fx.Uint32(0x07060302)
-        packed = []
-        for index in range_constexpr(0, scaled.numel, 2):
-            packed.append(
-                llvm.inline_asm(
-                    ir.IntegerType.get_signless(32),
-                    [
-                        _raw(scaled[index + 1]),
-                        _raw(scaled[index]),
-                        _raw(selector),
-                    ],
-                    "v_perm_b32 $0, $1, $2, $3",
-                    "=v,v,v,s",
-                    has_side_effects=True,
-                )
-            )
-        return packed
+        # 先舍入再打包；0x8000 不能作为浮点 FMA bias 代替整数舍入。
+        packed = _f32_to_bf16(values * scales).bitcast(fx.Uint32)
+        return [packed[index] for index in range_constexpr(packed.numel)]
 
     def _store_scaled_bf16(source, scales, destination):
         for src, scale, dst in fxh.all_elements(source, scales, destination):
@@ -322,11 +297,7 @@ def _build_moe_gemm2_1x4(
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
                 fxh._as_ptr(p_weight, weight_dtype)
-                + (
-                    fx.Int64(expert_id) * N * K
-                    if const_expr(_task_table)
-                    else fx.Int64(expert_id * N * K)
-                ),
+                + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     (
                         ((4, 2, 2, 4, 4, N // 256)),
@@ -631,7 +602,7 @@ def _build_moe_gemm2_1x4(
                         byte_offsets.append(byte_offset)
 
                     # Consume the older read first without forcing the newer read complete.
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
+                    fx.rocdl.s_waitcnt(lgkmcnt=1)
                     fx.rocdl.RawPtrBufferStoreOp(
                         Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
@@ -639,7 +610,7 @@ def _build_moe_gemm2_1x4(
                         fx.Int32(0).ir_value(),
                         aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                     )
-                    fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                    fx.rocdl.s_waitcnt(lgkmcnt=0)
                     fx.rocdl.RawPtrBufferStoreOp(
                         Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                         output_store_rsrc,
@@ -740,7 +711,7 @@ def _build_moe_gemm2_1x4(
                                     * 2
                                 ).to(fx.Int32)
                             )
-                        fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=1))
+                        fx.rocdl.s_waitcnt(lgkmcnt=1)
                         fx.rocdl.RawPtrBufferStoreOp(
                             Vec(out_frags[0].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,
@@ -748,7 +719,7 @@ def _build_moe_gemm2_1x4(
                             fx.Int32(0).ir_value(),
                             aux=ir.IntegerAttr.get(fx.Int32.ir_type, _store_cache),
                         )
-                        fx.rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                        fx.rocdl.s_waitcnt(lgkmcnt=0)
                         fx.rocdl.RawPtrBufferStoreOp(
                             Vec(out_frags[1].load()).bitcast(fx.Int32).ir_value(),
                             output_store_rsrc,

@@ -15,6 +15,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from . import common as fxh
+from .common import _f32_to_bf16
 
 # gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
 _DOWN_STORE_CACHE_MODIFIER = 2
@@ -115,6 +116,14 @@ def _build_moe_gemm2_default(
             f"act={act_quant_type})"
         )
 
+    if alg in ("splitk", "batch1", "prefill_1x4"):
+        down_k = 32 if alg == "prefill_1x4" and weight_dtype == "bf16" else TILE_K
+        assert K % down_k == 0, f"down K must be divisible by {down_k}, got K={K}"
+    if alg == "prefill_1x4":
+        assert N % 128 == 0, (
+            f"default down prefill requires paired 64-wide N tiles, got N={N}"
+        )
+
     if alg == "splitk":
 
         @fx.struct
@@ -129,12 +138,6 @@ def _build_moe_gemm2_default(
         assert alg in ("batch1", "splitk"), "fp4 is only supported by batch1/splitk"
         assert is_gfx950, "fp4 batch1/splitk is only supported on gfx950"
         weight_dtype = fx.Float4E2M1FN
-
-    def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
-        """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
-        vm_lo = vmcnt & 0xF
-        vm_hi = (vmcnt >> 4) & 0x3
-        return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
     class TensorWithIndex:
         # view: real tensor
@@ -284,20 +287,8 @@ def _build_moe_gemm2_default(
         src_vec = src_tensor.load()
         for i in range_constexpr(n_dwords):
             src_val = src_vec[i]
-            pk0_f32 = llvm.inline_asm(
-                T.f32x2,
-                [as_ir_value(src_val)],
-                "v_cvt_pk_f32_fp8 $0, $1",
-                "=v,v",
-                has_side_effects=False,
-            )
-            pk1_f32 = llvm.inline_asm(
-                T.f32x2,
-                [as_ir_value(src_val)],
-                "v_cvt_pk_f32_fp8_sdwa $0, $1 src0_sel:WORD_1",
-                "=v,v",
-                has_side_effects=False,
-            )
+            pk0_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=False))
+            pk1_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=True))
             tmp = (pk0_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
             items.append(tmp[0])
             items.append(tmp[1])
@@ -463,15 +454,7 @@ def _build_moe_gemm2_default(
 
     def _cvt_f32_to_bf16(c_frag):
         c_frag_bf16 = fx.make_fragment_like(c_frag, dtype=fx.BFloat16)
-        if const_expr(is_gfx950):
-            c_frag_bf16.store(c_frag.load().to(fx.BFloat16))
-        else:
-            round_bit = fx.Uint32(0x8000)
-            c_frag_bf16.store(
-                ((c_frag.load().bitcast(fx.Uint32) + round_bit) >> 16)
-                .to(fx.Uint16)
-                .bitcast(fx.BFloat16)
-            )
+        c_frag_bf16.store(_f32_to_bf16(c_frag.load()))
         return c_frag_bf16
 
     def _make_down_weight_view(p_weight, expert_id):
@@ -773,9 +756,9 @@ def _build_moe_gemm2_default(
                 if const_expr(pair_idx * 2 + 1 < num_k_iters):
                     _prefetch_b(odd_idx, 1)
                     _prefetch_a(odd_idx, 1)
-                    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                    rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
                 else:
-                    rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                    rocdl.s_waitcnt(vmcnt=0)
                 rocdl.sched_barrier(0)
                 rocdl.s_setprio(1)
                 _gemm_stage(0, even_idx, packed_scale_rows)
@@ -786,9 +769,9 @@ def _build_moe_gemm2_default(
                         next_even_idx = even_idx + 2
                         _prefetch_b(next_even_idx, 0)
                         _prefetch_a(next_even_idx, 0)
-                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                        rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
                     else:
-                        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+                        rocdl.s_waitcnt(vmcnt=0)
                     rocdl.sched_barrier(0)
                     rocdl.s_setprio(1)
                     _gemm_stage(1, odd_idx, packed_scale_rows)
@@ -800,13 +783,13 @@ def _build_moe_gemm2_default(
                 k_base = fx.Int32(k2 * 2)
                 _prefetch_a(k_base + 1, 1)
                 _prefetch_b(k_base + 1, 1)
-                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
                 rocdl.sched_barrier(splitk_stage_mask)
                 _gemm_stage(0, k_base)
                 rocdl.sched_barrier(splitk_stage_mask)
                 _prefetch_a(k_base + 2, 0)
                 _prefetch_b(k_base + 2, 0)
-                rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+                rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
                 rocdl.sched_barrier(splitk_stage_mask)
                 _gemm_stage(1, k_base + 1)
                 rocdl.sched_barrier(splitk_stage_mask)
@@ -1098,7 +1081,7 @@ def _build_moe_gemm2_default(
         # row and broadcast it across the TILE_M MFMA rows (stride 0); every computed row is then
         # identical, so any single row is the real result.
         arg_p_input = fx.make_view(
-            fxh._as_ptr(p_input) + fx.Int64(route_idx * K),
+            fxh._as_ptr(p_input) + fx.Int64(route_idx) * K,
             fx.make_layout((BLOCK_TILE_SIZE_M, K), (0, 1)),
         )
         if const_expr(weight_dtype != fx.BFloat16):
@@ -1132,7 +1115,7 @@ def _build_moe_gemm2_default(
 
         # write to mem
         arg_p_output = fx.make_view(
-            fxh._as_ptr(p_output) + fx.Int64(batch_idx * N),
+            fxh._as_ptr(p_output) + fx.Int64(batch_idx) * N,
             fx.make_layout((1, N), (N, 1)),
         )
         cp_atom_w = fx.make_copy_atom(
@@ -1222,11 +1205,7 @@ def _build_moe_gemm2_default(
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
                 fxh._as_ptr(p_weight, weight_dtype)
-                + (
-                    fx.Int64(expert_id) * N * K
-                    if const_expr(_task_table)
-                    else fx.Int64(expert_id * N * K)
-                ),
+                + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),
@@ -1398,14 +1377,6 @@ def _build_moe_gemm2_default(
 
                 frag_sorted_weight = frag_pt_scales
 
-            def f32_to_bf16(x):
-                round_bit = as_ir_value(fx.Uint32(0x8000)).bitcast(fx.Float32.ir_type)
-                return (
-                    ((x + round_bit).bitcast(fx.Uint32) >> 16)
-                    .to(fx.Uint16)
-                    .bitcast(fx.BFloat16)
-                )
-
             def gemm_compute(fragW, fragPCS, fragC):
                 fragC.fill(0)
                 for k in fx.range_constexpr(nBK):
@@ -1441,7 +1412,7 @@ def _build_moe_gemm2_default(
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
                 vec_f32 = fragC.load()
-                fragC_bf16.store(f32_to_bf16(vec_f32))
+                fragC_bf16.store(_f32_to_bf16(vec_f32))
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))

@@ -138,7 +138,11 @@ def _flydsl_quant_per_tensor_cached(device_cache_key, torch_dtype):
         worker_id = fx.block_idx.x
         num_workers = fx.grid_dim.x
 
-        inv_scale = fx.Float32(rocdl.rcp(T.f32, Amax[0]) * fx.Float32(fmax))
+        amax = fx.Float32(Amax[0])
+        inv_scale = (amax == fx.Float32(0.0)).select(
+            fx.Float32(0.0),
+            fx.Float32(rocdl.rcp(T.f32, amax) * fx.Float32(fmax)),
+        )
         copy_bits = 128
 
         ele0, _, neles = fxh.split_works(

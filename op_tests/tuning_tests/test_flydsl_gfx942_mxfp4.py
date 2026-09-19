@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import csv
+import importlib
 import os
 import tempfile
 import unittest
@@ -43,6 +44,38 @@ def _mxfp4_inputs(batch=4, experts=2, hidden_dim=512, inter_dim=128, topk=2):
 
 
 class TestFlydslGfx942Mxfp4(unittest.TestCase):
+    def test_two_stage_entry_does_not_select_whole_graph(self):
+        fused = importlib.import_module("aiter.fused_moe")
+        key = (
+            "gfx942", 80, 1, 2048, 128, 257, 9,
+            str(ActivationType.Silu), str(torch.bfloat16),
+            str(torch.float8_e4m3fnuz), str(torch.float8_e4m3fnuz),
+            str(QuantType.per_Token), True, False,
+        )
+        cfg = {
+            "kernelName1": "impl__flydsl_gfx942__16_16_16_False",
+            "block_m": 16, "ksplit": 0,
+        }
+        request = (
+            1, 2048, 128, 257, 9, torch.bfloat16,
+            torch.float8_e4m3fnuz, torch.float8_e4m3fnuz,
+            QuantType.per_Token, True, ActivationType.Silu, False, 0, 0,
+        )
+        fused.get_2stage_cfgs.cache_clear()
+        try:
+            with (
+                patch.object(fused, "cfg_2stages", ({key: cfg}, {})),
+                patch.object(fused, "get_cu_num", return_value=80),
+                patch.object(fused, "get_gfx_runtime", return_value="gfx942"),
+            ):
+                self.assertIsNotNone(fused.get_2stage_cfgs(*request).full_impl)
+                staged = fused.get_2stage_cfgs(*request, _disable_full_impl=True)
+                self.assertIsNone(staged.full_impl)
+                self.assertIsNotNone(staged.stage1)
+                self.assertIsNotNone(staged.stage2)
+        finally:
+            fused.get_2stage_cfgs.cache_clear()
+
     def test_compiled_kernel_cache_supports_compile_only_without_gpu(self):
         sentinel = object()
         with (
@@ -672,18 +705,18 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         )
 
         batch, experts, topk = 2, 8, 4
-        hidden_states = torch.empty((batch, 128), dtype=torch.bfloat16)
-        w1 = torch.empty((experts, 512, 128), dtype=torch.float8_e4m3fnuz)
-        w2 = torch.empty((experts, 128, 256), dtype=torch.float8_e4m3fnuz)
+        hidden_states = torch.empty((batch, 256), dtype=torch.bfloat16)
+        w1 = torch.empty((experts, 512, 256), dtype=torch.float8_e4m3fnuz)
+        w2 = torch.empty((experts, 256, 256), dtype=torch.float8_e4m3fnuz)
         topk_weight = torch.ones((batch, topk), dtype=torch.float32)
         topk_ids = torch.zeros((batch, topk), dtype=torch.int32)
         w1_scale = torch.ones((experts, 512), dtype=torch.float32)
-        w2_scale = torch.ones((experts, 128), dtype=torch.float32)
+        w2_scale = torch.ones((experts, 256), dtype=torch.float32)
         sorted_ids = torch.zeros(64, dtype=torch.int32)
         sorted_weights = torch.ones(64, dtype=torch.float32)
         sorted_expert_ids = torch.zeros(8, dtype=torch.int32)
         num_valid_ids = torch.tensor([64, batch], dtype=torch.int32)
-        expected_output = torch.empty((batch, 128), dtype=torch.bfloat16)
+        expected_output = torch.empty((batch, 256), dtype=torch.bfloat16)
         full_tasks = torch.empty((2, 2), dtype=torch.int32)
         tail_tasks = torch.empty((8, 2), dtype=torch.int32)
         task_counts = torch.empty(2, dtype=torch.int32)
@@ -736,15 +769,18 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 QuantType.per_Token,
                 w1_scale,
                 w2_scale,
+                None,
+                None,
+                0,
                 backend.Config.from_string(
-                    "64_128_64_True:8x1_compact:64:128"
+                    "64_128_128_True:8x1_compact:64:128"
                 ),
                 backend._Problem(
                     batch=batch,
                     experts=experts,
                     gateup_dim=512,
-                    hidden_dim=128,
-                    model_dim=128,
+                    hidden_dim=256,
+                    model_dim=256,
                     inter_dim=256,
                     topk=topk,
                     quant_type="ptpc",
@@ -762,7 +798,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         self.assertEqual(compiled[1]["BLOCK_TILE_SIZE_M"], 64)
         self.assertEqual(compiled[1]["BLOCK_TILE_SIZE_N"], 128)
         self.assertEqual(compiled[1]["METADATA_TILE_SIZE_M"], 64)
-        self.assertEqual(launched[1][1][2].shape, (512, 192))
+        self.assertEqual(launched[1][1][2].shape, (512, 320))
         self.assertEqual(len(launched[1][1]), 16)
         self.assertIs(launched[1][1][11], full_tasks)
         self.assertIs(launched[1][1][12], tail_tasks)
@@ -787,9 +823,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             patch.dict(os.environ, {"CU_NUM": "80"}),
         ):
             backend.precompile_flydsl_moe(
-                config_string="64_128_64_True:8x1_compact:64:128",
+                config_string="64_128_128_True:8x1_compact:64:128",
                 batch=1024,
-                model_dim=128,
+                model_dim=256,
                 inter_dim=256,
                 experts=128,
                 topk=4,
