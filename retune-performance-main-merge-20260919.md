@@ -3038,3 +3038,23 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 用户亦明确选择保留综合PR范围，不拆分当前分支历史；已恢复MLA trait和两个gfx1250 JSON文件的原末尾空行，使其与PR基线逐字节一致，去掉无关diff。拆分新Down与重构的建议将回复为用户确认的交付范围，不伪称已完成PR拆分。此前§29.3的79项为新增线程前的测试数量，最终数量另行记录。
 
 最终同一源码复跑结果：**80/80 CPU/mock回归通过**；**3/3已收集GPU测试通过**，涵盖24次run-only设备切换、上述4种compact数值分布及CU覆盖容量。前后48项kernel正确性/ISA与6项Down性能记录保留；新增CU修复仅改变host覆盖值选择，并由专门GPU容量测试验证。审查线程将在提交后附英文修复/验证说明；保留综合PR的范围建议需人工确认，不以“已拆分”标记。
+
+## 30. Copilot复审循环：AOT类型契约与跨架构冷缓存回归（2026-09-21）
+
+基线为lc PR #1的`8bfb94719b132bbdfe702dca1bac813f0d2729d0`。Copilot review `5268257198`于2026-09-21 15:06:29 UTC完成，新增FP8 AOT激活类型契约、gfx950缺冷缓存RUN_ONLY数值回归两条意见。完成状态以Copilot作者及review对应head为准；普通用户回复线程产生的COMMENTED记录不算新的Copilot审查。
+
+### 30.1 修复与新增覆盖
+
+- FP8 whole-graph AOT解析配置的`use_prefill`：prefill只允许省略或`torch.float8_e4m3fnuz`激活；decode/direct另允许BF16。FP16及`torch.float8_e4m3fn`均拒绝，与runtime约束保持一致。新增两种量化×三类配置×五种激活dtype共30个组合，修复前14个失败子项，修复后全部通过。
+- 同一个冷进程回归扩展至gfx942/gfx950，AOT子进程改走真实`parse_csv`→`compile_one_config`入口，新runtime进程强制`FLYDSL_RUNTIME_RUN_ONLY=1`，不允许补编。gfx950纳入Kimi已发布的B1/2/3/4、D3584/I512/E896/topk16、MXFP4/SiTUv2选型；B8/16小型用例分别补充direct和sorted decode覆盖。保留真实Torch参考、finite检查、logits_diff≤0.01、输入设备非默认stream及同进程GPU0→1→0缓存复用；测试显式使用默认保NaN RTE，不更改生产默认或历史RTA性能表。
+- Tuning Tests增加gfx942/MI300X和gfx950/MI35x矩阵，以及单独`run_only`入口。CI显式断言GPU可见且架构符合任务目标，避免硬件缺失或错架构时全部skip仍显示成功。
+- 新增gfx950交叉目标缓存配对检查实际发现**B3的AOT缺口**：runtime用BN32，而调优token键经`get_padded_M(3)`成为B4，旧AOT只编BN64。修复仅使MXFP4 B4桶同时预编BN32/BN64及separated/interleaved布局；不修改runtime选择、GPU数学、tile实现或六份重调模型CSV。旧缺缓存失败日志保留。
+
+### 30.2 验证与明确边界
+
+- 最终CPU/mock **81/81通过**；4个修改的Python文件Black/Ruff通过，workflow YAML及双架构矩阵检查通过。wrapper中5处pybind枚举类型注解诊断为已有问题，本轮未修改这些注解。
+- gfx942在物理GPU6/7执行**3/3收集测试通过**（147.159s）：24次冷进程run-only路径/设备检查、4种compact数值分布及CU覆盖容量测试。最大run-only rel_l2=0.0214091651142，logits_diff=0.000228964243433，未放宽门槛。该GPU执行完成后仅格式化测试，并追加只影响MXFP4预编译覆盖的host修复；gfx942路径及测试AST保持不变。
+- gfx950交叉目标检查：B1/2/3/4生产shape及B8/16小型shape全部从空cache预编，另一个进程以RUN_ONLY+COMPILE_ONLY和typed空指针加载runtime签名；每shape两种Gate/Up布局及Down共4次加载，**6个shape/24次签名加载通过**，包括非默认SiTUv2参数。此步骤**没有执行GPU**，不能替代MI350数值正确性。
+- 当前本机只有gfx942；lc fork的runner API返回`total_count=0`，没有可执行MI350任务的自托管runner。用户明确选择**保留gfx950注册与现有选型，补齐测试和CI，明确MI350实测待完成**。不把compile-only或gfx942成功标为MI350硬件通过；该硬件验证要求保留待完成。综合PR范围仍按此前用户决定保留，拆分建议待人工确认。
+
+本轮不做性能重调或扩大202形状矩阵，不产生新的性能收益声明。证据目录/tmp/aiter-pr1-review-loop-20260921，保留review快照、14个类型失败子项、B3缺缓存失败及修复后验证、81项CPU与24次gfx942数值结果。全部历史报告前缀和性能记录保留；后续提交将再次请求Copilot复审。

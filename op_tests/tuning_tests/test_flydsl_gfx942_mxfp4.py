@@ -700,15 +700,16 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                         activation="silu",
                     )
                 is_mxfp4 = weight_dtype == "fp4"
-                gate_count = 2 if is_mxfp4 else 1
+                gate_block_ns = (64,) if is_mxfp4 and batch >= 4 else (32,)
+                if is_mxfp4 and batch == 4:
+                    gate_block_ns = (32, 64)
+                gate_count = len(gate_block_ns) * (2 if is_mxfp4 else 1)
                 self.assertEqual(len(compiled), gate_count + 1)
                 for gate, args in zip(compiled[:gate_count], launched[:gate_count]):
                     self.assertTrue(gate["fused_down_clear"])
                     if not is_mxfp4:
                         self.assertFalse(gate["mxfp4_gate_up_interleaved"])
-                    self.assertEqual(
-                        gate["BLOCK_TILE_SIZE_N"], 64 if is_mxfp4 and batch >= 4 else 32
-                    )
+                    self.assertIn(gate["BLOCK_TILE_SIZE_N"], gate_block_ns)
                     self.assertEqual(args[4].dtype, torch.bfloat16)
                 self.assertEqual(
                     compiled[-1]["BLOCK_TILE_SIZE_N"],
@@ -876,7 +877,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             )
         self.assertEqual(run.call_args.args[-3:], (0.5, 2.0, GateMode.INTERLEAVE))
 
-    def test_precompile_mxfp4_direct_covers_both_gate_layouts(self):
+    def test_precompile_mxfp4_bucket_covers_b3_b4_and_both_gate_layouts(self):
         compiled = []
         launched = []
 
@@ -905,15 +906,18 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             )
 
         self.assertEqual(
-            [item["stage"] for item in compiled], ["gateup", "gateup", "down"]
+            [item["stage"] for item in compiled], ["gateup"] * 4 + ["down"]
         )
         self.assertEqual(
-            [item["mxfp4_gate_up_interleaved"] for item in compiled[:2]],
-            [False, True],
+            {
+                (item["BLOCK_TILE_SIZE_N"], item["mxfp4_gate_up_interleaved"])
+                for item in compiled[:-1]
+            },
+            {(32, False), (32, True), (64, False), (64, True)},
         )
-        self.assertTrue(all(item["fused_down_clear"] for item in compiled[:2]))
-        self.assertEqual(compiled[2]["BLOCK_TILE_SIZE_N"], 32)
-        self.assertEqual(len(launched), 3)
+        self.assertTrue(all(item["fused_down_clear"] for item in compiled[:-1]))
+        self.assertEqual(compiled[-1]["BLOCK_TILE_SIZE_N"], 32)
+        self.assertEqual(len(launched), 5)
 
     def test_precompile_specialized_prefill_uses_specialized_launcher_abi(self):
         compiled = []
@@ -1062,7 +1066,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             )
 
         run_compiled.assert_not_called()
-        self.assertEqual(preload.call_count, 3)
+        self.assertEqual(preload.call_count, 5)
 
     def test_compact_task_capacities_and_offline_cu_count(self):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
@@ -1124,6 +1128,52 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                     self.assertEqual(
                         len(jobs), int(activation_dtype != "torch.float8_e4m3fnuz")
                     )
+
+    def test_aot_fp8_activation_dtype_matches_prefill_and_decode(self):
+        from aiter.aot.flydsl import moe as aot_moe
+
+        for quant_type, config, activation_dtype in itertools.product(
+            ("QuantType.per_Token", "QuantType.per_Tensor"),
+            ("16_16_16_False", "16_16_16_False_True", "64_128_128_True"),
+            (
+                "",
+                "torch.bfloat16",
+                "torch.float16",
+                "torch.float8_e4m3fnuz",
+                "torch.float8_e4m3fn",
+            ),
+        ):
+            row = {
+                "token": 2,
+                "model_dim": 512,
+                "inter_dim": 128,
+                "expert": 2,
+                "topk": 1,
+                "act_type": "ActivationType.Silu",
+                "dtype": "torch.bfloat16",
+                "q_dtype_a": activation_dtype,
+                "q_dtype_w": "torch.float8_e4m3fnuz",
+                "q_type": quant_type,
+                "kernelName1": "impl__flydsl_gfx942__" + config,
+                "kernelName2": "",
+            }
+            allowed = activation_dtype in ("", "torch.float8_e4m3fnuz") or (
+                activation_dtype == "torch.bfloat16"
+                and not backend.Config.from_string(config).use_prefill
+            )
+            with (
+                self.subTest(
+                    quant_type=quant_type,
+                    config=config,
+                    activation_dtype=activation_dtype,
+                ),
+                tempfile.NamedTemporaryFile("w", newline="", suffix=".csv") as file,
+            ):
+                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+                file.flush()
+                self.assertEqual(len(aot_moe.parse_csv(file.name)), int(allowed))
 
     def test_compact_prefill_allocates_workspace_and_uses_metadata_block(self):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (

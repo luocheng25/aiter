@@ -165,6 +165,19 @@ def parse_csv(csv_path: str):
                         f"BF16 activations for BF16/MXFP4 weights, skipping {stage1_name}"
                     )
                     continue
+                if weight_dtype == "fp8":
+                    from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+                    config = Config.from_string(stage1_name[len(whole_graph_prefix) :])
+                    allowed_activation_dtypes = ("", "torch.float8_e4m3fnuz")
+                    if not config.use_prefill:
+                        allowed_activation_dtypes += ("torch.bfloat16",)
+                    if q_dtype_a.strip() not in allowed_activation_dtypes:
+                        print(
+                            "  [WARN] Unsupported whole-graph FP8 activation dtype "
+                            f"{q_dtype_a!r}, skipping {stage1_name}"
+                        )
+                        continue
                 whole_graph_job = {
                     "kernel_name": stage1_name,
                     "stage": "whole_graph",

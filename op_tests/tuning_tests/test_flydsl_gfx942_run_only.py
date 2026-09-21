@@ -17,21 +17,15 @@ import pandas as pd
 import torch
 
 
-def _precompile_in_fresh_process(config, inter_dim, weight_dtype, quant_type, batch):
-    from aiter.ops.flydsl import fused_moe_gfx942 as backend
+def _precompile_in_fresh_process(config_file):
+    from aiter.aot.flydsl.moe import compile_one_config, parse_csv
 
+    jobs = parse_csv(config_file)
+    assert len(jobs) == 1 and jobs[0]["stage"] == "whole_graph", jobs
     with patch.object(torch.cuda, "is_available", return_value=False):
-        backend.precompile_flydsl_moe(
-            config_string=config,
-            batch=batch,
-            model_dim=512,
-            inter_dim=inter_dim,
-            experts=2,
-            topk=2,
-            weight_dtype=weight_dtype,
-            quant_type=quant_type,
-            activation="silu",
-        )
+        result = compile_one_config(**jobs[0])
+    assert result["compile_time"] is not None, result
+    print("WHOLE_GRAPH_AOT_PASS", json.dumps(result), flush=True)
 
 
 def _run_config_in_fresh_process(config_file, expected_device, batch):
@@ -115,6 +109,7 @@ def _run_config_in_fresh_process(config_file, expected_device, batch):
         patch.object(common, "checkAllclose", side_effect=checked),
     ):
         results = tuner.run_config(options)
+    assert len(results) == len(errors) == 1, (results, errors)
     assert all(row["status"] == "ok" for row in results), results
     assert launched_devices and set(launched_devices) == {expected_device}
     for counts in task_counts:
@@ -125,14 +120,20 @@ def _run_config_in_fresh_process(config_file, expected_device, batch):
 
 
 class TestFlydslGfx942RunOnly(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "A GPU is required")
     def test_whole_graph_aot_cache_runs_in_a_fresh_process(self):
         from aiter.fused_moe import get_padded_M
 
+        expected_arch = os.environ.get("AITER_TEST_EXPECTED_GFX")
+        if not torch.cuda.is_available():
+            self.assertIsNone(expected_arch, "The selected CI GPU must be available")
+            self.skipTest("A GPU is required")
         device = torch.cuda.current_device()
         properties = torch.cuda.get_device_properties(device)
-        if properties.gcnArchName.split(":", 1)[0] != "gfx942":
-            self.skipTest("FP8 FNUZ whole-graph coverage requires gfx942")
+        arch = properties.gcnArchName.split(":", 1)[0]
+        if expected_arch:
+            self.assertEqual(arch, expected_arch)
+        if arch not in ("gfx942", "gfx950"):
+            self.skipTest("Whole-graph run-only coverage requires gfx942 or gfx950")
         # 满块数至少达到0.6*CU，避免compact把全部M256任务拆成M64。
         compact_batch = ((3 * properties.multi_processor_count + 9) // 10) * 256 + 64
         cases = (
@@ -145,42 +146,84 @@ class TestFlydslGfx942RunOnly(unittest.TestCase):
             ("ptpc", "256_128_128_True:8x1:64:128", 256, 64),
             ("ptpc", "64_128_128_True:8x1_compact:64:128", 320, compact_batch),
         )
+        if arch == "gfx950":
+            cases = tuple(
+                (
+                    "mxfp4",
+                    "16_16_16_False_True" if 2 <= batch <= 8 else "16_16_16_False",
+                    128,
+                    batch,
+                )
+                for batch in (1, 2, 3, 4, 8, 16)
+            )
         for quant_type, config, inter_dim, batch in cases:
             with self.subTest(
                 config=config, quant_type=quant_type
             ), tempfile.TemporaryDirectory() as directory:
                 cache = Path(directory) / "cache"
                 config_file = Path(directory) / "config.csv"
-                weight_dtype = "bf16" if quant_type == "no" else "fp8"
-                dtype = (
+                weight_dtype = (
+                    "bf16"
+                    if quant_type == "no"
+                    else "fp4" if quant_type == "mxfp4" else "fp8"
+                )
+                activation_dtype = (
                     "torch.bfloat16"
-                    if weight_dtype == "bf16"
+                    if weight_dtype in ("bf16", "fp4")
                     else "torch.float8_e4m3fnuz"
                 )
+                weight_dtype_name = (
+                    "torch.float4_e2m1fn_x2"
+                    if weight_dtype == "fp4"
+                    else activation_dtype
+                )
                 row = {
-                    "gfx": "gfx942",
+                    "gfx": arch,
                     "cu_num": properties.multi_processor_count,
                     "token": get_padded_M(batch),
                     "model_dim": 512,
                     "inter_dim": inter_dim,
                     "expert": 2,
                     "topk": 2,
-                    "act_type": "ActivationType.Silu",
+                    "act_type": (
+                        "ActivationType.Situv2"
+                        if weight_dtype == "fp4"
+                        else "ActivationType.Silu"
+                    ),
                     "dtype": "torch.bfloat16",
-                    "q_dtype_a": dtype,
-                    "q_dtype_w": dtype,
+                    "q_dtype_a": activation_dtype,
+                    "q_dtype_w": weight_dtype_name,
                     "q_type": "QuantType."
-                    + {"no": "No", "ptpc": "per_Token", "per_tensor": "per_Tensor"}[
-                        quant_type
-                    ],
+                    + {
+                        "no": "No",
+                        "ptpc": "per_Token",
+                        "per_tensor": "per_Tensor",
+                        "mxfp4": "per_1x32",
+                    }[quant_type],
                     "use_g1u1": 1,
                     "doweight_stage1": 0,
                     "block_m": int(config.split("_")[0]),
                     "ksplit": 0,
-                    "kernelName1": "impl__flydsl_gfx942__" + config,
+                    "kernelName1": f"impl__flydsl_{arch}__" + config,
                     "kernelName2": "",
                     "us": 1.0,
                 }
+                if arch == "gfx950" and batch <= 4:
+                    # 使用已发布的Kimi形状/布局/选型；B8/16另覆盖小型direct/decode。
+                    kimi_csv = (
+                        Path(__file__).resolve().parents[2]
+                        / "aiter/configs/model_configs/kimik3_a16w4_tuned_fmoe.csv"
+                    )
+                    kimi = pd.read_csv(kimi_csv)
+                    selected = kimi[(kimi.token == batch) & (kimi.inter_dim == 512)]
+                    self.assertEqual(len(selected), 1)
+                    row = selected.iloc[0].to_dict()
+                    self.assertTrue(
+                        row["kernelName1"].startswith("impl__flydsl_gfx950__")
+                    )
+                    config = row["kernelName1"].removeprefix("impl__flydsl_gfx950__")
+                    row["cu_num"] = properties.multi_processor_count
+                    row["token"] = get_padded_M(batch)
                 pd.DataFrame([row]).to_csv(config_file, index=False)
                 env = dict(os.environ)
                 env.pop("COMPILE_ONLY", None)
@@ -188,14 +231,18 @@ class TestFlydslGfx942RunOnly(unittest.TestCase):
                     FLYDSL_RUNTIME_CACHE_DIR=str(cache),
                     FLYDSL_RUNTIME_ENABLE_CACHE="1",
                     FLYDSL_RUNTIME_RUN_ONLY="1",
-                    FLYDSL_GPU_ARCH="gfx942",
+                    FLYDSL_GPU_ARCH=arch,
+                    GPU_ARCHS=arch,
                     CU_NUM=str(properties.multi_processor_count),
                     AITER_CONFIG_FMOE=str(config_file),
+                    AITER_ONLINE_TUNE="0",
+                    AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED="0",
+                    AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED="0",
                 )
                 compile_code = (
                     "from op_tests.tuning_tests.test_flydsl_gfx942_run_only import "
                     "_precompile_in_fresh_process; "
-                    f"_precompile_in_fresh_process({config!r}, {inter_dim}, {weight_dtype!r}, {quant_type!r}, {batch})"
+                    f"_precompile_in_fresh_process({str(config_file)!r})"
                 )
                 compiled = subprocess.run(
                     [sys.executable, "-c", compile_code],
@@ -222,6 +269,7 @@ class TestFlydslGfx942RunOnly(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                print(result.stdout, flush=True)
                 self.assertEqual(
                     result.stdout.count("WHOLE_GRAPH_RUN_ONLY_PASS"), len(devices)
                 )

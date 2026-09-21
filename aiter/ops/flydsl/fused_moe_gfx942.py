@@ -708,28 +708,32 @@ def precompile_flydsl_moe(
     use_batch1_algorithm = batch == 1 or config.use_batch1_algorithm
     if use_batch1_algorithm:
         gate_layouts = (False, True) if is_mxfp4 else (False,)
-        gate_block_n = 64 if is_mxfp4 and batch >= 4 else 32
-        for gate_up_interleaved in gate_layouts:
-            gateup = compile_kernel(
-                stage="gateup",
-                alg="batch1",
-                block_m=16,
-                block_n=gate_block_n,
-                mxfp4_gate_up_interleaved=gate_up_interleaved,
-                fused_down_clear=True,
-            )
-            _preload_compiled(
-                gateup,
-                _ptr(bf16),
-                _ptr(weight),
-                _ptr(bf16),
-                _ptr(int32),
-                _ptr(bf16),
-                _ptr(weight_scale),
-                batch,
-                *activation_scalars,
-                0,
-            )
+        gate_block_ns = (64,) if is_mxfp4 and batch >= 4 else (32,)
+        if is_mxfp4 and batch == 4:
+            # B4调优桶还覆盖B3，后者在runtime使用BN32。
+            gate_block_ns = (32, 64)
+        for gate_block_n in gate_block_ns:
+            for gate_up_interleaved in gate_layouts:
+                gateup = compile_kernel(
+                    stage="gateup",
+                    alg="batch1",
+                    block_m=16,
+                    block_n=gate_block_n,
+                    mxfp4_gate_up_interleaved=gate_up_interleaved,
+                    fused_down_clear=True,
+                )
+                _preload_compiled(
+                    gateup,
+                    _ptr(bf16),
+                    _ptr(weight),
+                    _ptr(bf16),
+                    _ptr(int32),
+                    _ptr(bf16),
+                    _ptr(weight_scale),
+                    batch,
+                    *activation_scalars,
+                    0,
+                )
         down = compile_kernel(
             stage="down",
             alg="batch1",

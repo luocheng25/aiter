@@ -16,6 +16,7 @@ on:
           - level01
           - tune_pipeline
           - run_config
+          - run_only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -196,14 +197,22 @@ jobs:
         if: always()
         run: ./.github/scripts/clean_up_rocm.sh
 
-  gpu-run-only-gfx942:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
-    name: Whole-graph MoE AOT run-only (gfx942)
-    runs-on: linux-aiter-oci-mi300x-1
+  gpu-run-only:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' || github.event.inputs.suite == 'run_only' }}
+    name: Whole-graph MoE AOT run-only (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: gfx942
+            runner: linux-aiter-oci-mi300x-1
+          - arch: gfx950
+            runner: linux-aiter-mi35x-1
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     needs: ci_config
     env:
-      GPU_ARCHS: gfx942
+      GPU_ARCHS: ${{ matrix.arch }}
       DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
@@ -230,19 +239,20 @@ jobs:
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -e PYTHONUNBUFFERED=1 \
             -e AITER_ONLINE_TUNE=0 \
+            -e AITER_TEST_EXPECTED_GFX="${GPU_ARCHS}" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             "$DOCKER_IMAGE" \
             bash -lc 'set -euo pipefail; BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh; python3 -m unittest op_tests.tuning_tests.test_flydsl_gfx942_run_only -v' \
-            2>&1 | tee "${LOG_DIR}/moe-run-only-gfx942.log"
+            2>&1 | tee "${LOG_DIR}/moe-run-only-${{ matrix.arch }}.log"
 
       - name: Upload MoE run-only results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tuning-tests-moe-run-only-gfx942-${{ github.run_id }}
+          name: tuning-tests-moe-run-only-${{ matrix.arch }}-${{ github.run_id }}
           if-no-files-found: ignore
-          path: ${{ env.LOG_DIR }}/moe-run-only-gfx942.log
+          path: ${{ env.LOG_DIR }}/moe-run-only-${{ matrix.arch }}.log
 
   gpu-run-config:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
