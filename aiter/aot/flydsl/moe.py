@@ -157,11 +157,12 @@ def parse_csv(csv_path: str):
                     )
                     continue
                 if dtype != "torch.bfloat16" or (
-                    weight_dtype == "fp4" and q_dtype_a != "torch.bfloat16"
+                    weight_dtype in ("bf16", "fp4")
+                    and q_dtype_a.strip() not in ("", "torch.bfloat16")
                 ):
                     print(
                         "  [WARN] Whole-graph backend requires BF16 output and "
-                        f"BF16 MXFP4 activations, skipping {stage1_name}"
+                        f"BF16 activations for BF16/MXFP4 weights, skipping {stage1_name}"
                     )
                     continue
                 whole_graph_job = {

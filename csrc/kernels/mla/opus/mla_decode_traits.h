@@ -268,3 +268,4 @@ struct opus_mla_decode_fp8_16mx8_32nx1_traits
     static constexpr int v_ds_read_insts =
         (GEMM1_E_N * GEMM1_E_K * W_N * W_K_ROPE) / (WARP_SIZE * VEC_TR_V);
 };
+

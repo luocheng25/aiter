@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 import inspect
-import types
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -463,29 +461,9 @@ class LdsTensor(fx.Tensor):
         fx.copy(copy_atom, vector, destination)
 
 
-class FlyObjCache:
-    def __init__(self, use_cache=True):
-        self._cached_methods = {}
-        if use_cache:
-            self._register_methods()
+class MoETileOps:
+    """Construct tile helpers locally without retaining region-bound IR values."""
 
-    def _register_methods(self):
-        for name, attr in self.__class__.__dict__.items():
-            if callable(attr) and hasattr(attr, "_use_cache") and attr._use_cache:
-                cached_func = functools.cache(attr)
-                setattr(self, name, types.MethodType(cached_func, self))
-                self._cached_methods[name] = cached_func
-
-    def clear_all(self):
-        for func in self._cached_methods.values():
-            func.cache_clear()
-
-    @staticmethod
-    def local_cache(func):
-        func._use_cache = True
-        return func
-
-    @local_cache
     def create_thr_mma(self, dtype, wave_mnk, tid=None):
         mfma_M = 16
         mfma_N = 16
@@ -513,17 +491,14 @@ class FlyObjCache:
 
         return tiled_mma.get_slice(fx.thread_idx.x if tid is None else tid)
 
-    @local_cache
     def get_universal_copy_atom(self, dtype, copy_bits):
         assert copy_bits % dtype.width == 0
         return fx.make_copy_atom(fx.UniversalCopy(copy_bits), dtype)
 
-    @local_cache
     def get_buffer_copy_atom(self, dtype, copy_bits):
         assert copy_bits % dtype.width == 0
         return fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), dtype)
 
-    @local_cache
     def get_tiled_mma_copy(self, copy_atom, mm, abc, tid=None):
         assert abc in ["A", "B", "C"]
         tid = mm.thr_idx if tid is None else tid
@@ -534,15 +509,12 @@ class FlyObjCache:
         else:
             return fx.make_tiled_copy_C(copy_atom, mm).get_slice(tid)
 
-    @local_cache
     def get_partition_S(self, thrcopy, src):
         return thrcopy.partition_S(src)
 
-    @local_cache
     def get_partition_D(self, thrcopy, src):
         return thrcopy.partition_D(src)
 
-    @local_cache
     def get_tiled_mma_partition_S(
         self, mm, src, abc, copy_atom_bits=128, dtype=None, copy_atom=None
     ):
@@ -554,7 +526,6 @@ class FlyObjCache:
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc)
         return self.get_partition_S(tcopy, src)
 
-    @local_cache
     def get_tiled_mma_retile(
         self, mm, frag, abc, copy_atom_bits=128, dtype=None, copy_atom=None
     ):
@@ -566,7 +537,6 @@ class FlyObjCache:
         tcopy = self.get_tiled_mma_copy(copy_atom, mm, abc)
         return self.get_retile(tcopy, frag)
 
-    @local_cache
     def get_retile(self, thrcopy, frag):
         return thrcopy.retile(frag)
 
@@ -624,7 +594,6 @@ class FlyObjCache:
             copy_atom, self.get_retile(tcopy, frag), self.get_partition_D(tcopy, dst)
         )
 
-    @local_cache
     def get_tiled_copy_coalesced_mn(self, tensor, copy_atom_bits=128, num_threads=256):
         """Build a coalesced copy for tensors whose two innermost modes are M, N."""
         if fx.const_expr(tensor.address_space == TargetAddressSpace.BufferDesc):

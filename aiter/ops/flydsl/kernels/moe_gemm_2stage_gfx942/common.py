@@ -80,7 +80,7 @@ def down_device_config_from_properties(gcn_arch_name, cu_count):
     return is_gfx942_80cu, 4 if is_gfx942_80cu else 8
 
 
-def get_down_device_config():
+def get_down_device_config(device=None):
     target_arch = os.environ.get("FLYDSL_GPU_ARCH")
     if target_arch is not None and "CU_NUM" in os.environ:
         try:
@@ -92,7 +92,7 @@ def get_down_device_config():
         return down_device_config_from_properties(target_arch, target_cu_count)
     if not torch.cuda.is_available():
         return False, 8
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    properties = torch.cuda.get_device_properties(device)
     return down_device_config_from_properties(
         properties.gcnArchName,
         properties.multi_processor_count,
@@ -110,13 +110,19 @@ def _get_device_cache_key(device):
     )
 
 
-def get_device_cache_key():
+def get_device_cache_key(device=None):
     target_arch = os.environ.get("FLYDSL_GPU_ARCH")
     target_cu_count = os.environ.get("CU_NUM")
     if not torch.cuda.is_available():
         return None, target_arch, target_cu_count
+    if device is None:
+        device = torch.cuda.current_device()
+    elif not isinstance(device, int):
+        device = torch.device(device).index
+        if device is None:
+            device = torch.cuda.current_device()
     return (
-        _get_device_cache_key(torch.cuda.current_device()),
+        _get_device_cache_key(device),
         target_arch,
         target_cu_count,
     )
@@ -128,8 +134,8 @@ def torch_tensor_to_pointer(tensor):
 
 from ..moe_gemm_2stage_gfx942_utils import (
     BufferTensor,
-    FlyObjCache,
     LdsTensor,
+    MoETileOps,
     _as_ptr,
     all_copy_atoms,
     all_elements,
@@ -146,8 +152,8 @@ from ..moe_gemm_2stage_gfx942_utils import (
 
 __all__ = [
     "BufferTensor",
-    "FlyObjCache",
     "LdsTensor",
+    "MoETileOps",
     "_as_ptr",
     "all_copy_atoms",
     "all_elements",

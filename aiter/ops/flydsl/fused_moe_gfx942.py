@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import os
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
@@ -23,7 +22,13 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
 from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.common import (
     get_device_cache_key,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.moe_reduce import (
+    precompile_moe_reduction_kernels,
+)
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.quant import (
+    precompile_moe_quant_kernels,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 from aiter.ops.flydsl.moe_common import GateMode
 
 
@@ -433,8 +438,8 @@ def _get_compiled_kernel_cached(
     )
 
 
-def _get_compiled_kernel(*args, **kwargs):
-    return _get_compiled_kernel_cached(get_device_cache_key(), *args, **kwargs)
+def _get_compiled_kernel(*args, device=None, **kwargs):
+    return _get_compiled_kernel_cached(get_device_cache_key(device), *args, **kwargs)
 
 
 _get_compiled_kernel.cache_clear = _get_compiled_kernel_cached.cache_clear
@@ -460,7 +465,7 @@ def _ptr(t):
 
 
 def _launch(kernel_fn, *args):
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.current_stream(args[0].device)
     prepared_args = [
         _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
     ]
@@ -473,8 +478,8 @@ def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=N
 
     amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     xq = torch.empty_like(x, dtype=quant_dtype)
-    flydsl_absmax()(x, amax)
-    flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
+    flydsl_absmax(device=x.device)(x, amax)
+    flydsl_quant_per_tensor(quant_dtype, device=x.device)(x, amax, xq)
     fmax = torch.finfo(quant_dtype).max
     xs = amax / fmax
     xs = xs.reshape(1).to(torch.float32)
@@ -598,14 +603,6 @@ def precompile_flydsl_moe(
     weight_scale = byte if is_mxfp4 else float32
     activation_scalars = _activation_scalars(activation, 1.0, 1.0, None)
 
-    def compile_launcher(executable, *args):
-        if (
-            os.environ.get("COMPILE_ONLY") == "1"
-            and getattr(executable, "_cf", None) is not None
-        ):
-            return
-        _run_compiled(executable, *args)
-
     def compile_kernel(*, stage, alg, block_m, block_n, **kwargs):
         return _get_compiled_kernel(
             N=2 * inter_dim if stage == "gateup" else model_dim,
@@ -633,7 +630,7 @@ def precompile_flydsl_moe(
             BLOCK_TILE_SIZE_K=config.BLOCK_K,
             METADATA_TILE_SIZE_M=config.BLOCK_M,
         )
-        compile_launcher(
+        _preload_compiled(
             gateup,
             _ptr(byte if is_fp8 else bf16),
             _ptr(weight),
@@ -700,12 +697,17 @@ def precompile_flydsl_moe(
                 full_capacity,
                 tail_capacity,
             )
-        compile_launcher(down, *down_args, 0)
+        _preload_compiled(down, *down_args, 0)
+        precompile_moe_reduction_kernels(
+            topk, model_dim, config.down_output_padding_bytes
+        )
+        if is_fp8 and quant_type == "per_tensor":
+            precompile_moe_quant_kernels(torch.float8_e4m3fnuz)
         return
 
     use_batch1_algorithm = batch == 1 or config.use_batch1_algorithm
     if use_batch1_algorithm:
-        gate_layouts = (False, True) if is_mxfp4 else (True,)
+        gate_layouts = (False, True) if is_mxfp4 else (False,)
         gate_block_n = 64 if is_mxfp4 and batch >= 4 else 32
         for gate_up_interleaved in gate_layouts:
             gateup = compile_kernel(
@@ -716,7 +718,7 @@ def precompile_flydsl_moe(
                 mxfp4_gate_up_interleaved=gate_up_interleaved,
                 fused_down_clear=True,
             )
-            compile_launcher(
+            _preload_compiled(
                 gateup,
                 _ptr(bf16),
                 _ptr(weight),
@@ -734,7 +736,7 @@ def precompile_flydsl_moe(
             block_m=16,
             block_n=32 if is_mxfp4 and batch > 1 else 64,
         )
-        compile_launcher(
+        _preload_compiled(
             down,
             _ptr(bf16),
             _ptr(weight),
@@ -750,7 +752,7 @@ def precompile_flydsl_moe(
 
     block_n = 64 if config.BLOCK_N == 16 else config.BLOCK_N
     block_k = 64 if config.BLOCK_K == 16 else config.BLOCK_K
-    gate_layouts = (False, True) if is_mxfp4 else (True,)
+    gate_layouts = (False, True) if is_mxfp4 else (False,)
     for gate_up_interleaved in gate_layouts:
         gateup = compile_kernel(
             stage="gateup",
@@ -760,7 +762,7 @@ def precompile_flydsl_moe(
             BLOCK_TILE_SIZE_K=block_k,
             mxfp4_gate_up_interleaved=gate_up_interleaved,
         )
-        compile_launcher(
+        _preload_compiled(
             gateup,
             _ptr(bf16),
             _ptr(weight),
@@ -782,7 +784,7 @@ def precompile_flydsl_moe(
         block_n=block_n,
         BLOCK_TILE_SIZE_K=block_k,
     )
-    compile_launcher(
+    _preload_compiled(
         down,
         _ptr(bf16),
         _ptr(weight),
@@ -852,6 +854,7 @@ def _run_prefill(
 
     gemm1_out = _gateup_output(hidden_states, problem)
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -919,6 +922,7 @@ def _run_prefill(
         "8x1_compact": 128,
     }[config.down_path]
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -976,16 +980,19 @@ def _run_prefill(
         dtype=torch.int32,
         device=hidden_states.device,
     )
-    invert_sorted_ids(problem.topk)(
+    invert_sorted_ids(problem.topk, device=hidden_states.device)(
         sorted_ids,
         loc_ids,
         num_valid_ids,
         sorted_ids.shape[0],
         problem.batch,
     )
-    sorted_sum(problem.topk, problem.model_dim, output_padding_bytes)(
-        loc_ids, gemm2_out, cur_out, problem.batch
-    )
+    sorted_sum(
+        problem.topk,
+        problem.model_dim,
+        output_padding_bytes,
+        device=hidden_states.device,
+    )(loc_ids, gemm2_out, cur_out, problem.batch)
     return cur_out
 
 
@@ -1019,6 +1026,7 @@ def _run_batch1(
         device=hidden_states.device,
     )
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -1052,6 +1060,7 @@ def _run_batch1(
     )
 
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -1120,6 +1129,7 @@ def _run_decode(
 
     gemm1_out = _gateup_output(hidden_states, problem)
     gateup_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.gateup_dim,
         K=problem.hidden_dim,
         weight_dtype_str=weight_dtype_str,
@@ -1156,6 +1166,7 @@ def _run_decode(
     )
 
     down_kernel = _get_compiled_kernel(
+        device=hidden_states.device,
         N=problem.model_dim,
         K=problem.inter_dim,
         weight_dtype_str=weight_dtype_str,
@@ -1310,63 +1321,64 @@ def run_flydsl_moe_gfx942(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
         )
-    topk_weight = topk_weight.float()
-    if config.use_prefill:
-        return _run_prefill(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            quant_type,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            config,
-            problem,
-            activation_str,
-            swiglu_limit,
-            situ_beta,
-            situ_linear_beta,
-        )
-    if problem.batch == 1 or config.use_batch1_algorithm:
-        return _run_batch1(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            problem,
-            activation_str,
-            swiglu_limit,
-            situ_beta,
-            situ_linear_beta,
-            gate_mode == GateMode.INTERLEAVE,
-        )
-    if 2 <= problem.batch <= 256:
-        return _run_decode(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            config,
-            problem,
-            activation_str,
-            swiglu_limit,
-            situ_beta,
-            situ_linear_beta,
-            gate_mode == GateMode.INTERLEAVE,
-        )
+    with torch.cuda.device(hidden_states.device.index):
+        topk_weight = topk_weight.float()
+        if config.use_prefill:
+            return _run_prefill(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                quant_type,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config,
+                problem,
+                activation_str,
+                swiglu_limit,
+                situ_beta,
+                situ_linear_beta,
+            )
+        if problem.batch == 1 or config.use_batch1_algorithm:
+            return _run_batch1(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                problem,
+                activation_str,
+                swiglu_limit,
+                situ_beta,
+                situ_linear_beta,
+                gate_mode == GateMode.INTERLEAVE,
+            )
+        if 2 <= problem.batch <= 256:
+            return _run_decode(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config,
+                problem,
+                activation_str,
+                swiglu_limit,
+                situ_beta,
+                situ_linear_beta,
+                gate_mode == GateMode.INTERLEAVE,
+            )
     raise RuntimeError(f"Unsupported batch-size {problem.batch}")
 
 

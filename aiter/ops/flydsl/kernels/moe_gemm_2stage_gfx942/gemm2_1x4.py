@@ -148,7 +148,7 @@ def _build_moe_gemm2_1x4(
                 ).bitcast(fx.BFloat16)
             )
 
-    down_ops = fxh.FlyObjCache()
+    down_ops = fxh.MoETileOps()
 
     @flyc.jit
     def _map_down_task(
@@ -891,7 +891,6 @@ def _build_moe_gemm2_1x4(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        down_ops.clear_all()
         kernel = moe_2stage_down_prefill_1x4_64x256(
             p_input,
             p_weight,

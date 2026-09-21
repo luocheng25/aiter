@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import csv
 import importlib
 import itertools
@@ -137,6 +138,36 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         self.assertEqual(gfx942_key, (None, "gfx942", None))
         self.assertEqual(gfx950_key, (None, "gfx950", None))
         self.assertNotEqual(gfx942_key, gfx950_key)
+
+    def test_compiled_kernel_cache_uses_explicit_tensor_device(self):
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import common
+
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(common, "_get_device_cache_key", return_value="gpu1") as key,
+        ):
+            self.assertEqual(
+                common.get_device_cache_key(torch.device("cuda:1"))[0], "gpu1"
+            )
+        key.assert_called_once_with(1)
+
+    def test_tile_helpers_do_not_retain_ir_objects(self):
+        from aiter.ops.flydsl.kernels import moe_gemm_2stage_gfx942_utils as utils
+
+        ops = utils.MoETileOps()
+        first, second = object(), object()
+        with (
+            patch.object(utils.fx, "UniversalCopy", return_value=object()),
+            patch.object(
+                utils.fx, "make_copy_atom", side_effect=[first, second]
+            ) as make,
+        ):
+            self.assertIs(ops.get_universal_copy_atom(utils.fx.BFloat16, 128), first)
+            self.assertIs(ops.get_universal_copy_atom(utils.fx.BFloat16, 128), second)
+        self.assertEqual(make.call_count, 2)
+        self.assertFalse(vars(ops))
+        self.assertFalse(hasattr(ops, "clear_all"))
 
     def test_aot_parser_and_worker_support_whole_graph_rows(self):
         from aiter.aot.flydsl import moe as aot_moe
@@ -649,7 +680,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                     patch.object(backend, "_ptr", side_effect=lambda tensor: tensor),
                     patch.object(
                         backend,
-                        "_run_compiled",
+                        "_preload_compiled",
                         side_effect=lambda kernel, *args, launched=launched: (
                             launched.append(args)
                         ),
@@ -673,6 +704,8 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 self.assertEqual(len(compiled), gate_count + 1)
                 for gate, args in zip(compiled[:gate_count], launched[:gate_count]):
                     self.assertTrue(gate["fused_down_clear"])
+                    if not is_mxfp4:
+                        self.assertFalse(gate["mxfp4_gate_up_interleaved"])
                     self.assertEqual(
                         gate["BLOCK_TILE_SIZE_N"], 64 if is_mxfp4 and batch >= 4 else 32
                     )
@@ -855,7 +888,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             patch.object(backend, "_get_compiled_kernel", side_effect=fake_compile),
             patch.object(
                 backend,
-                "_run_compiled",
+                "_preload_compiled",
                 side_effect=lambda kernel, *args: launched.append((kernel, args)),
             ),
         ):
@@ -894,9 +927,11 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             patch.object(backend, "_get_compiled_kernel", side_effect=fake_compile),
             patch.object(
                 backend,
-                "_run_compiled",
+                "_preload_compiled",
                 side_effect=lambda kernel, *args: launched.append((kernel, args)),
             ),
+            patch.object(backend, "precompile_moe_reduction_kernels"),
+            patch.object(backend, "precompile_moe_quant_kernels"),
         ):
             backend.precompile_flydsl_moe(
                 config_string="64_128_128_True:1x4_64x256:64:128",
@@ -916,7 +951,93 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         self.assertEqual(len(launched[0][1]), 17)
         self.assertEqual(len(launched[1][1]), 12)
 
-    def test_precompile_does_not_launch_cached_executable_in_compile_only(self):
+    def test_precompile_prefill_covers_reduction_and_per_tensor_quantization(self):
+        for weight_dtype, quant_type in (
+            ("bf16", "no"),
+            ("fp8", "ptpc"),
+            ("fp8", "per_tensor"),
+        ):
+            with (
+                self.subTest(quant_type=quant_type),
+                patch.object(backend, "_get_compiled_kernel"),
+                patch.object(backend, "_run_compiled"),
+                patch.object(backend, "_preload_compiled", create=True),
+                patch.object(
+                    backend, "precompile_moe_reduction_kernels", create=True
+                ) as reduction,
+                patch.object(
+                    backend, "precompile_moe_quant_kernels", create=True
+                ) as quantization,
+            ):
+                backend.precompile_flydsl_moe(
+                    config_string="64_128_128_True",
+                    batch=64,
+                    model_dim=512,
+                    inter_dim=128,
+                    experts=17,
+                    topk=3,
+                    weight_dtype=weight_dtype,
+                    quant_type=quant_type,
+                    activation="silu",
+                )
+                reduction.assert_called_once_with(3, 512, None)
+                if quant_type == "per_tensor":
+                    quantization.assert_called_once_with(torch.float8_e4m3fnuz)
+                else:
+                    quantization.assert_not_called()
+
+    def test_whole_graph_runners_execute_inside_input_device_context(self):
+        for batch, config, runner in (
+            (2, "16_16_16_False_True", "_run_batch1"),
+            (16, "16_16_16_False", "_run_decode"),
+            (64, "64_128_128_True", "_run_prefill"),
+        ):
+            hidden = torch.empty((batch, 512), dtype=torch.bfloat16)
+            w1 = torch.empty((2, 256, 512), dtype=torch.bfloat16)
+            w2 = torch.empty((2, 512, 128), dtype=torch.bfloat16)
+            w1.is_shuffled = w2.is_shuffled = True
+            weights = torch.ones((batch, 1), dtype=torch.float32)
+            ids = torch.zeros((batch, 1), dtype=torch.int32)
+            state = {"inside": False}
+
+            @contextlib.contextmanager
+            def device_context(index, state=state, hidden=hidden):
+                self.assertEqual(index, hidden.device.index)
+                state["inside"] = True
+                try:
+                    yield
+                finally:
+                    state["inside"] = False
+
+            def run(*_args, state=state, hidden=hidden):
+                self.assertTrue(state["inside"])
+                return hidden
+
+            with (
+                self.subTest(runner=runner),
+                patch.object(torch.cuda, "device", side_effect=device_context) as guard,
+                patch.object(backend, runner, side_effect=run),
+            ):
+                output = backend.run_flydsl_moe_gfx942(
+                    hidden,
+                    w1,
+                    w2,
+                    weights,
+                    ids,
+                    ActivationType.Silu,
+                    QuantType.No,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    config,
+                )
+                self.assertIs(output, hidden)
+                guard.assert_called_once_with(hidden.device.index)
+                self.assertFalse(state["inside"])
+
+    def test_precompile_uses_preload_for_cached_executable_in_compile_only(self):
         class CachedExecutable:
             _cf = object()
 
@@ -925,6 +1046,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 backend, "_get_compiled_kernel", return_value=CachedExecutable()
             ),
             patch.object(backend, "_run_compiled") as run_compiled,
+            patch.object(backend, "_preload_compiled") as preload,
             patch.dict(os.environ, {"COMPILE_ONLY": "1"}),
         ):
             backend.precompile_flydsl_moe(
@@ -940,6 +1062,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             )
 
         run_compiled.assert_not_called()
+        self.assertEqual(preload.call_count, 3)
 
     def test_compact_task_capacities_and_offline_cu_count(self):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942.gemm2_8x1_compact import (
@@ -949,6 +1072,12 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
 
         with patch.dict(os.environ, {"CU_NUM": "80"}):
             self.assertEqual(device_cu_count(), 80)
+        with (
+            patch.dict(os.environ, {"CU_NUM": "256"}),
+            patch.object(torch.cuda, "get_device_properties") as properties,
+        ):
+            self.assertEqual(device_cu_count(torch.device("cuda:0")), 256)
+            properties.assert_not_called()
         self.assertEqual(task_capacities(0, 1, cu_count=80), (1, 1))
         self.assertEqual(task_capacities(1000, 128, cu_count=80), (250, 572))
         self.assertEqual(
@@ -960,6 +1089,41 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             ),
             (250, 384),
         )
+
+    def test_aot_bf16_and_fp4_activation_dtype_contract(self):
+        from aiter.aot.flydsl import moe as aot_moe
+
+        for weight, quant_type in (
+            ("torch.bfloat16", "QuantType.No"),
+            ("torch.float4_e2m1fn_x2", "QuantType.per_1x32"),
+        ):
+            for activation_dtype in ("", "torch.bfloat16", "torch.float8_e4m3fnuz"):
+                row = {
+                    "token": 2,
+                    "model_dim": 512,
+                    "inter_dim": 128,
+                    "expert": 2,
+                    "topk": 1,
+                    "act_type": "ActivationType.Silu",
+                    "dtype": "torch.bfloat16",
+                    "q_dtype_a": activation_dtype,
+                    "q_dtype_w": weight,
+                    "q_type": quant_type,
+                    "kernelName1": "impl__flydsl_gfx950__16_16_16_False_True",
+                    "kernelName2": "",
+                }
+                with (
+                    self.subTest(weight=weight, activation_dtype=activation_dtype),
+                    tempfile.NamedTemporaryFile("w", newline="", suffix=".csv") as file,
+                ):
+                    writer = csv.DictWriter(file, fieldnames=list(row))
+                    writer.writeheader()
+                    writer.writerow(row)
+                    file.flush()
+                    jobs = aot_moe.parse_csv(file.name)
+                    self.assertEqual(
+                        len(jobs), int(activation_dtype != "torch.float8_e4m3fnuz")
+                    )
 
     def test_compact_prefill_allocates_workspace_and_uses_metadata_block(self):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
@@ -1079,9 +1243,11 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             patch.object(backend, "_get_compiled_kernel", side_effect=fake_compile),
             patch.object(
                 backend,
-                "_run_compiled",
+                "_preload_compiled",
                 side_effect=lambda kernel, *args: launched.append((kernel, args)),
             ),
+            patch.object(backend, "precompile_moe_reduction_kernels"),
+            patch.object(backend, "precompile_moe_quant_kernels"),
             patch.dict(os.environ, {"CU_NUM": "80"}),
         ):
             backend.precompile_flydsl_moe(

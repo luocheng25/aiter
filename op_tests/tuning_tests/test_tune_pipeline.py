@@ -16,6 +16,7 @@ import tempfile
 import textwrap
 import unittest
 from typing import Any, ClassVar
+from unittest import mock
 
 import pandas as pd
 
@@ -313,7 +314,7 @@ class TestFlydslGfx942MoeConfig(unittest.TestCase):
             down_device_config_from_properties("gfx950", 256),
             (False, 8),
         )
-        with unittest.mock.patch.dict(
+        with mock.patch.dict(
             os.environ,
             {"FLYDSL_GPU_ARCH": "gfx942", "CU_NUM": "80"},
         ):

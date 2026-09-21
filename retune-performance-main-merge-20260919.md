@@ -2967,3 +2967,74 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 | 8x1_compact | 320 | 36.323958 | 36.199022 | 184.750966 | 185.388612 | -0.343951 |
 
 六项没有超过3%的回退；不把微小波动称为新优化收益。结束已恢复GPU7 auto、NUMA1及原PTL，GPU利用率0%、显存297623552B。证据保存在本机/tmp/aiter-pr1-review-fix-20260921，包括CI原始失败日志、修复前后测试、机器码和性能记录。远端CI状态须以修复提交后的检查为准，本地通过不冒称远端GPU CI已通过。
+
+## 29. 未解决审查意见修复与编译期对象缓存取舍（2026-09-21）
+
+本次基线为lc PR #1的`c3e6d2ea17c82e5dce719c7861d05a93678bedc0`。核对3个未解决线程：AOT遗漏helper、ambient GPU与输入设备不一致、测试未显式导入`unittest.mock`。仅追加本节，不覆盖此前测量或生产调优CSV。
+
+### 29.1 审查修复
+
+- **完整AOT**：prefill预编译包含`invert_sorted_ids`、`sorted_sum`；per-tensor FP8同时包含`flydsl_absmax`、`flydsl_quant_per_tensor`。helper预编译和runtime共用同一launcher及签名，使用`_preload_compiled`安全材料化，不执行CPU占位指针。新增真实run-only测试进一步发现非MXFP4 direct/decode的AOT布局标志与runtime不一致，已统一为separated；MXFP4仍预编译两种布局。
+- **输入设备上下文**：三条whole-graph runner统一在`hidden_states.device`上下文内完成操作，6个Gate/Down编译请求显式传入device，辅助缓存key、量化CU数和launch stream也按tensor设备获取，调用结束恢复调用者当前GPU。`get_device_cache_key`增加的可选device参数保持已有13处调用兼容。
+- **测试导入**：显式`from unittest import mock`，不依赖其它模块碰巧导入子模块。
+- **CI覆盖**：真实gfx942 run-only回归放到既有MI300X runner池的独立Tuning Tests job，避免只在MI35x任务上被skip；不改变原Level 2调优测试范围。
+
+### 29.2 FlyObjCache不是必需：实测后移除
+
+区分两类缓存：被移除的是项目自定义的**IR/tile对象memoize缓存**`FlyObjCache`，不是已编译kernel缓存，也不是FlyDSL磁盘AOT缓存。后两者保留，避免逐调用重新编译，并支持`FLYDSL_RUNTIME_RUN_ONLY=1`。
+
+在相同旧源码中只切换`FlyObjCache`开关，关闭FlyDSL磁盘缓存，以独立冷进程按开/关、关/开、开/关顺序编译；每配置取三轮中位数。以下为编译wall-time秒，不是GPU运行时间：
+
+| Down配置 | K | 对象缓存开 s | 对象缓存关 s | 关闭后增加 ms | 关闭后变化% |
+|---|---:|---:|---:|---:|---:|
+| default | 192 | 0.479725 | 0.493138 | 13.412 | +2.796 |
+| 1x4_64x256 | 192 | 0.649991 | 0.676094 | 26.103 | +4.016 |
+| 8x1 | 192 | 2.542325 | 2.581447 | 39.122 | +1.539 |
+| 8x1 | 256 | 2.055104 | 2.103394 | 48.289 | +2.350 |
+| 8x1 | 320 | 2.565124 | 2.612762 | 47.638 | +1.857 |
+| 8x1_compact | 320 | 3.409679 | 3.487826 | 78.147 | +2.292 |
+
+六项中位数之和11.701948→11.954660s，增加0.252712s（2.1596%）；这不是整个工程构建时间。三轮全部GPU产物字节相同。收益不足以抵消维护region-bound IR对象缓存、注册和显式清理的复杂度，因此改为无状态`MoETileOps`，删除memoize装饰器、动态方法注册、`clear_all`及全部调用点。未改变GPU数学、tiles或流水顺序。
+
+### 29.3 验证结果
+
+- CPU/mock回归**79项通过**；修复前新增的AOT helper遗漏和设备上下文测试先产生6个失败子项，修复后通过。另验证显式设备cache-key及helper不持有IR对象。11个本次Python文件通过Black/Ruff检查。
+- 空缓存目录中独立进程AOT，随后新进程强制RUN_ONLY，覆盖direct、sorted decode、BF16/FP8两类量化prefill、1x4/8x1/compact共8种配置；同一runtime进程按逻辑GPU0→1→0复用缓存，ambient GPU切到另一张卡，输入使用非默认stream，共**24次完整路径检查通过**。物理测试卡为GPU6/7。compact B6208用例同时断言M256 full及M64 tail任务数均大于0；配置token键按`get_padded_M`归一化，实际输入/参考保持真实batch。
+- 旧版本与最终runtime另各执行24形状×2 seed＝48项GPU正确性，覆盖输出buffer、非默认stream、graph replay和零量化；48项对应GPU函数指令字节一致。修复后最大rel_l2=0.0213417410851，最大logits_diff=0.000227665266721，维持原logits_diff≤0.01。
+- gfx950 MXFP4 B1/2/4/8的分离/交错Gate/Up及Down compile-only通过；**未执行MI350 GPU性能或正确性验证**。
+
+### 29.4 移除对象缓存后的最小Down-only性能
+
+沿用第28节合成输入B2048/topk2/D2560/E2、6种path/K配置，8个buffer轮换、原生profiler 10次预热/51次采样、IQR均值后三轮中位数；基线改为本节c3e提交。仅测试GPU7空闲，PTL enabled / VECTOR,F8、1800MHz SoftMax、NUMA0，完成后恢复。有效工作量$F_d=2\times2048\times2\times2560\times K$ FLOPs，有效TFLOPS为$F_d/(t_{\mu s}\times10^6)$。
+
+| Down路径 | K | 修改前 µs | 修改后 µs | 修改前有效TFLOPS | 修改后有效TFLOPS | 时延变化% |
+|---|---:|---:|---:|---:|---:|---:|
+| 1x4_64x256 | 192 | 24.076326 | 24.741500 | 167.240297 | 162.744047 | +2.762774 |
+| 8x1 | 192 | 83.437714 | 83.429957 | 48.257936 | 48.262422 | -0.009297 |
+| 8x1_compact | 192 | 28.019000 | 27.960696 | 143.707193 | 144.006855 | -0.208089 |
+| 1x4_64x256 | 320 | 30.883204 | 30.921739 | 217.298904 | 217.028103 | +0.124777 |
+| 8x1 | 320 | 141.903245 | 141.840367 | 47.291987 | 47.312951 | -0.044310 |
+| 8x1_compact | 320 | 35.284979 | 35.299740 | 190.191029 | 190.111497 | +0.041834 |
+
+六项没有超过3%的回退，1x4/K192的+2.763%原样保留，不能把机器码一致等同于时延逐次完全相同。这是定点检查，不是202形状重调结果。证据目录/tmp/aiter-pr1-followup-20260921，包含缓存开关三轮、失败与成功run-only测试、48项前后正确性、ISA及Down性能。所有旧报告内容与六份模型配置保持原样。
+
+### 29.5 提交前新增审查意见
+
+提交前发现6个新线程（其中设备上下文为重复意见），进一步处理：
+
+- `device_cu_count(device=...)`此前忽略`CU_NUM`覆盖，而task-table编译会使用覆盖值，可能导致tail workspace按不同CU数分配。现显式device和无device两种调用都优先使用同一覆盖值；CPU回归先失败后修复。GPU以物理80CU、覆盖256CU、320个M64 metadata块验证全部转tail后的容量与任务覆盖。
+- BF16/FP4权重的AOT激活类型检查与runtime对齐，只允许BF16或省略，拒绝FP8；原先BF16/FP8误接受、FP4省略误拒绝的回归已复现并修复。
+- 新增被unittest收集的compact GPU数值测试，强制compact路径，不由tuner择优绕过；独立Torch参考显式执行FP8量化/反量化、Silu Gate/Up及route-weighted Down，不调用task-table/GEMM实现充当参考。同时检查full/tail任务计数、每个physical M64块恰好覆盖一次、expert标签及32元素红区。
+
+| compact路由分布 | 实际full行数 | 实际tail行数 | rel_l2 | logits_diff |
+|---|---:|---:|---:|---:|
+| native tails | 0 | 256 | 0.001118329354 | 6.253399079e-7 |
+| native full + tail | 12288 | 128 | 0.002776552225 | 3.854682291e-6 |
+| underfilled full wave拆尾 | 0 | 640 | 0.002772774780 | 3.844100320e-6 |
+| 倾斜路由及空expert | 0 | 1472 | 0.002979990328 | 4.440300472e-6 |
+
+用户明确选择**保留RTE默认、明确RTA性能前提**，而非改变精度默认或重跑202形状调优。PR正文已补充：现有表格及选型来自`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1`，不宣称默认RTE收益或默认模式下的最优选型。
+
+用户亦明确选择保留综合PR范围，不拆分当前分支历史；已恢复MLA trait和两个gfx1250 JSON文件的原末尾空行，使其与PR基线逐字节一致，去掉无关diff。拆分新Down与重构的建议将回复为用户确认的交付范围，不伪称已完成PR拆分。此前§29.3的79项为新增线程前的测试数量，最终数量另行记录。
+
+最终同一源码复跑结果：**80/80 CPU/mock回归通过**；**3/3已收集GPU测试通过**，涵盖24次run-only设备切换、上述4种compact数值分布及CU覆盖容量。前后48项kernel正确性/ISA与6项Down性能记录保留；新增CU修复仅改变host覆盖值选择，并由专门GPU容量测试验证。审查线程将在提交后附英文修复/验证说明；保留综合PR的范围建议需人工确认，不以“已拆分”标记。

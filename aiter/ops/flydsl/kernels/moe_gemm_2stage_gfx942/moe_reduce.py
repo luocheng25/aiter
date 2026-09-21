@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, _run_compiled
 
 from . import common as fxh
 from .common import get_device_cache_key
@@ -81,7 +81,11 @@ def _sorted_sum_cached(
 
     @flyc.jit
     def launch(
-        loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer, batch_size: fx.Int32, stream
+        loc_ids: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        batch_size: fx.Int32,
+        stream: fx.Stream,
     ):
         assert A.dtype == B.dtype
         sorted_sum_kernel(loc_ids, A, B).launch(
@@ -91,21 +95,32 @@ def _sorted_sum_cached(
     def callable(
         loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
+        with torch.cuda.device(B.device.index):
+            _run_compiled(
+                launch,
+                _ptr(loc_ids),
+                _ptr(A),
+                _ptr(B),
+                batch_size,
+                torch.cuda.current_stream(B.device),
+            )
+
+    def precompile():
+        _preload_compiled(
             launch,
-            _ptr(loc_ids),
-            _ptr(A),
-            _ptr(B),
-            batch_size,
-            stream,
+            flyc.from_c_void_p(fx.Int32, 0),
+            flyc.from_c_void_p(fx.BFloat16, 0),
+            flyc.from_c_void_p(fx.BFloat16, 0),
+            1,
+            fx.Stream(None),
         )
 
+    callable.precompile = precompile
     return callable
 
 
-def sorted_sum(TOPK, N, row_padding_bytes=None):
-    return _sorted_sum_cached(get_device_cache_key(), TOPK, N, row_padding_bytes)
+def sorted_sum(TOPK, N, row_padding_bytes=None, *, device=None):
+    return _sorted_sum_cached(get_device_cache_key(device), TOPK, N, row_padding_bytes)
 
 
 sorted_sum.cache_clear = _sorted_sum_cached.cache_clear
@@ -152,7 +167,7 @@ def _invert_sorted_ids_cached(device_cache_key, TOPK):
         p_num_valid: fx.Pointer,
         num_ids: fx.Uint32,
         batch_size: fx.Uint32,
-        stream,
+        stream: fx.Stream,
     ):
         grid_size = fxh.div_up(num_ids, num_threads)
         invert_sorted_ids_kernel(
@@ -166,23 +181,41 @@ def _invert_sorted_ids_cached(device_cache_key, TOPK):
         num_ids: int,
         batch_size: int,
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
+        with torch.cuda.device(sorted_ids.device.index):
+            _run_compiled(
+                launch,
+                _ptr(sorted_ids),
+                _ptr(invert),
+                _ptr(num_valid),
+                fx.Uint32(num_ids),
+                fx.Uint32(batch_size),
+                torch.cuda.current_stream(sorted_ids.device),
+            )
+
+    def precompile():
+        _preload_compiled(
             launch,
-            _ptr(sorted_ids),
-            _ptr(invert),
-            _ptr(num_valid),
-            fx.Uint32(num_ids),
-            fx.Uint32(batch_size),
-            stream,
+            flyc.from_c_void_p(fx.Int32, 0),
+            flyc.from_c_void_p(fx.Int32, 0),
+            flyc.from_c_void_p(fx.Int32, 0),
+            fx.Uint32(1),
+            fx.Uint32(1),
+            fx.Stream(None),
         )
 
+    callable.precompile = precompile
     return callable
 
 
-def invert_sorted_ids(TOPK):
-    return _invert_sorted_ids_cached(get_device_cache_key(), TOPK)
+def invert_sorted_ids(TOPK, *, device=None):
+    return _invert_sorted_ids_cached(get_device_cache_key(device), TOPK)
 
 
 invert_sorted_ids.cache_clear = _invert_sorted_ids_cached.cache_clear
 invert_sorted_ids.cache_info = _invert_sorted_ids_cached.cache_info
+
+
+def precompile_moe_reduction_kernels(topk, model_dim, row_padding_bytes=None):
+    """Materialize both prefill reduction launchers without executing them."""
+    invert_sorted_ids(topk).precompile()
+    sorted_sum(topk, model_dim, row_padding_bytes).precompile()

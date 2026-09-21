@@ -1141,7 +1141,7 @@ def _build_moe_gemm2_default(
                     ptr_base = fx.get_iter(c_dst[None, m, n, 0])
                     fxh.atomic_add_bf16(ptr_base, reg_vec)
 
-    flyobj = fxh.FlyObjCache()
+    flyobj = fxh.MoETileOps()
 
     @flyc.kernel
     def moe_2stage_down_prefill_1x4(

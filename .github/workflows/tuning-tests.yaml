@@ -196,6 +196,54 @@ jobs:
         if: always()
         run: ./.github/scripts/clean_up_rocm.sh
 
+  gpu-run-only-gfx942:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
+    name: Whole-graph MoE AOT run-only (gfx942)
+    runs-on: linux-aiter-oci-mi300x-1
+    timeout-minutes: 45
+    needs: ci_config
+    env:
+      GPU_ARCHS: gfx942
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Run cold-cache MoE AOT regressions
+        run: |
+          set -euo pipefail
+          mkdir -p "${LOG_DIR}"
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run --rm \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYTHONUNBUFFERED=1 \
+            -e AITER_ONLINE_TUNE=0 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "$DOCKER_IMAGE" \
+            bash -lc 'set -euo pipefail; BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh; python3 -m unittest op_tests.tuning_tests.test_flydsl_gfx942_run_only -v' \
+            2>&1 | tee "${LOG_DIR}/moe-run-only-gfx942.log"
+
+      - name: Upload MoE run-only results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-tests-moe-run-only-gfx942-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: ${{ env.LOG_DIR }}/moe-run-only-gfx942.log
+
   gpu-run-config:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
     name: README Level 2 Run Config

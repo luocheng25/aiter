@@ -192,7 +192,7 @@ def _build_moe_gemm2_8x1_compact(
 
 def device_cu_count(device=None):
     """ROCm的multi_processor_count为当前可用CU数，不按型号/XCC数猜测。"""
-    if device is None and "CU_NUM" in os.environ:
+    if "CU_NUM" in os.environ:
         try:
             count = int(os.environ["CU_NUM"])
         except ValueError as error:

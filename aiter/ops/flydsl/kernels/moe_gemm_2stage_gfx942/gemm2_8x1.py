@@ -77,7 +77,7 @@ def _build_moe_gemm2_8x1(
     assert _store_cache in (0, 2), "store aux: 0=普通，2=SLC"
 
     BM = 256
-    ops = fxh.FlyObjCache()
+    ops = fxh.MoETileOps()
     topology, xcc_count = get_down_device_config()
     se_count = xcc_count * 4
 
@@ -216,9 +216,8 @@ def _build_moe_gemm2_8x1(
         task_num: fx.Int32,
         stream: fx.Stream,
     ):
-        # 统一清理编译期缓存，并保留原ABI、launch形状与编译选项。
+        # 保留原ABI、launch形状与编译选项。
         CompilationContext.get_current()
-        ops.clear_all()
         kernel = moe_2stage_down_prefill_8x1(
             p_input,
             p_weight,
@@ -1273,7 +1272,6 @@ def _emit_k128n_body(
         initial, restore_state = prepare_loop_state(
             b_prefetch, c_bf16, c_scales, b_addresses
         )
-        ops.clear_all()
         for block_start, state in range(2, LOOP_END, 1, init=initial):
             b_prefetch, previous_packed, previous_scales, b_addresses = restore_state(
                 state
@@ -1288,7 +1286,6 @@ def _emit_k128n_body(
                 addresses=b_addresses,
             )
             results = yield save_state(b_prefetch, packed, scales, b_addresses)
-        ops.clear_all()
         b_prefetch, c_bf16, previous_scales, b_addresses = restore_state(results)
     else:
         previous_scales = c_scales[FIRST_UNPACKED:]
@@ -1981,7 +1978,6 @@ def _emit_k192_body(
         initial, restore_state = prepare_loop_state(
             b_prefetch, c_bf16, c_scales, b_addresses
         )
-        ops.clear_all()
         for block_start, state in range(2, LOOP_END, 1, init=initial):
             b_prefetch, previous_packed, previous_scales, b_addresses = restore_state(
                 state
@@ -1996,7 +1992,6 @@ def _emit_k192_body(
                 addresses=b_addresses,
             )
             results = yield save_state(b_prefetch, packed, scales, b_addresses)
-        ops.clear_all()
         b_prefetch, c_bf16, previous_scales, b_addresses = restore_state(results)
     else:
         previous_scales = c_scales[FIRST_UNPACKED:]
@@ -2574,7 +2569,6 @@ def _emit_k320_body(
         initial, restore_state = prepare_loop_state(
             b_prefetch, c_bf16, c_scales, b_addresses
         )
-        ops.clear_all()
         for block_start, state in range(2, LOOP_END, 1, init=initial):
             b_prefetch, previous_packed, previous_scales, b_addresses = restore_state(
                 state
@@ -2589,7 +2583,6 @@ def _emit_k320_body(
                 addresses=b_addresses,
             )
             results = yield save_state(b_prefetch, packed, scales, b_addresses)
-        ops.clear_all()
         b_prefetch, c_bf16, previous_scales, b_addresses = restore_state(results)
     else:
         previous_scales = c_scales[FIRST_UNPACKED:]
