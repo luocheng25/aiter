@@ -2927,3 +2927,43 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 - 用户wrapper、三个kernel源码和六生产CSV哈希保持冻结值，未修改runtime/test/config，未commit/push或操作原stash。唯一报告此前381948字节原样保留，前缀SHA-256 `aeab8bf95d582ee4de89ac67891286972301a93112229c3e8d1c5487cec88825`；只追加本节。
 - 本机临时证据目录：/tmp/aiter-clear-b1-regression-20260921；最终分析SHA-256 `1ce30e23811b362b4e5f46fb44fd5a9ee703e991a1291ff7d53bf1f4207ce91c`。包含原6轮样本、全部控制日志/地址/实际GPU符号字节hash、IQR复算、时钟控制失败和恢复记录。
 - **不撤回全开、不声称修复**：39项新增开启的收益与本项原已开启对照分开判断；当前没有证据支持修改目标算法或回退用户代码。若继续追底层机制，应保持目标与地址池固定，补充可验证的逐dispatch硬件计数/频率证据，不通过重新挑选快轮次掩盖原回退。
+
+## 28. 对照PR #3987审查意见的修复与CI核验（2026-09-21）
+
+针对lc仓库PR #1、原head `551c7da5d32dc41237f322fd8ca331614ebb558d`，读取上游#3987的123条行内评论（含回复）和92次review，按当前拆分文件核对适用性，不将旧评论直接视为现存缺陷。本节只追加修复和验证结果，不修改第25–27节的历史性能或六份生产CSV。
+
+### 28.1 修复内容
+
+- **CI直接失败为Black 26.5.1格式检查**：12个文件需要重排；Aiter、OPUS、Triton的`check-signal`因此失败，后续GPU job未执行，不是GPU正确性失败。按同版本修复格式，首轮12文件AST和注释均等价；保留原有两项尚未提交的all-direct-clear测试，并修复其中4处循环lambda捕获的Ruff警告。没有删除门禁、提高容差或关闭测试。
+- **B2–8 direct路径对齐保护**：原`use_batch1_algorithm`提前返回，未验证BF16/FP8的Gate/Up K必须整除256、Down K必须整除64。新增同一检查供runtime/tuner/AOT使用，并给底层Gate/Up batch1 builder补上K整除保护。D384/I128与D512/I96回归原先失败；有效生产形状和tiles不变。
+- **tuner保留有效基线**：没有精确CSV行时也保留已验证的运行时fallback时间，避免把10µs基线设为无穷大后接受12µs候选。输出CSV不存在或为零字节时不向运行时传入该路径。启用kernel排除规则而fallback身份未知时，不用它阻挡合法候选；精确行仍逐kernel检查排除规则。
+- **AOT语义与runtime一致**：whole-graph CSV拒绝不支持的激活（如GELU）和`doweight_stage1=True`，不再静默编译成Silu或丢弃路由加权语义。
+- **公开FlyDSL接口**：Gate/Up、8x1及per-tensor量化中剩余私有`_to_raw`调用改为公开`as_ir_value`，保留原始运算、指令顺序、布局和ABI。与#3987接口审查要求一致。
+- 新增8项CPU tuner回归与3项direct/AOT边界测试，连同已有MoE配置、清零、在线调优测试，纳入现有Tuning Tests的Level 0+1任务。
+
+已重新核对而未作误改的旧意见包括：whole-graph的输出buffer、EP/bias/scatter/静态activation scale/有效token数拒绝或回退；per-token Gate/Up scale实际按token的一维索引读取；默认Down实际使用单wave K分块，I192合法；FlyDSL 0.3.2带`init`的range支持现有零次循环状态；batch1 launcher仍正确传入完整ABI和`M=batch`。不采用将M改topk、强制禁止所有奇数K tile、扩展scale副本等不符合当前源码的建议。
+
+### 28.2 验证结果
+
+- 修复前先记录失败回归：direct K对齐、较慢fallback替换、缺失输出CSV，以及AOT两项语义；补充零字节CSV与未知fallback排除规则两个失败反例后再修复。最终**75/75 CPU/mock/配置回归通过**，无失败或跳过。
+- 本次15个Python文件全部通过**Black 26.5.1、Ruff 0.16.0及AST语法检查**，workflow YAML可解析，`git diff --check`通过。显式对所有tracked文件运行Black会额外触及原CI未扫描的旧`.claude`/`aiter/dist`文件，未将这些无关历史文件混入修复。
+- GPU7上修复前后分别执行**24形状×2 seed＝48项**正确性：BF16/FP8 per-token/per-tensor direct B1/2/4/8、单次K迭代、默认prefill I128/I192、1x4、8x1及compact的K192/K256/K320。包含输出buffer、非默认stream、每项3次graph replay及零输入per-tensor量化；全部finite且`logits_diff <= 0.01`。修复后最大`rel_l2=0.0213417410851`、最大`logits_diff=0.000227665266721`，保留原精度门槛。
+- 上述GPU执行关闭磁盘编译缓存，分别从原head与修改后源码编译；**48项对应GPU函数字节全部相同**（74个case/symbol组合），不是仅比较Python源码或整个共享库hash。
+- gfx950 MXFP4 B1/B2/B4/B8、分离/交错Gate/Up及Down的AOT compile-only通过。**没有MI350 GPU正确性或性能结果**。
+
+### 28.3 最小Down-only性能复查
+
+独立合成Down输入，B2048、topk2、D2560、E2，K192/K320；原head与修复版本三轮A/B、B/A、A/B，8个buffer轮换，原生profiler 10次预热/51次采样/IQR均值后取三轮中位数。只检查GPU7空闲，PTL enabled / VECTOR,F8、1800MHz SoftMax、NUMA0、RTA=1。纯Down时间包括实际full/tail Down kernel，不含compact任务表；辅助成本另存原始记录。此表不是重新tune或生产202形状对照。
+
+有效工作量为$F_d=2\times2048\times2\times2560\times K$ FLOPs；有效TFLOPS为$F_d/(t_{\mu s}\times10^6)$，不是ATT模型值。
+
+| Down路径 | K | 修复前 µs | 修复后 µs | 修复前有效TFLOPS | 修复后有效TFLOPS | 时延变化% |
+|---|---:|---:|---:|---:|---:|---:|
+| 1x4_64x256 | 192 | 24.379114 | 24.363292 | 165.163176 | 165.270436 | -0.064900 |
+| 8x1 | 192 | 84.426021 | 83.365857 | 47.693019 | 48.299531 | -1.255731 |
+| 8x1_compact | 192 | 28.320733 | 28.470283 | 142.176115 | 141.429289 | +0.528056 |
+| 1x4_64x256 | 320 | 30.888292 | 30.888511 | 217.263113 | 217.261573 | +0.000709 |
+| 8x1 | 320 | 141.859170 | 141.863265 | 47.306680 | 47.305315 | +0.002887 |
+| 8x1_compact | 320 | 36.323958 | 36.199022 | 184.750966 | 185.388612 | -0.343951 |
+
+六项没有超过3%的回退；不把微小波动称为新优化收益。结束已恢复GPU7 auto、NUMA1及原PTL，GPU利用率0%、显存297623552B。证据保存在本机/tmp/aiter-pr1-review-fix-20260921，包括CI原始失败日志、修复前后测试、机器码和性能记录。远端CI状态须以修复提交后的检查为准，本地通过不冒称远端GPU CI已通过。

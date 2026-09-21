@@ -10,7 +10,6 @@ from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
@@ -190,10 +189,14 @@ def _flydsl_quant_per_tensor_cached(device_cache_key, torch_dtype):
             frag2 = fx.make_fragment_like(src, B.dtype)
 
             lo0 = rocdl.cvt_pk_fp8_f32(
-                T.i32, _raw(frag_f32[0]), _raw(frag_f32[1]), fx.Int32(0), False
+                T.i32,
+                as_ir_value(frag_f32[0]),
+                as_ir_value(frag_f32[1]),
+                fx.Int32(0),
+                False,
             )
             w0 = rocdl.cvt_pk_fp8_f32(
-                T.i32, _raw(frag_f32[2]), _raw(frag_f32[3]), lo0, True
+                T.i32, as_ir_value(frag_f32[2]), as_ir_value(frag_f32[3]), lo0, True
             )
             vw0 = vector.broadcast(Vec.make_type((1,), fx.Int32), w0)
             vi8x4_0 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw0)
@@ -203,10 +206,14 @@ def _flydsl_quant_per_tensor_cached(device_cache_key, torch_dtype):
             frag2[3] = vi8x4_0[3]
 
             lo1 = rocdl.cvt_pk_fp8_f32(
-                T.i32, _raw(frag_f32[4]), _raw(frag_f32[5]), fx.Int32(0), False
+                T.i32,
+                as_ir_value(frag_f32[4]),
+                as_ir_value(frag_f32[5]),
+                fx.Int32(0),
+                False,
             )
             w1 = rocdl.cvt_pk_fp8_f32(
-                T.i32, _raw(frag_f32[6]), _raw(frag_f32[7]), lo1, True
+                T.i32, as_ir_value(frag_f32[6]), as_ir_value(frag_f32[7]), lo1, True
             )
             vw1 = vector.broadcast(Vec.make_type((1,), fx.Int32), w1)
             vi8x4_1 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw1)

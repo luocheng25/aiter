@@ -260,9 +260,7 @@ def _build_moe_gemm2_1x4(
             output_store_rsrc = fx.rocdl.get_buffer_rsrc(
                 fx.rocdl.make_buffer_ptr(
                     fx.get_iter(arg_p_output),
-                    num_records_bytes=block_m_per_4wave_group
-                    * output_row_stride
-                    * 2,
+                    num_records_bytes=block_m_per_4wave_group * output_row_stride * 2,
                 )
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
@@ -288,16 +286,15 @@ def _build_moe_gemm2_1x4(
             expert_id = (
                 p_sorted_expert_ids[2 * e_idx + 1]
                 if const_expr(_task_table)
-                else fxh.view_as_torch_tensor(
-                    p_sorted_expert_ids, (1,), fx.Int32
-                )[e_idx]
+                else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
+                    e_idx
+                ]
             )
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype)
-                + fx.Int64(expert_id) * N * K,
+                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     (
                         ((4, 2, 2, 4, 4, N // 256)),

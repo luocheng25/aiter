@@ -4666,9 +4666,7 @@ class FmoeTuner(TunerCommon):
                 if whole_graph_config_string:
                     from aiter.ops.flydsl.fused_moe_gfx942 import Config
 
-                    whole_graph_config = Config.from_string(
-                        whole_graph_config_string
-                    )
+                    whole_graph_config = Config.from_string(whole_graph_config_string)
                 else:
                     whole_graph_config = None
                 if config_string:
@@ -4988,9 +4986,7 @@ class FmoeTuner(TunerCommon):
                     if (
                         math.isfinite(err_ratio)
                         and math.isfinite(logits_diff)
-                        and (
-                            err_ratio <= allowed_err_ratio or logits_diff <= cos_tol
-                        )
+                        and (err_ratio <= allowed_err_ratio or logits_diff <= cos_tol)
                     ):
                         status = "ok"
                     else:
@@ -6024,9 +6020,7 @@ class FmoeTuner(TunerCommon):
                 existing_tunedf.loc[bad_gfx, "gfx"] = existing_tunedf.loc[
                     bad_gfx, "cu_num"
                 ].map(gfx_from_cu_num)
-        missing_keys = [
-            key for key in self.keys if key not in existing_tunedf.columns
-        ]
+        missing_keys = [key for key in self.keys if key not in existing_tunedf.columns]
         if missing_keys and not existing_tunedf.empty:
             raise ValueError(f"Baseline config is missing tuning keys: {missing_keys}")
         for key in missing_keys:
@@ -6052,7 +6046,13 @@ class FmoeTuner(TunerCommon):
                 validate="many_to_one",
             )
         results_base = self._run_config_for_shapes(
-            args, baseline_shapes, config_file=output_file
+            args,
+            baseline_shapes,
+            config_file=(
+                output_file
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 0
+                else None
+            ),
         )
         better_kernels = {}
 
@@ -6064,12 +6064,13 @@ class FmoeTuner(TunerCommon):
             row = self.untunedf.iloc[i]
             row_key = tuple(row[col] for col in self.keys)
             keyname = " ".join(map(str, row_key))
-            has_exact_tuned = row_key in tuned_keys
             baseline_valid = (
                 status == "ok"
                 and math.isfinite(e2e_us)
                 and e2e_us > 0
                 and math.isfinite(err_ratio)
+                # 未知fallback可能命中被排除的kernel，不能据此阻止合法候选。
+                and (row_key in tuned_keys or not _TUNE_EXCLUDE_KERNEL_PATTERNS)
                 and not any(
                     _is_tune_excluded_kernel(baseline_shapes.iloc[i].get(col, ""))
                     for col in ("kernelName1", "kernelName2")
@@ -6079,16 +6080,12 @@ class FmoeTuner(TunerCommon):
                 "name": keyname,
                 "row": row,
                 "kernel_name": None,
-                # An activation fallback is useful at runtime, but it is not a
-                # tuned result for this exact key. Force the first valid FlyDSL
-                # candidate to establish an explicit baseline for new shapes.
-                "e2e_us": (
-                    e2e_us if has_exact_tuned and baseline_valid else float("inf")
-                ),
+                # 没有精确配置行也不能用更慢的候选替换已验证的运行时fallback。
+                "e2e_us": e2e_us if baseline_valid else float("inf"),
                 "err_ratio": err_ratio,
                 "e2e_us_base": e2e_us,
                 "err_ratio_base": err_ratio,
-                "baseline_valid": has_exact_tuned and baseline_valid,
+                "baseline_valid": baseline_valid,
                 "status_base": status,
                 "candidate_statuses": {},
                 "skip_reason": "",
@@ -6117,8 +6114,7 @@ class FmoeTuner(TunerCommon):
         ):
             if doweight_stage1:
                 raise NotImplementedError(
-                    "FlyDSL whole-graph tuning does not support "
-                    "doweight_stage1=True"
+                    "FlyDSL whole-graph tuning does not support " "doweight_stage1=True"
                 )
             if dtype not in (None, hidden_states.dtype):
                 raise NotImplementedError(
@@ -6140,9 +6136,7 @@ class FmoeTuner(TunerCommon):
                 config_string=config_string,
                 swiglu_limit=swiglu_limit,
                 situ_beta=(1.0 if beta is None else float(beta)),
-                situ_linear_beta=(
-                    1.0 if linear_beta is None else float(linear_beta)
-                ),
+                situ_linear_beta=(1.0 if linear_beta is None else float(linear_beta)),
                 gate_mode=_flydsl_whole_graph_gate_mode(w1.dtype),
             )
 
@@ -6228,9 +6222,9 @@ class FmoeTuner(TunerCommon):
                     if not _is_tune_excluded_kernel(kernel_name):
                         tune_space.append(config_string)
                 if not tune_space:
-                    better_kernels[i]["skip_reason"] = (
-                        "no supported, non-excluded config"
-                    )
+                    better_kernels[i][
+                        "skip_reason"
+                    ] = "no supported, non-excluded config"
             except (ArgumentTypeError, TypeError, ValueError) as e:
                 better_kernels[i]["skip_reason"] = str(e)
             row_tune_spaces.append(tune_space)
@@ -6277,9 +6271,7 @@ class FmoeTuner(TunerCommon):
             for result_index, i in enumerate(eligible_indices):
                 k = better_kernels[i]
                 result = (
-                    results_cur[result_index]
-                    if result_index < len(results_cur)
-                    else {}
+                    results_cur[result_index] if result_index < len(results_cur) else {}
                 )
                 e2e_us = result.get("e2e_us", -1)
                 status = result.get("status", "error:missing candidate result")

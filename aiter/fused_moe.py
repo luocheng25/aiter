@@ -3156,7 +3156,9 @@ def get_2stage_cfgs(
         ):
             unsupported = f"gate mode {gate_mode.value!r}"
         elif activation not in (
-            ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
         ):
             unsupported = f"activation {activation}"
         if unsupported is not None:

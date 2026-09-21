@@ -200,8 +200,11 @@ def eltwise_op(inst_name, *args):
     if inst_name.startswith("llvm."):
         outputs = [
             llvm.call_intrinsic(
-                f32, inst_name,
-                [get_item(raw, index) for raw in raw_args], [], [],
+                f32,
+                inst_name,
+                [get_item(raw, index) for raw in raw_args],
+                [],
+                [],
             )
             for index in range(size)
         ]
@@ -381,7 +384,9 @@ class BufferTensor(fx.Tensor):
         return type(self)(result) if isinstance(result, fx.Tensor) else result
 
     def _packet_bits(self):
-        if not is_target_address_space(self.address_space, TargetAddressSpace.BufferDesc):
+        if not is_target_address_space(
+            self.address_space, TargetAddressSpace.BufferDesc
+        ):
             raise TypeError("explicit buffer access requires a BufferDesc tensor")
         if (
             not self.layout.is_static
@@ -398,7 +403,9 @@ class BufferTensor(fx.Tensor):
     def load(self, *, voffset_bytes=None, soffset_bytes=0, aux=0):
         if voffset_bytes is None:
             if not isinstance(soffset_bytes, int) or soffset_bytes != 0 or aux != 0:
-                raise ValueError("explicit soffset/aux requires an explicit voffset_bytes")
+                raise ValueError(
+                    "explicit soffset/aux requires an explicit voffset_bytes"
+                )
             return super().load()
         bits = self._packet_bits()
         if not isinstance(aux, int):

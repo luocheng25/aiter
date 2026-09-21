@@ -3,6 +3,7 @@
 
 import csv
 import importlib
+import itertools
 import os
 import tempfile
 import unittest
@@ -47,19 +48,41 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
     def test_two_stage_entry_does_not_select_whole_graph(self):
         fused = importlib.import_module("aiter.fused_moe")
         key = (
-            "gfx942", 80, 1, 2048, 128, 257, 9,
-            str(ActivationType.Silu), str(torch.bfloat16),
-            str(torch.float8_e4m3fnuz), str(torch.float8_e4m3fnuz),
-            str(QuantType.per_Token), True, False,
+            "gfx942",
+            80,
+            1,
+            2048,
+            128,
+            257,
+            9,
+            str(ActivationType.Silu),
+            str(torch.bfloat16),
+            str(torch.float8_e4m3fnuz),
+            str(torch.float8_e4m3fnuz),
+            str(QuantType.per_Token),
+            True,
+            False,
         )
         cfg = {
             "kernelName1": "impl__flydsl_gfx942__16_16_16_False",
-            "block_m": 16, "ksplit": 0,
+            "block_m": 16,
+            "ksplit": 0,
         }
         request = (
-            1, 2048, 128, 257, 9, torch.bfloat16,
-            torch.float8_e4m3fnuz, torch.float8_e4m3fnuz,
-            QuantType.per_Token, True, ActivationType.Silu, False, 0, 0,
+            1,
+            2048,
+            128,
+            257,
+            9,
+            torch.bfloat16,
+            torch.float8_e4m3fnuz,
+            torch.float8_e4m3fnuz,
+            QuantType.per_Token,
+            True,
+            ActivationType.Silu,
+            False,
+            0,
+            0,
         )
         fused.get_2stage_cfgs.cache_clear()
         try:
@@ -197,13 +220,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         backend._validate_mxfp4_inputs(w1, w2, w1_scale, w2_scale, problem)
 
         with self.assertRaisesRegex(ValueError, "E8M0"):
-            backend._validate_mxfp4_inputs(
-                w1, w2, w1_scale.float(), w2_scale, problem
-            )
+            backend._validate_mxfp4_inputs(w1, w2, w1_scale.float(), w2_scale, problem)
         with self.assertRaisesRegex(ValueError, "expected at least"):
-            backend._validate_mxfp4_inputs(
-                w1, w2, w1_scale[:1], w2_scale, problem
-            )
+            backend._validate_mxfp4_inputs(w1, w2, w1_scale[:1], w2_scale, problem)
 
     def test_mxfp4_config_gates_prefill_and_specialized_down(self):
         hidden_states, w1, w2, _, topk_ids, _, _ = _mxfp4_inputs()
@@ -211,9 +230,13 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             hidden_states, w1, w2, topk_ids, QuantType.per_1x32
         )
 
-        self.assertIsNone(backend.Config.from_string("16_16_16_False").unsupported_reason(problem))
         self.assertIsNone(
-            backend.Config.from_string("16_16_16_False_True").unsupported_reason(problem)
+            backend.Config.from_string("16_16_16_False").unsupported_reason(problem)
+        )
+        self.assertIsNone(
+            backend.Config.from_string("16_16_16_False_True").unsupported_reason(
+                problem
+            )
         )
         self.assertIn(
             "prefill",
@@ -232,13 +255,13 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         mxfp4_space = backend.get_tune_space(4, include_prefill=False)
         self.assertIn("16_16_16_False_True", mxfp4_space)
         self.assertTrue(
-            all(not backend.Config.from_string(item).use_prefill for item in mxfp4_space)
+            all(
+                not backend.Config.from_string(item).use_prefill for item in mxfp4_space
+            )
         )
 
     def test_extended_config_preserves_direct_flag(self):
-        config = backend.Config.from_string(
-            "16_16_16_False_True:default:16:none"
-        )
+        config = backend.Config.from_string("16_16_16_False_True:default:16:none")
         self.assertTrue(config.use_batch1_algorithm)
         self.assertEqual(config.to_string(), "16_16_16_False_True")
 
@@ -252,10 +275,100 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             topk=2,
             quant_type="mxfp4",
         )
-        padded = backend.Config.from_string(
-            "16_16_16_False_True:default:16:0"
-        )
+        padded = backend.Config.from_string("16_16_16_False_True:default:16:0")
         self.assertIn("extended", padded.unsupported_reason(problem))
+
+    def test_direct_path_rejects_incomplete_k_tiles_before_launch(self):
+        for quant_type in ("no", "ptpc", "per_tensor"):
+            for hidden_dim, inter_dim, expected in (
+                (384, 128, "gateup K"),
+                (512, 96, "down K"),
+            ):
+                with self.subTest(quant_type=quant_type, shape=(hidden_dim, inter_dim)):
+                    problem = backend._Problem(
+                        batch=2,
+                        experts=2,
+                        gateup_dim=2 * inter_dim,
+                        hidden_dim=hidden_dim,
+                        model_dim=hidden_dim,
+                        inter_dim=inter_dim,
+                        topk=1,
+                        quant_type=quant_type,
+                    )
+                    reason = backend.Config.from_string(
+                        "16_16_16_False_True"
+                    ).unsupported_reason(problem)
+                    self.assertIsNotNone(reason)
+                    self.assertIn(expected, reason)
+
+        with (
+            patch.object(backend, "_get_compiled_kernel") as compile_kernel,
+            self.assertRaisesRegex(ValueError, "gateup K"),
+        ):
+            backend.precompile_flydsl_moe(
+                config_string="16_16_16_False_True",
+                batch=2,
+                model_dim=384,
+                inter_dim=128,
+                experts=2,
+                topk=1,
+                weight_dtype="bf16",
+                quant_type="no",
+                activation="silu",
+            )
+        compile_kernel.assert_not_called()
+
+    def test_batch1_builder_rejects_truncated_gateup_k(self):
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import gemm1
+
+        for weight_dtype, quant_type in (("bf16", "no"), ("fp8", "ptpc")):
+            with (
+                self.subTest(weight_dtype=weight_dtype),
+                patch.object(gemm1, "get_rocm_arch", return_value="gfx942"),
+                self.assertRaisesRegex(AssertionError, "K divisible by 256"),
+            ):
+                gemm1._build_moe_gemm1(
+                    N=256,
+                    K=384,
+                    weight_dtype=weight_dtype,
+                    weight_quant_type=quant_type,
+                    TOPK=1,
+                    BLOCK_TILE_SIZE_M=16,
+                    BLOCK_TILE_SIZE_N=32,
+                    alg="batch1",
+                )
+
+    def test_aot_rejects_unsupported_whole_graph_semantics(self):
+        from aiter.aot.flydsl import moe as aot_moe
+
+        row = {
+            "token": 2,
+            "model_dim": 512,
+            "inter_dim": 128,
+            "expert": 2,
+            "topk": 1,
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float8_e4m3fnuz",
+            "q_dtype_w": "torch.float8_e4m3fnuz",
+            "q_type": "QuantType.per_Token",
+            "doweight_stage1": 0,
+            "kernelName1": "impl__flydsl_gfx942__16_16_16_False_True",
+            "kernelName2": "",
+        }
+        for unsupported in (
+            {"act_type": "ActivationType.Gelu"},
+            {"doweight_stage1": 1},
+        ):
+            with (
+                self.subTest(**unsupported),
+                tempfile.NamedTemporaryFile("w", newline="", suffix=".csv") as file,
+            ):
+                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow({**row, **unsupported})
+                file.flush()
+                self.assertEqual(aot_moe.parse_csv(file.name), [])
 
     def test_situv2_scalars_are_runtime_values(self):
         self.assertEqual(
@@ -425,12 +538,153 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         self.assertEqual(compiled[1]["BLOCK_TILE_SIZE_N"], 32)
         self.assertIs(launched[0][1][4], output)
         self.assertIs(launched[1][1][2], output)
-        self.assertEqual(
-            launched[0][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf"))
+        self.assertEqual(launched[0][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf")))
+        self.assertEqual(launched[1][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf")))
+
+    def test_batch1_clear_covers_all_weight_types_and_tokens(self):
+        # 所有 batch1/direct 组合开启清零，保持原有 dtype、layout 和 tile。
+        cases = (
+            (torch.float8_e4m3fnuz, QuantType.per_Token, False),
+            (torch.float8_e4m3fnuz, QuantType.per_Tensor, False),
+            (torch.bfloat16, QuantType.No, False),
+            (torch.float4_e2m1fn_x2, QuantType.per_1x32, False),
+            (torch.float4_e2m1fn_x2, QuantType.per_1x32, True),
         )
-        self.assertEqual(
-            launched[1][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf"))
-        )
+        for (
+            batch,
+            (weight_dtype, quant_type, interleaved),
+            activation,
+        ) in itertools.product(range(1, 9), cases, ("silu", "swiglu", "situv2")):
+            with self.subTest(
+                batch=batch,
+                dtype=weight_dtype,
+                activation=activation,
+                interleaved=interleaved,
+            ):
+                is_mxfp4 = weight_dtype == torch.float4_e2m1fn_x2
+                if is_mxfp4:
+                    hidden, w1, w2, weights, ids, scale1, scale2 = _mxfp4_inputs(
+                        batch=batch
+                    )
+                else:
+                    hidden = torch.empty((batch, 512), dtype=torch.bfloat16)
+                    w1 = torch.empty((2, 256, 512), dtype=weight_dtype)
+                    w2 = torch.empty((2, 512, 128), dtype=weight_dtype)
+                    weights = torch.ones((batch, 2), dtype=torch.float32)
+                    ids = torch.zeros((batch, 2), dtype=torch.int32)
+                    scale1 = scale2 = (
+                        None if weight_dtype == torch.bfloat16 else torch.ones(1)
+                    )
+                problem = backend._Problem.from_inputs(hidden, w1, w2, ids, quant_type)
+                compiled, launched = [], []
+                with (
+                    patch.object(
+                        backend,
+                        "_get_compiled_kernel",
+                        side_effect=lambda compiled=compiled, **kw: (
+                            compiled.append(kw) or kw["stage"]
+                        ),
+                    ),
+                    patch.object(
+                        backend,
+                        "_launch",
+                        side_effect=lambda kernel, *args, launched=launched: (
+                            launched.append(args)
+                        ),
+                    ),
+                    patch.object(torch, "zeros", wraps=torch.zeros) as zeros,
+                ):
+                    output = backend._run_batch1(
+                        hidden,
+                        w1,
+                        w2,
+                        weights,
+                        ids,
+                        scale1,
+                        scale2,
+                        problem,
+                        activation,
+                        None,
+                        0.5,
+                        2.0,
+                        interleaved,
+                    )
+                self.assertTrue(compiled[0]["fused_down_clear"])
+                self.assertEqual(
+                    compiled[0]["BLOCK_TILE_SIZE_N"],
+                    64 if is_mxfp4 and batch >= 4 else 32,
+                )
+                self.assertEqual(
+                    compiled[1]["BLOCK_TILE_SIZE_N"],
+                    32 if is_mxfp4 and batch > 1 else 64,
+                )
+                self.assertEqual(compiled[0]["mxfp4_gate_up_interleaved"], interleaved)
+                zeros.assert_not_called()
+                self.assertIs(launched[0][4], output)
+                self.assertIs(launched[1][2], output)
+                self.assertIs(launched[1][4], weights)
+                # TOPK 已在 grid.y；M=token 数，不能误传 topk。
+                self.assertEqual([args[6] for args in launched], [batch, batch])
+                expected = backend._activation_scalars(activation, 0.5, 2.0, None)
+                self.assertEqual(launched[0][-5:], expected)
+                self.assertEqual(launched[1][-5:], expected)
+
+    def test_precompile_batch1_clear_matches_runtime_for_all_types(self):
+        for batch, (weight_dtype, quant_type) in itertools.product(
+            range(1, 9),
+            (("bf16", "no"), ("fp8", "ptpc"), ("fp8", "per_tensor"), ("fp4", "mxfp4")),
+        ):
+            with self.subTest(
+                batch=batch, weight_dtype=weight_dtype, quant_type=quant_type
+            ):
+                compiled, launched = [], []
+                with (
+                    patch.object(
+                        backend,
+                        "_get_compiled_kernel",
+                        side_effect=lambda compiled=compiled, **kw: (
+                            compiled.append(kw) or kw["stage"]
+                        ),
+                    ),
+                    patch.object(backend, "_ptr", side_effect=lambda tensor: tensor),
+                    patch.object(
+                        backend,
+                        "_run_compiled",
+                        side_effect=lambda kernel, *args, launched=launched: (
+                            launched.append(args)
+                        ),
+                    ),
+                ):
+                    backend.precompile_flydsl_moe(
+                        config_string=(
+                            "16_16_16_False" if batch == 1 else "16_16_16_False_True"
+                        ),
+                        batch=batch,
+                        model_dim=2048,
+                        inter_dim=128,
+                        experts=257,
+                        topk=9,
+                        weight_dtype=weight_dtype,
+                        quant_type=quant_type,
+                        activation="silu",
+                    )
+                is_mxfp4 = weight_dtype == "fp4"
+                gate_count = 2 if is_mxfp4 else 1
+                self.assertEqual(len(compiled), gate_count + 1)
+                for gate, args in zip(compiled[:gate_count], launched[:gate_count]):
+                    self.assertTrue(gate["fused_down_clear"])
+                    self.assertEqual(
+                        gate["BLOCK_TILE_SIZE_N"], 64 if is_mxfp4 and batch >= 4 else 32
+                    )
+                    self.assertEqual(args[4].dtype, torch.bfloat16)
+                self.assertEqual(
+                    compiled[-1]["BLOCK_TILE_SIZE_N"],
+                    32 if is_mxfp4 and batch > 1 else 64,
+                )
+                self.assertEqual(launched[-1][4].dtype, torch.float32)
+                self.assertEqual(
+                    [args[6] for args in launched], [batch] * (gate_count + 1)
+                )
 
     def test_mxfp4_splitk_forwards_layout_scales_and_runtime_situv2(self):
         inputs = _mxfp4_inputs(batch=16)
@@ -444,7 +698,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         sorted_weights = torch.ones((16,), dtype=torch.float32)
         sorted_expert_ids = torch.zeros((1,), dtype=torch.int32)
         num_valid_ids = torch.tensor([16], dtype=torch.int32)
-        expected_output = torch.zeros((problem.batch, problem.model_dim), dtype=torch.bfloat16)
+        expected_output = torch.zeros(
+            (problem.batch, problem.model_dim), dtype=torch.bfloat16
+        )
 
         def fake_compile(**kwargs):
             compiled.append(kwargs)
@@ -491,16 +747,14 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
 
         self.assertIs(output, expected_output)
         self.assertEqual([entry["alg"] for entry in compiled], ["splitk", "splitk"])
-        self.assertEqual([entry["weight_dtype_str"] for entry in compiled], ["fp4", "fp4"])
+        self.assertEqual(
+            [entry["weight_dtype_str"] for entry in compiled], ["fp4", "fp4"]
+        )
         self.assertTrue(compiled[0]["mxfp4_gate_up_interleaved"])
         self.assertIs(launched[0][1][7], w1_scale)
         self.assertIs(launched[1][1][7], w2_scale)
-        self.assertEqual(
-            launched[0][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf"))
-        )
-        self.assertEqual(
-            launched[1][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf"))
-        )
+        self.assertEqual(launched[0][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf")))
+        self.assertEqual(launched[1][1][-5:], (0.5, 2.0, 2.0, 0.5, float("inf")))
 
     def test_stage2_only_forwards_fp4_options_to_default_builder(self):
         common = {
@@ -561,7 +815,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         self.assertEqual(compile_cached.call_args.args[9], "batch1")
 
     def test_request_forwards_beta_linear_beta_and_gate_mode(self):
-        hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale = _mxfp4_inputs()
+        hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale = (
+            _mxfp4_inputs()
+        )
         request = FusedMoeRequest(
             hidden_states=hidden_states,
             w1=w1,
@@ -579,8 +835,12 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             q_dtype_w=torch.float4_e2m1fn_x2,
         )
         sentinel = object()
-        with patch.object(backend, "run_flydsl_moe_gfx942", return_value=sentinel) as run:
-            self.assertIs(backend.run_flydsl_moe_gfx942_impl(request, "16_16_16_False"), sentinel)
+        with patch.object(
+            backend, "run_flydsl_moe_gfx942", return_value=sentinel
+        ) as run:
+            self.assertIs(
+                backend.run_flydsl_moe_gfx942_impl(request, "16_16_16_False"), sentinel
+            )
         self.assertEqual(run.call_args.args[-3:], (0.5, 2.0, GateMode.INTERLEAVE))
 
     def test_precompile_mxfp4_direct_covers_both_gate_layouts(self):
@@ -611,7 +871,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 activation="situv2",
             )
 
-        self.assertEqual([item["stage"] for item in compiled], ["gateup", "gateup", "down"])
+        self.assertEqual(
+            [item["stage"] for item in compiled], ["gateup", "gateup", "down"]
+        )
         self.assertEqual(
             [item["mxfp4_gate_up_interleaved"] for item in compiled[:2]],
             [False, True],
@@ -757,7 +1019,9 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 "allocate_task_buffers",
                 return_value=(full_tasks, tail_tasks, task_counts),
             ),
-            patch.object(backend, "invert_sorted_ids", return_value=lambda *_args: None),
+            patch.object(
+                backend, "invert_sorted_ids", return_value=lambda *_args: None
+            ),
             patch.object(backend, "sorted_sum", return_value=lambda *_args: None),
         ):
             output = backend._run_prefill(
@@ -772,9 +1036,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 None,
                 None,
                 0,
-                backend.Config.from_string(
-                    "64_128_128_True:8x1_compact:64:128"
-                ),
+                backend.Config.from_string("64_128_128_True:8x1_compact:64:128"),
                 backend._Problem(
                     batch=batch,
                     experts=experts,

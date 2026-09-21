@@ -137,9 +137,7 @@ class TestFlydslGfx942MoeConfig(unittest.TestCase):
         self.assertEqual(Config.from_string(extended.to_string()), extended)
         for retired_path in ("1x8", "2x4"):
             with self.assertRaisesRegex(ValueError, "Invalid down path"):
-                Config.from_string(
-                    f"128_256_128_True:{retired_path}:64:0"
-                )
+                Config.from_string(f"128_256_128_True:{retired_path}:64:0")
 
     def test_tune_space_is_unique_and_includes_new_down_paths(self):
         from aiter.ops.flydsl.fused_moe_gfx942 import get_tune_space

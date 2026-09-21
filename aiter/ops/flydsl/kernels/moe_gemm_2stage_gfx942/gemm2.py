@@ -46,9 +46,9 @@ def _compile_moe_gemm2_cached(
     METADATA_TILE_SIZE_M=None,
 ):
     del device_cache_key
-    assert down_path in _BUILDERS, (
-        f"unsupported down_path={down_path!r}; supported: {', '.join(_BUILDERS)}"
-    )
+    assert (
+        down_path in _BUILDERS
+    ), f"unsupported down_path={down_path!r}; supported: {', '.join(_BUILDERS)}"
     builder = _BUILDERS[down_path]
     default_kwargs = {}
     if down_path == "default":

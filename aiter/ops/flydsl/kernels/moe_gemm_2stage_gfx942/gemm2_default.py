@@ -120,9 +120,9 @@ def _build_moe_gemm2_default(
         down_k = 32 if alg == "prefill_1x4" and weight_dtype == "bf16" else TILE_K
         assert K % down_k == 0, f"down K must be divisible by {down_k}, got K={K}"
     if alg == "prefill_1x4":
-        assert N % 128 == 0, (
-            f"default down prefill requires paired 64-wide N tiles, got N={N}"
-        )
+        assert (
+            N % 128 == 0
+        ), f"default down prefill requires paired 64-wide N tiles, got N={N}"
 
     if alg == "splitk":
 
@@ -1175,37 +1175,28 @@ def _build_moe_gemm2_default(
             )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_sorted_ids)
-                + (
-                    row_begin
-                    if const_expr(_task_table)
-                    else e_idx * BLOCK_TILE_SIZE_M
-                ),
+                + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_sorted_weights)
-                + (
-                    row_begin
-                    if const_expr(_task_table)
-                    else e_idx * BLOCK_TILE_SIZE_M
-                ),
+                + (row_begin if const_expr(_task_table) else e_idx * BLOCK_TILE_SIZE_M),
                 (BLOCK_TILE_SIZE_M,),
                 fx.Float32,
             )
             expert_id = (
                 p_sorted_expert_ids[2 * e_idx + 1]
                 if const_expr(_task_table)
-                else fxh.view_as_torch_tensor(
-                    p_sorted_expert_ids, (1,), fx.Int32
-                )[e_idx]
+                else fxh.view_as_torch_tensor(p_sorted_expert_ids, (1,), fx.Int32)[
+                    e_idx
+                ]
             )
 
             # 16bytes/DW4
             element_num = 16 // (weight_dtype.width // 8)
             arg_p_weight = fx.make_view(
-                fxh._as_ptr(p_weight, weight_dtype)
-                + fx.Int64(expert_id) * N * K,
+                fxh._as_ptr(p_weight, weight_dtype) + fx.Int64(expert_id) * N * K,
                 fx.make_layout(
                     ((16, N // 16), (element_num, K // element_num)),
                     ((element_num, 16 * K), (1, 16 * element_num)),

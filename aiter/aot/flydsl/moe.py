@@ -125,6 +125,13 @@ def parse_csv(csv_path: str):
                 None,
             )
             if whole_graph_prefix is not None:
+                if act_name not in ("silu", "swiglu", "situv2") or doweight_stage1:
+                    print(
+                        "  [WARN] Unsupported whole-graph activation or "
+                        f"doweight_stage1: {act_type!r}/{doweight_stage1}, "
+                        f"skipping {stage1_name}"
+                    )
+                    continue
                 weight_dtype_name = q_dtype_w.strip().split(".")[-1]
                 weight_dtype = {
                     "bfloat16": "bf16",

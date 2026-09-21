@@ -13,7 +13,6 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch
 
 from . import common as fxh
@@ -89,9 +88,9 @@ def _build_moe_gemm1(
         assert situ_beta > 0.0, "situ_beta must be positive"
         assert situ_linear_beta > 0.0, "situ_linear_beta must be positive"
     if weight_dtype == "fp4":
-        assert weight_quant_type == "mxfp4" and act_quant_type == "no", (
-            "fp4 requires mxfp4 weights and bf16 activations"
-        )
+        assert (
+            weight_quant_type == "mxfp4" and act_quant_type == "no"
+        ), "fp4 requires mxfp4 weights and bf16 activations"
         assert K % 512 == 0, f"fp4 gateup K must be a multiple of 512, got {K}"
     else:
         assert weight_quant_type != "mxfp4", "mxfp4 quantization requires fp4 weights"
@@ -119,13 +118,14 @@ def _build_moe_gemm1(
             f"act={act_quant_type})"
         )
 
+    if alg in ("splitk", "batch1"):
+        assert (
+            K % (TILE_K * 4) == 0
+        ), f"gateup {alg} requires K divisible by {TILE_K * 4}, got K={K}"
     if alg == "splitk":
         assert (
             BLOCK_TILE_SIZE_N % 64 == 0
         ), "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
-        assert K % (TILE_K * 4) == 0, (
-            f"gateup split-K requires K divisible by {TILE_K * 4}, got K={K}"
-        )
         c_reduce_lds_size = (
             16 * 64 * 4
         )  # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
@@ -630,16 +630,16 @@ def _build_moe_gemm1(
     def _swiglu_oai(gate, up, neg_limit):
         gate, up = _clamp_gateup(gate, up, neg_limit)
         neg_alpha_log2e = -1.702 * 1.4426950408889634
-        tmp = rocdl.exp2(T.f32, _raw(gate * neg_alpha_log2e))
+        tmp = rocdl.exp2(T.f32, as_ir_value(gate * neg_alpha_log2e))
         return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
 
     def _sigmoid(value):
-        tmp = rocdl.exp2(T.f32, _raw(value * -1.4426950408889634))
+        tmp = rocdl.exp2(T.f32, as_ir_value(value * -1.4426950408889634))
         return rocdl.rcp(T.f32, 1.0 + tmp)
 
     def _tanh(value):
         abs_value = value.maximumf(-value)
-        exp_value = rocdl.exp2(T.f32, _raw(abs_value * -2.8853900817779268))
+        exp_value = rocdl.exp2(T.f32, as_ir_value(abs_value * -2.8853900817779268))
         tanh_abs = (1.0 - exp_value) * rocdl.rcp(T.f32, 1.0 + exp_value)
         return (value > fx.Float32(0.0)).select(tanh_abs, -tanh_abs)
 
@@ -756,7 +756,7 @@ def _build_moe_gemm1(
                 log2_exp1 = -1.4426950408889634
                 gate_log2 = gate * log2_exp1
                 for j in range_constexpr(gate.numel):
-                    tmp = rocdl.exp2(T.f32, _raw(gate_log2[j]))
+                    tmp = rocdl.exp2(T.f32, as_ir_value(gate_log2[j]))
                     acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
             acc = Vec.from_elements(acc, fx.Float32)
             c_frag_bf16[None, None, i].store(_f32_to_bf16(acc))
@@ -819,7 +819,7 @@ def _build_moe_gemm1(
                             )
                         )
                     else:
-                        tmp = rocdl.exp2(T.f32, _raw(g * log2_exp1))
+                        tmp = rocdl.exp2(T.f32, as_ir_value(g * log2_exp1))
                         acc.append((g * rocdl.rcp(T.f32, 1.0 + tmp)) * u)
                 acc = Vec.from_elements(acc, fx.Float32)
                 out_bf16[None, m, n].store(_f32_to_bf16(acc))
@@ -2102,7 +2102,8 @@ def _build_moe_gemm1(
                 if e_idx == 0 and clear_idx < K // 8:
                     clear_output = fx.make_view(
                         fxh._as_ptr(p_clear_output)
-                        + fx.Int64(batch_idx) * K + fx.Int64(clear_idx) * 8,
+                        + fx.Int64(batch_idx) * K
+                        + fx.Int64(clear_idx) * 8,
                         fx.make_layout(8, 1),
                     )
                     clear_frag = fx.make_fragment_like(clear_output)
