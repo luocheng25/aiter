@@ -3067,3 +3067,11 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 - MXFP4 AOT只接受`impl__flydsl_gfx950__`且`cu_num_to_arch`实际编译目标为gfx950的行；同时拒绝gfx942前缀及gfx950前缀/CU80不一致的输入，避免仅检查前缀仍向gfx942编译。BF16/FP8行为不变。
 
 修复前2个测试共**12个失败子项**；修复后**83/83 CPU测试通过**。只读检查已发布模型配置中**167条whole-graph选型全部仍被解析和shape gate接受**，没有修改任何CSV。最终源码再次通过**3/3 gfx942 GPU测试**（145.976s），包括24次冷缓存run-only数值/设备检查、4种compact分布、CU覆盖容量；最大run-only rel_l2=0.0214091651142、logits_diff=0.000228964243433。3个修改Python文件Black/Ruff通过。未运行性能矩阵、未修改GPU内核或数值精度；MI350实测及综合PR拆分两条旧意见仍按用户决定保留待人工/硬件确认。证据以`round2-`前缀保存于同一临时目录，不覆盖第一轮记录。
+
+### 30.4 第三轮复审：正文中此前遗漏的G1U1契约
+
+第二轮修复已推送lc `a033a95490bcf2aa1ed4b3f0e47bb81d22a32f00`。该head的Copilot review `5272811141`于2026-09-21 23:31:18 UTC完成，没有新增行内线程，但正文“Previously missed”提出AOT忽略`use_g1u1=0`：预编译总是假设`gateup_dim=2*inter_dim`，非配对runtime权重无法执行。因此不能只按未解决线程数量判断“无新意见”。
+
+本轮在whole-graph job生成前拒绝显式`use_g1u1=0`；省略字段继续使用原有G1U1默认，stage-specific parser不受影响。新增BF16、FP8 per-token/per-tensor、MXFP4四类量化×省略/0/1共12个组合；修复前4个拒绝子项失败，修复后**84/84 CPU测试通过**。对167条已发布whole-graph选型逐一比较旧/新parser输出，包含它们的CSV全部AOT job字典**完全一致**；两个Python文件Black/Ruff通过。
+
+此次仅parser、CPU回归和本追加段落变化，runtime/GPU源码与上一轮已验证的a033完全相同，未重复GPU或性能测试，不把旧GPU结果伪称为本轮新运行。保留`round3-`失败、成功及job对照凭证；MI350硬件与PR范围意见仍按用户确认保留待处理，后续推送后继续复审。

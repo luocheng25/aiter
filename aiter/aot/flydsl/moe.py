@@ -125,6 +125,12 @@ def parse_csv(csv_path: str):
                 None,
             )
             if whole_graph_prefix is not None:
+                if not bool(int(row.get("use_g1u1", "1"))):
+                    print(
+                        "  [WARN] Whole-graph backend requires paired gate/up "
+                        f"weights (use_g1u1=1), skipping {stage1_name}"
+                    )
+                    continue
                 if act_name not in ("silu", "swiglu", "situv2") or doweight_stage1:
                     print(
                         "  [WARN] Unsupported whole-graph activation or "

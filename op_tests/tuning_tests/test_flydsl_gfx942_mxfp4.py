@@ -401,6 +401,50 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 file.flush()
                 self.assertEqual(aot_moe.parse_csv(file.name), [])
 
+    def test_aot_whole_graph_requires_paired_gate_up_weights(self):
+        from aiter.aot.flydsl import moe as aot_moe
+
+        for (weight_dtype, quant_type), use_g1u1 in itertools.product(
+            (
+                ("torch.bfloat16", "QuantType.No"),
+                ("torch.float8_e4m3fnuz", "QuantType.per_Token"),
+                ("torch.float8_e4m3fnuz", "QuantType.per_Tensor"),
+                ("torch.float4_e2m1fn_x2", "QuantType.per_1x32"),
+            ),
+            (None, 0, 1),
+        ):
+            is_fp4 = quant_type == "QuantType.per_1x32"
+            arch = "gfx950" if is_fp4 else "gfx942"
+            row = {
+                "token": 2,
+                "model_dim": 512,
+                "inter_dim": 128,
+                "expert": 2,
+                "topk": 2,
+                "cu_num": 256 if is_fp4 else 80,
+                "act_type": "ActivationType.Silu",
+                "dtype": "torch.bfloat16",
+                "q_dtype_a": "torch.bfloat16" if is_fp4 else weight_dtype,
+                "q_dtype_w": weight_dtype,
+                "q_type": quant_type,
+                "kernelName1": f"impl__flydsl_{arch}__16_16_16_False_True",
+            }
+            if use_g1u1 is not None:
+                row["use_g1u1"] = use_g1u1
+            with (
+                self.subTest(
+                    weight_dtype=weight_dtype,
+                    quant_type=quant_type,
+                    use_g1u1=use_g1u1,
+                ),
+                tempfile.NamedTemporaryFile("w", newline="", suffix=".csv") as file,
+            ):
+                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+                file.flush()
+                self.assertEqual(len(aot_moe.parse_csv(file.name)), int(use_g1u1 != 0))
+
     def test_situv2_scalars_are_runtime_values(self):
         self.assertEqual(
             backend._activation_scalars("situv2", 0.5, 2.0, None),
