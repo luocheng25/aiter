@@ -659,24 +659,23 @@ def precompile_flydsl_moe(
 
     use_batch1_algorithm = batch == 1 or config.use_batch1_algorithm
     if use_batch1_algorithm:
-        fused_down_clear = is_mxfp4 and batch > 1
         gate_layouts = (False, True) if is_mxfp4 else (True,)
         gate_block_n = 64 if is_mxfp4 and batch >= 4 else 32
         for gate_up_interleaved in gate_layouts:
             gateup = compile_kernel(
                 stage="gateup", alg="batch1", block_m=16, block_n=gate_block_n,
                 mxfp4_gate_up_interleaved=gate_up_interleaved,
-                fused_down_clear=fused_down_clear,
+                fused_down_clear=True,
             )
             compile_launcher(
                 gateup,
                 _ptr(bf16), _ptr(weight), _ptr(bf16), _ptr(int32),
-                _ptr(bf16 if fused_down_clear else float32), _ptr(weight_scale),
+                _ptr(bf16), _ptr(weight_scale),
                 batch, *activation_scalars, 0,
             )
         down = compile_kernel(
             stage="down", alg="batch1", block_m=16,
-            block_n=32 if fused_down_clear else 64,
+            block_n=32 if is_mxfp4 and batch > 1 else 64,
         )
         compile_launcher(
             down,
@@ -915,13 +914,11 @@ def _run_batch1(
         "bf16" if w1.dtype == torch.bfloat16 else "fp4" if is_mxfp4 else "fp8"
     )
     force_batch1_path = problem.batch > 1
-    fused_down_clear = is_mxfp4 and force_batch1_path
     topk_weight = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
     gemm1_out = _gateup_output(hidden_states, problem)
-    output_factory = torch.empty if fused_down_clear else torch.zeros
-    cur_out = output_factory(
+    cur_out = torch.empty(
         [problem.batch, problem.model_dim],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
@@ -942,7 +939,7 @@ def _run_batch1(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         mxfp4_gate_up_interleaved=mxfp4_gate_up_interleaved,
-        fused_down_clear=fused_down_clear,
+        fused_down_clear=True,
     )
     activation_scalars = _activation_scalars(
         activation_str, situ_beta, situ_linear_beta, swiglu_limit
@@ -953,7 +950,7 @@ def _run_batch1(
         w1,
         gemm1_out,
         topk_ids,
-        cur_out if fused_down_clear else topk_weight,
+        cur_out,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
         problem.batch,
         *activation_scalars,
