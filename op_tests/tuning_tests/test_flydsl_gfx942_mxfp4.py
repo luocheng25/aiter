@@ -1175,6 +1175,79 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
                 file.flush()
                 self.assertEqual(len(aot_moe.parse_csv(file.name)), int(allowed))
 
+    def test_prefill_rejects_incomplete_reduction_thread_tiles(self):
+        configs = (
+            "64_128_128_True",
+            "64_128_128_True:1x4_64x256:64:128",
+            "256_128_128_True:8x1:64:128",
+            "64_128_128_True:8x1_compact:64:128",
+        )
+        for config, model_dim in itertools.product(configs, (256, 768, 512)):
+            problem = backend._Problem(
+                batch=64,
+                experts=2,
+                gateup_dim=384,
+                hidden_dim=model_dim,
+                model_dim=model_dim,
+                inter_dim=192,
+                topk=2,
+                quant_type="ptpc",
+            )
+            with self.subTest(config=config, model_dim=model_dim):
+                reason = backend.Config.from_string(config).unsupported_reason(problem)
+                if model_dim == 512:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIsNotNone(reason)
+                    self.assertIn("reduction", reason)
+                    with (
+                        patch.object(backend, "_get_compiled_kernel") as compile_kernel,
+                        self.assertRaisesRegex(ValueError, "reduction"),
+                    ):
+                        backend.precompile_flydsl_moe(
+                            config_string=config,
+                            batch=64,
+                            model_dim=model_dim,
+                            inter_dim=192,
+                            experts=2,
+                            topk=2,
+                            weight_dtype="fp8",
+                            quant_type="ptpc",
+                            activation="silu",
+                        )
+                    compile_kernel.assert_not_called()
+
+    def test_aot_mxfp4_requires_gfx950_prefix_and_compile_target(self):
+        from aiter.aot.flydsl import moe as aot_moe
+
+        for arch, cu_num in itertools.product(("gfx942", "gfx950"), (80, 256, 0)):
+            row = {
+                "token": 2,
+                "model_dim": 512,
+                "inter_dim": 128,
+                "expert": 2,
+                "topk": 2,
+                "cu_num": cu_num,
+                "act_type": "ActivationType.Situv2",
+                "dtype": "torch.bfloat16",
+                "q_dtype_a": "torch.bfloat16",
+                "q_dtype_w": "torch.float4_e2m1fn_x2",
+                "q_type": "QuantType.per_1x32",
+                "kernelName1": f"impl__flydsl_{arch}__16_16_16_False_True",
+            }
+            with (
+                self.subTest(arch=arch, cu_num=cu_num),
+                tempfile.NamedTemporaryFile("w", newline="", suffix=".csv") as file,
+            ):
+                writer = csv.DictWriter(file, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+                file.flush()
+                self.assertEqual(
+                    len(aot_moe.parse_csv(file.name)),
+                    int(arch == "gfx950" and cu_num != 80),
+                )
+
     def test_compact_prefill_allocates_workspace_and_uses_metadata_block(self):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
             gemm2_8x1_compact,
@@ -1303,7 +1376,7 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
             backend.precompile_flydsl_moe(
                 config_string="64_128_128_True:8x1_compact:64:128",
                 batch=1024,
-                model_dim=256,
+                model_dim=512,
                 inter_dim=256,
                 experts=128,
                 topk=4,

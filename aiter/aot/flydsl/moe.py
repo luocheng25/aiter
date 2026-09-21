@@ -156,6 +156,15 @@ def parse_csv(csv_path: str):
                         f"{q_dtype_w!r}/{q_type!r}, skipping {stage1_name}"
                     )
                     continue
+                if weight_dtype == "fp4" and (
+                    whole_graph_prefix != "impl__flydsl_gfx950__"
+                    or cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT) != "gfx950"
+                ):
+                    print(
+                        "  [WARN] Whole-graph MXFP4 requires a gfx950 implementation "
+                        f"and compile target, skipping {stage1_name}"
+                    )
+                    continue
                 if dtype != "torch.bfloat16" or (
                     weight_dtype in ("bf16", "fp4")
                     and q_dtype_a.strip() not in ("", "torch.bfloat16")

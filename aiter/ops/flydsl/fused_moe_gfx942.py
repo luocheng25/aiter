@@ -196,6 +196,9 @@ class Config:
             return None
         if problem.quant_type == "mxfp4":
             return "MXFP4 does not support the prefill algorithm"
+        # 归约每轮64线程各搬运8个BF16元素，目前不支持部分线程迭代。
+        if problem.model_dim % 512:
+            return "prefill reduction requires model_dim divisible by 512"
         gateup_block_m = self.GATEUP_BLOCK_M or self.BLOCK_M
         if not (32 <= gateup_block_m <= self.BLOCK_M <= 256):
             return "prefill requires 32 <= gateup BLOCK_M <= metadata BLOCK_M <= 256"

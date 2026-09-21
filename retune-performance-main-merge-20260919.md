@@ -3058,3 +3058,12 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 - 当前本机只有gfx942；lc fork的runner API返回`total_count=0`，没有可执行MI350任务的自托管runner。用户明确选择**保留gfx950注册与现有选型，补齐测试和CI，明确MI350实测待完成**。不把compile-only或gfx942成功标为MI350硬件通过；该硬件验证要求保留待完成。综合PR范围仍按此前用户决定保留，拆分建议待人工确认。
 
 本轮不做性能重调或扩大202形状矩阵，不产生新的性能收益声明。证据目录/tmp/aiter-pr1-review-loop-20260921，保留review快照、14个类型失败子项、B3缺缓存失败及修复后验证、81项CPU与24次gfx942数值结果。全部历史报告前缀和性能记录保留；后续提交将再次请求Copilot复审。
+
+### 30.3 第二轮复审：归约维度与MXFP4目标门禁
+
+第一轮已提交并推送lc `6d86734cc49fbd072ab8c9a5aad40159b0c2dbcd`。针对该head的Copilot review `5272652525`于2026-09-21 23:05:07 UTC完成，新增两条意见，均先由回归复现：
+
+- `sorted_sum`每轮64线程各复制128bit＝8个BF16元素，现有实现要求model_dim整除512；prefill原门禁允许D256/768，实际会在编译归约时assert。本次选择最小修复，在共享`Config.unsupported_reason`中拒绝不完整归约线程块，覆盖default/1x4/8x1/compact四条prefill路径；decode/direct约束不变，AOT在生成kernel前拒绝无效shape。未修改归约kernel，也未宣称新增partial-tile支持。原compact AOT ABI mock使用D256未实际编译归约，现改用合法D512；新增D256/768拒绝、D512保留及编译未发生的断言。
+- MXFP4 AOT只接受`impl__flydsl_gfx950__`且`cu_num_to_arch`实际编译目标为gfx950的行；同时拒绝gfx942前缀及gfx950前缀/CU80不一致的输入，避免仅检查前缀仍向gfx942编译。BF16/FP8行为不变。
+
+修复前2个测试共**12个失败子项**；修复后**83/83 CPU测试通过**。只读检查已发布模型配置中**167条whole-graph选型全部仍被解析和shape gate接受**，没有修改任何CSV。最终源码再次通过**3/3 gfx942 GPU测试**（145.976s），包括24次冷缓存run-only数值/设备检查、4种compact分布、CU覆盖容量；最大run-only rel_l2=0.0214091651142、logits_diff=0.000228964243433。3个修改Python文件Black/Ruff通过。未运行性能矩阵、未修改GPU内核或数值精度；MI350实测及综合PR拆分两条旧意见仍按用户决定保留待人工/硬件确认。证据以`round2-`前缀保存于同一临时目录，不覆盖第一轮记录。
