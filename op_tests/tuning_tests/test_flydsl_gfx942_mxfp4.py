@@ -238,6 +238,55 @@ class TestFlydslGfx942Mxfp4(unittest.TestCase):
         )
         self.assertIsNotNone(implementation)
 
+    def test_aot_worker_cu_override_and_arch_defaults(self):
+        from types import SimpleNamespace
+
+        from aiter.aot.flydsl import moe as aot_moe
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import gemm2_8x1_compact
+
+        for arch, cu_num in itertools.product(("gfx942", "gfx950"), (None, 0, 80, 256)):
+            expected_cu = str(cu_num) if cu_num else None
+            expected_arch = {80: "gfx942", 256: "gfx950"}.get(cu_num, arch)
+
+            def precompile(
+                expected_cu=expected_cu, expected_arch=expected_arch, **_kwargs
+            ):
+                self.assertEqual(os.environ.get("CU_NUM"), expected_cu)
+                self.assertEqual(os.environ["FLYDSL_GPU_ARCH"], expected_arch)
+                self.assertEqual(os.environ["COMPILE_ONLY"], "1")
+                self.assertGreaterEqual(gemm2_8x1_compact.task_capacities(100, 2)[1], 1)
+
+            kwargs = {} if cu_num is None else {"cu_num": cu_num}
+            with (
+                self.subTest(arch=arch, cu_num=cu_num),
+                patch.dict(os.environ, {"CU_NUM": "17", "FLYDSL_GPU_ARCH": "original"}),
+                patch.object(torch.cuda, "current_device", return_value=0),
+                patch.object(
+                    torch.cuda,
+                    "get_device_properties",
+                    return_value=SimpleNamespace(multi_processor_count=80),
+                ),
+                patch.object(backend, "precompile_flydsl_moe", side_effect=precompile),
+            ):
+                result = aot_moe.compile_one_config(
+                    kernel_name=f"impl__flydsl_{arch}__64_128_128_True:8x1_compact:64:128",
+                    model_dim=512,
+                    inter_dim=320,
+                    experts=2,
+                    topk=2,
+                    stage="whole_graph",
+                    config_string="64_128_128_True:8x1_compact:64:128",
+                    token_num=64,
+                    weight_dtype="fp8",
+                    quant_type="ptpc",
+                    act="silu",
+                    **kwargs,
+                )
+                self.assertIsNotNone(result["compile_time"], result)
+                self.assertEqual(result["compile_arch"], expected_arch)
+                self.assertEqual(os.environ["CU_NUM"], "17")
+                self.assertEqual(os.environ["FLYDSL_GPU_ARCH"], "original")
+
     def test_problem_restores_packed_dimensions_and_validates_e8m0_scales(self):
         hidden_states, w1, w2, _, topk_ids, w1_scale, w2_scale = _mxfp4_inputs()
         problem = backend._Problem.from_inputs(

@@ -1122,9 +1122,14 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     is_epilogue = kwargs.get("stage") == "epilogue"
     is_whole_graph = kwargs.get("stage") == "whole_graph"
+    default_arch = (
+        "gfx942"
+        if is_whole_graph and kernel_name.startswith("impl__flydsl_gfx942__")
+        else MOE_AOT_ARCH_DEFAULT
+    )
+    aot_arch = cu_num_to_arch(cu_num, default=default_arch)
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
         if is_epilogue
@@ -1162,7 +1167,7 @@ def compile_one_config(
             with (
                 compile_only_env(),
                 override_env("FLYDSL_GPU_ARCH", aot_arch),
-                override_env("CU_NUM", str(cu_num)),
+                override_env("CU_NUM", str(cu_num) if cu_num > 0 else None),
             ):
                 precompile_flydsl_moe(
                     config_string=kwargs["config_string"],

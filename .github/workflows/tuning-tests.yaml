@@ -52,7 +52,7 @@ jobs:
     uses: ./.github/workflows/ci-config.yaml
 
   cpu-validation:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
     name: README Level 0+1
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 45

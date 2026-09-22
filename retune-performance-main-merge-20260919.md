@@ -3081,3 +3081,11 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 第三轮修复已推送lc `7a411691872c6502434f70787695363ba62b7bc2`。该head的Copilot review `5272964920`于2026-09-21 23:52:59 UTC完成，正文“Previously missed”指出run-only矩阵仅支持schedule/workflow_dispatch，PR不能触发。本轮将相关FlyDSL/MoE/AOT、模型配置、测试、构建依赖或workflow变更接入面向main的pull_request opened/synchronize/reopened/ready_for_review事件；非draft PR运行gfx942/gfx950矩阵，原有Level 0/1和调优pipeline仍保持定时/手动范围。使用pull_request而非pull_request_target，workflow权限收敛为contents:read。
 
 静态回归在修复前因缺少pull_request触发器失败，修复后3项全部通过：PR路径与任务可达、手动/定时范围保留、两架构runner及expected-architecture断言保留。另下载与CI相同的actionlint 1.7.7，核对发布的SHA256后执行本workflow检查，退出0。仅workflow和本段报告变化，不重复CPU/kernel/性能测试；新增远端矩阵是否完成须看当前head对应结果，lc无自托管runner这一环境限制仍在，不能以job已创建或queued冒称GPU通过。临时目录保留`round4-`验证凭证及检查器校验和。
+
+### 30.6 第五轮复审：缺省CU语义与PR的CPU覆盖
+
+第四轮已推送lc `a3b796dfd8780f4e5fc2fa6b74d161684bfbaa67`，远端PR已真实生成gfx942/gfx950 run-only job，当前因无runner排队。对应Copilot review `5273088475`于2026-09-22 00:18:02 UTC完成，新增缺省`cu_num`被导出为零而导致compact容量assert、CPU regression suite仍未在PR运行两条意见。
+
+whole-graph AOT worker现与既有stage-specific helper一致，仅正`cu_num`设置CU覆盖，缺省/零临时移除覆盖并在退出时恢复调用者环境；未给CU映射时，目标架构按whole-graph实现前缀选择，避免gfx942行错误使用全局gfx950默认。8种架构/CU回归检查真实compact容量计算与COMPILE_ONLY、目标架构及原环境恢复，修复前4个缺省/零子项失败。CPU-validation任务加入同样的非draft PR条件，其余调优pipeline不扩大；该workflow条件回归修复前失败，修复后通过。
+
+最终**85/85 CPU测试通过**，Black/Ruff及actionlint通过。额外实际执行一个最小定点gfx942验证：省略`cu_num`的compact CSV经真实parser与worker写入全新AOT cache，确认目标gfx942且环境不残留CU_NUM；新进程无CU覆盖、RUN_ONLY执行B6208/D512/I320/E2/topk2，同时覆盖full与tail，rel_l2=0.003845165018、logits_diff=7.392706266e-6。原checkAllclose的0.2%元素warning保留，仍按原finite与logits_diff≤0.01判定，不改阈值。测试驱动曾因给CPU mock预注入架构导致失败、两次Black折行检查失败，均保留原日志；最终可信凭证在`round5-verified/`，父任务直接核验退出0。不修改GPU数学、选型CSV或性能表，MI350硬件与PR范围两条旧意见仍待确认。
