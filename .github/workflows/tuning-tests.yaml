@@ -52,7 +52,14 @@ jobs:
     uses: ./.github/workflows/ci-config.yaml
 
   cpu-validation:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    # Persistent GPU hosts only execute trusted same-repository PR branches.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01'))
     name: README Level 0+1
     runs-on: linux-aiter-mi35x-1
     timeout-minutes: 45
@@ -218,7 +225,15 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-run-only:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' || github.event.inputs.suite == 'run_only' }}
+    # Forks retain GitHub-hosted checks; do not expose them to persistent GPU hosts.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' ||
+        github.event.inputs.suite == 'run_only'))
     name: Whole-graph MoE AOT run-only (${{ matrix.arch }})
     strategy:
       fail-fast: false

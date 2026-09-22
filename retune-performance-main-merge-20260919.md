@@ -3089,3 +3089,11 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 whole-graph AOT worker现与既有stage-specific helper一致，仅正`cu_num`设置CU覆盖，缺省/零临时移除覆盖并在退出时恢复调用者环境；未给CU映射时，目标架构按whole-graph实现前缀选择，避免gfx942行错误使用全局gfx950默认。8种架构/CU回归检查真实compact容量计算与COMPILE_ONLY、目标架构及原环境恢复，修复前4个缺省/零子项失败。CPU-validation任务加入同样的非draft PR条件，其余调优pipeline不扩大；该workflow条件回归修复前失败，修复后通过。
 
 最终**85/85 CPU测试通过**，Black/Ruff及actionlint通过。额外实际执行一个最小定点gfx942验证：省略`cu_num`的compact CSV经真实parser与worker写入全新AOT cache，确认目标gfx942且环境不残留CU_NUM；新进程无CU覆盖、RUN_ONLY执行B6208/D512/I320/E2/topk2，同时覆盖full与tail，rel_l2=0.003845165018、logits_diff=7.392706266e-6。原checkAllclose的0.2%元素warning保留，仍按原finite与logits_diff≤0.01判定，不改阈值。测试驱动曾因给CPU mock预注入架构导致失败、两次Black折行检查失败，均保留原日志；最终可信凭证在`round5-verified/`，父任务直接核验退出0。不修改GPU数学、选型CSV或性能表，MI350硬件与PR范围两条旧意见仍待确认。
+
+### 30.7 第六轮复审：自托管GPU任务的PR信任边界
+
+第五轮修复已推送lc `7dd7500229c3cde57943793f9393a35056e1516e`，CPU与两架构run-only均真实生成PR job，远端Black/Ruff/workflow检查通过。对应Copilot review `5273202395`于2026-09-22 00:44:34 UTC完成，新增风险为外部fork PR代码进入持久GPU主机的Docker/设备/网络环境。
+
+本轮在两个自托管PR任务的job级条件同时要求`head.repo.full_name == github.repository`及非draft；外部fork不自动调度本workflow的CPU/GPU主机任务。定时任务及有权限发起的workflow_dispatch选择保持原行为，并显式限定手动事件；不用pull_request_target、不增加token权限，也不声称Docker本身提供GPU主机隔离。GitHub托管的Black/Ruff/Actionlint等常规PR检查保留，fork若需GPU结果须经可信分支移入或另行配置隔离临时runner。当前lc PR的head/base同属luocheng25/aiter，仍满足新条件。
+
+修复前事件矩阵准确发现两个fork/non-draft子项被错误允许；修复后3项静态测试通过（含8种同仓/fork×draft×job组合、schedule/manual suite真值和托管基础检查），actionlint 1.7.7退出0。临时表达式检查器曾不支持多行YAML条件，修正求值器后父任务直接核验退出0，失败日志保留。仅workflow与本追加说明变更，未重复kernel/CPU/perf执行，85项CPU及上一节缺省CU实际GPU证据不被冒充为本轮新测试；MI350实测和范围意见仍待确认。
