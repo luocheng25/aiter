@@ -3075,3 +3075,9 @@ ROCm本地API说明`rsmi_perf_determinism_mode_set()`设置GFXCLK SoftMax。给�
 本轮在whole-graph job生成前拒绝显式`use_g1u1=0`；省略字段继续使用原有G1U1默认，stage-specific parser不受影响。新增BF16、FP8 per-token/per-tensor、MXFP4四类量化×省略/0/1共12个组合；修复前4个拒绝子项失败，修复后**84/84 CPU测试通过**。对167条已发布whole-graph选型逐一比较旧/新parser输出，包含它们的CSV全部AOT job字典**完全一致**；两个Python文件Black/Ruff通过。
 
 此次仅parser、CPU回归和本追加段落变化，runtime/GPU源码与上一轮已验证的a033完全相同，未重复GPU或性能测试，不把旧GPU结果伪称为本轮新运行。保留`round3-`失败、成功及job对照凭证；MI350硬件与PR范围意见仍按用户确认保留待处理，后续推送后继续复审。
+
+### 30.5 第四轮复审：让run-only矩阵成为PR检查（2026-09-22）
+
+第三轮修复已推送lc `7a411691872c6502434f70787695363ba62b7bc2`。该head的Copilot review `5272964920`于2026-09-21 23:52:59 UTC完成，正文“Previously missed”指出run-only矩阵仅支持schedule/workflow_dispatch，PR不能触发。本轮将相关FlyDSL/MoE/AOT、模型配置、测试、构建依赖或workflow变更接入面向main的pull_request opened/synchronize/reopened/ready_for_review事件；非draft PR运行gfx942/gfx950矩阵，原有Level 0/1和调优pipeline仍保持定时/手动范围。使用pull_request而非pull_request_target，workflow权限收敛为contents:read。
+
+静态回归在修复前因缺少pull_request触发器失败，修复后3项全部通过：PR路径与任务可达、手动/定时范围保留、两架构runner及expected-architecture断言保留。另下载与CI相同的actionlint 1.7.7，核对发布的SHA256后执行本workflow检查，退出0。仅workflow和本段报告变化，不重复CPU/kernel/性能测试；新增远端矩阵是否完成须看当前head对应结果，lc无自托管runner这一环境限制仍在，不能以job已创建或queued冒称GPU通过。临时目录保留`round4-`验证凭证及检查器校验和。

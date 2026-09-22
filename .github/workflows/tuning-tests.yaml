@@ -1,6 +1,23 @@
 name: Tuning Tests
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - "aiter/ops/flydsl/**"
+      - "aiter/aot/flydsl/**"
+      - "aiter/fused_moe.py"
+      - "aiter/fused_moe_registry.py"
+      - "aiter/configs/**"
+      - "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"
+      - "op_tests/tuning_tests/**"
+      - ".github/workflows/tuning-tests.yaml"
+      - ".github/workflows/ci-config.yaml"
+      - ".github/scripts/build_aiter_triton.sh"
+      - "requirements*.txt"
+      - "pyproject.toml"
+      - "setup.py"
   schedule:
     # Runs daily at 04:00 Beijing time.
     - cron: "0 20 * * *"
@@ -17,6 +34,9 @@ on:
           - tune_pipeline
           - run_config
           - run_only
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -198,7 +218,7 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-run-only:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' || github.event.inputs.suite == 'run_only' }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' || github.event.inputs.suite == 'run_only' }}
     name: Whole-graph MoE AOT run-only (${{ matrix.arch }})
     strategy:
       fail-fast: false
