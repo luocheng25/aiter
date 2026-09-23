@@ -55,6 +55,7 @@ from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.moe_kernels import (
@@ -116,6 +117,30 @@ TUNE_MOE_EXPERT_BALANCE = (
 COS_DIFF_THRESHOLD = 1e-1
 
 
+def _flydsl_whole_graph_impl_name(gfx=None):
+    gfx = get_gfx() if gfx is None else gfx
+    if gfx not in ("gfx942", "gfx950"):
+        raise ValueError(f"Unsupported FlyDSL whole-graph architecture: {gfx}")
+    return f"flydsl_{gfx}"
+
+
+def _flydsl_whole_graph_gate_mode(weight_dtype):
+    return (
+        GateMode.INTERLEAVE.value
+        if weight_dtype == dtypes.fp4x2
+        else GateMode.SEPARATED.value
+    )
+
+
+# Kernels excluded from tuning candidates, set per-tune via the
+# AITER_FMOE_TUNE_EXCLUDE_KERNELS env var (comma-separated kernel-name
+# substrings). Use it to keep a kernel out of a model's tuned config when it is
+# known to emit NaN / wrong output for that shape -- e.g. the ASM stage1 kernel
+# `fmoe_stage1_bf16_pertokenFp8_g1u1_16x64_5tg_pf3` leaves garbage in the padded
+# sorted-token rows for Qwen3.5-397B (E=513), which propagates to NaN once paired
+# with a CK stage2. The tuner skips excluded kernels so they are never selected;
+# it falls back to the next-best accurate kernel (CK stage1 / FlyDSL / 1-stage).
+# Scoped to the invoking tune only, so other models are unaffected.
 _TUNE_EXCLUDE_KERNEL_PATTERNS = [
     p.strip()
     for p in os.environ.get("AITER_FMOE_TUNE_EXCLUDE_KERNELS", "").split(",")
@@ -2480,6 +2505,9 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        quantize_activations=True,
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2493,12 +2521,26 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         AQDType = hidden_states.dtype
 
-        if quant_type == aiter.QuantType.per_1x128:
+        if not quantize_activations and quant_type in (
+            QuantType.per_Token,
+            QuantType.per_Tensor,
+        ):
+            a2_qt = ref1
+            a2_scale = (
+                torch.ones(
+                    (ref1.shape[0], ref1.shape[1]),
+                    dtype=dtypes.fp32,
+                    device=ref1.device,
+                )
+                if quant_type == QuantType.per_Token
+                else torch.ones(1, dtype=dtypes.fp32, device=ref1.device)
+            )
+        elif quant_type == aiter.QuantType.per_1x128:
             a2_qt, a2_scale = aiter.pertoken_quant(
                 ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
             )
@@ -4563,48 +4605,86 @@ class FmoeTuner(TunerCommon):
         results = []
         for i in range(len(untunedf)):
             row = untunedf.iloc[i]
-            token = int(row["token"])
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
-            expert = int(row["expert"])
-            topk = int(row["topk"])
-            act_type = eval(row["act_type"])
-            dtype = eval(row["dtype"])
-            q_dtype_a = eval(row["q_dtype_a"])
-            q_dtype_w = eval(row["q_dtype_w"])
-            q_type = eval(row["q_type"])
-            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-            use_g1u1 = bool(row["use_g1u1"])
-            doweight_stage1 = bool(row["doweight_stage1"])
-            # fused_moe overrides the activation quant dtype at runtime for
-            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
-            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
-            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
-            # kernel actually runs a4w4. Mirror that here so the reference and the
-            # kernel weight layout match (else outputs are uncorrelated).
-            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
-            eff_q_dtype_a = q_dtype_a
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                if act_type == ActivationType.Swiglu:
-                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
-                else:
-                    eff_q_dtype_a = dtypes.fp4x2
-            shape_str = (
-                f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
-                f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
-                f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
-                f"dw_s1={doweight_stage1})"
-            )
-            allowed_err_ratio, allowed_err_ratio_desc = (
-                self._get_run_config_err_ratio_limit(row, args)
-            )
+            shape_str = self._format_benchmark_keys(row)
+            us = -1
             kernel_us = None
-            if "us" in row and pd.notna(row["us"]):
-                try:
-                    kernel_us = float(row["us"])
-                except (TypeError, ValueError):
-                    kernel_us = None
+            err_ratio = 1.0
+            allowed_err_ratio = float("nan")
+            allowed_err_ratio_desc = "unavailable"
             try:
+                token = int(row["token"])
+                model_dim = int(row["model_dim"])
+                inter_dim = int(row["inter_dim"])
+                expert = int(row["expert"])
+                topk = int(row["topk"])
+                act_type = _parse_tuning_type(row["act_type"])
+                dtype = _parse_tuning_type(row["dtype"])
+                q_dtype_a = _parse_tuning_type(row["q_dtype_a"])
+                q_dtype_w = _parse_tuning_type(row["q_dtype_w"])
+                q_type = _parse_tuning_type(row["q_type"])
+                q_type = (
+                    QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+                )
+                use_g1u1 = bool(row["use_g1u1"])
+                doweight_stage1 = bool(row["doweight_stage1"])
+                # Mirror fused_moe's effective activation dtype for its default
+                # SEPARATED path; whole-graph decode keeps BF16 below instead.
+                eff_q_dtype_a = q_dtype_a
+                if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+                    if act_type == ActivationType.Situv2:
+                        eff_q_dtype_a = dtypes.bf16
+                    elif act_type == ActivationType.Swiglu:
+                        eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
+                    else:
+                        eff_q_dtype_a = dtypes.fp4x2
+                shape_str = (
+                    f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
+                    f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
+                    f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
+                    f"dw_s1={doweight_stage1})"
+                )
+                allowed_err_ratio, allowed_err_ratio_desc = (
+                    self._get_run_config_err_ratio_limit(row, args)
+                )
+                if "us" in row and pd.notna(row["us"]):
+                    try:
+                        kernel_us = float(row["us"])
+                    except (TypeError, ValueError):
+                        kernel_us = None
+                whole_graph_config_string = config_string
+                if not whole_graph_config_string:
+                    kernel_name = str(row.get("kernelName1", ""))
+                    for gfx in ("gfx942", "gfx950"):
+                        kernel_name_prefix = make_fused_moe_impl_kernel_name(
+                            _flydsl_whole_graph_impl_name(gfx), ""
+                        )
+                        if kernel_name.startswith(kernel_name_prefix):
+                            whole_graph_config_string = kernel_name[
+                                len(kernel_name_prefix) :
+                            ]
+                            break
+                if whole_graph_config_string:
+                    from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+                    whole_graph_config = Config.from_string(whole_graph_config_string)
+                else:
+                    whole_graph_config = None
+                if config_string:
+                    from aiter.ops.flydsl.fused_moe_gfx942 import (
+                        get_tune_config_unsupported_reason,
+                    )
+
+                    unsupported_reason = get_tune_config_unsupported_reason(
+                        config_string,
+                        token=token,
+                        model_dim=model_dim,
+                        inter_dim=inter_dim,
+                        expert=expert,
+                        topk=topk,
+                        quant_type=q_type,
+                    )
+                    if unsupported_reason is not None:
+                        raise ValueError(f"Unsupported config: {unsupported_reason}")
                 torch.manual_seed(0)
                 hidden = (
                     torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
@@ -4754,7 +4834,27 @@ class FmoeTuner(TunerCommon):
 
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
-                if q_type == QuantType.per_1x128:
+                bf16_activation_reference = (
+                    whole_graph_config is not None
+                    and not whole_graph_config.use_prefill
+                    and (
+                        q_type in (QuantType.per_Token, QuantType.per_Tensor)
+                        or (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2)
+                    )
+                )
+                if bf16_activation_reference:
+                    a1_qt = hidden
+                    if q_type == QuantType.per_Token:
+                        a1_scale = torch.ones(
+                            (token, 1), dtype=dtypes.fp32, device=hidden.device
+                        )
+                    elif q_type == QuantType.per_Tensor:
+                        a1_scale = torch.ones(
+                            1, dtype=dtypes.fp32, device=hidden.device
+                        )
+                    else:
+                        a1_scale = None
+                elif q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
                     )
@@ -4817,7 +4917,15 @@ class FmoeTuner(TunerCommon):
                     dtype=dtype,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
+                    **(
+                        {"gate_mode": _flydsl_whole_graph_gate_mode(q_dtype_w)}
+                        if whole_graph_config is not None
+                        and target_fused_moe is fused_moe
+                        else {}
+                    ),
                 )
+                if not math.isfinite(us) or us <= 0:
+                    raise ValueError(f"invalid e2e latency: {us}")
                 # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
                 # The torch reference detects int4 weights by the i4x2 dtype, so
                 # pass an i4x2-reinterpreted view to the reference only (the kernel
@@ -4839,12 +4947,19 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    quantize_activations=not bf16_activation_reference,
+                    situ_beta=DEFAULT_SITUV2_BETA,
+                    situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
                 )
-                if not _all_finite(out) or not _all_finite(ref):
+                if out.shape != ref.shape or out.numel() == 0:
+                    diag = tensor_compare_diagnostics(ref, out)
+                    status = f"error:invalid output shape; {diag}"
+                    err_ratio = 1.0
+                elif not _all_finite(out) or not _all_finite(ref):
                     diag = tensor_compare_diagnostics(ref, out)
                     status = f"error:nonfinite output or reference; {diag}"
                     err_ratio = 1.0
-                elif out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                elif out.count_nonzero() == 0:
                     diag = tensor_compare_diagnostics(ref, out)
                     status = (
                         "error:output is all zeros (kernel produced no output); "
@@ -4868,7 +4983,11 @@ class FmoeTuner(TunerCommon):
                         else 0.0
                     )
                     cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
-                    if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
+                    if (
+                        math.isfinite(err_ratio)
+                        and math.isfinite(logits_diff)
+                        and (err_ratio <= allowed_err_ratio or logits_diff <= cos_tol)
+                    ):
                         status = "ok"
                     else:
                         diag = tensor_compare_diagnostics(ref, out)
@@ -4902,8 +5021,9 @@ class FmoeTuner(TunerCommon):
                         results.append(
                             {
                                 "shape": shape_str,
-                                "e2e_us": us if "us" in locals() else -1,
+                                "e2e_us": us,
                                 "kernel_us": kernel_us,
+                                "err_ratio": err_ratio,
                                 "status": (
                                     f"mismatch:catastrophic err_ratio={err_ratio:.6g}"
                                     f"(>{allowed_err_ratio_desc})"
@@ -4917,6 +5037,7 @@ class FmoeTuner(TunerCommon):
                                 "e2e_us": -1,
                                 "kernel_us": kernel_us,
                                 "status": f"error:{e}",
+                                "err_ratio": err_ratio,
                             }
                         )
                 else:
@@ -4926,6 +5047,7 @@ class FmoeTuner(TunerCommon):
                             "e2e_us": -1,
                             "kernel_us": kernel_us,
                             "status": f"error:{e}",
+                            "err_ratio": 1.0,
                         }
                     )
             except Exception as e:  # noqa: BLE001
@@ -4935,6 +5057,7 @@ class FmoeTuner(TunerCommon):
                         "e2e_us": -1,
                         "kernel_us": kernel_us,
                         "status": f"error:{e}",
+                        "err_ratio": 1.0,
                     }
                 )
             finally:
@@ -4971,10 +5094,10 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             ) = line
-            dtype = eval(dtype)
-            q_dtype_a = eval(q_dtype_a)
-            q_dtype_w = eval(q_dtype_w)
-            q_type = eval(q_type)
+            dtype = _parse_tuning_type(dtype)
+            q_dtype_a = _parse_tuning_type(q_dtype_a)
+            q_dtype_w = _parse_tuning_type(q_dtype_w)
+            q_type = _parse_tuning_type(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
@@ -4983,7 +5106,7 @@ class FmoeTuner(TunerCommon):
             if not use_g1u1:
                 print("no moe solution(g1u0) can tune for ", line)
                 continue
-            act_type = eval(act_type)
+            act_type = _parse_tuning_type(act_type)
             info = (
                 gfx,
                 cu_num,
@@ -5876,36 +5999,98 @@ class FmoeTuner(TunerCommon):
 
         from aiter.ops.flydsl.fused_moe_gfx942 import (
             Config,
-            _Problem,
+            get_tune_config_unsupported_reason,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
 
+        # --all removes the target rows from self.tunedf during preprocessing.
+        # 基线元数据和运行时配置必须来自同一个实际输出文件，不能混入次级 CSV。
+        output_file = self.get_out_file(args.tune_file)
+        existing_tunedf = self.get_tuned_gemm_list(output_file)
+        if "gfx" in self.keys and "cu_num" in existing_tunedf.columns:
+            if "gfx" not in existing_tunedf.columns:
+                existing_tunedf.insert(
+                    0, "gfx", existing_tunedf["cu_num"].map(gfx_from_cu_num)
+                )
+            else:
+                bad_gfx = existing_tunedf["gfx"].isna() | existing_tunedf["gfx"].astype(
+                    str
+                ).isin(["0", "", "nan", "None"])
+                existing_tunedf.loc[bad_gfx, "gfx"] = existing_tunedf.loc[
+                    bad_gfx, "cu_num"
+                ].map(gfx_from_cu_num)
+        missing_keys = [key for key in self.keys if key not in existing_tunedf.columns]
+        if missing_keys and not existing_tunedf.empty:
+            raise ValueError(f"Baseline config is missing tuning keys: {missing_keys}")
+        for key in missing_keys:
+            existing_tunedf[key] = pd.Series(dtype=object)
+
+        baseline_tunedf = existing_tunedf
+        if "_tag" in baseline_tunedf.columns:
+            baseline_tunedf = baseline_tunedf[
+                baseline_tunedf["_tag"].fillna("") != "flydsl_fallback"
+            ]
+        # 与运行时一致：同键取第一条；保留 kernelName1 以选择正确的 decode 参考。
+        baseline_tunedf = baseline_tunedf.drop_duplicates(
+            subset=self.keys, keep="first"
+        )
+        tuned_keys = set(baseline_tunedf[self.keys].apply(tuple, axis=1))
+        baseline_shapes = self.untunedf[self.keys].copy()
+        if not baseline_tunedf.empty:
+            baseline_shapes = baseline_shapes.merge(
+                baseline_tunedf,
+                on=self.keys,
+                how="left",
+                sort=False,
+                validate="many_to_one",
+            )
         results_base = self._run_config_for_shapes(
             args,
-            self.untunedf,
-            config_file=self.get_out_file(args.tune_file),
+            baseline_shapes,
+            config_file=(
+                output_file
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 0
+                else None
+            ),
         )
         better_kernels = {}
 
         for i in range(len(self.untunedf)):
-            e2e_us = results_base[i]["e2e_us"]
-            err_ratio = results_base[i].get("err_ratio", 0)
-            status = results_base[i].get("status", "")
+            result = results_base[i] if i < len(results_base) else {}
+            e2e_us = result.get("e2e_us", -1)
+            err_ratio = result.get("err_ratio", 1.0)
+            status = result.get("status", "error:missing baseline result")
             row = self.untunedf.iloc[i]
             row_key = tuple(row[col] for col in self.keys)
             keyname = " ".join(map(str, row_key))
-            baseline_valid = status == "ok" and e2e_us > 0
+            baseline_valid = (
+                status == "ok"
+                and math.isfinite(e2e_us)
+                and e2e_us > 0
+                and math.isfinite(err_ratio)
+                # 未知fallback可能命中被排除的kernel，不能据此阻止合法候选。
+                and (row_key in tuned_keys or not _TUNE_EXCLUDE_KERNEL_PATTERNS)
+                and not any(
+                    _is_tune_excluded_kernel(baseline_shapes.iloc[i].get(col, ""))
+                    for col in ("kernelName1", "kernelName2")
+                )
+            )
             better_kernels[i] = {
                 "name": keyname,
                 "row": row,
                 "kernel_name": None,
+                # 没有精确配置行也不能用更慢的候选替换已验证的运行时fallback。
                 "e2e_us": e2e_us if baseline_valid else float("inf"),
                 "err_ratio": err_ratio,
                 "e2e_us_base": e2e_us,
                 "err_ratio_base": err_ratio,
+                "baseline_valid": baseline_valid,
+                "status_base": status,
+                "candidate_statuses": {},
+                "skip_reason": "",
             }
-            print(keyname, e2e_us, err_ratio)
+            print(keyname, e2e_us, err_ratio, f"baseline={status}")
 
         def target_fused_moe(
             hidden_states,
@@ -5927,11 +6112,13 @@ class FmoeTuner(TunerCommon):
             beta=None,
             linear_beta=None,
         ):
-            del beta, linear_beta
             if doweight_stage1:
                 raise NotImplementedError(
-                    "gfx942 FlyDSL whole-graph tuning does not support "
-                    "doweight_stage1=True"
+                    "FlyDSL whole-graph tuning does not support " "doweight_stage1=True"
+                )
+            if dtype not in (None, hidden_states.dtype):
+                raise NotImplementedError(
+                    "FlyDSL whole-graph tuning does not support output dtype conversion"
                 )
             return run_flydsl_moe_gfx942(
                 hidden_states,
@@ -5948,34 +6135,111 @@ class FmoeTuner(TunerCommon):
                 moe_sorting_dispatch_policy,
                 config_string=config_string,
                 swiglu_limit=swiglu_limit,
+                situ_beta=(1.0 if beta is None else float(beta)),
+                situ_linear_beta=(1.0 if linear_beta is None else float(linear_beta)),
+                gate_mode=_flydsl_whole_graph_gate_mode(w1.dtype),
             )
 
         GREEN = "\033[0;32m"
         YELLOW = "\033[1;33m"
         RED = "\033[0;31m"
         END = "\033[0m"
-        for config_string in get_tune_space():
-            config = Config.from_string(config_string)
-            eligible_indices = [
-                position
-                for position, (_, row) in enumerate(self.untunedf.iterrows())
-                if not bool(row["doweight_stage1"])
-                and config.unsupported_reason(
-                    _Problem(
-                        batch=int(row["token"]),
-                        experts=int(row["expert"]),
-                        gateup_dim=int(row["inter_dim"]) * 2,
-                        hidden_dim=int(row["model_dim"]),
-                        model_dim=int(row["model_dim"]),
-                        inter_dim=int(row["inter_dim"]),
-                        topk=int(row["topk"]),
-                        quant_type="",
+        gfx = get_gfx()
+        row_tune_spaces = []
+        for i in range(len(self.untunedf)):
+            row = self.untunedf.iloc[i]
+            tune_space = []
+            try:
+                if gfx not in ("gfx942", "gfx950") or str(row["gfx"]) != gfx:
+                    raise ValueError(
+                        f"unsupported whole-graph architecture: {row['gfx']} on {gfx}"
                     )
+                if not bool(row["use_g1u1"]) or bool(row["doweight_stage1"]):
+                    raise ValueError(
+                        "whole-graph requires g1u1=True and doweight_stage1=False"
+                    )
+                dtype = _parse_tuning_type(row["dtype"])
+                act_type = _parse_tuning_type(row["act_type"])
+                q_dtype_a = _parse_tuning_type(row["q_dtype_a"])
+                q_dtype_w = _parse_tuning_type(row["q_dtype_w"])
+                q_type = _parse_tuning_type(row["q_type"])
+                if dtype != dtypes.bf16 or act_type not in (
+                    ActivationType.Silu,
+                    ActivationType.Swiglu,
+                    ActivationType.Situv2,
+                ):
+                    raise ValueError(
+                        f"unsupported whole-graph dtype/activation: {dtype}/{act_type}"
+                    )
+                is_mxfp4 = (
+                    gfx == "gfx950"
+                    and q_dtype_a == dtypes.bf16
+                    and q_dtype_w == dtypes.fp4x2
+                    and q_type == QuantType.per_1x32
                 )
-                is None
+                is_bf16 = (
+                    q_dtype_a == dtypes.bf16
+                    and q_dtype_w == dtypes.bf16
+                    and q_type == QuantType.No
+                )
+                is_supported_fp8 = (
+                    q_dtype_w == torch.float8_e4m3fnuz
+                    and q_dtype_a in (torch.float8_e4m3fnuz, dtypes.bf16)
+                    and q_type in (QuantType.per_Token, QuantType.per_Tensor)
+                )
+                if not (is_mxfp4 or is_bf16 or is_supported_fp8):
+                    raise ValueError(
+                        "unsupported whole-graph quantization: "
+                        f"{q_dtype_a}/{q_dtype_w}/{q_type}"
+                    )
+                for config_string in get_tune_space(
+                    int(row["token"]), include_prefill=not is_mxfp4
+                ):
+                    config = Config.from_string(config_string)
+                    if (
+                        is_supported_fp8
+                        and config.use_prefill
+                        and q_dtype_a != q_dtype_w
+                    ):
+                        continue
+                    # 以当前后端为准，保留分支已支持的 tail192/扩展 Down 路径。
+                    if (
+                        get_tune_config_unsupported_reason(
+                            config_string,
+                            token=int(row["token"]),
+                            model_dim=int(row["model_dim"]),
+                            inter_dim=int(row["inter_dim"]),
+                            expert=int(row["expert"]),
+                            topk=int(row["topk"]),
+                            quant_type=q_type,
+                        )
+                        is not None
+                    ):
+                        continue
+                    kernel_name = make_fused_moe_impl_kernel_name(
+                        _flydsl_whole_graph_impl_name(gfx), config_string
+                    )
+                    if not _is_tune_excluded_kernel(kernel_name):
+                        tune_space.append(config_string)
+                if not tune_space:
+                    better_kernels[i][
+                        "skip_reason"
+                    ] = "no supported, non-excluded config"
+            except (ArgumentTypeError, TypeError, ValueError) as e:
+                better_kernels[i]["skip_reason"] = str(e)
+            row_tune_spaces.append(tune_space)
+        config_strings = list(
+            dict.fromkeys(
+                config for tune_space in row_tune_spaces for config in tune_space
+            )
+        )
+        for config_string in config_strings:
+            eligible_indices = [
+                i
+                for i, tune_space in enumerate(row_tune_spaces)
+                if config_string in tune_space
             ]
-            if not eligible_indices:
-                continue
+            config = Config.from_string(config_string)
             all_untunedf = self.untunedf
             self.untunedf = all_untunedf.iloc[eligible_indices].reset_index(drop=True)
             try:
@@ -5988,7 +6252,10 @@ class FmoeTuner(TunerCommon):
                 )
             except Exception as e:  # noqa: BLE001
                 print(f"{RED}Error with config {config_string}: {e}{END}")
-                continue
+                results_cur = [
+                    {"e2e_us": -1, "status": f"error:{e}", "err_ratio": 1.0}
+                    for _ in eligible_indices
+                ]
             finally:
                 self.untunedf = all_untunedf
             block_m = config.BLOCK_M
@@ -5997,17 +6264,29 @@ class FmoeTuner(TunerCommon):
             err1 = "0%"
             err2 = "0%"
             kernelName1 = make_fused_moe_impl_kernel_name(
-                "flydsl_gfx942", config_string
+                _flydsl_whole_graph_impl_name(gfx), config_string
             )
             kernelName2 = ""
             xbf16 = 0
             for result_index, i in enumerate(eligible_indices):
                 k = better_kernels[i]
-                e2e_us = results_cur[result_index]["e2e_us"]
-                status = results_cur[result_index]["status"]
-                err_ratio = results_cur[result_index].get("err_ratio", 0)
+                result = (
+                    results_cur[result_index] if result_index < len(results_cur) else {}
+                )
+                e2e_us = result.get("e2e_us", -1)
+                status = result.get("status", "error:missing candidate result")
+                err_ratio = result.get("err_ratio", 1.0)
+                if status == "ok" and (
+                    not math.isfinite(e2e_us)
+                    or e2e_us <= 0
+                    or not math.isfinite(err_ratio)
+                ):
+                    status = "error:invalid e2e latency or error ratio"
+                status_summary, _ = self._split_benchmark_status(status)
+                statuses = k["candidate_statuses"]
+                statuses[status_summary] = statuses.get(status_summary, 0) + 1
                 # skip invalid kernel
-                if e2e_us < 0 or status != "ok":
+                if status != "ok":
                     print(
                         f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
                     )
@@ -6021,7 +6300,7 @@ class FmoeTuner(TunerCommon):
                     k["kernel_name"] = kernelName1
                     row = self.untunedf.iloc[i]
                     try:
-                        key = tuple(row[self.keys].values)
+                        key = tuple(row[col] for col in self.keys)
                         tflops, bw = self.calculate(
                             (key, "stage1", kernelName1, block_m, e2e_us, err1)
                         )
@@ -6047,6 +6326,17 @@ class FmoeTuner(TunerCommon):
         tune_results = []
 
         for i, k in better_kernels.items():
+            if k["kernel_name"] is not None:
+                outcome = "updated"
+            elif k["baseline_valid"]:
+                outcome = "kept_baseline"
+            else:
+                outcome = "no_valid_tuned_result"
+            print(
+                f"{k['name']} e2e_status={outcome} baseline={k['status_base']} "
+                f"eligible={len(row_tune_spaces[i])} candidates={k['candidate_statuses']} "
+                f"{k['skip_reason']}"
+            )
             if k["kernel_name"] is None:
                 continue
             tune_results.append([*[k["row"][col] for col in self.keys], *k["results"]])
@@ -6057,42 +6347,22 @@ class FmoeTuner(TunerCommon):
         if tune_results:
             new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
             new_tunedf["_tag"] = ""
-            output_file = self.get_out_file(args.tune_file)
             # Merge with existing tuned file: keep existing rows that are not
             # being updated, so repeated runs don't lose entries for shapes
             # where the new kernel doesn't beat the baseline.
-            key_cols = []
-            if os.path.exists(output_file):
-                existing_df = pd.read_csv(output_file)
-                # Build key for dedup: use the untuned input columns
-                key_cols = [
-                    c
-                    for c in self.keys
-                    if c in new_tunedf.columns and c in existing_df.columns
-                ]
-                if key_cols:
-                    # Remove from existing any rows that will be replaced by new results
-                    new_keys = set(new_tunedf[key_cols].apply(tuple, axis=1))
-                    keep_mask = (
-                        ~existing_df[key_cols].apply(tuple, axis=1).isin(new_keys)
-                    )
-                    merged_df = pd.concat(
-                        [existing_df[keep_mask], new_tunedf], ignore_index=True
-                    )
-                else:
-                    merged_df = new_tunedf
-            else:
-                merged_df = new_tunedf
-            # Sort by key columns before writing
-            sort_cols = (
-                [c for c in key_cols if c in merged_df.columns] if key_cols else []
+            new_keys = set(new_tunedf[self.keys].apply(tuple, axis=1))
+            keep_mask = ~existing_tunedf[self.keys].apply(tuple, axis=1).isin(new_keys)
+            merged_df = pd.concat(
+                [existing_tunedf[keep_mask], new_tunedf], ignore_index=True
             )
-            if sort_cols:
-                merged_df = merged_df.sort_values(sort_cols, ignore_index=True)
-            merged_df.to_csv(output_file, index=False)
+            merged_df = merged_df.sort_values(self.keys, ignore_index=True)
+            ordered_cols = self.columns + [
+                col for col in merged_df.columns if col not in self.columns
+            ]
+            merged_df[ordered_cols].to_csv(output_file, index=False)
             print(f"{output_file} has been updated with {len(tune_results)} entries!")
         else:
-            print("No improvements found during e2e tuning.")
+            print("No e2e updates; existing tuned rows left unchanged.")
 
 
 class GroupedFmoeTuner(FmoeTuner):

@@ -12,7 +12,7 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+_MIN_FLYDSL_VERSION = Version("0.3.2")
 
 installed_flydsl_version = getattr(_flydsl, "__version__", None)
 if installed_flydsl_version is None:
@@ -110,6 +110,7 @@ __all__ = [
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
 register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
+register_fused_moe_impl("flydsl_gfx950", _fused_moe_impl_path)
 
 
 def __getattr__(name: str):

@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import functools
+import os
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import torch
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import Vector as Vec
+
+# 默认使用保留 NaN 的 RTE；RTA 必须显式开启，简化位运算不保留所有 NaN。
+_SIMPLIFIED_BF16_RTA = os.environ.get(
+    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", "0"
+).lower() in ("1", "true")
+_SIMPLIFIED_BF16_RTE = os.environ.get(
+    "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED", "0"
+).lower() in ("1", "true")
+
+
+def _f32_to_bf16_rta(value):
+    # 有限值及 Inf 与标准 RTA 一致；正负 halfway 均向远离零方向舍入。
+    return (
+        ((value.bitcast(fx.Uint32) + fx.Uint32(0x8000)) >> 16)
+        .to(fx.Uint16)
+        .bitcast(fx.BFloat16)
+    )
+
+
+def _f32_to_bf16_rte(value):
+    if _SIMPLIFIED_BF16_RTE:
+        # 与 main 一致的可选简化 RTE，不保证 NaN 保留。
+        bits = value.bitcast(fx.Uint32)
+        rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
+        return (rounded >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+    # ck_tile/float_to_bf16_rtn_asm：默认将 NaN 规范化为 0x7FFF。
+    rounded = llvm.inline_asm(
+        T.i32,
+        [
+            as_ir_value(value),
+            as_ir_value(fx.Uint32(0x7FFF)),
+            as_ir_value(fx.Uint32(0x7FFF0000)),
+        ],
+        "v_cmp_u_f32 vcc, $1, $1\n\t"
+        "v_bfe_u32 $0, $1, 16, 1\n\t"
+        "v_add3_u32 $0, $1, $0, $2\n\t"
+        "v_cndmask_b32 $0, $0, $3, vcc",
+        "=&v,v,v,v,~{vcc}",
+        has_side_effects=False,
+    )
+    return (fx.Uint32(rounded) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+
+
+def _f32_to_bf16(value):
+    if _SIMPLIFIED_BF16_RTA:
+        return _f32_to_bf16_rta(value)
+    if isinstance(value, Vec):
+        return Vec.from_elements(
+            [_f32_to_bf16_rte(value[i]) for i in range_constexpr(value.numel)],
+            fx.BFloat16,
+        )
+    return _f32_to_bf16_rte(value)
+
+
+_TORCH_TO_FX = {
+    torch.bfloat16: fx.BFloat16,
+    torch.float32: fx.Float32,
+    torch.float64: fx.Float64,
+    torch.int32: fx.Int32,
+    torch.float8_e4m3fnuz: fx.Uint8,
+    torch.float8_e4m3fn: fx.Uint8,
+}
+
+
+def down_device_config_from_properties(gcn_arch_name, cu_count):
+    is_gfx942_80cu = gcn_arch_name.split(":", 1)[0] == "gfx942" and cu_count == 80
+    return is_gfx942_80cu, 4 if is_gfx942_80cu else 8
+
+
+def get_down_device_config(device=None):
+    target_arch = os.environ.get("FLYDSL_GPU_ARCH")
+    if target_arch is not None and "CU_NUM" in os.environ:
+        try:
+            target_cu_count = int(os.environ["CU_NUM"])
+        except ValueError as error:
+            raise ValueError(
+                f"CU_NUM must be an integer, got {os.environ['CU_NUM']!r}"
+            ) from error
+        return down_device_config_from_properties(target_arch, target_cu_count)
+    if not torch.cuda.is_available():
+        return False, 8
+    properties = torch.cuda.get_device_properties(device)
+    return down_device_config_from_properties(
+        properties.gcnArchName,
+        properties.multi_processor_count,
+    )
+
+
+@functools.cache
+def _get_device_cache_key(device):
+    properties = torch.cuda.get_device_properties(device)
+    return (
+        device,
+        properties.name,
+        properties.gcnArchName,
+        properties.multi_processor_count,
+    )
+
+
+def get_device_cache_key(device=None):
+    target_arch = os.environ.get("FLYDSL_GPU_ARCH")
+    target_cu_count = os.environ.get("CU_NUM")
+    if not torch.cuda.is_available():
+        return None, target_arch, target_cu_count
+    if device is None:
+        device = torch.cuda.current_device()
+    elif not isinstance(device, int):
+        device = torch.device(device).index
+        if device is None:
+            device = torch.cuda.current_device()
+    return (
+        _get_device_cache_key(device),
+        target_arch,
+        target_cu_count,
+    )
+
+
+def torch_tensor_to_pointer(tensor):
+    return flyc.from_c_void_p(_TORCH_TO_FX[tensor.dtype], tensor.data_ptr())
+
+
+from ..moe_gemm_2stage_gfx942_utils import (
+    BufferTensor,
+    LdsTensor,
+    MoETileOps,
+    _as_ptr,
+    all_copy_atoms,
+    all_elements,
+    asm_mark,
+    atom_tensor,
+    atomic_add_bf16,
+    div_up,
+    eltwise_op,
+    make_1d_coord_tensor,
+    split_works,
+    torch_layout,
+    view_as_torch_tensor,
+)
+
+__all__ = [
+    "BufferTensor",
+    "LdsTensor",
+    "MoETileOps",
+    "_as_ptr",
+    "all_copy_atoms",
+    "all_elements",
+    "asm_mark",
+    "atom_tensor",
+    "atomic_add_bf16",
+    "div_up",
+    "eltwise_op",
+    "make_1d_coord_tensor",
+    "split_works",
+    "torch_layout",
+    "view_as_torch_tensor",
+]

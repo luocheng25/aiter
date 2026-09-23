@@ -2874,6 +2874,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    _disable_full_impl=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3245,9 +3246,18 @@ def get_2stage_cfgs(
             unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
-        elif gate_mode is not GateMode.SEPARATED:
+        elif gate_mode is not GateMode.SEPARATED and not (
+            kernel_name1.startswith("impl__flydsl_gfx950__")
+            and q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and gate_mode is GateMode.INTERLEAVE
+        ):
             unsupported = f"gate mode {gate_mode.value!r}"
-        elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        elif activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
             unsupported = f"activation {activation}"
         if unsupported is not None:
             cfg = None
@@ -3256,7 +3266,7 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
-    if is_ep and full_impl is not None:
+    if (is_ep or _disable_full_impl) and full_impl is not None:
         cfg = None
         full_impl = None
     if full_impl is not None:
@@ -4011,6 +4021,7 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        _disable_full_impl=True,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)

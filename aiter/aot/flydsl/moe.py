@@ -63,6 +63,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
+_WHOLE_GRAPH_IMPL_PREFIXES = ("impl__flydsl_gfx950__", "impl__flydsl_gfx942__")
 
 
 def parse_csv(csv_path: str):
@@ -95,6 +96,7 @@ def parse_csv(csv_path: str):
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
+            q_dtype_a = row.get("q_dtype_a", "")
             q_dtype_w = row.get("q_dtype_w", "")
             # Cover both runtime bias choices for fp4-weight MoE. Model configs
             # share kernel families, and runtime bias selection can vary by
@@ -114,6 +116,102 @@ def parse_csv(csv_path: str):
             # a2_scale shape with what runtime actually passes.
             stage1_name = row.get("kernelName1", "").strip()
             stage2_name = row.get("kernelName2", "").strip()
+            whole_graph_prefix = next(
+                (
+                    prefix
+                    for prefix in _WHOLE_GRAPH_IMPL_PREFIXES
+                    if stage1_name.startswith(prefix)
+                ),
+                None,
+            )
+            if whole_graph_prefix is not None:
+                if not bool(int(row.get("use_g1u1", "1"))):
+                    print(
+                        "  [WARN] Whole-graph backend requires paired gate/up "
+                        f"weights (use_g1u1=1), skipping {stage1_name}"
+                    )
+                    continue
+                if act_name not in ("silu", "swiglu", "situv2") or doweight_stage1:
+                    print(
+                        "  [WARN] Unsupported whole-graph activation or "
+                        f"doweight_stage1: {act_type!r}/{doweight_stage1}, "
+                        f"skipping {stage1_name}"
+                    )
+                    continue
+                weight_dtype_name = q_dtype_w.strip().split(".")[-1]
+                weight_dtype = {
+                    "bfloat16": "bf16",
+                    "float8_e4m3fnuz": "fp8",
+                    "float4_e2m1fn_x2": "fp4",
+                }.get(weight_dtype_name)
+                quant_type_name = q_type.strip().split(".")[-1]
+                quant_type = {
+                    "No": "no",
+                    "per_Token": "ptpc",
+                    "per_Tensor": "per_tensor",
+                    "per_1x32": "mxfp4",
+                }.get(quant_type_name)
+                if (weight_dtype, quant_type) not in (
+                    ("bf16", "no"),
+                    ("fp8", "ptpc"),
+                    ("fp8", "per_tensor"),
+                    ("fp4", "mxfp4"),
+                ):
+                    print(
+                        "  [WARN] Unsupported whole-graph dtype/quant pair: "
+                        f"{q_dtype_w!r}/{q_type!r}, skipping {stage1_name}"
+                    )
+                    continue
+                if weight_dtype == "fp4" and (
+                    whole_graph_prefix != "impl__flydsl_gfx950__"
+                    or cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT) != "gfx950"
+                ):
+                    print(
+                        "  [WARN] Whole-graph MXFP4 requires a gfx950 implementation "
+                        f"and compile target, skipping {stage1_name}"
+                    )
+                    continue
+                if dtype != "torch.bfloat16" or (
+                    weight_dtype in ("bf16", "fp4")
+                    and q_dtype_a.strip() not in ("", "torch.bfloat16")
+                ):
+                    print(
+                        "  [WARN] Whole-graph backend requires BF16 output and "
+                        f"BF16 activations for BF16/MXFP4 weights, skipping {stage1_name}"
+                    )
+                    continue
+                if weight_dtype == "fp8":
+                    from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+                    config = Config.from_string(stage1_name[len(whole_graph_prefix) :])
+                    allowed_activation_dtypes = ("", "torch.float8_e4m3fnuz")
+                    if not config.use_prefill:
+                        allowed_activation_dtypes += ("torch.bfloat16",)
+                    if q_dtype_a.strip() not in allowed_activation_dtypes:
+                        print(
+                            "  [WARN] Unsupported whole-graph FP8 activation dtype "
+                            f"{q_dtype_a!r}, skipping {stage1_name}"
+                        )
+                        continue
+                whole_graph_job = {
+                    "kernel_name": stage1_name,
+                    "stage": "whole_graph",
+                    "config_string": stage1_name[len(whole_graph_prefix) :],
+                    "token_num": token,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "experts": experts,
+                    "topk": topk,
+                    "cu_num": cu_num,
+                    "act": act,
+                    "weight_dtype": weight_dtype,
+                    "quant_type": quant_type,
+                }
+                key = job_identity(whole_graph_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(whole_graph_job)
+                continue
             stage1_params = (
                 get_flydsl_kernel_params(stage1_name)
                 if stage1_name.startswith("flydsl_")
@@ -1024,8 +1122,14 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     is_epilogue = kwargs.get("stage") == "epilogue"
+    is_whole_graph = kwargs.get("stage") == "whole_graph"
+    default_arch = (
+        "gfx942"
+        if is_whole_graph and kernel_name.startswith("impl__flydsl_gfx942__")
+        else MOE_AOT_ARCH_DEFAULT
+    )
+    aot_arch = cu_num_to_arch(cu_num, default=default_arch)
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
         if is_epilogue
@@ -1049,6 +1153,7 @@ def compile_one_config(
     # real (COMPILE_ONLY) tensors outside FakeTensorMode.
     is_a16w_port = (
         not is_epilogue
+        and not is_whole_graph
         and kwargs.get("shared_expert_id", -1) < 0
         and kwargs.get("a_dtype") == "bf16"
         and kwargs.get("b_dtype") in ("fp4", "int4")
@@ -1056,7 +1161,26 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        if is_a16w_port:
+        if is_whole_graph:
+            from aiter.ops.flydsl.fused_moe_gfx942 import precompile_flydsl_moe
+
+            with (
+                compile_only_env(),
+                override_env("FLYDSL_GPU_ARCH", aot_arch),
+                override_env("CU_NUM", str(cu_num) if cu_num > 0 else None),
+            ):
+                precompile_flydsl_moe(
+                    config_string=kwargs["config_string"],
+                    batch=kwargs["token_num"],
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    experts=experts,
+                    topk=topk,
+                    weight_dtype=kwargs["weight_dtype"],
+                    quant_type=kwargs["quant_type"],
+                    activation=kwargs["act"],
+                )
+        elif is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(
                     model_dim=model_dim,
@@ -1134,6 +1258,7 @@ def main():
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
     epilogue_jobs = [j for j in all_jobs if j["stage"] == "epilogue"]
+    whole_graph_jobs = [j for j in all_jobs if j["stage"] == "whole_graph"]
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
@@ -1142,6 +1267,7 @@ def main():
     print(f"  Stage1 jobs:    {len(stage1_jobs)}")
     print(f"  Stage2 jobs:    {len(stage2_jobs)}")
     print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
+    print(f"  Whole graph:    {len(whole_graph_jobs)}")
     print(f"  Total jobs:     {len(all_jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
@@ -1153,9 +1279,13 @@ def main():
     # Stage1, stage2 and CK-Tile epilogue kernels are independent compiles
     # (each writes its own artifact to cache; none reads another's output), so
     # they share a single pool for maximum fan-out instead of serial passes.
-    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2 + epilogue) ---")
+    print(
+        f"\n--- Compiling {len(all_jobs)} kernels "
+        "(stage1 + stage2 + epilogue + whole graph) ---"
+    )
     results = run_jobs_parallel(
-        compile_one_config, stage1_jobs + stage2_jobs + epilogue_jobs
+        compile_one_config,
+        stage1_jobs + stage2_jobs + epilogue_jobs + whole_graph_jobs,
     )
 
     total_elapsed = time.time() - total_t0

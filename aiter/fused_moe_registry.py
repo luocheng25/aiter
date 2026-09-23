@@ -66,6 +66,7 @@ def make_fused_moe_impl_kernel_name(name: str, config: str) -> str:
 
 
 def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
+    """Resolve a whole-graph backend while preserving safe import fallback."""
     if not kernel_name.startswith(_KERNEL_NAME_PREFIX):
         return None
 
