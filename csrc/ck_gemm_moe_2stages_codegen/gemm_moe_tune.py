@@ -157,6 +157,58 @@ def _parse_tuning_type(value):
     return parsed
 
 
+def _flydsl_e2e_row_supported(config, row) -> bool:
+    """Filter CSV rows; the backend owns tune-space and shape validation."""
+    from aiter.ops.flydsl.fused_moe_gfx942 import _Problem
+
+    quant_modes = {
+        str(QuantType.No): "no",
+        str(QuantType.per_Token): "ptpc",
+        str(QuantType.per_Tensor): "per_tensor",
+        str(QuantType.per_1x32): "mxfp4",
+        str(QuantType.per_1x128): "block",
+        str(QuantType.per_128x128): "block",
+    }
+    quant_mode = quant_modes.get(row["q_type"])
+    if quant_mode is None or bool(row["doweight_stage1"]):
+        return False
+    if config.is_blockscale_prefill or config.is_blockscale_decode:
+        # Keep the existing non-blockscale candidate eligibility unchanged.
+        # block_a16w8 deliberately keeps BF16 activations. It competes against
+        # the same A8W8 reference and tolerance, not a substituted reference.
+        architecture = get_gfx()
+        if architecture not in ("gfx942", "gfx950") or (
+            config.is_blockscale_prefill and architecture != "gfx950"
+        ):
+            return False
+        fp8_dtype = (
+            torch.float8_e4m3fn if architecture == "gfx950" else torch.float8_e4m3fnuz
+        )
+        if (
+            row["dtype"] != str(torch.bfloat16)
+            or row["q_dtype_a"] != str(fp8_dtype)
+            or row["q_dtype_w"] != str(fp8_dtype)
+            or not bool(row["use_g1u1"])
+            or row["act_type"] != str(ActivationType.Silu)
+        ):
+            return False
+        # Match run_config's existing clamp input; zero is inactive at runtime.
+        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        if limit_env not in (None, "") and float(limit_env):
+            return False
+    problem = _Problem(
+        batch=int(row["token"]),
+        experts=int(row["expert"]),
+        gateup_dim=int(row["inter_dim"]) * 2,
+        hidden_dim=int(row["model_dim"]),
+        model_dim=int(row["model_dim"]),
+        inter_dim=int(row["inter_dim"]),
+        topk=int(row["topk"]),
+        quant_type=quant_mode,
+    )
+    return config.unsupported_reason(problem) is None
+
+
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
     """compare_fn for a16w-mix stage1/stage2 in SORTED layout: ref is the sorted bf16
     reference ([max_sorted, inter], padding rows all-zero), res the kernel's sorted
@@ -5918,7 +5970,6 @@ class FmoeTuner(TunerCommon):
 
         from aiter.ops.flydsl.fused_moe_gfx942 import (
             Config,
-            _Problem,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
@@ -5997,32 +6048,12 @@ class FmoeTuner(TunerCommon):
         YELLOW = "\033[1;33m"
         RED = "\033[0;31m"
         END = "\033[0m"
-        quant_modes = {
-            str(QuantType.No): "no",
-            str(QuantType.per_Token): "ptpc",
-            str(QuantType.per_Tensor): "per_tensor",
-            str(QuantType.per_1x32): "mxfp4",
-        }
         for config_string in get_tune_space():
             config = Config.from_string(config_string)
             eligible_indices = [
                 position
                 for position, (_, row) in enumerate(self.untunedf.iterrows())
-                if row["q_type"] in quant_modes
-                and not bool(row["doweight_stage1"])
-                and config.unsupported_reason(
-                    _Problem(
-                        batch=int(row["token"]),
-                        experts=int(row["expert"]),
-                        gateup_dim=int(row["inter_dim"]) * 2,
-                        hidden_dim=int(row["model_dim"]),
-                        model_dim=int(row["model_dim"]),
-                        inter_dim=int(row["inter_dim"]),
-                        topk=int(row["topk"]),
-                        quant_type=quant_modes[row["q_type"]],
-                    )
-                )
-                is None
+                if _flydsl_e2e_row_supported(config, row)
             ]
             if not eligible_indices:
                 continue
@@ -6100,13 +6131,22 @@ class FmoeTuner(TunerCommon):
         for i, k in better_kernels.items():
             if k["kernel_name"] is None:
                 continue
-            tune_results.append([*[k["row"][col] for col in self.keys], *k["results"]])
+            row = k["row"]
+            if row["q_type"] == str(QuantType.per_128x128):
+                # Public fused_moe normalizes this alias before its CSV lookup.
+                row = row.copy()
+                row["q_type"] = str(QuantType.per_1x128)
+            tune_results.append([*[row[col] for col in self.keys], *k["results"]])
             print(
                 f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%) {END} {k['kernel_name']}"
             )
 
         if tune_results:
             new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
+            # The input may contain both blockscale aliases for the same shape.
+            new_tunedf = new_tunedf.sort_values("us", kind="stable").drop_duplicates(
+                subset=self.keys, keep="first"
+            )
             new_tunedf["_tag"] = ""
             output_file = self.get_out_file(args.tune_file)
             # Merge with existing tuned file: keep existing rows that are not
