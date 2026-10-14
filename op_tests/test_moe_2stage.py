@@ -114,6 +114,11 @@ def test_fmoe(
             DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
         )
     torch_quant = aiter.get_torch_quant(qType)
+    # Both MoE aliases use W128x128 weights and A1x128 activations.
+    is_blockscale = qType in (
+        aiter.QuantType.per_1x128,
+        aiter.QuantType.per_128x128,
+    )
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
         qType == aiter.QuantType.per_1x32
@@ -190,7 +195,7 @@ def test_fmoe(
         w2_qt, w2_scale = per_1x32_f8_scale_f8_quant(
             w2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
         )
-    elif qType == aiter.QuantType.per_128x128:
+    elif is_blockscale:
 
         def weight_per_128x128_quant(weight, quant_dtype):
             E, dim1, dim2 = weight.shape
@@ -245,7 +250,7 @@ def test_fmoe(
             reference_aq_dtype = runtime_aq_dtype
 
     # Quant-ing a
-    if qType == aiter.QuantType.per_128x128:
+    if is_blockscale:
         a1_qt, a1_scale = aiter.pertoken_quant(
             input.view(token, -1, 128), quant_dtype=AQDType
         )
@@ -425,7 +430,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
+    if is_blockscale:
         a2_qt, a2_scale = aiter.pertoken_quant(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )

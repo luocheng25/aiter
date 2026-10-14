@@ -3,6 +3,7 @@
 """CPU-only checks for FlyDSL blockscale E2E tuner eligibility and CSV output."""
 
 import ast
+import functools
 import io
 import os
 import sys
@@ -407,6 +408,126 @@ class TestFlydslBlockscaleTuning(unittest.TestCase):
                     self.code._flydsl_e2e_row_supported(self._config(), row),
                     gfx == "gfx950" and dtype_a == dtype_w == torch.float8_e4m3fn,
                 )
+
+    def test_moe_2stage_blockscale_alias_preparation(self):
+        # Execute the real test function, but not its module-level CLI/GPU sweep.
+        path = _ROOT / "op_tests/test_moe_2stage.py"
+        function = next(
+            node
+            for node in ast.parse(path.read_text()).body
+            if isinstance(node, ast.FunctionDef) and node.name == "test_fmoe"
+        )
+        function.decorator_list = []
+        quant_path = _ROOT / "aiter/ops/quant.py"
+        quant_nodes = [
+            node
+            for node in ast.parse(quant_path.read_text()).body
+            if getattr(node, "name", None)
+            in {"get_dtype_max", "pertoken_quant", "per_block_quant_wrapper"}
+        ]
+        ns = {
+            "torch": torch,
+            "functools": functools,
+            "dtypes": SimpleNamespace(
+                fp32=torch.float32,
+                bf16=torch.bfloat16,
+                fp16=torch.float16,
+                fp8=torch.float8_e4m3fn,
+                i8=torch.int8,
+                fp4x2=getattr(torch, "float4_e2m1fn_x2", None),
+                i4x2=getattr(torch, "int4", None),
+            ),
+            "get_gfx": lambda: "gfx950",
+            "AITER_MOE_NUM_EXPERT_ACTIVATED": 0,
+            "AITER_MOE_EXPERT_BALANCE": False,
+            "shuffle_weight": lambda tensor, **kwargs: tensor,
+            "fp4_utils": SimpleNamespace(e8m0_shuffle=lambda scale: scale),
+            "logger": mock.Mock(),
+            "checkAllclose": lambda *args, **kwargs: 0,
+            "fused_moe": mock.Mock(),
+        }
+        exec(  # noqa: S102 - trusted pure-Torch quantization definitions
+            compile(
+                ast.Module(body=quant_nodes, type_ignores=[]), str(quant_path), "exec"
+            ),
+            ns,
+        )
+        ns["aiter"] = SimpleNamespace(
+            QuantType=self.code.QuantType,
+            ActivationType=SimpleNamespace(
+                Silu="silu", Swiglu="swiglu", Situv2="situv2"
+            ),
+            pertoken_quant=ns["pertoken_quant"],
+            get_torch_quant=lambda quant: ns["per_block_quant_wrapper"]((1, 128))(
+                ns["pertoken_quant"]
+            ),
+        )
+        captured = []
+
+        def stage1(a, w1, w2, weights, ids, **kwargs):
+            self.assertEqual(tuple(kwargs["w1_scale"].shape), (2, 2, 2))
+            self.assertEqual(tuple(kwargs["a1_scale"].shape), (3, 2))
+            captured.extend((a, w1, w2, kwargs["a1_scale"], kwargs["w1_scale"]))
+            return (
+                torch.arange(3 * 2 * 128, dtype=torch.float32)
+                .reshape(3, 2, 128)
+                .bfloat16()
+            )
+
+        def stage2(a, w1, w2, weights, ids, **kwargs):
+            self.assertEqual(tuple(kwargs["w2_scale"].shape), (2, 2, 1))
+            self.assertEqual(tuple(kwargs["a2_scale"].shape), (3, 2, 1))
+            captured.extend((a, kwargs["a2_scale"], kwargs["w2_scale"]))
+            return torch.ones(3, 256, dtype=torch.bfloat16)
+
+        ns.update(
+            fused_topk=lambda x, score, topk, renormalize: (
+                torch.ones(3, 2),
+                torch.arange(2).expand(3, 2).int(),
+            ),
+            torch_moe_stage1=stage1,
+            torch_moe_stage2=stage2,
+            run_perftest=lambda *args, **kwargs: (
+                torch.ones(3, 256, dtype=torch.bfloat16),
+                1.0,
+            ),
+        )
+        exec(  # noqa: S102 - real data preparation with only GPU consumers replaced
+            compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), ns
+        )
+        for dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            with self.subTest(dtype=dtype), torch.device("cpu"):
+                outputs = []
+                for quant in (
+                    self.code.QuantType.per_128x128,
+                    self.code.QuantType.per_1x128,
+                ):
+                    torch.manual_seed(23)
+                    captured.clear()
+                    ns["test_fmoe"](
+                        torch.bfloat16,
+                        3,
+                        256,
+                        128,
+                        2,
+                        2,
+                        "silu",
+                        "separated",
+                        quant,
+                        dtype,
+                        dtype,
+                        use_g1u1=True,
+                    )
+                    outputs.append(
+                        [
+                            tensor.contiguous().view(torch.uint8).clone()
+                            for tensor in captured
+                        ]
+                    )
+                self.assertEqual(len(outputs[0]), 8)
+                self.assertEqual(len(outputs[1]), 8)
+                for alias, canonical in zip(*outputs):
+                    torch.testing.assert_close(alias, canonical, atol=0, rtol=0)
 
     def test_legacy_eligibility_is_unchanged(self):
         configs = (
