@@ -12,8 +12,8 @@ from flydsl.expr import range_constexpr, rocdl
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .moe_blockscale_common import _ptr, get_device_cache_key, rocdl_aux
-from .moe_fp8_blockscale_stage2 import _scalar
+from .common import _ptr, get_device_cache_key, rocdl_aux
+from .a8w8_blockscale_gemm2 import _scalar
 
 
 @cache

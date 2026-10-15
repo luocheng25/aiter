@@ -24,7 +24,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .moe_blockscale_common import get_device_cache_key, rocdl_aux
+from .common import get_device_cache_key, rocdl_aux
 
 SORT_BLOCK_M = 256
 BLOCK_M = 128

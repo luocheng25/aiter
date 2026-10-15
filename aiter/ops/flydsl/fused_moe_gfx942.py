@@ -11,7 +11,7 @@ from aiter import ActivationType, QuantType
 from aiter.fused_moe import GateMode, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.moe_blockscale_config import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_config import (
     m128_down_lds_bytes,
     routed_down_lds_bytes,
 )
@@ -514,7 +514,7 @@ def _run_blockscale_prefill(
     config,
     problem,
 ):
-    from aiter.ops.flydsl.kernels.moe_fp8_blockscale_stage1 import fp8_blockscale_stage1
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm1 import fp8_blockscale_stage1
 
     with torch.cuda.device(hidden_states.device):
         si, sw, se, valid, output = moe_sorting(
@@ -552,7 +552,7 @@ def _run_blockscale_prefill(
             "num_oc_splits": config.num_oc_splits,
         }
         if config.down_path == "block_8wave":
-            from aiter.ops.flydsl.kernels.moe_8wave_down import (
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_8wave_down import (
                 flydsl_moe_gemm_8wave_down,
             )
 
@@ -580,11 +580,11 @@ def _run_blockscale_prefill(
             )
             torch.sum(routes, dim=1, out=output)
         else:
-            from aiter.ops.flydsl.kernels.moe_fp8_blockscale_stage2 import (
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm2 import (
                 M128_QUEUE_SIZE,
                 make_m128_down,
             )
-            from aiter.ops.flydsl.kernels.moe_packed_reduce import make_moe_sum
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_packed_reduce import make_moe_sum
 
             persistent = config.down_path == "block_m128_persistent"
             down = make_m128_down(

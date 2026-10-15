@@ -23,13 +23,13 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from . import moe_blockscale_common as fxh
-from .moe_8wave_down_utils import ROCDLBuffer
-from .moe_blockscale_common import (
+from . import common as fxh
+from .common import (
     _ptr,
     get_device_cache_key,
 )
-from .moe_blockscale_config import routed_down_lds_bytes
+from .gemm2_common import eltwise_op
+from .a8w8_blockscale_config import routed_down_lds_bytes
 
 
 def _atomic_add_i32(addr, value):
@@ -66,6 +66,103 @@ def ptr_to_tensor(ptr, shape, dtype=None, as_buffer=False):
         tensor = fx.rocdl.make_buffer_tensor(tensor, False)
     return tensor
 
+
+class ROCDLBuffer:
+    """Buffer-resource view for direct global-to-LDS copies of dwords."""
+
+    def __init__(self, base_tensor):
+        self.base_offset = fx.ptrtoint(fx.get_iter(base_tensor))
+        buffer = fx.rocdl.make_buffer_tensor(base_tensor, False)
+        self.rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(buffer))
+
+    @flyc.jit
+    def load_async(
+        self,
+        ptr_src: fx.Pointer,
+        ptr_dst: fx.Pointer,
+        num_dwords: int,
+        num_threads: int,
+    ):
+        """Cooperatively copy contiguous dwords from global memory to LDS.
+
+        ``ptr_src`` must point inside the tensor used to construct this object;
+        its descriptor-relative byte offset is calculated automatically.
+        ``ptr_dst`` must point to compact LDS storage. No LDS bank swizzle is
+        applied, so preshuffled input is copied byte-for-byte.
+
+        Every full round uses one 16-byte DMA per thread. A partial 16-byte
+        round is predicated by thread ID, and up to three residual dwords are
+        copied by the first lanes of wave 0. The caller owns async group commit,
+        waiting, and the workgroup barrier.
+        """
+        assert num_dwords > 0
+        assert num_threads > 0 and num_threads % 64 == 0
+
+        atom_bytes = 16
+        dword_bytes = 4
+        num_bytes = num_dwords * dword_bytes
+        num_atoms = num_bytes // atom_bytes
+        num_rounds = num_atoms // num_threads
+        tail_atoms = num_atoms % num_threads
+        tail_dwords = (num_bytes % atom_bytes) // dword_bytes
+
+        tid = fx.thread_idx.x
+        wave = tid // fx.Int32(64)
+        zero_i32 = arith._to_raw(fx.Int32(0))
+        wave_byte_offset = fx.Int32(
+            fx.rocdl.readfirstlane(
+                T.i32,
+                arith._to_raw(wave * fx.Int32(64 * atom_bytes)),
+            )
+        )
+        lds_address = fx.Int32(fx.ptrtoint(ptr_dst)) + wave_byte_offset
+        lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+        src_base_byte_offset = fx.Int32(fx.ptrtoint(ptr_src) - self.base_offset)
+        source_byte_offset = src_base_byte_offset + tid * fx.Int32(atom_bytes)
+
+        # Full rounds: every thread copies one 16-byte atom.
+        for copy_round in range_constexpr(num_rounds):
+            rocdl.raw_ptr_buffer_load_async_lds(
+                self.rsrc,
+                llvm.inttoptr(lds_ptr_type, arith._to_raw(lds_address)),
+                arith._to_raw(fx.Int32(atom_bytes)),
+                arith._to_raw(source_byte_offset),
+                zero_i32,
+                zero_i32,
+                aux=fxh.rocdl_aux(0),
+            )
+            lds_address += num_threads * atom_bytes
+            source_byte_offset += num_threads * atom_bytes
+
+        # Partial 16-byte round.
+        if fx.const_expr(tail_atoms != 0):  # noqa: SIM102 - Compile-time/runtime split.
+            if tid < fx.Int32(tail_atoms):
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    self.rsrc,
+                    llvm.inttoptr(lds_ptr_type, arith._to_raw(lds_address)),
+                    arith._to_raw(fx.Int32(atom_bytes)),
+                    arith._to_raw(source_byte_offset),
+                    zero_i32,
+                    zero_i32,
+                    aux=fxh.rocdl_aux(0),
+                )
+
+            # Up to three residual dwords after the final 16-byte atom.
+        if fx.const_expr(tail_dwords != 0):
+            dword_source_base = src_base_byte_offset + fx.Int32(
+                (num_bytes // atom_bytes) * atom_bytes
+            )
+            dword_lds_address = lds_address + tail_atoms * atom_bytes
+            if tid < fx.Int32(tail_dwords):
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    self.rsrc,
+                    llvm.inttoptr(lds_ptr_type, arith._to_raw(dword_lds_address)),
+                    arith._to_raw(fx.Int32(dword_bytes)),
+                    arith._to_raw(dword_source_base + tid * fx.Int32(dword_bytes)),
+                    zero_i32,
+                    zero_i32,
+                    aux=fxh.rocdl_aux(0),
+                )
 
 @cache
 def _compile_8wave_down(
@@ -431,7 +528,7 @@ def _compile_8wave_down(
                                         # Match PyHIP/tuned cross-K rounding. Separate mul/add
                                         # can flip a BF16 tie and lose a TOPK-sum residual.
                                         acc[None, mi0, ni0].store(
-                                            fxh.eltwise_op(
+                                            eltwise_op(
                                                 "llvm.fma.f32",
                                                 c_mma_frag.load(),
                                                 mfma_scaleAB,
@@ -449,7 +546,7 @@ def _compile_8wave_down(
                         c_mma_frag, mfma_scaleAB, (mi0, ni0) = dequant_queue.pop(0)
                         if const_expr((mi0, ni0) in acc_init):
                             acc[None, mi0, ni0].store(
-                                fxh.eltwise_op(
+                                eltwise_op(
                                     "llvm.fma.f32",
                                     c_mma_frag.load(),
                                     mfma_scaleAB,
@@ -483,7 +580,7 @@ def _compile_8wave_down(
 
                 fx.rocdl.asyncmark()
                 fx.rocdl.wait_asyncmark(1)
-                fxh.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.barrier()
 
                 compute()
@@ -500,7 +597,7 @@ def _compile_8wave_down(
 
                     fx.rocdl.asyncmark()
                     fx.rocdl.wait_asyncmark(1)
-                    fxh.s_waitcnt(lgkmcnt=0)
+                    fx.rocdl.s_waitcnt(lgkmcnt=0)
                     fx.barrier()
 
                     compute()
@@ -511,7 +608,7 @@ def _compile_8wave_down(
 
                 fx.rocdl.asyncmark()
                 fx.rocdl.wait_asyncmark(1)
-                fxh.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.barrier()
 
                 compute()
@@ -520,7 +617,7 @@ def _compile_8wave_down(
                 ds_read_b(n_tiles_per_split - 1)
                 global_store(n_tiles_per_split - 2)
 
-                fxh.s_waitcnt(lgkmcnt=0)
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.barrier()
 
                 compute()

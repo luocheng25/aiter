@@ -14,13 +14,13 @@ from aiter.fused_moe import GateMode, moe_sorting
 from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import fused_moe_gfx942 as backend
-from aiter.ops.flydsl.kernels.moe_8wave_down import flydsl_moe_gemm_8wave_down
-from aiter.ops.flydsl.kernels.moe_fp8_blockscale_stage1 import fp8_blockscale_stage1
-from aiter.ops.flydsl.kernels.moe_fp8_blockscale_stage2 import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_8wave_down import flydsl_moe_gemm_8wave_down
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm1 import fp8_blockscale_stage1
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm2 import (
     M128_QUEUE_SIZE,
     make_m128_down,
 )
-from aiter.ops.flydsl.kernels.moe_packed_reduce import make_moe_sum
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_packed_reduce import make_moe_sum
 from op_tests.test_flydsl_moe_blockscale import (
     check_result,
     prepare_case,

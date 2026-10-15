@@ -659,6 +659,32 @@ class FlyObjCache:
         return tiled_copy.get_slice(fx.thread_idx.x), copy_atom
 
 
+def pin_vgpr(value):
+    """Pin a numeric scalar or vector to VGPRs with tied empty asm."""
+    raw = value.ir_value()
+    result = llvm.inline_asm(raw.type, [raw], "", "=v,0", has_side_effects=True)
+    if isinstance(raw.type, ir.VectorType):
+        return fx.Vector(result)
+    return fx.Numeric.from_ir_type(raw.type)(result)
+
+def llvm_extract_as_vector(element_type, *args):
+    elements = []
+    current_vec = None
+
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            assert current_vec is not None
+            elements.append(
+                element_type(
+                    llvm.extractvalue(element_type.ir_type, current_vec, arg)
+                )
+            )
+        else:
+            current_vec = arg
+
+    return fx.Vector.from_elements(elements, element_type)
+
+
 def asm_mark(mark: str):
     caller_frame = inspect.currentframe().f_back
     filename = caller_frame.f_code.co_filename
@@ -1728,3 +1754,16 @@ def make_gemm_helpers(
         return c_frag_reduce
 
     return TensorWithIndex, _read_sorted_index, gemm_splitk
+
+def rocdl_aux(value=0):
+    return ir.IntegerAttr.get(fx.Int32.ir_type, value)
+
+def get_device_cache_key():
+    device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+    return (
+        device,
+        properties.name,
+        properties.gcnArchName,
+        properties.multi_processor_count,
+    )
