@@ -49,6 +49,10 @@ def compile_moe_gemm1(
         activation,
         swiglu_limit,
     )
+    if weight_quant_type == "block":
+        assert K % 512 == 0, "Blockscale Gate/Up requires K divisible by 512"
+        assert N % 256 == 0, "Blockscale Gate/Up requires each half divisible by 128"
+        assert BLOCK_TILE_SIZE_N in (32, 64, 128)
     if weight_dtype == "fp4":
         assert K % 512 == 0, "MXFP4 Gate/Up requires K divisible by 512"
         assert BLOCK_TILE_SIZE_M == 16
@@ -155,6 +159,7 @@ def compile_moe_gemm1(
         N,
         BLOCK_TILE_SIZE_N,
         mxfp4_gate_up_interleaved,
+        weight_quant_type=weight_quant_type,
     )
 
     def _clamp_gateup(gate, up):
@@ -318,7 +323,9 @@ def compile_moe_gemm1(
         element_num = 16 // (p_weight.dtype.width // 8)
         expert_offset = (
             fx.Int64(expert_id) * N * storage_k
-            if const_expr(weight_dtype == fx.Float4E2M1FN)
+            if const_expr(
+                weight_dtype == fx.Float4E2M1FN or weight_quant_type == "block"
+            )
             else fx.Int64(expert_id * N * K)
         )
         return fx.make_view(

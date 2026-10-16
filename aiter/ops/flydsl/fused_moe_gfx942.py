@@ -11,6 +11,10 @@ from aiter import ActivationType, QuantType
 from aiter.fused_moe import GateMode, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_config import (
+    m128_down_lds_bytes,
+    routed_down_lds_bytes,
+)
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
@@ -19,6 +23,8 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+_BLOCKSCALE_PREFILL_PATHS = ("block_m128", "block_m128_persistent", "block_8wave")
 
 
 @dataclass
@@ -30,33 +36,82 @@ class Config:
     down_path: str = "default"
     down_output_padding_bytes: int = 0
     use_batch1_algorithm: bool = False
+    down_block_n: int = 128
+    num_oc_splits: int = 1
+
+    @property
+    def is_blockscale_prefill(self):
+        return self.down_path in _BLOCKSCALE_PREFILL_PATHS
+
+    @property
+    def is_blockscale_decode(self):
+        # Explicit weight-only A16W8, unlike the A1x128 prefill paths above.
+        return self.down_path == "block_a16w8"
 
     def __post_init__(self):
-        if self.down_path not in ("default", "1x4_64x256", "8x1_compact"):
+        if self.down_path not in (
+            "default",
+            "1x4_64x256",
+            "8x1_compact",
+            "block_a16w8",
+            *_BLOCKSCALE_PREFILL_PATHS,
+        ):
             raise ValueError(f"Unsupported Down path: {self.down_path}")
         if self.down_output_padding_bytes not in (0, 32, 64, 128):
             raise ValueError("Down output padding must be 0, 32, 64 or 128 bytes")
         if self.down_path == "default" and self.down_output_padding_bytes != 0:
             raise ValueError("The default Down path does not support output padding")
-        if self.down_path != "default" and not self.use_prefill:
+        if (
+            self.down_path != "default"
+            and not self.is_blockscale_decode
+            and not self.use_prefill
+        ):
             raise ValueError("Specialized Down paths require prefill")
         if self.use_batch1_algorithm and (
-            self.use_prefill or self.down_path != "default"
+            self.use_prefill or self.down_path not in ("default", "block_a16w8")
         ):
             raise ValueError(
                 "Direct decoding cannot use prefill or specialized Down paths"
             )
+        if self.is_blockscale_decode and (
+            self.use_prefill or self.down_output_padding_bytes
+        ):
+            raise ValueError("block_a16w8 requires decoding without output padding")
+        if self.is_blockscale_prefill:
+            # BLOCK_M is the shared sorting block, not the M128 Down tile.
+            if (self.BLOCK_M, self.BLOCK_N, self.BLOCK_K) != (256, 256, 128):
+                raise ValueError("blockscale uses sort256 and fixed Gate/Up N256/K128")
+            if self.down_output_padding_bytes:
+                raise ValueError("blockscale Down does not support output padding")
+            if type(self.num_oc_splits) is not int or self.num_oc_splits <= 0:
+                raise ValueError("num_oc_splits must be a positive integer")
+            allowed_n = (32, 64, 128) if self.down_path == "block_8wave" else (128,)
+            if self.down_block_n not in allowed_n:
+                raise ValueError(
+                    f"{self.down_path} requires down_block_n in {allowed_n}"
+                )
+        elif (self.down_block_n, self.num_oc_splits) != (128, 1):
+            raise ValueError("Down N/OC overrides are supported by blockscale only")
 
     def to_string(self):
-        return (
+        value = (
             f"{self.BLOCK_M}_{self.BLOCK_N}_{self.BLOCK_K}_"
             f"{self.use_prefill}_{self.use_batch1_algorithm}:"
             f"{self.down_path}:{self.down_output_padding_bytes}"
         )
+        # Keep every existing config/CSV spelling unchanged.
+        if self.is_blockscale_prefill:
+            value += f":{self.down_block_n}:{self.num_oc_splits}"
+        return value
 
     @classmethod
     def from_string(cls, data: str):
-        tile, down_path, padding = data.split(":")
+        fields = data.split(":")
+        if len(fields) not in (3, 5):
+            raise ValueError(f"Invalid FlyDSL MoE config: {data!r}")
+        tile, down_path, padding = fields[:3]
+        if (down_path in _BLOCKSCALE_PREFILL_PATHS) != (len(fields) == 5):
+            raise ValueError("blockscale configs require Down N and OC split fields")
         block_m, block_n, block_k, use_prefill, use_batch1_algorithm = tile.split("_")
         if use_prefill not in ("True", "False") or use_batch1_algorithm not in (
             "True",
@@ -71,9 +126,60 @@ class Config:
             down_path,
             int(padding),
             use_batch1_algorithm=use_batch1_algorithm == "True",
+            down_block_n=int(fields[3]) if len(fields) == 5 else 128,
+            num_oc_splits=int(fields[4]) if len(fields) == 5 else 1,
         )
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
+        if self.is_blockscale_prefill:
+            if problem.quant_type != "block":
+                return "blockscale configs require W128x128/A1x128 FP8"
+            if not 0 < problem.batch < (1 << 24):
+                return "blockscale requires 1 to 2**24-1 tokens"
+            if problem.hidden_dim < 256 or problem.hidden_dim % 256:
+                return "blockscale Gate/Up requires hidden_dim divisible by 256"
+            if problem.inter_dim <= 0 or problem.inter_dim % 128:
+                return "blockscale requires inter_dim divisible by 128"
+            if problem.gateup_dim != 2 * problem.inter_dim:
+                return "blockscale requires separated Gate/Up weights"
+            try:
+                params = {
+                    "n": problem.model_dim,
+                    "k": problem.inter_dim,
+                    "topk": problem.topk,
+                    "num_experts": problem.experts,
+                    "num_oc_splits": self.num_oc_splits,
+                }
+                if self.down_path == "block_8wave":
+                    routed_down_lds_bytes(
+                        **params, block_m=256, block_n=self.down_block_n
+                    )
+                else:
+                    m128_down_lds_bytes(
+                        **params, persistent=self.down_path == "block_m128_persistent"
+                    )
+            except ValueError as error:
+                return str(error)
+            return None
+        if self.is_blockscale_decode:
+            if problem.quant_type != "block":
+                return "block_a16w8 requires FP8 blockscale weights"
+            if problem.hidden_dim <= 0 or problem.hidden_dim % 512:
+                return "block_a16w8 requires hidden_dim divisible by 512"
+            if problem.inter_dim <= 0 or problem.inter_dim % 128:
+                return "block_a16w8 requires inter_dim divisible by 128"
+            if problem.model_dim <= 0 or problem.model_dim % 128:
+                return "block_a16w8 requires model_dim divisible by 128"
+            if problem.gateup_dim != 2 * problem.inter_dim:
+                return "block_a16w8 requires separated Gate/Up weights"
+            # The baseline decode gather/atomic mask reads signed slot bits.
+            # TOPK itself is the padding slot, so it must also stay below 128.
+            if problem.experts <= 0 or not 1 <= problem.topk <= min(
+                problem.experts, 127
+            ):
+                return "block_a16w8 requires 1 to min(experts,127) routing slots"
+        elif problem.quant_type == "block":
+            return "blockscale requires a dedicated blockscale prefill or decode config"
         if not self.use_prefill:
             if self.use_batch1_algorithm:
                 if not 2 <= problem.batch <= 8:
@@ -195,11 +301,14 @@ class _Problem:
                 QuantType.per_Token: "ptpc",
                 QuantType.per_Tensor: "per_tensor",
                 QuantType.per_1x32: "mxfp4",
+                QuantType.per_1x128: "block",
+                QuantType.per_128x128: "block",
             }[quant_type],
         )
 
 
 def get_tune_space():
+    architecture = get_gfx()
     prefill = [(256, 128), (128, 256), (128, 128)]
     configs = [
         Config(16, 16, 16, False),
@@ -207,7 +316,41 @@ def get_tune_space():
         Config(16, 64, 64, False),
         Config(16, 128, 64, False),
     ]
-    if get_gfx() == "gfx950":
+    if architecture in ("gfx942", "gfx950"):
+        configs.extend(
+            (
+                Config(16, 16, 16, False, down_path="block_a16w8"),
+                Config(
+                    16,
+                    16,
+                    16,
+                    False,
+                    down_path="block_a16w8",
+                    use_batch1_algorithm=True,
+                ),
+                Config(16, 64, 64, False, down_path="block_a16w8"),
+                Config(16, 128, 64, False, down_path="block_a16w8"),
+            )
+        )
+    if architecture == "gfx950":
+        configs.extend(
+            Config(256, 256, 128, True, down_path=path, num_oc_splits=splits)
+            for path in ("block_m128", "block_m128_persistent")
+            for splits in (1, 2, 4, 8)
+        )
+        configs.extend(
+            Config(
+                256,
+                256,
+                128,
+                True,
+                down_path="block_8wave",
+                down_block_n=block_n,
+                num_oc_splits=splits,
+            )
+            for block_n in (32, 64, 128)
+            for splits in (1, 2, 4, 8)
+        )
         return [config.to_string() for config in configs]
     configs.extend(Config(64, block_n, block_k, True) for block_n, block_k in prefill)
     configs.extend(
@@ -319,6 +462,168 @@ def _gateup_output(hidden_states: torch.Tensor, problem: _Problem):
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+
+
+def _validate_blockscale_inputs(
+    hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale, problem
+):
+    fp8_dtype = torch.float8_e4m3fn if get_gfx() == "gfx950" else torch.float8_e4m3fnuz
+    if not (getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
+        raise ValueError("blockscale requires shuffle_weight(16,16) for both weights")
+    if (
+        hidden_states.shape != (problem.batch, problem.hidden_dim)
+        or w2.shape != (problem.experts, problem.model_dim, problem.inter_dim)
+        or topk_ids.shape != (problem.batch, problem.topk)
+        or topk_weight.shape != topk_ids.shape
+    ):
+        raise ValueError("blockscale input/weight/routing shape mismatch")
+    for tensor, dtype in (
+        (hidden_states, torch.bfloat16),
+        (w1, fp8_dtype),
+        (w2, fp8_dtype),
+        (topk_weight, torch.float32),
+        (topk_ids, torch.int32),
+        (w1_scale, torch.float32),
+        (w2_scale, torch.float32),
+    ):
+        if (
+            tensor.dtype != dtype
+            or not tensor.is_cuda
+            or tensor.device != hidden_states.device
+        ):
+            raise ValueError(
+                "blockscale tensors must have matching dtypes and GPU device"
+            )
+    for scale, channels, reduction in (
+        (w1_scale, problem.gateup_dim, problem.hidden_dim),
+        (w2_scale, problem.model_dim, problem.inter_dim),
+    ):
+        if scale.numel() != problem.experts * (channels // 128) * (reduction // 128):
+            raise ValueError("blockscale weights require FP32 [E,N/128,K/128] scales")
+
+
+def _run_blockscale_prefill(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    w1_scale,
+    w2_scale,
+    moe_sorting_dispatch_policy,
+    config,
+    problem,
+):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm1 import fp8_blockscale_stage1
+
+    with torch.cuda.device(hidden_states.device):
+        si, sw, se, valid, output = moe_sorting(
+            topk_ids,
+            topk_weight,
+            problem.experts,
+            problem.model_dim,
+            torch.bfloat16,
+            256,
+            None,
+            None,
+            moe_sorting_dispatch_policy,
+        )
+        quantize = aiter.get_hip_quant(QuantType.per_1x128)
+        gate_input, gate_scale = quantize(
+            hidden_states, quant_dtype=w1.dtype, transpose_scale=True
+        )
+        mid = _gateup_output(hidden_states, problem)
+        fp8_blockscale_stage1(gate_input, w1, gate_scale, w1_scale, si, se, valid, mid)
+        # transpose_scale=True already writes K-major scale bytes. Do not transpose again.
+        down_input, down_scale = quantize(
+            mid,
+            quant_dtype=w2.dtype,
+            num_rows_factor=problem.topk,
+            transpose_scale=True,
+        )
+        weight_scale = w2_scale.view(
+            problem.experts, problem.model_dim // 128, problem.inter_dim // 128
+        )
+        params = {
+            "n": problem.model_dim,
+            "k": problem.inter_dim,
+            "topk": problem.topk,
+            "num_experts": problem.experts,
+            "num_oc_splits": config.num_oc_splits,
+        }
+        if config.down_path == "block_8wave":
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_8wave_down import (
+                flydsl_moe_gemm_8wave_down,
+            )
+
+            down = flydsl_moe_gemm_8wave_down(
+                **params, block_m=256, block_n=config.down_block_n
+            )
+            routes = torch.empty(
+                (problem.batch, problem.topk, problem.model_dim),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            counter = torch.empty(1, dtype=torch.int32, device=output.device)
+            # The launcher resets its caller-owned counter on every launch/replay.
+            down(
+                routes,
+                down_input,
+                w2,
+                down_scale,
+                weight_scale,
+                si,
+                sw,
+                se,
+                valid,
+                counter,
+            )
+            torch.sum(routes, dim=1, out=output)
+        else:
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.a8w8_blockscale_gemm2 import (
+                M128_QUEUE_SIZE,
+                make_m128_down,
+            )
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.moe_packed_reduce import make_moe_sum
+
+            persistent = config.down_path == "block_m128_persistent"
+            down = make_m128_down(
+                **params, persistent=persistent, is_sorted_bm_256=True
+            )
+            routes = torch.empty(
+                (se.numel() * 256, problem.model_dim),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            counter = (
+                torch.zeros(M128_QUEUE_SIZE, dtype=torch.int32, device=output.device)
+                if persistent
+                else torch.empty(1, dtype=torch.int32, device=output.device)
+            )
+            down(
+                routes,
+                down_input,
+                w2,
+                down_scale,
+                weight_scale,
+                si,
+                sw,
+                se,
+                valid,
+                counter,
+            )
+            # Unmasked native sorting contains every real (token, slot) once.
+            inverse = torch.empty(
+                (problem.batch, problem.topk), dtype=torch.int32, device=output.device
+            )
+            invert_sorted_ids(problem.topk)(
+                si, inverse, valid, si.numel(), problem.batch
+            )
+            # Packed M128/N64 layout, even though the shared routing uses sort256.
+            make_moe_sum(n=problem.model_dim, topk=problem.topk, sort_block_m=128)(
+                output, routes, inverse
+            )
+    return output
 
 
 def _run_prefill(
@@ -694,6 +999,8 @@ def run_flydsl_moe_gfx942(
     gate_mode: GateMode | str = GateMode.SEPARATED,
 ) -> torch.Tensor:
     architecture = get_gfx()
+    if quant_type == QuantType.per_128x128:
+        quant_type = QuantType.per_1x128
     if num_local_tokens is not None:
         raise NotImplementedError(
             f"{architecture} FlyDSL whole-graph backend does not support num_local_tokens"
@@ -717,9 +1024,15 @@ def run_flydsl_moe_gfx942(
         raise NotImplementedError(
             f"Unsupported FlyDSL MoE architecture: {architecture}"
         )
-    if architecture == "gfx950" and config.use_prefill:
+    if config.is_blockscale_prefill and architecture != "gfx950":
+        raise NotImplementedError("FP8 blockscale prefill requires gfx950")
+    if (
+        architecture == "gfx950"
+        and config.use_prefill
+        and not config.is_blockscale_prefill
+    ):
         raise NotImplementedError(
-            "This FlyDSL backend supports decoding only on gfx950"
+            "This FlyDSL backend supports only decoding and blockscale prefill on gfx950"
         )
     fp8_dtype = (
         torch.float8_e4m3fn if architecture == "gfx950" else torch.float8_e4m3fnuz
@@ -732,7 +1045,8 @@ def run_flydsl_moe_gfx942(
     is_fp8 = (
         w1.dtype == fp8_dtype
         and w2.dtype == fp8_dtype
-        and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
+        and quant_type
+        in (QuantType.per_Token, QuantType.per_Tensor, QuantType.per_1x128)
     )
     is_mxfp4 = (
         architecture == "gfx950"
@@ -759,6 +1073,20 @@ def run_flydsl_moe_gfx942(
     if is_bf16 and (w1_scale is not None or w2_scale is not None):
         raise NotImplementedError("BF16 weights do not support weight scales")
 
+    if config.is_blockscale_prefill or config.is_blockscale_decode:
+        if activation != ActivationType.Silu or swiglu_limit:
+            raise NotImplementedError(
+                "blockscale Gate/Up supports SiLU without clamp only"
+            )
+        if (
+            hidden_states.ndim != 2
+            or w1.ndim != 3
+            or w2.ndim != 3
+            or topk_ids.ndim != 2
+        ):
+            raise ValueError(
+                "blockscale expects input[M,H], weights[E,N,K], routing[M,topk]"
+            )
     if activation == ActivationType.Situv2:
         if config.use_prefill:
             raise NotImplementedError("SiTUv2 is supported by decoding kernels only")
@@ -773,6 +1101,23 @@ def run_flydsl_moe_gfx942(
         raise RuntimeError(
             f"Unsupported {architecture} FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
+        )
+    if config.is_blockscale_prefill or config.is_blockscale_decode:
+        _validate_blockscale_inputs(
+            hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale, problem
+        )
+    if config.is_blockscale_prefill:
+        return _run_blockscale_prefill(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            moe_sorting_dispatch_policy,
+            config,
+            problem,
         )
     if config.use_prefill:
         return _run_prefill(
@@ -837,6 +1182,8 @@ def run_flydsl_moe_gfx942_impl(
 ) -> torch.Tensor:
     config = Config.from_string(config_string)
     architecture = get_gfx()
+    if config.is_blockscale_prefill and architecture != "gfx950":
+        raise NotImplementedError("FP8 blockscale prefill requires gfx950")
     if not (
         getattr(request.w1, "is_shuffled", False)
         and getattr(request.w2, "is_shuffled", False)

@@ -15,6 +15,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, vector
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.math import fma
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -108,7 +109,11 @@ def validate_gemm_options(
     swiglu_limit,
 ):
     if act_quant_type is None:
-        act_quant_type = "no" if weight_dtype == "fp4" else weight_quant_type
+        act_quant_type = (
+            "no"
+            if weight_dtype == "fp4" or weight_quant_type == "block"
+            else weight_quant_type
+        )
     assert (
         BLOCK_TILE_SIZE_M <= 256
     ), "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
@@ -122,7 +127,8 @@ def validate_gemm_options(
         "ptpc",
         "per_tensor",
         "mxfp4",
-    ], "weight_quant_type must be 'no', 'ptpc', 'per_tensor' or 'mxfp4'"
+        "block",
+    ], "weight_quant_type must be 'no', 'ptpc', 'per_tensor', 'mxfp4' or 'block'"
     assert act_quant_type in [
         "no",
         "ptpc",
@@ -141,6 +147,17 @@ def validate_gemm_options(
             raise ValueError("MXFP4 requires E8M0 weight scales and BF16 activations")
     elif weight_quant_type == "mxfp4":
         raise ValueError("MXFP4 quantization requires FP4 weights")
+    if weight_quant_type == "block":
+        if get_rocm_arch().split(":", 1)[0] not in ("gfx942", "gfx950"):
+            raise ValueError("Blockscale A16W8 decoding requires gfx942 or gfx950")
+        if weight_dtype != "fp8" or act_quant_type != "no":
+            raise ValueError(
+                "Blockscale decoding requires FP8 weights and BF16 activations"
+            )
+        if alg not in ("batch1", "splitk"):
+            raise ValueError("Blockscale A16W8 is supported by decoding kernels only")
+        if BLOCK_TILE_SIZE_M != 16:
+            raise ValueError("Blockscale decoding requires BLOCK_TILE_SIZE_M=16")
     assert activation in [
         "silu",
         "swiglu",
@@ -642,6 +659,32 @@ class FlyObjCache:
         return tiled_copy.get_slice(fx.thread_idx.x), copy_atom
 
 
+def pin_vgpr(value):
+    """Pin a numeric scalar or vector to VGPRs with tied empty asm."""
+    raw = value.ir_value()
+    result = llvm.inline_asm(raw.type, [raw], "", "=v,0", has_side_effects=True)
+    if isinstance(raw.type, ir.VectorType):
+        return fx.Vector(result)
+    return fx.Numeric.from_ir_type(raw.type)(result)
+
+def llvm_extract_as_vector(element_type, *args):
+    elements = []
+    current_vec = None
+
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            assert current_vec is not None
+            elements.append(
+                element_type(
+                    llvm.extractvalue(element_type.ir_type, current_vec, arg)
+                )
+            )
+        else:
+            current_vec = arg
+
+    return fx.Vector.from_elements(elements, element_type)
+
+
 def asm_mark(mark: str):
     caller_frame = inspect.currentframe().f_back
     filename = caller_frame.f_code.co_filename
@@ -685,21 +728,35 @@ def _select(tensor: fx.Tensor, order):
     return fx.make_view(fx.get_iter(tensor), new_layout)
 
 
-def _cvt_fp8_bf16(src_tensor: fx.Tensor, dst_tensor: fx.Tensor):
+def _cvt_fp8_bf16(src_tensor: fx.Tensor, dst_tensor: fx.Tensor, native=False):
     n_dwords = fx.size(fx.get_shape(src_tensor)).to_py_value()
 
     items = []
     src_vec = src_tensor.load()
     for i in range_constexpr(n_dwords):
         src_val = src_vec[i]
-        pk0_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=False))
-        pk1_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=True))
-        tmp = (pk0_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
-        items.append(tmp[0])
-        items.append(tmp[1])
-        tmp = (pk1_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
-        items.append(tmp[0])
-        items.append(tmp[1])
+        if const_expr(native):
+            # gfx950 converts FP8 exactly; arbitrary block scales stay in FP32.
+            for high_half in range_constexpr(2):
+                pair = Vec(
+                    rocdl.cvt_scalef32_pk_bf16_fp8(
+                        ir.VectorType.get([2], fx.BFloat16.ir_type),
+                        _raw(src_val),
+                        _raw(fx.Float32(1.0)),
+                        bool(high_half),
+                    )
+                )
+                items.append(pair[0])
+                items.append(pair[1])
+        else:
+            pk0_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=False))
+            pk1_f32 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, src_val, word_sel=True))
+            tmp = (pk0_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+            items.append(tmp[0])
+            items.append(tmp[1])
+            tmp = (pk1_f32.bitcast(fx.Uint32) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+            items.append(tmp[0])
+            items.append(tmp[1])
     vec = Vec.from_elements(items, fx.BFloat16)
     layout = fx.get_layout(dst_tensor)
     for i in range_constexpr(4 * n_dwords):
@@ -715,8 +772,14 @@ def make_gemm_helpers(
     N=None,
     BLOCK_TILE_SIZE_N=None,
     mxfp4_gate_up_interleaved=True,
+    weight_quant_type="no",
 ):
     """Build the shared gather/scatter and split-K helpers without tracing IR."""
+    # Compile-time specialization; gfx942 uses the existing K16 BF16 MMA and
+    # exact FP8 -> FP32 -> BF16 conversion. Scale/FMA and K64 steps are shared.
+    native_block_fp8 = (
+        weight_quant_type == "block" and get_rocm_arch().split(":", 1)[0] == "gfx950"
+    )
 
     class TensorWithIndex:
         def __init__(
@@ -1155,6 +1218,12 @@ def make_gemm_helpers(
                 fx.make_layout((8, 4 * splitk_waves, 4), (1, 32, 8)),
             )
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
+        elif const_expr(native_block_fp8):
+            # Two K32 MFMAs consume each lane's contiguous 16 FP8 values.
+            k_perm = fx.make_tile(
+                None, None, fx.make_layout((8, 4 * splitk_waves, 2), (1, 16, 8))
+            )
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16))
         else:
             rep_k_per_lane = 4 if const_expr(weight_dtype != fx.BFloat16) else 2
             k_perm = fx.make_tile(
@@ -1229,6 +1298,26 @@ def make_gemm_helpers(
 
         num_k_iters = K // tile_k_per_wg
 
+        if const_expr(weight_quant_type == "block"):
+            block_c_frag = fx.make_fragment_like(c_frag)
+            block_scale_ptrs = []
+            for n in range_constexpr(TILE_N // 16):
+                # C's lane/value offset is within this N16 fragment. With
+                # BN32/64/128 it cannot cross an N128 scale or Gate/Up boundary.
+                grouped_n = blk_n * TILE_N + n * 16
+                if const_expr(gateup_contiguous_n is not None):
+                    logical_n = (
+                        grouped_n // (2 * gateup_contiguous_n) * gateup_contiguous_n
+                        + grouped_n % gateup_contiguous_n
+                        + grouped_n // gateup_contiguous_n % 2 * (N // 2)
+                    )
+                else:
+                    logical_n = grouped_n
+                scale_row = fx.Int64(expert_id) * (N // 128) + fx.Int64(
+                    logical_n // 128
+                )
+                block_scale_ptrs.append(_as_ptr(p_w_scale) + scale_row * (K // 128))
+
         def _a_k_offset(k_idx):
             if const_expr(fp4_jit_kmap):
                 wave_id = tid // 64
@@ -1246,7 +1335,20 @@ def make_gemm_helpers(
             return 0
 
         def _gemm_stage(buf, k_idx, packed_scale_rows=None):
-            if const_expr(weight_dtype == fx.Float4E2M1FN):
+            if const_expr(weight_quant_type == "block"):
+                # Each K64 wave fragment is wholly inside one K128 scale block.
+                k_group = (k_idx * tile_k_per_wg + tid // 64 * TILE_K) // 128
+                scales = [ptr[k_group] for ptr in block_scale_ptrs]
+                _cvt_fp8_bf16(b_frag_retile[buf], b_frag[buf], native=native_block_fp8)
+                block_c_frag.fill(0)
+                fx.gemm(tiled_mma, block_c_frag, b_frag[buf], a_frag[buf], block_c_frag)
+                for n in range_constexpr(TILE_N // 16):
+                    for m in range_constexpr(TILE_M // 16):
+                        part = block_c_frag[None, n, m].load()
+                        total = c_frag[None, n, m].load()
+                        scale = Vec.filled(part.numel, scales[n], fx.Float32)
+                        c_frag[None, n, m].store(Vec(fma(part, scale, total)))
+            elif const_expr(weight_dtype == fx.Float4E2M1FN):
                 _cvt_mxfp4_bf16(
                     b_frag_retile[buf],
                     b_frag[buf],
@@ -1262,7 +1364,8 @@ def make_gemm_helpers(
             else:
                 if const_expr(weight_dtype != fx.BFloat16):
                     _cvt_fp8_bf16(b_frag_retile[buf], b_frag[buf])
-            fx.gemm(tiled_mma, c_frag, b_frag[buf], a_frag[buf], c_frag)
+            if const_expr(weight_quant_type != "block"):
+                fx.gemm(tiled_mma, c_frag, b_frag[buf], a_frag[buf], c_frag)
 
         def _prefetch_a(k_idx, buf):
             extra_offset = _a_k_offset(k_idx)
@@ -1357,7 +1460,39 @@ def make_gemm_helpers(
 
         rocdl.sched_barrier(0)
 
-        if const_expr(weight_dtype == fx.Float4E2M1FN):
+        if const_expr(weight_quant_type == "block"):
+            # Keep the final pair outside the loop: no A/B/scale prefetch past K.
+            assert num_k_iters % 2 == 0, "Blockscale decoding requires paired K64 tiles"
+            results = acc_init
+            for pair_idx, state in range(
+                fx.Int32(0),
+                fx.Int32(num_k_iters // 2 - 1),
+                fx.Int32(1),
+                init=[acc_init],
+            ):
+                c_frag.store(state[0])
+                k_base = fx.Int32(pair_idx) * 2
+                _prefetch_a(k_base + 1, 1)
+                _prefetch_b(k_base + 1, 1)
+                rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
+                rocdl.sched_barrier(0)
+                _gemm_stage(0, k_base)
+                _prefetch_a(k_base + 2, 0)
+                _prefetch_b(k_base + 2, 0)
+                rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
+                rocdl.sched_barrier(0)
+                _gemm_stage(1, k_base + 1)
+                results = yield [c_frag.load()]
+            c_frag.store(results)
+            _prefetch_a(fx.Int32(num_k_iters - 1), 1)
+            _prefetch_b(fx.Int32(num_k_iters - 1), 1)
+            rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
+            rocdl.sched_barrier(0)
+            _gemm_stage(0, fx.Int32(num_k_iters - 2))
+            rocdl.s_waitcnt(vmcnt=0)
+            rocdl.sched_barrier(0)
+            _gemm_stage(1, fx.Int32(num_k_iters - 1))
+        elif const_expr(weight_dtype == fx.Float4E2M1FN):
             c_frag.store(acc_init)
             if const_expr(fp4_jit_kmap and K % 1024 == 0):
                 for pair_idx in range_constexpr(num_k_iters // 2):
@@ -1619,3 +1754,16 @@ def make_gemm_helpers(
         return c_frag_reduce
 
     return TensorWithIndex, _read_sorted_index, gemm_splitk
+
+def rocdl_aux(value=0):
+    return ir.IntegerAttr.get(fx.Int32.ir_type, value)
+
+def get_device_cache_key():
+    device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+    return (
+        device,
+        properties.name,
+        properties.gcnArchName,
+        properties.multi_processor_count,
+    )
