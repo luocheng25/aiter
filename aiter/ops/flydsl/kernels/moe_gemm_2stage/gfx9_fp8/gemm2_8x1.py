@@ -105,52 +105,39 @@ def read_8x1_scale_g2r(n, pair, *, weight_quant_type, scale_buffer, mm, ops):
 
 
 def _fma_f32(a, b):
-    # Per-element inline v_fma_f32(a, b, 0.0) pins the explicit f32 instruction order.
+    # Per-element fma(a, b, 0.0); the kernel's -packed-fp32-ops keeps it scalar and hazard-checked.
     a, b, zero = as_ir_value(a), as_ir_value(b), as_ir_value(fx.Float32(0.0))
     f32 = ir.F32Type.get()
-    lanes = []
-    for i in range(a.type.shape[0]):
-        operands = [
-            vector_dialect.extract(x, static_position=[i], dynamic_position=[])
-            for x in (a, b)
-        ]
-        lanes.append(
-            llvm.inline_asm(
-                f32,
-                operands + [zero],
-                "v_fma_f32 $0, $1, $2, $3",
-                "=v,v,v,v",
-                has_side_effects=False,
-            )
+    lanes = [
+        llvm.intr_fma(
+            vector_dialect.extract(a, static_position=[i], dynamic_position=[]),
+            vector_dialect.extract(b, static_position=[i], dynamic_position=[]),
+            zero,
         )
+        for i in range(a.type.shape[0])
+    ]
     return Vec(
         vector_dialect.from_elements(ir.VectorType.get([len(lanes)], f32), lanes)
     )
 
 
-def pack_8x1_record(pair, scale, *, c, row_scale, weight_quant_type):
-    weighted, rows = [], []
-    for row in range_constexpr(2):
-        for ng in range_constexpr(2 * pair, 2 * pair + 2):
-            if const_expr(weight_quant_type == "ptpc"):
-                weighted.append(
-                    _fma_f32(
-                        Vec(c[None, ng, row].load()),
-                        Vec(scale[None, ng % 2, row].load()),
-                    )
-                )
-            else:
-                weighted.append(Vec(c[None, ng, row].load()))
-            # Row scales vary only by token row; one shared scalar avoids spilled splat copies.
-            rows.append(Vec(row_scale[None, 0, row].load())[0])
-    records = [[], []]
-    for index in range_constexpr(4):
-        packed = _f32_to_bf16(weighted[index] * rows[index]).bitcast(fx.Uint32)
-        for element in range_constexpr(packed.numel):
-            records[index // 2].append(packed[element])
-    return [
-        Vec.from_elements(record, fx.Uint32).bitcast(fx.BFloat16) for record in records
-    ]
+def pack_8x1_row(pair, row, scale, *, c, row_scale, weight_quant_type):
+    """Scale one token row of an N32 record (two 16x16 fragments) and round it to BF16."""
+    # Row scales vary only by token row; one shared scalar avoids spilled splat copies.
+    row_value = Vec(row_scale[None, 0, row].load())[0]
+    packed = []
+    for ng in range_constexpr(2 * pair, 2 * pair + 2):
+        value = Vec(c[None, ng, row].load())
+        if const_expr(weight_quant_type == "ptpc"):
+            value = _fma_f32(value, Vec(scale[None, ng % 2, row].load()))
+        bits = _f32_to_bf16(value * row_value).bitcast(fx.Uint32)
+        for element in range_constexpr(bits.numel):
+            packed.append(bits[element])
+    return Vec.from_elements(packed, fx.Uint32).bitcast(fx.BFloat16)
+
+
+def pack_8x1_record(pair, scale, **kwargs):
+    return [pack_8x1_row(pair, row, scale, **kwargs) for row in range_constexpr(2)]
 
 
 def store_8x1_c_r2g(fragments, destinations, lgkmcnt=0, *, store_atom):
@@ -354,18 +341,26 @@ def _b_coords(n, target, ks):
 
 # ==================== Shared 8x1 event accounting and SSA ====================
 def packing_events(k, stage, first=False):
-    """Return (packet, previous-N, super-record), not the current MFMA output fragment."""
+    """Return (packet, previous-N, super-record, row) jobs; each packs one token row."""
     assert k in (256, 384, 512, 640), "shared 8x1 schedule supports only K128n"
     ks = k // 128
-    if stage == 0 and not first:
-        return ((0, True, 3),)
-    if stage == ks - 1:
-        return ((1, False, 0),)
-    if stage == ks:
-        return ((0, False, 1),)
-    if stage == 2 * ks - 1:
-        return ((1, False, 2),)
-    return ()
+    # One row job per packet after each record's last MFMA; C2 row 1/C3 finish before CShuffle 2/3.
+    jobs = {
+        2 * ks - 1: (False, 0, 0),
+        2 * ks: (False, 0, 1),
+        2 * ks + 1: (False, 1, 0),
+        2 * ks + 2: (False, 1, 1),
+        4 * ks - 1: (False, 2, 0),
+        0: (True, 2, 1),
+        1: (True, 3, 0),
+        2: (True, 3, 1),
+    }
+    events = []
+    for packet in range(2):
+        job = jobs.get(2 * stage + packet)
+        if job is not None and not (first and job[0]):
+            events.append((packet, *job))
+    return tuple(events)
 
 
 @cache
@@ -402,7 +397,7 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True):
         events.extend([("store", n, stage)] * store_count)
         required = [requests[q]] if valid(q) else []
         if ptpc:
-            for _, previous, record in packing_events(k, stage, n == 0):
+            for _, previous, record, _row in packing_events(k, stage, n == 0):
                 required.append(scales[n - int(previous), record])
         budget = min((len(events) - 1 - index for index in required), default=63)
         result.append(budget)
@@ -419,43 +414,58 @@ def _b_parts(b_prefetch):
     ]
 
 
-def save_8x1_state(b_prefetch, packed, scales, addresses, *, c, ptpc, first_unpacked):
+def _packed_pattern(packed):
+    # Per (record, row): True when BF16 is ready, False while its two fragments stay FP32 in C.
+    return tuple(
+        tuple(packed[pair][row] is not None for row in range(2)) for pair in range(4)
+    )
+
+
+def save_8x1_state(b_prefetch, packed, scales, addresses, *, c, ptpc):
     # Keep FP8 payloads as integer bits across SCF loop boundaries.
     state = [part.load().bitcast(fx.Uint32) for part in _b_parts(b_prefetch)]
+    pattern = _packed_pattern(packed)
     for row in range_constexpr(2):
-        for group in range_constexpr(2 * first_unpacked, 8):
-            state.append(c[None, group, row].load())
+        for group in range_constexpr(8):
+            if const_expr(not pattern[group // 2][row]):
+                state.append(c[None, group, row].load())
     if const_expr(ptpc):
-        for pair in range_constexpr(first_unpacked, 4):
-            state.append(scales[pair].load())
-    for pair in range_constexpr(first_unpacked):
+        for pair in range_constexpr(4):
+            if const_expr(not all(pattern[pair])):
+                state.append(scales[pair].load())
+    for pair in range_constexpr(4):
         for row in range_constexpr(2):
-            state.append(packed[pair][row])
+            if const_expr(pattern[pair][row]):
+                state.append(packed[pair][row])
     state.extend(addresses)
     return state
 
 
-def restore_8x1_state(state, *, c, ptpc, first_unpacked, b_carriers, scale_carriers):
+def restore_8x1_state(state, *, c, ptpc, pattern, b_carriers, scale_carriers):
     carriers = _b_parts(b_carriers)
     for carrier, value in zip(carriers, state):
         carrier.store(value.bitcast(carrier.dtype))
     offset = len(carriers)
-    scales = []
     for row in range_constexpr(2):
-        for group in range_constexpr(2 * first_unpacked, 8):
-            c[None, group, row].store(state[offset])
-            offset += 1
-    for pair in range_constexpr(first_unpacked, 4):
-        if const_expr(ptpc):
-            scale_carriers[pair - first_unpacked].store(state[offset])
-            offset += 1
-            scales.append(scale_carriers[pair - first_unpacked])
-        else:
-            scales.append(fx.Float32(1.0))
-    packed = []
-    for pair in range_constexpr(first_unpacked):
-        packed.append([Vec(state[offset]), Vec(state[offset + 1])])
-        offset += 2
+        for group in range_constexpr(8):
+            if const_expr(not pattern[group // 2][row]):
+                c[None, group, row].store(state[offset])
+                offset += 1
+    scales = [None] * 4
+    for pair in range_constexpr(4):
+        if const_expr(not all(pattern[pair])):
+            if const_expr(ptpc):
+                scale_carriers[pair].store(state[offset])
+                offset += 1
+                scales[pair] = scale_carriers[pair]
+            else:
+                scales[pair] = fx.Float32(1.0)
+    packed = [[None, None] for _ in range(4)]
+    for pair in range_constexpr(4):
+        for row in range_constexpr(2):
+            if const_expr(pattern[pair][row]):
+                packed[pair][row] = Vec(state[offset])
+                offset += 1
     # Carried B addresses (K192 and K128n KS=3/5 only) are the state tail.
     addresses = [fx.Int32(value) for value in state[offset:]]
     b_prefetch = [
@@ -466,7 +476,7 @@ def restore_8x1_state(state, *, c, ptpc, first_unpacked, b_carriers, scale_carri
 
 
 def _prepare_8x1_loop_state(
-    b_prefetch, packed, scales, b_addresses, *, c, ptpc, first_unpacked, save_state
+    b_prefetch, packed, scales, b_addresses, *, c, ptpc, save_state
 ):
     # Create carriers only after N1 completes; do not extend cross-N SSA lifetimes earlier.
     b_carriers = [
@@ -477,17 +487,18 @@ def _prepare_8x1_loop_state(
         )
         for carrier in b_prefetch
     ]
+    pattern = _packed_pattern(packed)
     scale_carriers = None
     if const_expr(ptpc):
         scale_carriers = [
-            fx.make_fragment_like(scales[pair])
-            for pair in range_constexpr(first_unpacked, 4)
+            None if all(pattern[pair]) else fx.make_fragment_like(scales[pair])
+            for pair in range_constexpr(4)
         ]
     restore_state = partial(
         restore_8x1_state,
         c=c,
         ptpc=ptpc,
-        first_unpacked=first_unpacked,
+        pattern=pattern,
         b_carriers=b_carriers,
         scale_carriers=scale_carriers,
     )
@@ -511,7 +522,7 @@ def run_8x1_tile(
     store_b_r2s,
     read_b_s2r,
     read_scale_g2r,
-    pack,
+    pack_row,
     shuffle_c_r2s2r,
     store_c_r2g,
     mma,
@@ -521,17 +532,16 @@ def run_8x1_tile(
 ):
     """Run one N tile; q = 2*KS*n + step orders events and packing_events drives packing.
 
-    Completes previous_packed in place and returns the current N's packed records and
-    all four scales; previous_scales holds only the tail, indexed by record - FIRST_UNPACKED.
+    Completes previous_packed in place and returns the current N's packed rows (None while
+    still FP32 in C) and all four scales; previous_scales is indexed by record.
     """
     KS = k // 128
     budgets = vmem_wait_schedule(k, n_tiles, ptpc)
-    FIRST_UNPACKED = 3
 
     def has_b_target(step, *, ahead, last):
         return not last or step + ahead < 2 * KS
 
-    packed, scales = [], []
+    packed, scales = [[None, None] for _ in range(4)], []
     for step in range_constexpr(2 * KS):
         # kb indexes BK128 blocks; it is not an offset or slot.
         # half=0/1 selects the first/last 64 columns of N128; visit all L K blocks before H.
@@ -602,6 +612,8 @@ def run_8x1_tile(
 
         # Compute: preserve packet order, interleaving current-record MFMA with old/new-record packing.
         priority(3)
+        # One wait for all B fragments; LLVM's per-MFMA LDS waits would each take an issue slot.
+        rocdl.s_waitcnt(lgkmcnt=0)
         # packet=0/1 selects each half's first/last 32 columns; record=0..3 identifies N32 outputs.
         for packet in range_constexpr(2):
             record = 2 * half + packet
@@ -613,17 +625,16 @@ def run_8x1_tile(
             else:
                 b_packet = b0 if const_expr(packet == 0) else b1
                 mma(b_packet, kb, record)
-            for pack_packet, from_previous_n, pack_record in events:
+            for pack_packet, from_previous_n, pack_record, row in events:
                 if const_expr(packet == pack_packet):
                     if const_expr(from_previous_n):
-                        previous_packed.append(
-                            pack(
-                                pack_record,
-                                previous_scales[pack_record - FIRST_UNPACKED],
-                            )
+                        previous_packed[pack_record][row] = pack_row(
+                            pack_record, row, previous_scales[pack_record]
                         )
                     else:
-                        packed.append(pack(pack_record, scales[pack_record]))
+                        packed[pack_record][row] = pack_row(
+                            pack_record, row, scales[pack_record]
+                        )
                     schedule_pack()
         if const_expr(
             prepare_b_addresses is not None and step == 2 * KS - 1 and not last
@@ -642,16 +653,15 @@ def _run_8x1_pipeline(
     group,
     n_tiles,
     tail_tiles,
-    first_unpacked,
     run_tile,
     prepare_loop_state,
     save_state,
-    pack,
+    pack_row,
     store_c_tile_r2g,
 ):
     """Run N0, N1, the dynamic N loop and the last tail_tiles N tiles, then drain C.
 
-    Records below first_unpacked are packed within their N; the rest stay FP32 until the next N.
+    Rows that run_tile leaves unpacked stay FP32 in C until the next N or the epilogue.
     """
     loop_end = n_tiles - tail_tiles
     # N0: stagger the groups before q0; group1's wait pairs with group0's final barrier.
@@ -661,9 +671,9 @@ def _run_8x1_pipeline(
         0, b_prefetch, [], [], first=True, addresses=b_addresses
     )
 
-    # N1: finish packing/drain N0 while producing N1; pass only the unpacked records' old scales.
+    # N1: finish packing/drain N0 while producing N1.
     b_prefetch, c_bf16, c_scales, b_addresses = run_tile(
-        1, b_prefetch, c_bf16, c_scales[first_unpacked:], addresses=b_addresses
+        1, b_prefetch, c_bf16, c_scales, addresses=b_addresses
     )
 
     # Loop: retire old C/compute new C with a one-N backedge; a zero-trip loop keeps its state.
@@ -680,7 +690,7 @@ def _run_8x1_pipeline(
             addresses=b_addresses,
         )
         results = yield save_state(b_prefetch, packed, scales, b_addresses)
-    b_prefetch, c_bf16, previous_scales, b_addresses = restore_state(results)
+    b_prefetch, c_bf16, c_scales, b_addresses = restore_state(results)
 
     # Tail: still interleave old/new C; prune only B without consumers.
     for n in range_constexpr(loop_end, n_tiles):
@@ -688,17 +698,18 @@ def _run_8x1_pipeline(
             n,
             b_prefetch,
             c_bf16,
-            previous_scales,
+            c_scales,
             last=n == n_tiles - 1,
             addresses=b_addresses,
         )
-        previous_scales = c_scales[first_unpacked:]
 
-    # Epilogue: wait, pack the remaining records, store all four output quarters, and keep
+    # Epilogue: wait, pack the remaining rows, store all four output quarters, and keep
     # group0's compensating barrier.
     rocdl.s_waitcnt(vmcnt=0)
-    for pair in range_constexpr(first_unpacked, 4):
-        c_bf16.append(pack(pair, c_scales[pair]))
+    for pair in range_constexpr(4):
+        for row in range_constexpr(2):
+            if const_expr(c_bf16[pair][row] is None):
+                c_bf16[pair][row] = pack_row(pair, row, c_scales[pair])
     store_c_tile_r2g(n_tiles - 1, c_bf16)
     stage_end()
     if group == 0:
@@ -805,11 +816,14 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
             p_w_scale,
             p_a_scale,
             M,
-            value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
+            value_attrs={
+                "llvm.target_features": ir.Attribute.parse(
+                    '#llvm.target_features<["-packed-fp32-ops"]>'
+                ),
+            },
         )
         kernel.launch(grid=(1, task_num, 1), block=(512, 1, 1), stream=stream)
 
-    launch_prefill_8x1.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_8x1
 
 
@@ -848,7 +862,6 @@ def _emit_k128n_body(
     NT = N // BN
     K_WIDTHS = (BK,) * KS
     K_OFFSETS = tuple(ks * BK for ks in range(KS))
-    FIRST_UNPACKED = 3
     WEIGHT_QUARTER_ATOMS = BN * BK // (16 * 4)
     WEIGHT_PREFETCH_SLOTS = 2
     OUTPUT_STORES_PER_WAVE = WAVE_M * BN * 2 // (64 * 16)
@@ -1148,20 +1161,15 @@ def _emit_k128n_body(
         )
 
     def schedule_pack():
-        # PTPC has 40 VALU instructions, or 24 after scalar-scale fusion; use only long BK128 packets.
+        # A row job is 28 VALUs with PTPC RTA (8 fma, 8 mul, 8 add, 4 perm), 20 per-tensor.
+        count = 28 if weight_quant_type == "ptpc" else 20
         for index in range_constexpr(16):
             rocdl.sched_group_barrier(0x8, 1, 0)
-            if const_expr(weight_quant_type == "ptpc"):
-                if const_expr(index < 13):
-                    rocdl.sched_group_barrier(0x2, 3, 0)
-                elif const_expr(index == 13):
-                    rocdl.sched_group_barrier(0x2, 1, 0)
-            else:
-                rocdl.sched_group_barrier(0x2, 2 if index < 8 else 1, 0)
+            rocdl.sched_group_barrier(0x2, count // 16 + int(index < count % 16), 0)
         rocdl.sched_barrier(0)
 
-    pack = partial(
-        pack_8x1_record,
+    pack_row = partial(
+        pack_8x1_row,
         c=frag_c,
         row_scale=frag_row_scale,
         weight_quant_type=weight_quant_type,
@@ -1174,7 +1182,6 @@ def _emit_k128n_body(
         save_8x1_state,
         c=frag_c,
         ptpc=weight_quant_type == "ptpc",
-        first_unpacked=FIRST_UNPACKED,
     )
     run_tile = partial(
         run_8x1_tile,
@@ -1191,7 +1198,7 @@ def _emit_k128n_body(
             mm=mm,
             ops=ops,
         ),
-        pack=pack,
+        pack_row=pack_row,
         shuffle_c_r2s2r=shuffle_c_r2s2r,
         store_c_r2g=store_c_r2g,
         mma=mma,
@@ -1236,11 +1243,10 @@ def _emit_k128n_body(
         _prepare_8x1_loop_state,
         c=frag_c,
         ptpc=weight_quant_type == "ptpc",
-        first_unpacked=FIRST_UNPACKED,
         save_state=save_state,
     )
 
-    # Pipeline: prologue keeps A resident, LDS=Q0, P0/P1=Q1/Q2; N0 packs C0-C2, leaving FP32 C3.
+    # Pipeline: prologue keeps A resident, LDS=Q0, P0/P1=Q1/Q2; N0 leaves FP32 C2 row 1 and C3.
     b_prefetch = prologue()
     b_addresses = (
         prepare_b_addresses(0) if const_expr(prepare_addresses is not None) else []
@@ -1251,11 +1257,10 @@ def _emit_k128n_body(
         group,
         NT,
         1,
-        FIRST_UNPACKED,
         run_tile,
         prepare_loop_state,
         save_state,
-        pack,
+        pack_row,
         store_c_tile_r2g,
     )
 
@@ -1324,15 +1329,13 @@ def _emit_k192_body(
     K_OFFSETS = (0,)
     NT = N // BN
     STRIDE = N + padding // 2
-    FIRST_UNPACKED = 2
 
     def schedule_pack():
-        # PTPC has 40 VALU instructions, per-tensor 24; each K192 packet has 24 MFMA instructions.
+        # A whole pack is 56 VALUs with PTPC RTA (fma, mul, add per element + perm), 40 per-tensor.
+        count = 56 if weight_quant_type == "ptpc" else 40
         for index in range_constexpr(24):
             rocdl.sched_group_barrier(0x8, 1, 0)
-            rocdl.sched_group_barrier(
-                0x2, 2 if weight_quant_type == "ptpc" and index < 16 else 1, 0
-            )
+            rocdl.sched_group_barrier(0x2, count // 24 + int(index < count % 24), 0)
         rocdl.sched_barrier(0)
 
     row_begin = p_sorted_expert_ids[2 * e_idx]
@@ -1461,6 +1464,9 @@ def _emit_k192_body(
     pack = partial(
         pack_8x1_record, c=c, row_scale=row_scale, weight_quant_type=weight_quant_type
     )
+    pack_row = partial(
+        pack_8x1_row, c=c, row_scale=row_scale, weight_quant_type=weight_quant_type
+    )
 
     def shuffle_c_r2s2r(n, packed, row, half):
         for local_pair in range_constexpr(2):
@@ -1516,7 +1522,6 @@ def _emit_k192_body(
         save_8x1_state,
         c=c,
         ptpc=weight_quant_type == "ptpc",
-        first_unpacked=FIRST_UNPACKED,
     )
     run_tile = partial(
         run_k192_tile,
@@ -1573,7 +1578,6 @@ def _emit_k192_body(
         _prepare_8x1_loop_state,
         c=c,
         ptpc=weight_quant_type == "ptpc",
-        first_unpacked=FIRST_UNPACKED,
         save_state=save_state,
     )
 
@@ -1586,11 +1590,10 @@ def _emit_k192_body(
         group,
         NT,
         2,
-        FIRST_UNPACKED,
         run_tile,
         prepare_loop_state,
         save_state,
-        pack,
+        pack_row,
         store_c_tile_r2g,
     )
 
@@ -1620,8 +1623,8 @@ def run_k192_tile(
 ):
     """Run one K192 N tile as L/H halves (q = 2*n + half), completing old C2/C3 in place.
 
-    Returns the current N's packed C0/C1 and all four scales; previous_scales holds
-    old scale2/scale3 only.
+    Returns the current N's packed C0/C1 (C2/C3 rows None) and all four scales;
+    previous_scales is indexed by record.
     """
     budgets = k192_wait_schedule(n_tiles, ptpc)
     body_budgets = tuple(
@@ -1631,7 +1634,7 @@ def run_k192_tile(
     has_next = not last
     # Dynamic n occurs only before the last two N; do not convert runtime SSA to a host bool.
     has_future = n + 2 < n_tiles if isinstance(n, int) else True
-    packed, scales = [], []
+    packed, scales = [[None, None] for _ in range(4)], []
 
     # K192 has one K block (kb=0); half=0/1 processes the first/last 64 columns of current N128.
     for half in range_constexpr(2):
@@ -1670,6 +1673,8 @@ def run_k192_tile(
 
         # Compute: retain packing interleaving and preparation of five next-N addresses.
         priority(3)
+        # One wait for all B fragments; LLVM's per-MFMA LDS waits would each take an issue slot.
+        rocdl.s_waitcnt(lgkmcnt=0)
         # packet=0/1 selects the first/last 32 columns of the half; record=0..3 identifies N32 outputs.
         for packet in range_constexpr(2):
             record = half * 2 + packet
@@ -1677,14 +1682,16 @@ def run_k192_tile(
             fx.rocdl.sched_barrier(0)
             mma(b_packets[packet], 0, record)
             if const_expr(half == 0 and not first):
-                # After L computes new C0/C1, pack old C2/C3 with tail scales indexed by packet.
+                # After L computes new C0/C1, pack old C2/C3.
                 pack_record = 2 + packet
-                previous_packed.append(pack(pack_record, previous_scales[packet]))
+                previous_packed[pack_record] = pack(
+                    pack_record, previous_scales[pack_record]
+                )
                 schedule_pack()
             elif const_expr(half == 1):
                 # After H computes new C2/C3, pack this N's completed C0/C1.
                 pack_record = packet
-                packed.append(pack(pack_record, scales[pack_record]))
+                packed[pack_record] = pack(pack_record, scales[pack_record])
                 schedule_pack()
         if const_expr(half == 1 and has_next):
             addresses = prepare_b_addresses(n + 1)
