@@ -349,14 +349,18 @@ def _make_a_fragments(mm, a, rows, k_widths):
 
 
 def _b_coords(n, target, ks):
-    """(n, kb, half, lds_slot) of B request Q[target], counted from N tile n."""
+    """(n, kb, half) of B request Q[target], counted from N tile n."""
     target_n, target_kb = n + target // (2 * ks), target % ks
-    return (
-        target_n,
-        target_kb,
-        (target % (2 * ks)) // ks,
-        (target_n * ks + target_kb) & 1,
-    )
+    return target_n, target_kb, (target % (2 * ks)) // ks
+
+
+def _b_region(target):
+    """(slot, half) of the 8KB LDS region q % 4 holding Q[target], counted from the N tile start.
+
+    Region reuse every four requests keeps a slot's readers two barriers ahead of its next writer;
+    odd KS resolves the slot against N parity through the carried addresses.
+    """
+    return (target >> 1) & 1, target & 1
 
 
 # ==================== Shared 8x1 event accounting and SSA ====================
@@ -385,10 +389,10 @@ def packing_events(k, stage, first=False):
 
 @cache
 def vmem_wait_schedule(k, n_tiles, ptpc=True):
-    """Per-step vmcnt budgets, counting one event per buffer/global load.
+    """Per-step (B, scale) vmcnt budgets, counting one event per buffer/global load or store.
 
-    A budget is the minimum age of the B and scale loads consumed next; scales
-    count because some K256 packets use the previous step's scale.
+    Step q first writes Q[q+1] (B budget), then issues the Q[q+3] prefetch, its scales and C
+    stores; the scale budget covers this step's pack scales, some from the previous step on K256.
     """
     assert (
         k in (256, 384, 512, 640) and n_tiles >= 1
@@ -404,25 +408,28 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True):
             events.append(("B", q))
             requests[q] = len(events) - 1
 
+    def budget(required):
+        return min((len(events) - 1 - index for index in required), default=63)
+
     request(0)
     request(1)
-    result = []
+    b_budgets, scale_budgets = [], []
     for q in range(n_tiles * 2 * ks):
         n, stage = divmod(q, 2 * ks)
+        b_budgets.append(budget([requests[q]] if valid(q) else []))
+        request(q + 2)
         scale_count = 2 if ptpc and stage < 4 else 0
         events.extend([("scale", n, stage)] * scale_count)
         if scale_count:
             scales[n, stage] = len(events) - 1
         store_count = 2 if n > 0 and stage < 4 else 0
         events.extend([("store", n, stage)] * store_count)
-        required = [requests[q]] if valid(q) else []
+        required = []
         if ptpc:
             for _, previous, record, _row in packing_events(k, stage, n == 0):
                 required.append(scales[n - int(previous), record])
-        budget = min((len(events) - 1 - index for index in required), default=63)
-        result.append(budget)
-        request(q + 2)
-    return tuple(result)
+        scale_budgets.append(budget(required))
+    return tuple(b_budgets), tuple(scale_budgets)
 
 
 def _b_parts(b_prefetch):
@@ -556,24 +563,53 @@ def run_8x1_tile(
     still FP32 in C) and all four scales; previous_scales is indexed by record.
     """
     KS = k // 128
-    budgets = vmem_wait_schedule(k, n_tiles, ptpc)
+    b_budgets, scale_budgets = vmem_wait_schedule(k, n_tiles, ptpc)
+    # N0 and N1 are separate; the backedge uses n>=2.
+    budget_n = 0 if first else n_tiles - 1 if last else n if isinstance(n, int) else 2
+    budget_base = 2 * KS * budget_n
 
     def has_b_target(step, *, ahead, last):
         return not last or step + ahead < 2 * KS
+
+    def b_address(slot, base):
+        # Carried addresses: [read slot 0, read slot 1, write slot 0, write slot 1] relative to N parity.
+        if const_expr(prepare_b_addresses is None):
+            return None
+        return addresses[base + slot]
 
     packed, scales = [[None, None] for _ in range(4)], []
     for step in range_constexpr(2 * KS):
         # kb indexes BK128 blocks; it is not an offset or slot.
         # half=0/1 selects the first/last 64 columns of N128; visit all L K blocks before H.
         kb, half, prefetch_slot = step % KS, step // KS, step & 1
-        lds_slot = (n * KS + kb) & 1
+        lds_slot, lds_half = _b_region(step)
         # N0 q0 reads a whole N64 half; all other steps read two N32 packets.
         read_full_half = first and step == 0
         has_output = not first and step < 4
         events = packing_events(k, step, first=first)
 
-        # Memory: read Q[q], interleaving previous-N C stores; P and LDS slots rotate independently.
+        # Memory: write Q[q+1] first so only it must land before the barrier; P and LDS rotate independently.
         priority(0)
+        if const_expr(has_b_target(step, ahead=1, last=last)):
+            _b_r2s_n, b_r2s_kb, _b_r2s_half = _b_coords(n, step + 1, KS)
+            r2s_slot, r2s_half = _b_region(step + 1)
+            rocdl.s_waitcnt(vmcnt=b_budgets[budget_base + step])
+            store_b_r2s(
+                r2s_slot,
+                b_r2s_kb,
+                r2s_half,
+                prefetch_slot=prefetch_slot,
+                fragment=b_prefetch[prefetch_slot],
+                address=b_address(r2s_slot, 2),
+            )
+        if const_expr(has_b_target(step, ahead=3, last=last)):
+            # Prefetch Q[q+3] into the submitted P slot; materialize its target before the sched barrier.
+            b_g2r_n, b_g2r_kb, b_g2r_half = _b_coords(n, step + 3, KS)
+            fx.rocdl.sched_barrier(0)
+            b_prefetch[prefetch_slot] = read_b_g2r(
+                b_g2r_n, b_g2r_kb, b_g2r_half, prefetch_slot=prefetch_slot
+            )
+        fx.rocdl.sched_barrier(0)
         if const_expr(step < 4):
             scales.append(read_scale_g2r(n, step))
         if const_expr(has_output):
@@ -581,52 +617,23 @@ def run_8x1_tile(
             fragments, destinations = shuffle_c_r2s2r(
                 n - 1, previous_packed, step % 2, step // 2
             )
-        b_read_address = (
-            addresses[kb & 1] if const_expr(prepare_b_addresses is not None) else None
-        )
+        b_read_address = b_address(lds_slot, 0)
         if const_expr(read_full_half):
             # Whole-half and two-packet reads are exclusive and use their matching MFMA indices.
-            b_full = read_b_s2r(lds_slot, kb, half, packet=None, address=b_read_address)
+            b_full = read_b_s2r(
+                lds_slot, kb, lds_half, packet=None, address=b_read_address
+            )
         else:
-            b0 = read_b_s2r(lds_slot, kb, half, packet=0, address=b_read_address)
+            b0 = read_b_s2r(lds_slot, kb, lds_half, packet=0, address=b_read_address)
             if const_expr(has_output):
                 # Issue stores once old CShuffle reads complete; current B reads may remain in flight.
                 store_c_r2g(fragments, destinations, lgkmcnt=4)
                 fx.rocdl.sched_barrier(0)
-            b1 = read_b_s2r(lds_slot, kb, half, packet=1, address=b_read_address)
-
-        # Protect the next B submission and this step's pack scales; N1 is separate, the backedge uses n>=2.
-        budget_n = (
-            0 if first else n_tiles - 1 if last else n if isinstance(n, int) else 2
-        )
-        if const_expr(has_b_target(step, ahead=1, last=last) or (ptpc and events)):
-            rocdl.s_waitcnt(vmcnt=budgets[budget_n * 2 * KS + step])
-        if const_expr(has_b_target(step, ahead=1, last=last)):
-            # B r->s submits Q[q+1]; materialize the target after waiting, consuming P[prefetch_slot].
-            _b_r2s_n, b_r2s_kb, b_r2s_half, b_r2s_lds_slot = _b_coords(n, step + 1, KS)
-            if const_expr(prepare_b_addresses is not None):
-                # The last L K block advances to the same N's H/K0; odd KS cannot use current LDS slot+1.
-                relative_slot = (b_r2s_kb + ((step + 1) // (2 * KS)) * KS) & 1
-                write_address = addresses[2 + relative_slot]
-            else:
-                write_address = None
-            store_b_r2s(
-                b_r2s_lds_slot,
-                b_r2s_kb,
-                b_r2s_half,
-                prefetch_slot=prefetch_slot,
-                fragment=b_prefetch[prefetch_slot],
-                address=write_address,
-            )
-        if const_expr(has_b_target(step, ahead=3, last=last)):
-            # Prefetch Q[q+3] into the submitted P slot; materialize its target before the sched barrier.
-            b_g2r_n, b_g2r_kb, b_g2r_half, _b_g2r_lds_slot = _b_coords(n, step + 3, KS)
-            fx.rocdl.sched_barrier(0)
-            b_prefetch[prefetch_slot] = read_b_g2r(
-                b_g2r_n, b_g2r_kb, b_g2r_half, prefetch_slot=prefetch_slot
-            )
-        # s_barrier does not drain LDS; the staggered group reads/overwrites these B slots after it.
-        rocdl.s_waitcnt(lgkmcnt=0)
+            b1 = read_b_s2r(lds_slot, kb, lds_half, packet=1, address=b_read_address)
+        if const_expr(ptpc and events):
+            rocdl.s_waitcnt(vmcnt=scale_budgets[budget_base + step])
+        # The other group reads Q[q+1] after the barrier; at least 8 B ds_reads follow that write.
+        rocdl.s_waitcnt(lgkmcnt=0 if read_full_half else 8)
         stage_end()
 
         # Compute: preserve packet order, interleaving current-record MFMA with old/new-record packing.
@@ -1230,8 +1237,8 @@ def _emit_k128n_body(
     def prologue():
         # B (n,kb,half) denotes N128 tile, K block, and N64 half (0=L/1=H); slot is the buffer slot.
         # Startup prefetches Q1/Q2; at least four steps per N guarantee their consumers.
-        prefetch0_n, prefetch0_kb, prefetch0_half, _ = _b_coords(0, 1, KS)
-        prefetch1_n, prefetch1_kb, prefetch1_half, _ = _b_coords(0, 2, KS)
+        prefetch0_n, prefetch0_kb, prefetch0_half = _b_coords(0, 1, KS)
+        prefetch1_n, prefetch1_kb, prefetch1_half = _b_coords(0, 2, KS)
 
         # Execute: first B -> A -> Q0 to LDS -> Q1/Q2; C address pins remain after A.
         read_b_g2r(0, 0, 0, prefetch_slot=0)
@@ -1288,8 +1295,13 @@ def _emit_k128n_body(
 # ==================== K=192: whole-K192 two-slot pipeline, 48 MFMA per half/wave ====================
 @cache
 def k192_wait_schedule(n_tiles, ptpc):
-    """Each FIFO half-B uses two VMEM instructions (16B+8B); protect B and cross-half pack scales."""
-    sequence, requests, scales, budgets = 0, {}, {}, []
+    """(B, scale) budgets per half; each FIFO half-B uses two VMEM instructions (16B+8B).
+
+    Half q first writes Q[q+1] (B budget), then prefetches Q[q+3] and issues its scales and C
+    stores; the scale budget covers the cross-half pack scales.
+    """
+    sequence, requests, scales = 0, {}, {}
+    b_budgets, scale_budgets = [], []
 
     def request_b_g2r(q):
         nonlocal sequence
@@ -1297,26 +1309,30 @@ def k192_wait_schedule(n_tiles, ptpc):
             sequence += 2
             requests[q] = sequence
 
+    def budget(required):
+        return min((sequence - event for event in required), default=63)
+
     request_b_g2r(1)
     request_b_g2r(2)
     for n in range(n_tiles):
         for half in range(2):
             q = 2 * n + half
+            b_budgets.append(budget([requests[q + 1]] if q + 1 < 2 * n_tiles else []))
+            request_b_g2r(q + 3)
             if ptpc:
                 for pair in range(2 * half, 2 * half + 2):
                     sequence += 2
                     scales[n, pair] = sequence
             if n > 0:
                 sequence += 4
-            required = [requests[q + 1]] if q + 1 < 2 * n_tiles else []
+            required = []
             if ptpc:
                 if half == 0 and n > 0:
                     required.extend(scales[n - 1, pair] for pair in (2, 3))
                 elif half == 1:
                     required.extend(scales[n, pair] for pair in (0, 1))
-            budgets.append(min((sequence - event for event in required), default=63))
-            request_b_g2r(q + 3)
-    return tuple(budgets)
+            scale_budgets.append(budget(required))
+    return tuple(b_budgets), tuple(scale_budgets)
 
 
 @flyc.jit
@@ -1647,10 +1663,13 @@ def run_k192_tile(
     Returns the current N's packed C0/C1 (C2/C3 rows None) and all four scales;
     previous_scales is indexed by record.
     """
-    budgets = k192_wait_schedule(n_tiles, ptpc)
-    body_budgets = tuple(
-        min((budgets[2 * n + half] for n in range(2, n_tiles - 2)), default=63)
-        for half in range(2)
+    b_budgets, scale_budgets = k192_wait_schedule(n_tiles, ptpc)
+    body_b_budgets, body_scale_budgets = (
+        tuple(
+            min((budgets[2 * n + half] for n in range(2, n_tiles - 2)), default=63)
+            for half in range(2)
+        )
+        for budgets in (b_budgets, scale_budgets)
     )
     has_next = not last
     # Dynamic n occurs only before the last two N; do not convert runtime SSA to a host bool.
@@ -1660,8 +1679,26 @@ def run_k192_tile(
     # K192 has one K block (kb=0); half=0/1 processes the first/last 64 columns of current N128.
     for half in range_constexpr(2):
         prefetch_slot = half
-        # Memory: read Q[2*n+half], interleaving previous-N CShuffle/stores per packet.
+        b_budget = (
+            b_budgets[2 * n + half] if isinstance(n, int) else body_b_budgets[half]
+        )
+        scale_budget = (
+            scale_budgets[2 * n + half]
+            if isinstance(n, int)
+            else body_scale_budgets[half]
+        )
+        # Memory: write Q[q+1] first so only it must land before the barrier, then read Q[2*n+half].
         priority(0)
+        if const_expr(half == 0 or has_next):
+            # B r->s submits Q[q+1]: L writes current-N.H, H writes next-N.L.
+            if const_expr(b_budget != 63):
+                rocdl.s_waitcnt(vmcnt=b_budget)
+            store_b_r2s(1 - half, b_prefetch[prefetch_slot], addresses=addresses)
+        if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
+            # Prefetch Q[q+3] into just-submitted P[half]: next-N.H or following-N.L.
+            fx.rocdl.sched_barrier(0)
+            b_prefetch[prefetch_slot] = read_b_g2r(n + 1 + half, 1 - half)
+        fx.rocdl.sched_barrier(0)
         for pair in range_constexpr(2 * half, 2 * half + 2):
             scales.append(read_scale_g2r(n, pair))
         b_packets = []
@@ -1676,19 +1713,10 @@ def run_k192_tile(
                 # C reads precede the next six B ds_reads; issue stores without waiting for all of B.
                 store_c_r2g(fragments, destinations, lgkmcnt=6)
                 fx.rocdl.sched_barrier(0)
-        budget = budgets[2 * n + half] if isinstance(n, int) else body_budgets[half]
-        # Protect the next B submission and this step's pack scales; later prefetches do not count.
-        if const_expr(budget != 63):
-            rocdl.s_waitcnt(vmcnt=budget)
-        if const_expr(half == 0 or has_next):
-            # B r->s submits Q[q+1]: L writes current-N.H, H writes next-N.L.
-            store_b_r2s(1 - half, b_prefetch[prefetch_slot], addresses=addresses)
-        if const_expr((half == 0 and has_next) or (half == 1 and has_future)):
-            # Prefetch Q[q+3] into just-submitted P[half]: next-N.H or following-N.L.
-            fx.rocdl.sched_barrier(0)
-            b_prefetch[prefetch_slot] = read_b_g2r(n + 1 + half, 1 - half)
-        # s_barrier does not drain LDS; the staggered group reads/overwrites these B slots after it.
-        rocdl.s_waitcnt(lgkmcnt=0)
+        if const_expr(scale_budget != 63):
+            rocdl.s_waitcnt(vmcnt=scale_budget)
+        # The other group reads Q[q+1] after the barrier; 12 B ds_reads follow that write.
+        rocdl.s_waitcnt(lgkmcnt=12)
         stage_end()
 
         # Compute: retain packing interleaving and preparation of five next-N addresses.
