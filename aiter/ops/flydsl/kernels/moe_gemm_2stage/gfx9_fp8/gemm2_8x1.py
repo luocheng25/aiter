@@ -164,6 +164,23 @@ def clear_8x1_record(pair, *, c):
             c[None, ng, row].fill(0)
 
 
+# Accumulator tile (group, row) stays in v[ACC_VGPR_BASE + 4 * (row * 8 + group)], the top 64 VGPRs.
+ACC_VGPR_BASE = 192
+
+
+def _pin_accumulator(acc, index):
+    # Empty asm tied to fixed VGPRs keeps MFMA dst == SrcC, avoiding RA-induced SrcC hazard s_nops.
+    reg = ACC_VGPR_BASE + 4 * index
+    value = llvm.inline_asm(
+        ir.VectorType.get([4], ir.F32Type.get()),
+        [as_ir_value(Vec(acc.load()))],
+        "",
+        f"={{v[{reg}:{reg + 3}]}},0",
+        has_side_effects=False,
+    )
+    acc.store(Vec(value))
+
+
 def mfma_8x1_record(
     weight, ks, pair, *, k_widths, afragments, c, atom, weight_n_group_begin=0
 ):
@@ -179,6 +196,9 @@ def mfma_8x1_record(
                         weight_piece,
                         activation,
                         c[None, pair * 2 + ng, row],
+                    )
+                    _pin_accumulator(
+                        c[None, pair * 2 + ng, row], row * 8 + pair * 2 + ng
                     )
 
 
@@ -605,9 +625,8 @@ def run_8x1_tile(
             b_prefetch[prefetch_slot] = read_b_g2r(
                 b_g2r_n, b_g2r_kb, b_g2r_half, prefetch_slot=prefetch_slot
             )
-        if const_expr(first and step == 0):
-            # Q1's cross-group consumers need both LDS writes.
-            rocdl.s_waitcnt(lgkmcnt=0)
+        # s_barrier does not drain LDS; the staggered group reads/overwrites these B slots after it.
+        rocdl.s_waitcnt(lgkmcnt=0)
         stage_end()
 
         # Compute: preserve packet order, interleaving current-record MFMA with old/new-record packing.
@@ -1162,7 +1181,8 @@ def _emit_k128n_body(
 
     def schedule_pack():
         # A row job is 28 VALUs with PTPC RTA (8 fma, 8 mul, 8 add, 4 perm), 20 per-tensor.
-        count = 28 if weight_quant_type == "ptpc" else 20
+        # IGroupLP also counts each MFMA's empty accumulator pin as a VALU.
+        count = (28 if weight_quant_type == "ptpc" else 20) + 16
         for index in range_constexpr(16):
             rocdl.sched_group_barrier(0x8, 1, 0)
             rocdl.sched_group_barrier(0x2, count // 16 + int(index < count % 16), 0)
@@ -1332,7 +1352,8 @@ def _emit_k192_body(
 
     def schedule_pack():
         # A whole pack is 56 VALUs with PTPC RTA (fma, mul, add per element + perm), 40 per-tensor.
-        count = 56 if weight_quant_type == "ptpc" else 40
+        # IGroupLP also counts each MFMA's empty accumulator pin as a VALU.
+        count = (56 if weight_quant_type == "ptpc" else 40) + 24
         for index in range_constexpr(24):
             rocdl.sched_group_barrier(0x8, 1, 0)
             rocdl.sched_group_barrier(0x2, count // 24 + int(index < count % 24), 0)
@@ -1666,9 +1687,8 @@ def run_k192_tile(
             # Prefetch Q[q+3] into just-submitted P[half]: next-N.H or following-N.L.
             fx.rocdl.sched_barrier(0)
             b_prefetch[prefetch_slot] = read_b_g2r(n + 1 + half, 1 - half)
-        if const_expr(first and half == 0):
-            # Already staggered before q0; the other group must see both groups' full Q1 before H.
-            rocdl.s_waitcnt(lgkmcnt=0)
+        # s_barrier does not drain LDS; the staggered group reads/overwrites these B slots after it.
+        rocdl.s_waitcnt(lgkmcnt=0)
         stage_end()
 
         # Compute: retain packing interleaving and preparation of five next-N addresses.
