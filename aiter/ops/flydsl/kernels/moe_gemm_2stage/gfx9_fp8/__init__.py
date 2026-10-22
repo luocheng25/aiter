@@ -41,6 +41,8 @@ def compile_gemm(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    sort_block_m=None,
+    fuse_quant=False,
 ):
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
@@ -60,6 +62,8 @@ def compile_gemm(
             activation=activation,
             swiglu_limit=swiglu_limit,
             fused_down_clear=fused_down_clear,
+            sort_block_m=sort_block_m,
+            fuse_quant=fuse_quant,
         )
     return compile_moe_gemm2(
         N=N,

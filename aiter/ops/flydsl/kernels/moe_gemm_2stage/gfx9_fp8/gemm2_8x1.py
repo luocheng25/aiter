@@ -747,6 +747,14 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
             rank = cu * short + arith.select(cu < long, cu, long) + round_id
             logical = ((xcc + 2) & (xcc_count - 1)) * (per_se * 4) + se * per_se + rank
             e_idx = fx.Int32(arith.select(u < mapped, logical, u))
+        else:
+            # Workgroup w runs on XCD w % xcc_count; contiguous task ranges keep an
+            # expert's full tasks, and so its weights, in one L2.
+            tasks = fxh.div_up(fx.Uint32(valid), BM)
+            chunk = tasks // xcc_count
+            u = fx.Uint32(wg)
+            mapped = (u % xcc_count) * chunk + u // xcc_count
+            e_idx = fx.Int32(arith.select(u < chunk * xcc_count, mapped, u))
 
         if e_idx * BM < valid:
             emit_body(

@@ -20,6 +20,21 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+# Gate/Up BLOCK_N covering a whole 512-wide gate+up row; it fuses the PTPC quantization.
+FULL_ROW_BLOCK_N = 512
+
+
+def _is_m128_path(down_path):
+    return down_path == "m128" or down_path.startswith("m128_oc")
+
+
+def _m128_oc(down_path):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_m128 import (
+        m128_oc_splits,
+    )
+
+    return m128_oc_splits(down_path)
+
 
 @dataclass
 class Config:
@@ -32,7 +47,11 @@ class Config:
     use_batch1_algorithm: bool = False
 
     def __post_init__(self):
-        if self.down_path not in ("default", "1x4_64x256", "8x1_compact"):
+        if self.down_path not in (
+            "default",
+            "1x4_64x256",
+            "8x1_compact",
+        ) and not _is_m128_path(self.down_path):
             raise ValueError(f"Unsupported Down path: {self.down_path}")
         if self.down_output_padding_bytes not in (0, 32, 64, 128):
             raise ValueError("Down output padding must be 0, 32, 64 or 128 bytes")
@@ -88,12 +107,20 @@ class Config:
         if not self.use_prefill and problem.batch == 1 and self.BLOCK_N != 16:
             return "batch 1 uses the 16_16_16 config"
         if self.down_path != "default":
-            if self.BLOCK_M != 64:
-                return "specialized Down paths require unchanged M64 Gate/Up metadata"
             # The native tuner's empty quant_type is a shape-only probe. The
             # runtime wrapper checks actual FP8 weight and activation support.
             if problem.quant_type not in ("", "ptpc", "per_tensor"):
                 return "specialized Down paths require FP8 weights"
+            if _is_m128_path(self.down_path):
+                if self.BLOCK_M not in (64, 128):
+                    return "M128 Down requires Gate/Up BLOCK_M 64 or 128"
+                if problem.inter_dim % 64 != 0 or not 64 <= problem.inter_dim <= 256:
+                    return "M128 Down requires inter_dim in {64,128,192,256}"
+                if problem.model_dim % (64 * _m128_oc(self.down_path)) != 0:
+                    return "M128 Down requires model_dim divisible by 64*OC"
+        if self.down_path in ("1x4_64x256", "8x1_compact"):
+            if self.BLOCK_M != 64:
+                return "specialized Down paths require unchanged M64 Gate/Up metadata"
             if self.down_path == "8x1_compact":
                 if problem.inter_dim not in (192, 256, 384, 512, 640):
                     return "compact Down requires inter_dim in {192,256,384,512,640}"
@@ -111,6 +138,11 @@ class Config:
                 return "BF16 Gate/Up ping-pong exceeds the 64 KiB LDS capacity"
             if self.BLOCK_M * problem.inter_dim * 2 > 64 * 1024:
                 return "BF16 default Down exceeds the 64 KiB LDS capacity"
+        if self.use_prefill and self.BLOCK_N == FULL_ROW_BLOCK_N:
+            if problem.quant_type not in ("", "ptpc"):
+                return "BLOCK_N=512 fuses PTPC quantization into Gate/Up"
+            if problem.gateup_dim != FULL_ROW_BLOCK_N:
+                return "BLOCK_N=512 Gate/Up needs gateup_dim == 512"
         if self.use_prefill and problem.gateup_dim % self.BLOCK_N != 0:
             return (
                 f"gateup_dim={problem.gateup_dim} is not divisible by "
@@ -210,6 +242,8 @@ def _get_compiled_kernel(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    sort_block_m=None,
+    fuse_quant=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -232,6 +266,8 @@ def _get_compiled_kernel(
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
+        sort_block_m=sort_block_m,
+        fuse_quant=fuse_quant,
     )
 
 
@@ -287,16 +323,25 @@ def _run_prefill(
     activation_str: str,
     swiglu_limit: float | None,
 ):
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+    # The M128 Down consumes native sort128 blocks; M64 Gate/Up tiles split them.
+    sort_block_m = 128 if _is_m128_path(config.down_path) else config.BLOCK_M
+    # sorted_sum writes every output row, so the sort need not zero an output buffer.
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
         problem.model_dim,
         hidden_states.dtype,
-        config.BLOCK_M,
+        sort_block_m,
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        accumulate=False,
+    )
+    cur_out = torch.empty(
+        [problem.batch, problem.model_dim],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
@@ -318,7 +363,25 @@ def _run_prefill(
         gateup_in = hidden_states
         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
-    gemm1_out = _gateup_output(hidden_states, problem)
+    # A full-row (BLOCK_N=512) Gate/Up quantizes its BF16 output per token itself.
+    fuse_quant = (
+        weight_dtype_str == "fp8"
+        and quant_type == QuantType.per_Token
+        and config.BLOCK_N == FULL_ROW_BLOCK_N
+    )
+    if fuse_quant:
+        gemm1_out = torch.empty(
+            [problem.batch * problem.topk, problem.inter_dim],
+            dtype=w2.dtype,
+            device=hidden_states.device,
+        )
+        gemm1_scale = torch.empty(
+            [problem.batch * problem.topk, 1],
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+    else:
+        gemm1_out = _gateup_output(hidden_states, problem)
     gateup_kernel = _get_compiled_kernel(
         N=problem.gateup_dim,
         K=problem.hidden_dim,
@@ -334,6 +397,8 @@ def _run_prefill(
         act_quant_type_str=act_quant_type_str,
         activation_str=activation_str,
         swiglu_limit=swiglu_limit,
+        sort_block_m=sort_block_m,
+        fuse_quant=fuse_quant,
     )
     task_num = int(sorted_expert_ids.shape[0])
     _launch(
@@ -347,11 +412,14 @@ def _run_prefill(
         num_valid_ids,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
         a_scale,
+        *((gemm1_scale,) if fuse_quant else ()),
         problem.batch,
-        task_num,
+        task_num * (sort_block_m // config.BLOCK_M),
     )
 
-    if weight_dtype_str == "fp8":
+    if fuse_quant:
+        down_in, down_in_scale = gemm1_out, gemm1_scale
+    elif weight_dtype_str == "fp8":
         down_in, down_in_scale = quant_func(
             gemm1_out.view(problem.batch * problem.topk, -1),
             scale=None,
@@ -367,7 +435,7 @@ def _run_prefill(
         + config.down_output_padding_bytes // hidden_states.element_size()
     )
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
+        [sorted_expert_ids.shape[0] * sort_block_m, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )

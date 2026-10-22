@@ -53,6 +53,19 @@ def compile_moe_gemm2(
             f"down prefill requires N to be divisible by 256 for paired "
             f"128-wide tiles, got N={N}"
         )
+    if down_path.startswith("m128"):
+        from .gemm2_m128 import _build_moe_gemm2_m128, m128_oc_splits
+
+        assert alg == "prefill_1x4" and weight_dtype == "fp8"
+        return _build_moe_gemm2_m128(
+            N=N,
+            K=K,
+            weight_quant_type=weight_quant_type,
+            act_quant_type=act_quant_type,
+            TOPK=TOPK,
+            padding=down_output_padding_bytes,
+            oc_splits=m128_oc_splits(down_path),
+        )
     if down_path != "default":
         assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
         assert weight_dtype == "fp8"
