@@ -11,6 +11,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from . import common as fxh
 from .common import (
     _f32_to_bf16,
@@ -42,11 +44,16 @@ def compile_moe_gemm1(
     fused_down_clear=False,
     sort_block_m=None,
     fuse_quant=False,
+    wave_grid=None,
+    persistent=False,
 ):
     TILE_K = 64
     # prefill_1x4 waves split BN into 16-channel groups; a full 512-wide row uses 8.
-    GU_WAVES = max(4, BLOCK_TILE_SIZE_N // 64)
+    GU_WAVE_M, GU_WAVE_N = wave_grid or (1, max(4, BLOCK_TILE_SIZE_N // 64))
+    GU_WAVES = GU_WAVE_M * GU_WAVE_N
     GU_THREADS = 64 * GU_WAVES
+    assert GU_WAVES in (4, 8)
+    assert wave_grid is None or alg == "prefill_1x4"
     sort_block_m = sort_block_m or BLOCK_TILE_SIZE_M
     assert sort_block_m % BLOCK_TILE_SIZE_M == 0
     assert sort_block_m == BLOCK_TILE_SIZE_M or alg == "prefill_1x4"
@@ -155,6 +162,7 @@ def compile_moe_gemm1(
             f"TILE_K={TILE_K}, dtype={'fp8' if weight_dtype == 'fp8' else 'bf16'})"
         )
         _, xcd_count = get_down_device_config()
+        gu_worker_count = get_cu_num()
         num_n_blocks = N // BLOCK_TILE_SIZE_N
 
     if weight_dtype == "bf16":
@@ -317,7 +325,7 @@ def compile_moe_gemm1(
             k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
-            fx.make_layout((GU_WAVES, 1, 1), (1, 0, 0)),
+            fx.make_layout((GU_WAVE_N, GU_WAVE_M, 1), (1, GU_WAVE_N, 0)),
             fx.make_tile(None, None, k_perm),
         )
         return mma_atom, tiled_mma
@@ -488,7 +496,9 @@ def compile_moe_gemm1(
                 rocdl.sched_mfma(1)
                 used += 1
             if const_expr(mfma_cnt - n_dswr * 2 - used > 0):
-                rocdl.sched_mfma(mfma_cnt - n_dswr * 2 - used)
+                remaining_before_stores = mfma_cnt - n_dswr * 2 - used
+                rocdl.sched_mfma(remaining_before_stores)
+                used += remaining_before_stores
             for _ in range_constexpr(n_dswr):
                 rocdl.sched_dswr(1)
                 rocdl.sched_mfma(2)
@@ -593,8 +603,8 @@ def compile_moe_gemm1(
                 cp_atom_scale = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
                 scale_copy = fx.make_tiled_copy(
                     cp_atom_scale,
-                    fx.make_layout(((16, 4, GU_WAVES), 4), ((0, 4, 16), 1)),
-                    fx.make_tile(16 * GU_WAVES),
+                    fx.make_layout(((16, 4, (GU_WAVE_N, GU_WAVE_M)), 4), ((0, 4, (16, 0)), 1)),
+                    fx.make_tile(16 * GU_WAVE_N),
                 )
                 sg_thr = scale_copy.get_slice(tid).partition_S(scale_gate)
                 su_thr = scale_copy.get_slice(tid).partition_S(scale_up)
@@ -941,8 +951,8 @@ def compile_moe_gemm1(
             0,
         )
 
-    @flyc.kernel
-    def moe_2stage_gateup_prefill_1x4(
+    @flyc.jit
+    def _gateup_prefill_task(
         p_input: fx.Pointer,
         p_weight: fx.Pointer,
         p_output: fx.Pointer,
@@ -954,6 +964,7 @@ def compile_moe_gemm1(
         p_a_scale: fx.Pointer,
         p_out_scale: fx.Pointer,
         M: fx.Int32,
+        task: fx.Uint32,
     ):
         tid = gpu.thread_idx.x
 
@@ -966,15 +977,6 @@ def compile_moe_gemm1(
             fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid_ids)), fx.make_layout(1, 1)
         )
         max_valid_id = num_valid_buf[0]
-        # Workgroup w runs on XCD w % xcd_count; give each XCD a contiguous range of
-        # (M block, N block) tasks so one expert's weights and each A tile stay in one L2.
-        wg = fx.Uint32(gpu.block_idx.x)
-        valid_tasks = (
-            (fx.Uint32(max_valid_id) + (BLOCK_TILE_SIZE_M - 1)) // BLOCK_TILE_SIZE_M
-        ) * num_n_blocks
-        chunk = valid_tasks // xcd_count
-        mapped = (wg % xcd_count) * chunk + wg // xcd_count
-        task = fx.Uint32(arith.select(wg < chunk * xcd_count, mapped, wg))
         blk_n = fx.Int32(task % num_n_blocks)
         e_idx = fx.Int32(task // num_n_blocks)
         if const_expr(weight_dtype != fx.BFloat16):
@@ -1016,6 +1018,7 @@ def compile_moe_gemm1(
 
             # Capture scatter indices before a_ping reuses sorted_lds.
             if const_expr(not fuse_quant):
+                output_tid = tid % 256
                 arg_p_output = fx.make_view(
                     fxh._as_ptr(p_output),
                     fx.make_layout((M, TOPK, N // 2), (TOPK * N // 2, N // 2, 1)),
@@ -1040,7 +1043,7 @@ def compile_moe_gemm1(
                     fx.make_tile(32),
                 )
                 c_out_index_frag = _read_sorted_index(
-                    c_index_copy, tid, lds.sorted_lds
+                    c_index_copy, output_tid, lds.sorted_lds
                 )
                 c_out = TensorWithIndex(
                     out_tensor,
@@ -1048,7 +1051,7 @@ def compile_moe_gemm1(
                     contiguous_n,
                     c_out_index_frag,
                     c_rw_copy,
-                    tid,
+                    output_tid,
                     is_read_from_mem=False,
                     TOPK=TOPK,
                 )
@@ -1057,8 +1060,8 @@ def compile_moe_gemm1(
             if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
                 asc_index_copy = fx.make_tiled_copy(
                     fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                    fx.make_layout(((16, 4, GU_WAVES), 1), ((1, 0, 0), 0)),
-                    fx.make_tile(16),
+                    fx.make_layout(((16, 4, (GU_WAVE_N, GU_WAVE_M)), 1), ((1, 0, (0, 16)), 0)),
+                    fx.make_tile(16 * GU_WAVE_M),
                 )
                 cp_atom_idx = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
                 asc_lds = fx.make_view(
@@ -1133,9 +1136,49 @@ def compile_moe_gemm1(
             if const_expr(fuse_quant):
                 _quantize_rows(tid, lds_c, routes, M, p_output, p_out_scale)
             else:
-                rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
-                fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-                c_out.copy(buf_atom_w128, blk_n, rd)
+                def store_routed_output():
+                    rd = fx.make_fragment_like(c_rw_copy.get_slice(output_tid).partition_S(lds_c))
+                    fx.copy(cshuf_atom_r, c_rw_copy.get_slice(output_tid).partition_S(lds_c), rd)
+                    c_out.copy(buf_atom_w128, blk_n, rd)
+
+                if tid < 256:
+                    store_routed_output()
+            if const_expr(persistent):
+                gpu.barrier()
+
+    @flyc.kernel
+    def moe_2stage_gateup_prefill_1x4(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
+        p_out_scale: fx.Pointer,
+        M: fx.Int32,
+    ):
+        valid_rows = fx.recast_iter(fx.Uint32, fxh._as_ptr(p_num_valid_ids))[0]
+        valid_tasks = ((valid_rows + BLOCK_TILE_SIZE_M - 1) // BLOCK_TILE_SIZE_M) * num_n_blocks
+        chunk = valid_tasks // xcd_count
+        worker = fx.Uint32(gpu.block_idx.x)
+
+        def process(rank):
+            mapped = (rank % xcd_count) * chunk + rank // xcd_count
+            task = (rank < chunk * xcd_count).select(mapped, rank)
+            _gateup_prefill_task(
+                p_input, p_weight, p_output, p_sorted_ids, p_sorted_weights,
+                p_sorted_expert_ids, p_num_valid_ids, p_w_scale, p_a_scale,
+                p_out_scale, M, task,
+            )
+
+        if const_expr(persistent):
+            for rank in range(worker, valid_tasks, fx.Uint32(gu_worker_count)):
+                process(rank)
+        else:
+            process(worker)
 
     @flyc.jit
     def launch_splitk(
@@ -1227,7 +1270,7 @@ def compile_moe_gemm1(
             p_a_scale,
             M,
         ).launch(
-            grid=(num_n_blocks * task_num, 1, 1),
+            grid=(gu_worker_count if persistent else num_n_blocks * task_num, 1, 1),
             block=(GU_THREADS, 1, 1),
             stream=stream,
         )
@@ -1264,7 +1307,7 @@ def compile_moe_gemm1(
             p_out_scale,
             M,
         ).launch(
-            grid=(task_num, 1, 1),
+            grid=(gu_worker_count if persistent else task_num, 1, 1),
             block=(GU_THREADS, 1, 1),
             stream=stream,
         )

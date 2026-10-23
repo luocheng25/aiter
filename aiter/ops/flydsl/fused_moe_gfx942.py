@@ -25,7 +25,7 @@ FULL_ROW_BLOCK_N = 512
 
 
 def _is_m128_path(down_path):
-    return down_path == "m128" or down_path.startswith("m128_oc")
+    return down_path in ("m128", "m128_lds", "m128_regs", "m128_lds_regs", "m128_packed", "m128_pipe") or down_path.startswith("m128_oc")
 
 
 def _m128_oc(down_path):
@@ -51,6 +51,7 @@ class Config:
             "default",
             "1x4_64x256",
             "8x1_compact",
+            "8x1_single",
         ) and not _is_m128_path(self.down_path):
             raise ValueError(f"Unsupported Down path: {self.down_path}")
         if self.down_output_padding_bytes not in (0, 32, 64, 128):
@@ -112,16 +113,23 @@ class Config:
             if problem.quant_type not in ("", "ptpc", "per_tensor"):
                 return "specialized Down paths require FP8 weights"
             if _is_m128_path(self.down_path):
+                if self.down_path in ("m128_packed", "m128_pipe") and self.down_output_padding_bytes:
+                    return "M128 packed output does not support padding"
                 if self.BLOCK_M not in (64, 128):
                     return "M128 Down requires Gate/Up BLOCK_M 64 or 128"
+                if self.down_path in ("m128_lds", "m128_lds_regs") and problem.inter_dim != 256:
+                    return "M128 shared-LDS Down requires inter_dim == 256"
                 if problem.inter_dim % 64 != 0 or not 64 <= problem.inter_dim <= 256:
                     return "M128 Down requires inter_dim in {64,128,192,256}"
                 if problem.model_dim % (64 * _m128_oc(self.down_path)) != 0:
                     return "M128 Down requires model_dim divisible by 64*OC"
-        if self.down_path in ("1x4_64x256", "8x1_compact"):
+        if self.down_path in ("1x4_64x256", "8x1_compact", "8x1_single"):
             if self.BLOCK_M != 64:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
-            if self.down_path == "8x1_compact":
+            if self.down_path == "8x1_single":
+                if problem.inter_dim not in (256, 384, 512, 640):
+                    return "single-launch Down requires inter_dim in {256,384,512,640}"
+            if self.down_path in ("8x1_compact", "8x1_single"):
                 if problem.inter_dim not in (192, 256, 384, 512, 640):
                     return "compact Down requires inter_dim in {192,256,384,512,640}"
                 if problem.model_dim < 512:
@@ -206,7 +214,7 @@ class _Problem:
 
 
 def get_tune_space():
-    prefill = [(256, 128), (128, 256), (128, 128)]
+    prefill = [(256, 128), (128, 256), (128, 128), (512, 128), (512, 256)]
     configs = [
         Config(16, 16, 16, False),
         Config(16, 16, 16, False, use_batch1_algorithm=True),
@@ -217,7 +225,7 @@ def get_tune_space():
         Config(
             64, block_n, block_k, True, down_path=path, down_output_padding_bytes=128
         )
-        for path in ("1x4_64x256", "8x1_compact")
+        for path in ("1x4_64x256", "8x1_compact", "8x1_single")
         for block_n, block_k in prefill
     )
     return [config.to_string() for config in configs]
@@ -244,6 +252,8 @@ def _get_compiled_kernel(
     fused_down_clear=False,
     sort_block_m=None,
     fuse_quant=False,
+    wave_grid=None,
+    persistent=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -268,6 +278,8 @@ def _get_compiled_kernel(
         fused_down_clear=fused_down_clear,
         sort_block_m=sort_block_m,
         fuse_quant=fuse_quant,
+        wave_grid=wave_grid,
+        persistent=persistent,
     )
 
 
@@ -296,6 +308,31 @@ def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=N
 
 def _empty_scale(device):
     return torch.empty(0, device=device)
+
+
+def _quantize_intermediate(hidden_states, quant_dtype):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.quant import (
+        flydsl_quant_per_token,
+        per_token_quant_supported,
+    )
+
+    cols = hidden_states.shape[-1]
+    if (
+        hidden_states.dtype == torch.bfloat16
+        and quant_dtype == torch.float8_e4m3fnuz
+        and hidden_states.shape[0] >= 4096
+        and per_token_quant_supported(cols)
+    ):
+        output = torch.empty_like(hidden_states, dtype=quant_dtype)
+        scales = torch.empty(
+            (hidden_states.shape[0], 1), dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        flydsl_quant_per_token(quant_dtype, cols)(hidden_states, output, scales)
+        return output, scales
+    return aiter.get_hip_quant(QuantType.per_Token)(
+        hidden_states, scale=None, quant_dtype=quant_dtype, num_rows=None
+    )
 
 
 def _gateup_output(hidden_states: torch.Tensor, problem: _Problem):
@@ -419,6 +456,10 @@ def _run_prefill(
 
     if fuse_quant:
         down_in, down_in_scale = gemm1_out, gemm1_scale
+    elif weight_dtype_str == "fp8" and quant_type == QuantType.per_Token:
+        down_in, down_in_scale = _quantize_intermediate(
+            gemm1_out.view(problem.batch * problem.topk, -1), w2.dtype
+        )
     elif weight_dtype_str == "fp8":
         down_in, down_in_scale = quant_func(
             gemm1_out.view(problem.batch * problem.topk, -1),
@@ -487,6 +528,13 @@ def _run_prefill(
             tail_tasks.shape[0],
             cu_count,
         )
+    elif config.down_path == "8x1_single":
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_8x1_compact import (
+            allocate_expert_tasks,
+        )
+
+        tasks, counts = allocate_expert_tasks(sorted_expert_ids, problem.experts)
+        _launch(down_kernel, *down_args, tasks, counts, tasks.shape[0])
     else:
         _launch(down_kernel, *down_args)
 
@@ -502,7 +550,10 @@ def _run_prefill(
         sorted_ids.shape[0],
         problem.batch,
     )
-    sorted_sum(problem.topk, problem.model_dim, config.down_output_padding_bytes)(
+    sorted_sum(
+        problem.topk, problem.model_dim, config.down_output_padding_bytes,
+        packed_rows=128 if config.down_path in ("m128_packed", "m128_pipe") else 0,
+    )(
         loc_ids, gemm2_out, cur_out, problem.batch
     )
     return cur_out

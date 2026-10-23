@@ -27,7 +27,11 @@ from aiter.fused_moe_registry import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
+from aiter.ops.flydsl.fused_moe_gfx942 import (
+    Config,
+    _quantize_intermediate,
+    get_tune_space,
+)
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
 )
@@ -36,6 +40,9 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.quant import (
+    flydsl_quant_per_token,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -229,6 +236,79 @@ def test_sorted_sum(token, model_dim, topk, padding):
     }
 
 
+@benchmark()
+def test_short_quant(rows, cols, case):
+    source = torch.randn((rows, cols), dtype=dtypes.bf16)
+    if case == "zero":
+        source.zero_()
+    elif case == "rounding":
+        source.copy_(
+            ((torch.arange(rows * cols) % 512 - 256) / 16).reshape(rows, cols)
+        )
+    torch_scale = source.float().abs().amax(dim=-1, keepdim=True) * (
+        1.0 / torch.finfo(dtypes.fp8).max
+    )
+    hip_quant = aiter.get_hip_quant(QuantType.per_Token)
+    expected, expected_scale = hip_quant(source, quant_dtype=dtypes.fp8)
+    byte_storage = torch.full((rows + 2, cols), 0x55, dtype=torch.uint8)
+    scale_storage = torch.full((rows + 2, 1), CANARY, dtype=dtypes.fp32)
+    output = byte_storage[1:-1].view(dtypes.fp8)
+    scales = scale_storage[1:-1]
+    kernel = flydsl_quant_per_token(dtypes.fp8, cols)
+
+    def run_flydsl():
+        kernel(source, output, scales)
+        return output, scales
+
+    candidates = {
+        "hip": lambda: hip_quant(source, quant_dtype=dtypes.fp8),
+        "flydsl": run_flydsl,
+    }
+    result = {}
+    nbytes = source.nbytes + output.nbytes + scales.nbytes
+    flops = source.numel() + rows
+    for name, candidate in candidates.items():
+        (actual, actual_scale), us = run_perftest(candidate)
+        err = checkAllclose(
+            expected.view(torch.uint8).float(), actual.view(torch.uint8).float(),
+            rtol=0, atol=0, msg=f"{name} FP8 bytes",
+        )
+        scale_err = checkAllclose(
+            torch_scale, actual_scale, rtol=0, atol=0, msg=f"{name} row scale"
+        )
+        assert err == 0 and scale_err == 0
+        assert torch.equal(expected_scale, actual_scale)
+        result.update({
+            f"{name} us": us,
+            f"{name} TFLOPS": flops / us / 1e6,
+            f"{name} TB/s": nbytes / us / 1e6,
+            f"{name} err": err,
+        })
+    with patch(
+        "aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.quant.flydsl_quant_per_token",
+        wraps=flydsl_quant_per_token,
+    ) as factory:
+        dispatched, dispatched_scale = _quantize_intermediate(source, dtypes.fp8)
+        assert factory.called == (rows >= 4096)
+    assert torch.equal(expected.view(torch.uint8), dispatched.view(torch.uint8))
+    assert torch.equal(expected_scale, dispatched_scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_flydsl()
+        run_flydsl()
+    for zero in (True, False, True):
+        source.zero_() if zero else source.normal_()
+        graph.replay()
+        expected, expected_scale = hip_quant(source, quant_dtype=dtypes.fp8)
+        assert torch.equal(expected.view(torch.uint8), output.view(torch.uint8))
+        assert torch.equal(expected_scale, scales)
+    assert bool((byte_storage[0] == 0x55).all())
+    assert bool((byte_storage[-1] == 0x55).all())
+    assert bool((scale_storage[0] == CANARY).all())
+    assert bool((scale_storage[-1] == CANARY).all())
+    return result
+
+
 def test_config_strings():
     for encoded in get_tune_space():
         assert Config.from_string(encoded).to_string() == encoded
@@ -404,6 +484,45 @@ def run_compact(impl, request, experts, cu_count):
     return output, f"{full}/{tail}"
 
 
+def run_single(impl, request, experts):
+    """Run with guarded expert task buffers; every M64 block is covered exactly once."""
+    allocations = []
+
+    def guarded(sorted_expert_ids, task_experts):
+        capacity = compact.expert_task_capacity(sorted_expert_ids.numel(), task_experts)
+        storages, buffers = [], []
+        for shape in ((capacity, 2), (2,)):
+            storage = torch.full(
+                (torch.Size(shape).numel() + 2 * GUARD,),
+                CANARY,
+                dtype=torch.int32,
+                device=sorted_expert_ids.device,
+            )
+            storages.append(storage)
+            buffers.append(storage[GUARD:-GUARD].view(shape))
+        allocations.append((sorted_expert_ids, storages, buffers))
+        return buffers
+
+    with patch.object(compact, "allocate_expert_tasks", guarded):
+        output = impl(request)
+    metadata, storages, (tasks, counts) = allocations[-1]
+    check_guards(storages)
+    sizes = torch.bincount(request.topk_ids.flatten().long(), minlength=experts)
+    expert_blocks = (sizes + 63) // 64
+    blocks = metadata[: int(expert_blocks.sum())].tolist()
+    count = int(counts[0]) // 256
+    assert count == int(((expert_blocks + 3) // 4).sum()), "wrong task count"
+    coverage = [0] * len(blocks)
+    for row_begin, entry in tasks[:count].tolist():
+        expert, task_blocks = entry & 0xFFFF, entry >> 16
+        assert row_begin % 64 == 0 and 1 <= task_blocks <= 4
+        for block in range(row_begin // 64, row_begin // 64 + task_blocks):
+            assert blocks[block] == expert, "task routed to another expert"
+            coverage[block] += 1
+    assert coverage == [1] * len(blocks), "blocks not covered exactly once"
+    return output, f"{count}/0"
+
+
 def rms_error(expected, actual, rms):
     """Largest elementwise difference in units of the token's reference RMS."""
     return float(((actual.float() - expected.float()).abs() / rms).max())
@@ -441,6 +560,8 @@ def check_moe(
                     other, _ = run_compact(impl, request, experts, cu_count)
                 diff = rms_error(output, other, rms)
                 assert diff < PATH_DIFF_LIMIT, f"{config} at {cu_count} CUs: {diff=}"
+    elif parsed.down_path == "8x1_single":
+        output, tasks = run_single(impl, request, experts)
     else:
         output = impl(request)
     err = check_output(reference, output, config)
@@ -524,13 +645,14 @@ EDGE_CASES = [
             f"64_256_128_True:{path}:128",
         )
         for routing in ("random", "hot")
-        for path in ("8x1_compact", "1x4_64x256")
+        for path in ("8x1_compact", "1x4_64x256", "8x1_single")
     ),
     # One expert with 64 full tasks: kept on 80 CUs, split into tails on 304.
     *(
         (16384, 1024, 384, 1, 1, "per_tensor", "silu", "hot", config)
         for config in (
             "64_256_128_True:8x1_compact:128",
+            "64_256_128_True:8x1_single:128",
             "64_256_128_True:1x4_64x256:128",
             "64_256_128_True:default:0",
         )
@@ -548,8 +670,17 @@ EDGE_CASES = [
             "random",
             f"64_256_128_True:{path}:{padding}",
         )
-        for path in ("8x1_compact", "1x4_64x256")
+        for path in ("8x1_compact", "1x4_64x256", "8x1_single")
         for padding in (0, 32, 64)
+    ),
+    # Single-launch Down for the other K128n inter_dims, with partial and whole M256 tasks.
+    *(
+        (8192, 1024, inter_dim, 64, 4, "ptpc", "silu", "random", config)
+        for inter_dim in (384, 640)
+        for config in (
+            "64_256_128_True:8x1_compact:128",
+            "64_256_128_True:8x1_single:128",
+        )
     ),
 ]
 
@@ -581,6 +712,17 @@ def main():
     args = parser.parse_args()
 
     test_config_strings()
+    summarize(
+        "Short-row FP8 quantization",
+        [
+            test_short_quant(rows, cols, case)
+            for rows, cols, case in itertools.product(
+                (1, 17, 33, 4096),
+                (192, 256, 384, 512, 640, 1024),
+                ("random", "zero", "rounding"),
+            )
+        ],
+    )
     summarize(
         "Compact task table",
         [

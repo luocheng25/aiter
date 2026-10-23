@@ -209,20 +209,46 @@ def _input_tensor(p_input, M, TOPK, K):
     )
 
 
-def _sorted_ids_tensor(p_sorted_ids, row_begin, rows):
+def _sorted_ids_tensor(p_sorted_ids, row_begin, rows, valid_rows=None):
     return fx.rocdl.make_buffer_tensor(
         fxh.view_as_torch_tensor(
             fxh._as_ptr(p_sorted_ids) + fx.Int64(row_begin), (rows,), fx.Int32
         ),
         max_size=False,
-        num_records_bytes=rows * 4,
+        num_records_bytes=rows * 4 if valid_rows is None else fx.Int64(valid_rows) * 4,
     )
 
 
-def _routing_scale(p_sorted_weights, row_begin, rows):
-    return fxh.view_as_torch_tensor(
+def _routing_scale(p_sorted_weights, row_begin, rows, valid_rows=None):
+    view = fxh.view_as_torch_tensor(
         fxh._as_ptr(p_sorted_weights) + fx.Int64(row_begin), (rows,), fx.Float32
     )
+    if valid_rows is None:
+        return view
+    # A partial task may end at the metadata end; rows past it read zero.
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=False, num_records_bytes=fx.Int64(valid_rows) * 4
+    )
+
+
+# Element offset past every Down output buffer, still a positive Int32 in bytes.
+_OUTPUT_OOB_ELEMENTS = 0x20000000
+
+
+def _row_valid_bits(sorted_lds, rows, M, task_rows):
+    """Bit i: rows[i] is a route row inside the task. Pinned before sorted_lds is reused."""
+    bits = fx.Int32(0)
+    for index, row in enumerate(rows):
+        valid = (sorted_lds[row].bitcast(fx.Uint32) & 0xFFFFFF) < fx.Uint32(M)
+        if task_rows is not None:
+            valid = valid & (row < task_rows)
+        bits = bits | valid.select(fx.Int32(1 << index), fx.Int32(0))
+    return _pin_vgpr(bits)
+
+
+def _mask_output_offset(offset, bits, index):
+    valid = ((bits >> index) & 1) != 0
+    return valid.select(offset, fx.Int32(_OUTPUT_OOB_ELEMENTS))
 
 
 def _expert_weights(p_weight, expert, N, K):
@@ -702,13 +728,24 @@ def _run_8x1_pipeline(
 
 
 # ==================== Entry point ====================
-def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, padding):
-    """M256 full-task kernel of the compact Down path; the compact builder validates shapes."""
+def _build_moe_gemm2_8x1(
+    *, N, K, weight_quant_type, act_quant_type, TOPK, padding,
+    mask_rows=False, partial_tasks=False,
+):
+    """M256 task kernel of the compact/single Down paths; their builders validate shapes.
+
+    ``mask_rows`` drops stores of padding rows. ``partial_tasks`` reads tasks whose
+    expert entry packs an M64 block count above the expert, so the M256 tile may
+    cover fewer rows; it implies ``mask_rows``.
+    """
     BM = 256
     ops = FlyObjCache(cache_ir=False)
     topology, xcc_count = get_down_device_config()
     se_count = xcc_count * 4
     emit_body = _emit_k192_body if K == 192 else _emit_k128n_body
+    assert not partial_tasks or mask_rows
+    assert K != 192 or not mask_rows, "row masking is implemented for K128n only"
+    body_options = () if K == 192 else (mask_rows, partial_tasks)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def moe_2stage_down_prefill_8x1(
@@ -780,6 +817,7 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
                 weight_quant_type,
                 act_quant_type,
                 ops,
+                *body_options,
             )
 
     @flyc.jit
@@ -843,6 +881,8 @@ def _emit_k128n_body(
     weight_quant_type,
     act_quant_type,
     ops,
+    mask_rows=False,
+    partial_tasks=False,
 ):
     BM = 256
     BN = 128
@@ -865,10 +905,15 @@ def _emit_k128n_body(
     assert OUTPUT_STORES_PER_WAVE == 8
 
     row_begin = p_sorted_expert_ids[2 * e_idx]
+    task_rows = None
+    if const_expr(partial_tasks):
+        task_rows = (p_sorted_expert_ids[2 * e_idx + 1] >> 16) * 64
     input_tensor = _input_tensor(p_input, M, TOPK, K)
-    sorted_ids = _sorted_ids_tensor(p_sorted_ids, row_begin, BM)
-    sorted_weights = _routing_scale(p_sorted_weights, row_begin, BM)
+    sorted_ids = _sorted_ids_tensor(p_sorted_ids, row_begin, BM, task_rows)
+    sorted_weights = _routing_scale(p_sorted_weights, row_begin, BM, task_rows)
     expert_id = p_sorted_expert_ids[2 * e_idx + 1]
+    if const_expr(partial_tasks):
+        expert_id = expert_id & 0xFFFF
 
     shared_allocator = fx.SharedAllocator()
     weight_slots = shared_allocator.allocate(
@@ -882,7 +927,11 @@ def _emit_k128n_body(
         fx.recast_iter(fx.Int32, cshuffle_storage.peek().ptr), fx.make_layout(BM, 1)
     )
     if tid < BM:
-        sorted_lds[tid] = sorted_ids[tid]
+        if const_expr(partial_tasks):
+            # Rows past a partial task decode as padding, so their A, scales and MFMAs are zero.
+            sorted_lds[tid] = (tid < task_rows).select(sorted_ids[tid], M)
+        else:
+            sorted_lds[tid] = sorted_ids[tid]
     gpu.barrier()
 
     mm = ops.create_thr_mma(fx.Float8E4M3FNUZ, (1, NUM_WAVES, 1))
@@ -1021,12 +1070,18 @@ def _emit_k128n_body(
             fx.rocdl.sched_barrier(0)
             output_fragments.append(fragment_pair)
             destination_index = n_half * 2 + output_row_half
+            destination_offset = output_destination_offsets[row_pair][
+                destination_index
+            ]
+            if const_expr(mask_rows):
+                destination_offset = _mask_output_offset(
+                    destination_offset, row_valid_bits, row_pair * 2 + output_row_half
+                )
             destinations.append(
                 (
                     block_n,
                     fx.make_view(
-                        fx.get_iter(output_tensor)
-                        + output_destination_offsets[row_pair][destination_index],
+                        fx.get_iter(output_tensor) + destination_offset,
                         fx.make_layout(8, 1),
                     ),
                 )
@@ -1108,10 +1163,25 @@ def _emit_k128n_body(
                     + output_row_half * 8
                     + lane // 8
                 )
-                row_pair_offsets.append(
-                    output_tensor.layout(output_atom * 8, output_row)
-                )
+                if const_expr(mask_rows):
+                    row_pair_offsets.append(output_atom * 8 + output_row * STRIDE)
+                else:
+                    row_pair_offsets.append(
+                        output_tensor.layout(output_atom * 8, output_row)
+                    )
         output_destination_offsets.append(row_pair_offsets)
+    row_valid_bits = None
+    if const_expr(mask_rows):
+        row_valid_bits = _row_valid_bits(
+            sorted_lds,
+            [
+                wave * 16 + row_pair * (NUM_WAVES * 16) + output_row_half * 8 + lane // 8
+                for row_pair in range_constexpr(WAVE_M // 16)
+                for output_row_half in range_constexpr(2)
+            ],
+            M,
+            task_rows,
+        )
 
     # Prepare only C read pointers here; side-effecting pins still follow A loads.
     cshuffle_read_bases = []

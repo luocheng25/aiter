@@ -79,6 +79,14 @@ def _lds_load(address, words):
     return Vec(llvm.load(vector, _lds_pointer(address), alignment=4 * words))
 
 
+def _dma(rsrc, lds_address, voffset, soffset):
+    rocdl.raw_ptr_buffer_load_async_lds(
+        rsrc, _lds_pointer(lds_address), fx.Int32(4).ir_value(),
+        fx.Int32(voffset).ir_value(), fx.Int32(soffset).ir_value(),
+        fx.Int32(0).ir_value(), aux=_aux(0),
+    )
+
+
 def _mfma(weight, activation, acc):
     return Vec(
         rocdl.mfma_f32_16x16x32_fp8_fp8(
@@ -95,7 +103,7 @@ def _halves(packet):
 
 def m128_oc_splits(down_path):
     """`m128` uses OC4; `m128_ocS` selects S output-column splits per M128 block."""
-    if down_path == "m128":
+    if down_path in ("m128", "m128_lds", "m128_regs", "m128_lds_regs", "m128_packed", "m128_pipe"):
         return 4
     prefix = "m128_oc"
     if not down_path.startswith(prefix) or not down_path[len(prefix):].isdigit():
@@ -104,11 +112,16 @@ def m128_oc_splits(down_path):
 
 
 def _build_moe_gemm2_m128(
-    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, oc_splits
+    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, oc_splits,
+    shared_lds=False,
+    register_shuffle=False,
+    packed_output=False,
+    shared_subpacket=False,
 ):
     assert K % 64 == 0 and 64 <= K <= 256, "M128 Down supports K in {64,...,256}"
     assert N % (oc_splits * PACKET_N) == 0, "N/OC must be a multiple of 64"
     assert padding in (0, 32, 64, 128)
+    assert not packed_output or padding == 0
     assert weight_quant_type in ("ptpc", "per_tensor")
     assert act_quant_type in ("ptpc", "per_tensor")
     _, xcd_count = get_down_device_config()
@@ -116,7 +129,22 @@ def _build_moe_gemm2_m128(
     N_OC = N // oc_splits
     PACKETS = N_OC // PACKET_N
     STRIDE = (N + padding // 2) * 2
-    WAVE_LDS = 32 * 128
+    SUB_KB = 2 if K % 128 == 0 else 1
+    SUBS_PER_PACKET = KB // SUB_KB
+    RING_SLOTS = 3 if SUB_KB == 2 else 4
+    half_shuffle = shared_subpacket and SUB_KB == 2
+    WAVE_LDS = (16 if half_shuffle else 32) * 128
+    packet_bytes = PACKET_N * K
+    subpacket_bytes = PACKET_N * 64 * SUB_KB
+    ring_bytes = RING_SLOTS * subpacket_bytes
+    if shared_subpacket:
+        shared_bytes = ring_bytes + WAVES * WAVE_LDS
+    elif register_shuffle:
+        shared_bytes = 2 * packet_bytes if shared_lds else 16
+    else:
+        shared_bytes = packet_bytes + WAVES * WAVE_LDS if shared_lds else WAVES * WAVE_LDS
+    assert not shared_lds or K == 256
+    assert shared_bytes <= 32 * 1024
     assert BLOCK_M * STRIDE < OOB
 
     @flyc.kernel(known_block_size=[WAVES * 64, 1, 1])
@@ -150,10 +178,11 @@ def _build_moe_gemm2_m128(
             expert = fx.Int32(p_sorted_expert_ids[m_block])
 
             storage = fx.SharedAllocator().allocate(
-                fx.Array[fx.Int32, WAVES * WAVE_LDS // 4, 16]
+                fx.Array[fx.Int32, shared_bytes // 4, 16]
             )
-            lds_view = storage.peek().view(fx.make_layout(WAVES * WAVE_LDS // 4, 1))
-            lds_base = fx.Int32(fx.ptrtoint(fx.get_iter(lds_view))) + wave * WAVE_LDS
+            lds_view = storage.peek().view(fx.make_layout(shared_bytes // 4, 1))
+            storage_base = fx.Int32(fx.ptrtoint(fx.get_iter(lds_view)))
+            lds_base = storage_base + (ring_bytes if shared_subpacket else packet_bytes if shared_lds else 0) + wave * WAVE_LDS
 
             ids_rsrc = _rsrc(fxh._as_ptr(p_sorted_ids, fx.Int32) + fx.Int64(row_begin), BLOCK_M * 4)
             routing_rsrc = _rsrc(
@@ -168,6 +197,33 @@ def _build_moe_gemm2_m128(
                 fxh._as_ptr(p_output, fx.BFloat16) + fx.Int64(row_begin) * (STRIDE // 2),
                 BLOCK_M * STRIDE,
             )
+
+            def issue_packet(packet):
+                slot = storage_base + ((packet % 2) * packet_bytes if register_shuffle else 0)
+                start = (n_begin + packet * PACKET_N) * K
+                for turn in range_constexpr(packet_bytes // WAVES // 256):
+                    offset = wave * (packet_bytes // WAVES) + turn * 256
+                    _dma(weight_rsrc, slot + offset, lane * 4, start + offset)
+                rocdl.asyncmark()
+
+            def issue_subpacket(subpacket):
+                subpacket = fx.Int32(subpacket)
+                packet = subpacket // SUBS_PER_PACKET
+                kb = (subpacket % SUBS_PER_PACKET) * SUB_KB
+                slot = storage_base + (subpacket % RING_SLOTS) * subpacket_bytes
+                source = (n_begin + packet * PACKET_N + wave * 16) * K + kb * 1024
+                for turn in range_constexpr(4 * SUB_KB):
+                    offset = (subpacket < PACKETS * SUBS_PER_PACKET).select(source + turn * 256, fx.Int32(OOB))
+                    _dma(weight_rsrc, slot + wave * SUB_KB * 1024 + turn * 256, lane * 4, offset)
+                rocdl.asyncmark()
+
+            if const_expr(shared_subpacket):
+                for prefetch in range_constexpr(RING_SLOTS - 1):
+                    issue_subpacket(fx.Int32(prefetch))
+            if const_expr(shared_lds):
+                issue_packet(fx.Int32(0))
+                if const_expr(register_shuffle and PACKETS > 1):
+                    issue_packet(fx.Int32(1))
 
             def decode(row):
                 encoded = _load(ids_rsrc, row * 4, 0, 1).bitcast(fx.Uint32)
@@ -212,7 +268,7 @@ def _build_moe_gemm2_m128(
                 row = wave * 32 + s * 8 + lane // 8
                 valid, _ = decode(row)
                 store_offsets.append(
-                    valid.select(row * STRIDE + (lane % 8) * 16, fx.Int32(OOB))
+                    valid.select(row * (128 if packed_output else STRIDE) + (lane % 8) * 16, fx.Int32(OOB))
                 )
 
             # Wave-private CShuffle: chunk c of row r lives at chunk c ^ (r % 8); rows with
@@ -232,11 +288,19 @@ def _build_moe_gemm2_m128(
 
             def load_packet(packet):
                 n0 = n_begin + packet * PACKET_N
-                weights = [
-                    _load(weight_rsrc, weight_lane + kb * 1024, (n0 + 16 * j) * K, 4)
-                    for j in range_constexpr(4)
-                    for kb in range_constexpr(KB)
-                ]
+                if const_expr(shared_lds):
+                    slot = storage_base + ((packet % 2) * packet_bytes if register_shuffle else 0)
+                    weights = [
+                        _lds_load(slot + weight_lane + kb * 1024 + channel * 16 * K, 4)
+                        for channel in range_constexpr(4)
+                        for kb in range_constexpr(KB)
+                    ]
+                else:
+                    weights = [
+                        _load(weight_rsrc, weight_lane + kb * 1024, (n0 + 16 * j) * K, 4)
+                        for j in range_constexpr(4)
+                        for kb in range_constexpr(KB)
+                    ]
                 scales = []
                 if const_expr(weight_quant_type == "ptpc"):
                     scales = [
@@ -245,58 +309,176 @@ def _build_moe_gemm2_m128(
                     ]
                 return weights + scales
 
-            def compute_store(packet, state):
+            def store_acc(packet, acc, scales, shuffle_offset=0):
                 n0 = n_begin + packet * PACKET_N
+                output_column = n0 * (BLOCK_M if packed_output else 1) * 2
+                packed_words = []
+                for i in range_constexpr(2):
+                    for j in range_constexpr(4):
+                        values = acc[i][j]
+                        if const_expr(weight_quant_type == "ptpc"):
+                            values = values * Vec(scales[j]).bitcast(fx.Float32)
+                        packed = _f32_to_bf16(values * row_scales[i]).bitcast(fx.Int32)
+                        if const_expr(register_shuffle):
+                            packed_words.extend((packed[0], packed[1]))
+                        else:
+                            _lds_store(write_offsets[j] + (0 if half_shuffle else i * 2048) + shuffle_offset, packed, 8)
+                    if const_expr(half_shuffle):
+                        for part in range_constexpr(2):
+                            chunk = _lds_load(read_offset + part * 1024, 4)
+                            if const_expr(part == 1):
+                                chunk = chunk.shuffle(chunk, [2, 3, 0, 1])
+                            _store(output_rsrc, chunk, store_offsets[i * 2 + part], output_column, DOWN_STORE_CACHE_MODIFIER)
+                if const_expr(register_shuffle):
+                    for lane_mask, register_mask in ((16, 2), (8, 4)):
+                        lane_bit = (lane & lane_mask) != 0
+                        for register in range_constexpr(16):
+                            if const_expr(register & register_mask == 0):
+                                low = packed_words[register]
+                                high = packed_words[register | register_mask]
+                                peer = lane_bit.select(low, high).shuffle_xor(lane_mask, 64)
+                                packed_words[register] = lane_bit.select(peer, low)
+                                packed_words[register | register_mask] = lane_bit.select(high, peer)
+                    source_lane = ((lane >> 3) & 7) | ((lane & 1) << 5) | ((lane & 2) << 3) | ((lane & 4) << 1)
+                    reordered = [
+                        fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, (source_lane * 4).ir_value(), word.ir_value()))
+                        for word in packed_words
+                    ]
+                    for part in range_constexpr(4):
+                        _store(output_rsrc, Vec.from_elements(reordered[4 * part:4 * part + 4], fx.Int32),
+                               store_offsets[part], output_column, DOWN_STORE_CACHE_MODIFIER)
+                elif const_expr(not half_shuffle):
+                    for s in range_constexpr(4):
+                        chunk = _lds_load(read_offset + s * 1024 + shuffle_offset, 4)
+                        if const_expr(s % 2 == 1):
+                            chunk = chunk.shuffle(chunk, [2, 3, 0, 1])
+                        _store(
+                            output_rsrc, chunk, store_offsets[s], output_column,
+                            DOWN_STORE_CACHE_MODIFIER,
+                        )
+
+            def compute_store(packet, state, shuffle_offset=0):
                 weights = [_halves(state[index]) for index in range_constexpr(4 * KB)]
                 acc = [
                     [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(4)]
                     for _ in range_constexpr(2)
                 ]
                 for kb in range_constexpr(KB):
-                    for h in range_constexpr(2):
-                        for j in range_constexpr(4):
-                            for i in range_constexpr(2):
-                                acc[i][j] = _mfma(
-                                    weights[j * KB + kb][h],
-                                    a_halves[i * KB + kb][h],
-                                    acc[i][j],
+                    for half in range_constexpr(2):
+                        for channel in range_constexpr(4):
+                            for height in range_constexpr(2):
+                                acc[height][channel] = _mfma(
+                                    weights[channel * KB + kb][half],
+                                    a_halves[height * KB + kb][half],
+                                    acc[height][channel],
                                 )
-                for i in range_constexpr(2):
-                    for j in range_constexpr(4):
-                        values = acc[i][j]
-                        if const_expr(weight_quant_type == "ptpc"):
-                            values = values * Vec(state[4 * KB + j]).bitcast(fx.Float32)
-                        packed = _f32_to_bf16(values * row_scales[i]).bitcast(fx.Int32)
-                        _lds_store(write_offsets[j] + i * 2048, packed, 8)
-                for s in range_constexpr(4):
-                    chunk = _lds_load(read_offset + s * 1024, 4)
-                    if const_expr(s % 2 == 1):
+                store_acc(packet, acc, state[4 * KB:], shuffle_offset)
+
+            def store_previous_half(packet, previous, height):
+                output_column = (n_begin + packet * PACKET_N) * (BLOCK_M if packed_output else 1) * 2
+                for channel in range_constexpr(4):
+                    values = previous[height * 4 + channel]
+                    if const_expr(weight_quant_type == "ptpc"):
+                        values = values * Vec(previous[8 + channel]).bitcast(fx.Float32)
+                    packed = _f32_to_bf16(values * row_scales[height]).bitcast(fx.Int32)
+                    _lds_store(write_offsets[channel], packed, 8)
+                for part in range_constexpr(2):
+                    chunk = _lds_load(read_offset + part * 1024, 4)
+                    if const_expr(part == 1):
                         chunk = chunk.shuffle(chunk, [2, 3, 0, 1])
-                    _store(output_rsrc, chunk, store_offsets[s], n0 * 2,
-                           DOWN_STORE_CACHE_MODIFIER)
+                    _store(output_rsrc, chunk, store_offsets[height * 2 + part], output_column, DOWN_STORE_CACHE_MODIFIER)
 
             # Ping-pong in an unrolled pair: the next packet loads while the current one
             # computes, and the carried buffer is reloaded in place, so the loop head never
             # waits for the stores still in flight (gfx9 vmcnt also counts stores).
-            current = load_packet(fx.Int32(0))
-            pairs = (PACKETS - 1) // 2
-            if const_expr(pairs > 0):
-                for pair, carried in range(
-                    fx.Int32(0), fx.Int32(pairs), fx.Int32(1), init=current
-                ):
-                    first = pair * 2
-                    following = load_packet(first + 1)
-                    compute_store(first, carried)
-                    preloaded = load_packet(first + 2)
-                    compute_store(first + 1, following)
-                    carried = yield preloaded
-                current = carried
-            if const_expr(PACKETS - 2 * pairs == 2):
-                following = load_packet(fx.Int32(PACKETS - 1))
-                compute_store(fx.Int32(PACKETS - 2), current)
-                compute_store(fx.Int32(PACKETS - 1), following)
+            if const_expr(shared_subpacket):
+                initial = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(8)]
+                if const_expr(weight_quant_type == "ptpc"):
+                    initial += [Vec.filled(4, 0, fx.Int32) for _ in range_constexpr(4)]
+                for packet, previous in range(fx.Int32(0), fx.Int32(PACKETS), fx.Int32(1), init=initial):
+                    scales = []
+                    if const_expr(weight_quant_type == "ptpc"):
+                        scales = [
+                            _load(w_scale_rsrc, lq * 16, (n_begin + packet * PACKET_N + 16 * channel) * 4, 4)
+                            for channel in range_constexpr(4)
+                        ]
+                    acc = [
+                        [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(4)]
+                        for _ in range_constexpr(2)
+                    ]
+                    for sub in range_constexpr(SUBS_PER_PACKET):
+                        subpacket = packet * SUBS_PER_PACKET + sub
+                        rocdl.wait_asyncmark(RING_SLOTS - 2)
+                        rocdl.s_waitcnt(lgkmcnt=0)
+                        rocdl.s_barrier()
+                        slot = storage_base + (subpacket % RING_SLOTS) * subpacket_bytes
+                        weights = [
+                            _halves(_lds_load(slot + (channel * SUB_KB + inner) * 1024 + weight_lane, 4))
+                            for channel in range_constexpr(4)
+                            for inner in range_constexpr(SUB_KB)
+                        ]
+                        issue_subpacket(subpacket + RING_SLOTS - 1)
+                        for inner in range_constexpr(SUB_KB):
+                            for half in range_constexpr(2):
+                                if const_expr(half_shuffle and K == 256 and inner == 1 and half == 0):
+                                    if packet > 0:
+                                        store_previous_half(packet - 1, previous, sub)
+                                for channel in range_constexpr(4):
+                                    for height in range_constexpr(2):
+                                        acc[height][channel] = _mfma(
+                                            weights[channel * SUB_KB + inner][half],
+                                            a_halves[height * KB + sub * SUB_KB + inner][half],
+                                            acc[height][channel],
+                                        )
+                    if const_expr(not half_shuffle or K != 256):
+                        store_acc(packet, acc, scales)
+                    previous = yield [value for row in acc for value in row] + scales
+                if const_expr(half_shuffle and K == 256):
+                    store_previous_half(fx.Int32(PACKETS - 1), previous, 0)
+                    store_previous_half(fx.Int32(PACKETS - 1), previous, 1)
+                rocdl.wait_asyncmark(0)
+                rocdl.s_waitcnt(lgkmcnt=0)
+            elif const_expr(shared_lds):
+                for packet in range(fx.Int32(0), fx.Int32(PACKETS), fx.Int32(1)):
+                    if const_expr(register_shuffle):
+                        if packet + 1 < PACKETS:
+                            rocdl.wait_asyncmark(1)
+                        else:
+                            rocdl.wait_asyncmark(0)
+                    else:
+                        rocdl.wait_asyncmark(0)
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    rocdl.s_barrier()
+                    current = load_packet(packet)
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    rocdl.s_barrier()
+                    if const_expr(register_shuffle):
+                        if packet + 2 < PACKETS:
+                            issue_packet(packet + 2)
+                    else:
+                        if packet + 1 < PACKETS:
+                            issue_packet(packet + 1)
+                    compute_store(packet, current)
             else:
-                compute_store(fx.Int32(PACKETS - 1), current)
+                current = load_packet(fx.Int32(0))
+                pairs = (PACKETS - 1) // 2
+                if const_expr(pairs > 0):
+                    for pair, carried in range(
+                        fx.Int32(0), fx.Int32(pairs), fx.Int32(1), init=current
+                    ):
+                        first = pair * 2
+                        following = load_packet(first + 1)
+                        compute_store(first, carried)
+                        preloaded = load_packet(first + 2)
+                        compute_store(first + 1, following)
+                        carried = yield preloaded
+                    current = carried
+                if const_expr(PACKETS - 2 * pairs == 2):
+                    following = load_packet(fx.Int32(PACKETS - 1))
+                    compute_store(fx.Int32(PACKETS - 2), current)
+                    compute_store(fx.Int32(PACKETS - 1), following)
+                else:
+                    compute_store(fx.Int32(PACKETS - 1), current)
 
     @flyc.jit
     def launch_m128(

@@ -65,6 +65,10 @@ def compile_moe_gemm2(
             TOPK=TOPK,
             padding=down_output_padding_bytes,
             oc_splits=m128_oc_splits(down_path),
+            shared_lds=down_path in ("m128_lds", "m128_lds_regs"),
+            register_shuffle=down_path in ("m128_regs", "m128_lds_regs"),
+            packed_output=down_path in ("m128_packed", "m128_pipe"),
+            shared_subpacket=down_path == "m128_pipe",
         )
     if down_path != "default":
         assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
@@ -85,6 +89,10 @@ def compile_moe_gemm2(
             from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
 
             return _build_moe_gemm2_8x1_compact(E=E, **options)
+        if down_path == "8x1_single":
+            from .gemm2_8x1_compact import _build_moe_gemm2_8x1_single
+
+            return _build_moe_gemm2_8x1_single(E=E, **options)
         raise ValueError(f"Unsupported Down path: {down_path}")
     if down_output_padding_bytes != 0:
         raise ValueError("The default Down path does not support output padding")

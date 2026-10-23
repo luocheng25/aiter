@@ -560,3 +560,397 @@ B=32768，R=8B=262144，D=6144，I=256，E=384。按张量尺寸计算（十进�
    - 估算：理想流量 3.9 GB 按约 3.65 TB/s 约 1070 us，当前 down_full + down_tail + compact 约 1285 us。
 
 证据：`mytest/results/b6_clock_grbm_32k.json`（逐内核 GRBM 周期）。B6 的 tile 扫描、消融、融合结果来自单次运行的终端输出（数字见上表），没有存 JSON。
+
+---
+
+## B7 - MI300X 恢复实验、融合量化验证与 wave/LDS 扫描 - 2026-10-23
+
+本条为阶段状态，不代表优化目标已经完成。当前源码为 `6ff2979a174a815bda6a17f93017d7e1c39619a1` 加工作树实验改动，保留 B0-B6，不覆盖历史数字。
+
+### 环境与验证补充
+
+- 当前设备是 **MI300X、gfx942、304 CU、8 XCD、750W 功耗上限**，不是 B2-B6 的 MI325X。频率与功耗设置均未修改；绝对耗时不能跨两种机器直接比较。
+- 恢复路径为 `/sgl-workspace/aiter/mytest/`。当前 venv 的 FlyDSL 是 0.1.5，隔离安装 0.4.0 到 `/tmp/aiter_mimo_flydsl040`，通过 `PYTHONPATH` 加载；JIT 使用 `/tmp/aiter_mimo_resume_jit`，不替换系统 venv 或仓库旧二进制。
+- 沿用 `bench_mimo.py` 的相同输入地址、交替配置顺序、5 次预热、20 次迭代、3 轮测量。BF16 使用默认 RTE，不启用简化 RTA/RTE。
+- benchmark 新增精度失败即停止，以及 `--check-quant`：捕获融合 Gate/Up 的 FP8 输出和 scale，与原 BF16 Gate/Up 输出经过 HIP 逐 token 量化的结果逐字节比较。随机和全零输入在 token=32、8192、16384、32768 均通过，FP8 与 scale 不一致元素数均为 0。
+- `op_tests/test_flydsl_moe_gfx942.py -b 32768` 正式回归通过，日志含 72 个 passed。该回归覆盖默认路径、BF16、per-tensor、SiLU/Swiglu，**运行于最后两个寄存器重排原型加入之前**；不能把它解释为对所有实验原型的完整覆盖。
+
+### 已确认的整行 Gate/Up 融合量化收益
+
+对照为 `64_256_128_True:8x1_compact:128`，融合方案为 `64_512_256_True:8x1_compact:128`。下表均为各自同进程三轮总耗时中位数。
+
+| token | 对照 us | 融合方案 us | 总耗时降低 |
+|---:|---:|---:|---:|
+| 8192 | 1508.883 | 1442.521 | 4.40% |
+| 16384 | 2751.635 | 2666.521 | 3.09% |
+| 32768 | 4887.906 | 4722.368 | 3.39% |
+
+另一次 32K 配对与 PMC 采集为 4965.344 → 4725.168 us。Gate/Up 本体从 1771.339 变为 1843.395 us，但融合省掉约 246.846 us 的独立中间量化；收益应看整体，不应声称 Gate/Up GEMM 本体更快。其读/写流量从 3.5481/0.1342 GB 变为 3.1478/0.0753 GB。
+
+已把合法的 `(BN,BK)=(512,128)/(512,256)` 加入 whole-MoE 调优候选；既有 PTPC、完整行宽等约束仍生效。**尚未重新执行最终全形状调优或更新正式 CSV。**
+
+证据：[results/b7_mi300_baseline_32k.json](results/b7_mi300_baseline_32k.json)、[results/b7_fused_8k.json](results/b7_fused_8k.json)、[results/b7_fused_16k.json](results/b7_fused_16k.json)、[results/b7_gateup_compute_limits.json](results/b7_gateup_compute_limits.json)。
+
+### Gate/Up wave 网格与调度实验
+
+为复现用户提出的网格，新增可选 `wave_grid=(M,N)`，沿用原 K 双缓冲流水，调整 scale/路由索引布局以及输出拷贝线程。benchmark 配置可用 `@2x4` 等后缀，在同进程交替比较；后缀仅属于实验驱动，不是正式 CSV 配置格式。
+
+| 配置/网格 | 32K Gate/Up us | 结果 |
+|---|---:|---|
+| M64 N256 K128，原 1x4，sort128 对照 | 1780.089 | 对照 |
+| M128 N256 K128，2x4 | 1978.365 | 精度通过，较慢 |
+| M128 N256 K128，4x2 | 2156.033 | 精度通过，较慢 |
+| M128 N256 K128，4x1 | 2216.392 | 精度通过，较慢 |
+| M128 N512 K128，2x4，融合量化 | 9177.810 | 明显退化，未推广；资源原因仍待针对性验证 |
+| M64 N256 K128，2x2，sort64 | 2068.412 | 精度通过，较慢 |
+| M64 N256 K128，2x4，sort64 | 2157.397 | 精度通过，较慢 |
+| M64 N256 K256，2x2，sort64 | 2121.193 | 精度通过，较慢 |
+
+- M32 也未获益：相同 default Down 对照中，M64 Gate/Up 为 1643.754 us，M32 候选为 2057.605-2294.169 us。
+- 手工 MFMA 调度预算的中间填补没有累加到 `used`，已修正；未观察到稳定的单独性能收益，不能将此计为已实现的加速。
+- 删除手工发射顺序提示后，M64 Gate/Up 从约 1750-1770 us 退化到 1960.525 us，融合 N512 退化到 2132.339 us，已恢复原提示。
+- 提前首包 B 到 A/路由索引准备之前，没有稳定收益，已撤回。
+
+证据：[results/b7_gateup_wave_scan_32k.json](results/b7_gateup_wave_scan_32k.json)、[results/b7_gateup_m64_wave_scan.json](results/b7_gateup_m64_wave_scan.json)、[results/b7_gateup_m32_scan.json](results/b7_gateup_m32_scan.json)、[results/b7_gateup_llvm_schedule.json](results/b7_gateup_llvm_schedule.json)。
+
+### M128 Down 的共享 LDS 与寄存器重排实验
+
+所有方案保持原 PTPC 缩放、路由乘法和 BF16 舍入顺序，使用原生 sort128；没有因优化放宽精度。实验路径不进入默认选型。
+
+| 实验 | 32K Down us | 结论 |
+|---|---:|---|
+| 原 M128 寄存器加载 + LDS CShuffle | 1728.172 | 本轮末次配对对照 |
+| 双 B 槽，已消费槽复用作 CShuffle，32 KiB LDS | 1868.375 | 较慢 |
+| 上述路径删除 wave 私有 CShuffle 退休后的冗余 CTA barrier | 1845.615 | 改善很小，仍较慢 |
+| 单 B 槽 + 独立 CShuffle，读完 B 后提前 refill | 1974.137 | 较慢 |
+| 寄存器加载 B + 寄存器 lane 重排（m128_regs） | 1755.360 | 无稳定改善 |
+| 两槽共享 B + 寄存器 lane 重排（m128_lds_regs） | 2112.556 | 较慢 |
+| 同次 compact 对照 | 1510.249，含构表 | 仍优于 M128 实验 |
+
+- LDS 计数器：原 M128 与共享 LDS 路径的 bank conflict 都为 0；LDS 延迟约从 59.74 增至 101.8 cycles，平均驻留从 7.08 增至 7.409 waves/CU。增加驻留没有抵消片上搬运和同步成本。
+- 寄存器重排先做 CPU 证明：两次 lane/寄存器位交换和最终 lane 置换对 1024 个 BF16 packed pair 一一映射，最终仍由每 8 个 lane 写连续 128B。GPU 上 token=128 和 32768 的三个方案误差指标一致；性能却未改善，因此不能把“去掉 CShuffle LDS”本身当作收益。
+- 当前仍保留这些显式实验路径供后续分析，但没有修改正式 CSV 指向它们。仍需精简或移至实验目录后再考虑提交。
+
+证据：[results/b7_m128_lds_32k.json](results/b7_m128_lds_32k.json)、[results/b7_m128_lds_counters.json](results/b7_m128_lds_counters.json)、[results/b7_m128_lds_early_refill.json](results/b7_m128_lds_early_refill.json)、[results/b7_register_shuffle_32k.json](results/b7_register_shuffle_32k.json)。
+
+### 当前目标差距与下一步
+
+- **Gate/Up 1200 TFLOP/s：未达到。** 当前原 M64 约 930-940 TFLOP/s；融合 N512 的内核计时包含量化，按有效 GEMM FLOPs 折算约 880-900 TFLOP/s，但整体更快。
+- **Down 理想有效带宽 4.5 TB/s：未达到。** 以权重/激活/有效输出各一次的 3.903 GB 口径，当前 compact 约 2.5-2.6 TB/s，M128 约 2.2-2.3 TB/s。
+- 同机 3.221 GB 纯写微基准：row128 默认策略 4.136 TB/s、NT 4.569 TB/s；row64 默认 4.553 TB/s、NT 3.167 TB/s；MFMA 原生碎片布局默认 3.594 TB/s、NT 1.847 TB/s。说明 4.5 TB/s 不是被纯写能力直接否定，但 Down 的计算、片上搬运和同步仍需优化，不能用纯写峰值代替实际内核性能。
+- PMC 确认现有 XCD 局部性收益仍在：32K Gate/Up 读流量约 3.55 GB，Down full 读约 0.710 GB，远低于 B0/B1 的重复读取。不能把本次已经存在的 XCD 映射再记为新增优化。
+- 下一步应围绕更小的 B/scale 片上返回流量、CShuffle/跨 lane 指令成本和 K 流水关键依赖继续做有计数器依据的实验，而非再盲目扩大 tile。最终达标后仍需完整回归、重调优和正式 CSV 更新。
+
+所有结果保存在 `mytest/results/`。本轮改动未提交；原有 `3rdparty/composable_kernel` 变化未动。当前没有后台 GPU 实验。
+
+## B8：参考 gfx950 分支的方法迁移与 MI300X 复测
+
+### 参考与测量边界
+
+- 参考分支：`lc/luocheng/moe_gemm_308_opt3-350`，tip `ab90f2bbf`。仅通过 `git show` 读取，没有切换分支或 cherry-pick。
+- 仍在 MI300X / gfx942 / 304 CU / 8 XCD 上测量，不与 B2-B6 的 MI325X 数字直接相减。使用独立 FlyDSL 0.4.0 路径及 JIT 目录，BF16 保持默认 RTE。
+- 除最初短行量化试验外，后续主实验均设置 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 重新编译，避免参考分支记录的旧磁盘缓存问题；未删除共享缓存。
+- 延续同一进程、相同输入/权重地址、3 份 routing 输入、5 次 warmup、20 次迭代、3 轮交替的测法。总时间是每次迭代 GPU kernel 时间之和的中位数；分项是代表轮中各 kernel 的中位数，两者不必严格相加。
+- 本轮不改变功耗或时钟设置，不把未改动阶段的 DVFS 波动算作新内核收益，也不把逻辑 XCD 顺序当作新增的物理 placement 证明。
+
+参考分支的主要方法不是简单改变 wave grid：其独立 256x256 四波 Gate/Up 使用 persistent 与跨任务预取，M128 Down 使用 packed 输出、B 子包 ring 和延迟 epilogue。其 Gate/Up 的 4A+4B LDS 超过 128 KiB，不能直接放入 gfx942 的 64 KiB；gfx950 的 16B/lane LDS DMA、K128 MFMA atom、permlane16_swap 也没有直接移植。本轮保留 gfx942 MFMA 及 PTPC 的整段 FP32 累加后缩放顺序。
+
+### 保留项：多行并行短行量化
+
+- 在现有 `gfx9_fp8/quant.py` 增加短行 per-token FP8 FNUZ 量化，按 8 个 BF16/线程向量读取，用行宽与 wave64 的公因数安排多个行组。I=256 时一个 256-thread block 处理 16 行，避免 HIP 的每 block 一行。
+- 保留 `scale = amax * fp32(1/240)`、倒数、clamp、FP8 转换顺序，包括全零行的 HIP 行为。没有将 gfx950 分支的全零特判直接照搬。
+- 启用范围：BF16 连续中间输出、FP8 FNUZ、`128 < I <= 1024`、I 为 8 的倍数、路由行数至少 4096；其余仍走 HIP。输入量化、per-tensor、decode 路径不改变。
+- 行数交叉点测试：I=256、128/512/1024 行时 FlyDSL 约 2.85/2.95/2.92 us，HIP 约 2.53/2.70/2.76 us；4096 行约 3.11 vs 4.52 us，所以默认分派采用保守的 4096 行门槛。其他已测试短行宽在 4096 行也受益。
+- `@hipquant` 仅是 `mytest/bench_mimo.py` 的同进程对照标签，不是生产配置字符串。
+
+32K 最终配对结果，来自 [results/b8_final_pmc_32k.json](results/b8_final_pmc_32k.json)：
+
+| 配置 | 整体 us | Gate/Up us | 中间量化 us | Down full us | Down tail us | 构表 us | reduce us |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| M64 N256 K128 + compact，HIP 量化 | 4979.456 | 1753.231 | 239.169 | 1109.150 | 398.635 | 28.224 | 1255.265 |
+| 相同配置，短行 FlyDSL 量化 | 4884.484 | 1737.112 | 52.240 | 1042.230 | 392.742 | 25.538 | 1322.861 |
+| 已有 M64 N512 K256 融合量化 + compact | 4808.584 | 1853.861 | 已融合 | 1033.440 | 387.670 | 25.838 | 1156.939 |
+
+短行量化单项约快 4.58x，整体中位数降低 1.91%；已有融合方案整体降低 3.43%，仍是这组三配置的最快者。后者是 B7 已有方案，本轮只做复测，不能算作 B8 新增收益。三轮整体值分别为：HIP `[4963.399, 4988.538, 4979.456]`，短行量化 `[4830.033, 4941.329, 4884.484]`，融合 `[4808.584, 4763.140, 4854.045]`。
+
+### 32K 流量复测
+
+FetchSize 与 WriteSize 分开采集。下表是 L2 与 fabric 之间的计数，可能含 Infinity Cache 命中，不等于纯 HBM 流量；TB/s 用独立无计数器计时换算，只作跨 pass 指标，不用于反推精确时钟。
+
+| 阶段 | HIP 对照 读/写 GB | 短行量化 读/写 GB | 融合方案 读/写 GB |
+|---|---:|---:|---:|
+| Gate/Up | 3.5971 / 0.1342 | 3.5519 / 0.1342 | 3.1470 / 0.0753 |
+| 中间量化 | 0.1342 / 0.0755 | 0.1342 / 0.0682 | 无独立 kernel |
+| Down full | 0.7101 / 2.6802 | 0.7101 / 2.6802 | 0.7100 / 2.6802 |
+| Down tail | 0.5265 / 0.6889 | 0.5265 / 0.6889 | 0.5265 / 0.6889 |
+| reduce | 3.2235 / 0.4027 | 3.2235 / 0.4027 | 3.2234 / 0.4027 |
+
+短行量化的 fabric 吞吐约 3.87 TB/s，对照约 0.88 TB/s；主要收益来自利用率，Down 流量基本没有变化。既有 XCD 映射仍在，不能再次记为本轮新增优化。
+
+### 未胜出的迁移实验
+
+每行只使用其对应同进程对照；不同试验之间的数字不作直接差值。
+
+| 实验 | 32K 核心结果 | 结论与证据 |
+|---|---|---|
+| reduce 64 -> 128/256 threads | 64-thread 稳态约 1044 us，128-thread 1035 us，256-thread 1021 us | 仅约 2-5% 微基准改善，未改默认线程数 |
+| M128 仅改 packed 地址 | Down 1777.867 -> 1747.898 us | 未超过 compact；[packed](results/b8_packed_32k.json) |
+| K64 子包，4 个 4 KiB B 槽，独立 CShuffle，共 32 KiB LDS | packed 寄存器 B 1640.050 us，子包版 1739.960 us | 无改善；[K64](results/b8_subpacket_32k.json) |
+| K128 子包，3 个 8 KiB B 槽，半块 CShuffle，共 32 KiB LDS | packed 寄存器 B 1623.472 us，子包版 1661.740 us | 比 K64 试验有改善迹象，但同次仍未胜出；[K128](results/b8_k128_subpacket_32k.json) |
+| 上一 packet epilogue 分半穿插到当前 MFMA 中 | packed 1725.686 us，延迟 epilogue 1782.336 us，compact full+tail+构表 1496.678 us | 没有 Down 收益；[overlap](results/b8_overlap_epilogue_32k.json) |
+| M128 N256，2x2-wave | K128 2062.557 us，K256 1930.394 us；同次 M64 1728.309 us | 更慢；[M128 四波](results/b8_gateup_four_wave_32k.json) |
+| M256 大行块，缩小 K 分片 | N256 K64 2x2: 3105.134 us；N256 K128 2x2: 3782.330 us；N128 K64 4x1: 3764.550 us；同次 M64 1735.226 us | 更慢；只比较 Gate/Up，Down 不是相同实现；[M256](results/b8_gateup_m256_32k.json) |
+| 原 M64 核心加静态 persistent | 普通 1755.674 -> 2052.777 us；融合 1875.209 -> 1862.841 us，但总时间未胜出 | 仅增加 persistent 不够；[persistent](results/b8_persistent_gateup_32k.json) |
+
+packed ABI 为 `[block128, global_N64, row128, col64]`，消费者直接按该布局读取，无额外 restore。子包流水仍使用 gfx942 的 4B/lane DMA，K128 是传输子包大小，不是 gfx950 K128 MFMA。同步负责发布已完成的 DMA，并在槽复用前退休全部 LDS 读者。静态 persistent 无全局计数器或跨 CTA 自旋，每任务结束后退休 LDS。
+
+实验路径 `m128_packed`、`m128_pipe` 和 benchmark `@persistent` 明确未进入默认 tune space，未写生产 CSV。它们在 token=128/32768 的随机端到端检查中通过，但没有完整的各 K、per-tensor、empty/graph 生命周期回归，不能当作生产验证完成。源码仍保留实验供下一轮分析；本轮没有收集它们的完整 ISA 资源或 ATT 证据，不能将变慢直接归因于已证实的 spilling/occupancy。
+
+编译试验中修复的局部问题：动态控制流 helper 需要 `@flyc.jit`；`get_down_device_config()` 首项是布尔设备标志而非 CU 数，persistent worker 改用 `get_cu_num()`；带 loop-carried 状态的 packet 索引在 DMA 越界选择前显式转换成 i32。修复后重跑相同检查通过。
+
+### MiMo 2K-32K 六候选复测
+
+每个 batch 比较：N256 K128 compact 的 HIP/短行量化对照，N512 K128/K256 融合 compact，以及 N256 K128、N128 K256 的 1x4 Down。精度、随机/全零融合 FP8 字节及 scale 契约均通过。共 5 个 batch x 6 个配置 x 3 轮；这是有限候选复测，不是 PR recipe 的全量 staged + e2e retune。
+
+下表固定同一 compact 配置，隔离短行量化效果：
+
+| token | HIP 整体 us | 短行量化整体 us | HIP / FlyDSL 中间量化 us | 整体逐轮胜出 | 逐轮 speedup 中位数 |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 812.616 | 803.616 | 17.058 / 6.895 | 3/3 | 1.0192x |
+| 4096 | 1082.677 | 1060.646 | 31.693 / 10.083 | 3/3 | 1.0261x |
+| 8192 | 1504.517 | 1466.560 | 65.029 / 16.998 | 3/3 | 1.0210x |
+| 16384 | 2749.509 | 2729.905 | 125.607 / 29.086 | 3/3 | 1.0070x |
+| 32768 | 5053.587 | 4905.798 | 250.756 / 52.880 | 3/3 | 1.0191x |
+
+六候选中最小总中位数分别为：2K N256 K128 + 1x4 787.340 us；4K N512 K256 + compact 1047.557 us；8K N512 K128 + compact 1454.031 us；16K N256 K128 + 1x4 2670.550 us；32K N512 K128 + compact 4808.084 us。16K 的逐轮中位收益未超过 3%，32K 的 K128/K256 融合差距也小；不据此直接覆盖正式选择。
+
+原始数据：[2048](results/b8_candidates_2048.json)、[4096](results/b8_candidates_4096.json)、[8192](results/b8_candidates_8192.json)、[16384](results/b8_candidates_16384.json)、[32768](results/b8_candidates_32768.json)。相邻 `.log` 保留完整打印结果。
+
+### 最终验证与目标状态
+
+- 在既有 `op_tests/test_flydsl_moe_gfx942.py` 中补充短行测试，遵循候选 dict、`run_perftest`、`checkAllclose` 和 markdown 汇总格式。输入包括随机、全零、固定舍入分布；检查与 HIP 的 FP8 字节一致、与 Torch 的 scale 一致、输出/scale 前后 canary，以及每个 graph 两次 launch、三次修改输入后 replay。
+- 最终命令：`ROCR_VISIBLE_DEVICES=0 GPU_ARCHS=gfx942 FLYDSL_RUNTIME_ENABLE_CACHE=0 PYTHONPATH=/tmp/aiter_mimo_flydsl040:/sgl-workspace/aiter AITER_JIT_DIR=/tmp/aiter_mimo_resume_jit /opt/venv/bin/python op_tests/test_flydsl_moe_gfx942.py --batch 32768`。
+- [最终回归日志](results/b8_final_regression_32k.log)：72 个短行量化/分派用例、19 个 compact 任务表用例、32 个 padded reduction 用例、11 个 32K 整体配置，以及既有 cross-config/edge 检查；360 条 `checkAllclose` 通过，无 Traceback。编辑器未报告本轮文件错误。该结果不等于新增实验路径的完整回归。
+- **Gate/Up 1200 TFLOP/s：未达到。** 最后配对中的原 M64 为 949.43 TFLOP/s，融合内核计时含量化、按有效 GEMM FLOPs 算为 889.64 TFLOP/s。目标对应 1374.390 us，原 M64 为 1737.112 us。
+- **Down 理想 4.5 TB/s：未达到。** 32K 理想总字节为 3,902,799,872 B，目标对应 867.289 us。最后融合配置的 full+tail 为 1421.110 us，即 2.746 TB/s；含构表为 1446.948 us，即 2.697 TB/s。这不是本轮新 Down 内核的收益，流量及内核没有改变。
+- **全量 retune、正式 CSV 更新未执行。** 本轮保留短行量化优化和默认小输入回退；其余迁移未胜出。下一阶段若继续攻目标，需要针对独立计算核心/调度生成的 ISA 和资源做定位，不能再假设扩大 tile 或加 persistent 自动有效。
+
+本节只追加，不修改 B0-B7。没有提交、切换分支、修改正式 CSV 或回退用户的 submodule 变化。
+
+## B9：ISA/资源驱动的局部实验与持续功耗观察（2026-10-23）
+
+### 结果与保留范围
+
+本轮**没有取得稳定的新提速**，1200 TFLOP/s Gate/Up 与 4.5 TB/s Down 目标仍未达到。B9 新增的运行时实验已移除，恢复 B8 的计算、分派和归约实现；保留 B8 短行量化、小输入 HIP 回退及之前已有实验，不回退用户改动。
+
+保留的新增工具是 `mytest/bench_mimo.py --dump-compiled DIRECTORY`：执行真实输入一次，导出 HSACO、反汇编和 AMDGPU metadata，并查询 Gate/Up 的 `max_blocks_per_cu()`。该诊断不进入性能计时，依赖当前 FlyDSL 0.4.0 的编译产物接口及 `/opt/rocm/llvm/bin` 工具。
+
+未胜出的源码已归档到 [results/b9_experimental_sources.tar.gz](results/b9_experimental_sources.tar.gz)。这是含 B7/B8 基础的七个完整源码文件快照，不是可直接套到任意版本的独立补丁。对应 JSON、资源和恢复后的回归日志仍保留。没有提交、切换分支或修改正式 CSV；未执行全量 retune。
+
+### 已确认的编译资源
+
+用真实 gfx942 编译产物查询，不再凭较慢的计时推断 spilling。表中寄存器数字保留 metadata 字段含义；驻留以 HIP 查询为准。
+
+| Gate/Up 方案 | vgpr_count | agpr_count | LDS B | private B/thread | vgpr_spill_count | 最大 CTA/CU |
+|---|---:|---:|---:|---:|---:|---:|
+| 原 M64 N256 K128 | 182 | 0 | 16384 | 0 | 0 | 2 |
+| M128 N256 K128，2x2 wave | 356 | 100 | 32768 | 0 | 0 | 1 |
+| 原 M64 强制 3 wave/SIMD | 168 | 未单独记录 | 16384 | 140 | 50 | 3 |
+| M64 N512 K256 融合，B 前瞻 2 tile | 256 | 未单独记录 | 32768 | 448 | 302 | 1 |
+
+因此，M128 四波慢并不等于发生 scratch spill：它没有 scratch，但驻留下降。反之，强制 3-wave 与融合 B 深预取的 spill 是已经测到的事实。原 M64 不存在需要修复的 scratch spill。
+
+资源证据位于 `results/b9_resources/`，每个配置各有 `gateup/kernels.notes`、`gateup/kernels.s` 与 HSACO。恢复后的基线另存 `results/b9_restored_resources/`。原热循环的 ISA 可见 Up 权重消费前的 vmcnt 等待，以及阶段末尾 A 写 LDS 前的等待；这些是后续实验的假设来源，不是 ATT 证明的独占瓶颈。
+
+### 局部实验结果
+
+沿用 MI300X、GPU0、默认 RTE、独立 FlyDSL/JIT 路径；主实验禁用 FlyDSL 磁盘缓存。32K 对比均为同进程、相同地址、3 轮交替、每轮 5 warmup + 20 iterations；不同表行来自各自同次对照，不能跨运行相减。
+
+| 实验 | 同次 Gate/Up 或关键分项 us：对照 -> 实验 | 整体 us：对照 -> 实验 | 结论 |
+|---|---:|---:|---|
+| Gate/Up 在同一 K 分片内分组 MFMA | 1737.471 -> 1786.826 | 4938.176 -> 4924.751 | 核心未加速，总时间微差不作为收益 |
+| B 寄存器三槽、前瞻 2 tile，普通 M64 | 1741.943 -> 1764.775 | 4912.986 -> 4900.913 | 无稳定改善 |
+| 同上，融合 N512 K256 | 1856.105 -> 4407.089 | 4773.522 -> 7147.638 | 大量 spill，拒绝 |
+| A 直接 routed gather 至 MFMA 寄存器，K128 | 1717.487 -> 3024.692 | 4876.944 -> 5811.197 | 移除热循环 LDS/barrier 后仍退化 |
+| A 直接 gather，K64 | 同次原 M64 1717.487，实验 3190.693 | 4876.944 -> 5963.987 | 更短 K 分片也无收益 |
+| A 直接 gather，N512 K128 融合 | 原 N512 K256 1853.800，实验 3194.542 | 4766.726 -> 5984.451 | 不同 K 分片下的整体候选比较，未胜出 |
+| A 双寄存器前瞻、提前发布 LDS，普通 M64 | 1746.740 -> 1771.276 | 4910.308 -> 4906.199 | 无稳定改善 |
+| 同上，融合 N512 K256 | 1854.006 -> 1885.458 | 4794.303 -> 4820.143 | 未胜出 |
+| 交换 MFMA M/N 方向，普通 M64 | 1753.894 -> 1752.431 | 4907.574 -> 4876.748 | 核心持平，整体微差不升级 |
+| 同上，融合 N512 K256 | 1859.798 -> 1859.457 | 4751.762 -> 4762.766 | 持平 |
+| 权重读取 cache modifier 2，普通 M64 | 1719.695 -> 2856.871 | 4879.382 -> 6244.813 | 明显退化 |
+| 同上，融合 N512 K256 | 1858.534 -> 2055.748 | 4767.717 -> 5225.966 | 退化 |
+| 普通行布局 reduce 按 2048 列、256 threads 拆 CTA | reduce 1277.721 -> 1204.553 | 4917.030 -> 4937.958 | 整体未胜出 |
+| 同上，搭配融合 Gate/Up | reduce 1079.244 -> 1211.729 | 4755.218 -> 4781.519 | 未胜出 |
+| M128 原生 MFMA packed 写出，无 CShuffle | Down 1657.776 -> 1536.172；reduce 1295.984 -> 10298.176 | 5072.613 -> 14209.455 | 成本转移到消费者，拒绝 |
+
+另有 token=128 的 epilogue 索引重载实验：原 Gate/Up 299.748 us，重载 314.081 us，重载加 3-wave 约束 416.697 us。没有继续宣称它改善了资源或大 batch 性能。
+
+所有候选都保持 PTPC 的 K 累加和后置 scale、BF16 舍入要求，未放宽阈值。原生 packed 试验初始未通过精度：单独反排 Down 输出与对照逐位一致，错误定位在消费者；改为显式 buffer 字节偏移并修正编译期分支局部绑定后，128/32768 精度通过，但性能不合格，最终同样移除。
+
+主要数据：[MFMA 分组](results/b9_gatefirst_32k.json)、[B 前瞻](results/b9_bpf2_32k.json)、[直接 A](results/b9_directa_32k.json)、[A 早发布](results/b9_apf2_32k.json)、[MFMA 方向](results/b9_natural_32k.json)、[权重 cache](results/b9_weight_cache_32k.json)、[reduce 分块](results/b9_reduce2048_32k.json)、[原生 packed](results/b9_native_down_32k.json)、[索引重载](results/b9_remat_smoke.json)。
+
+### 持续负载的时钟与功耗
+
+未调整任何时钟或功耗设置。整体 MoE 连续发射时，GPU0 三次采样约为 1067/1014/1022 MHz、734.6/747.3/749.3 W、97/100/100% 利用率。
+
+随后截取真实 Gate/Up 的 launcher 和张量参数，单独重复它：每次采样先排入 100 次，再用 HIP events 包围 100 次，排队执行期间读取 `rocm-smi`。有效 sorted rows 为 274176，相对 262144 条真实路由有 4.59% padding。结果见 [results/b9_gateup_power.json](results/b9_gateup_power.json)：
+
+| 采样 | Gate/Up event 平均 us | 有效 TFLOP/s | 瞬时 SCLK MHz | 瞬时 package W | 利用率 |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1830.717 | 900.886 | 1033 | 720.718 | 95% |
+| 1 | 1831.454 | 900.524 | 951 | 749.191 | 100% |
+| 2 | 1838.057 | 897.289 | 949 | 749.895 | 100% |
+
+这是**持续负载的运行状态证据**，提示接近 750 W 功耗墙、低 SCLK 是后续分析必须考虑的条件；不是与普通 20-iteration profiler 完全同口径的性能，也不是精确的整段平均时钟。不能由瞬时采样严格推导 1200 TFLOP/s 不可能，更不能通过改变功耗或插入空闲来声称代码达标。下一轮应关注单位工作量的访存/执行能耗及同一功耗条件下的实际效率，而不只增加并行度。
+
+### 恢复与验证
+
+- B9 未胜出的 Gate/Up 参数、MFMA 原生 Down 布局及 reduce 分块分支已从运行时代码移除，源码快照保留在归档；B7/B8 原有修改不动。
+- 恢复后普通、融合与 B8 persistent 的 token=128 检查通过，融合随机/全零 FP8 字节和 scale 契约通过：[恢复 smoke](results/b9_gateup_restored.json)。
+- [恢复后的完整回归](results/b9_restored_regression.log)：72 个短行量化/分派/graph 用例、19 个任务表用例、32 个归约用例、11 个 32K 整体配置及既有交叉/边界检查；360 条 `checkAllclose` 通过，无 Traceback。
+- 编辑器未报告相关文件错误。最终保留的 `--dump-compiled` 在恢复后基线上再次执行成功，HIP 查询仍为 2 CTA/CU。
+- 本轮没有新的生产赢家，故未重新跑全量 staged/e2e retune，也未覆盖正式 CSV。两个性能目标仍未完成；以上负结果与资源证据用于避免重复尝试。
+
+### 优化方法与当前状态汇总
+
+截至 2026-10-23、B9 结束，**运行时保持 B8 状态，B9 没有新增稳定性能收益**。以下汇总用于继续优化时快速定位；详细数据和测量条件以上文各轮记录为准。
+
+| 方法 | 当前状态 | 结论或使用边界 |
+|---|---|---|
+| XCD 任务顺序与 compact full/tail 分派 | 保留既有实现 | 已有局部性优化，不重复记为 B9 收益；逻辑映射不保证物理 XCD 归属 |
+| N512 Gate/Up 融合中间 FP8 量化 | 保留候选 | 当前 MiMo 32K 整体约 4.8 ms；融合 kernel 的计时包含量化，不能与纯 GEMM 吞吐混淆 |
+| 多行并行短行 per-token 量化 | 保留 B8 优化 | BF16 -> FP8 FNUZ，128 < I <= 1024、I 为 8 的倍数、至少 4096 条路由行；小输入继续走 HIP |
+| B7/B8 的 M128、packed、子包 ring、延迟 epilogue、persistent 原型 | 仍保留此前实验状态 | 尚未证明优于整体基线，不视为完整生产验证通过 |
+| B9 驻留约束、A/B 深预取、直接 A、索引重载、MFMA 分组/方向、权重 cache 策略 | 已归档并移除本轮运行时分支 | 没有稳定收益；部分方案出现已确认的 scratch spill |
+| B9 MFMA 原生 packed Down、2048 列归约分块 | 已归档并移除本轮运行时分支 | 必须按 Down + reduce + 整体验收；原生布局将主要成本转移到归约端 |
+| HSACO/ISA/资源导出 | 保留诊断工具 | 使用 `mytest/bench_mimo.py --dump-compiled DIRECTORY`，不参与计时 |
+
+**当前性能与目标：**
+
+- B8 最终同次配对：非融合 M64 Gate/Up 为 1737.112 us、949.43 TFLOP/s；融合方案整体为 4808.584 us。Gate/Up 1200 TFLOP/s 目标仍未达到。
+- 同次融合方案 Down full+tail 为 1421.110 us；按 3,902,799,872 B 理想字节计算为 2.746 TB/s，含构表为 2.697 TB/s。Down 4.5 TB/s 目标仍未达到。这些是已恢复基线的历史测量，不是 B9 新收益。
+- B9 持续 Gate/Up 约 1.83 ms，后两次瞬时采样约 0.95 GHz、749-750 W；与短时 profiler 的口径不同，不能据此断言目标不可达。
+
+**验证与交付状态：**
+
+- 恢复前后的 M64 Gate/Up HSACO SHA-256 完全一致：`afbb7a09db407ecc8ed27af5c6cecdafefd67de082aff3fcee6e3ad95e8bf8ae`。比较对象为 `b9_resources/` 与 `b9_restored_resources/` 下同一基线配置的产物。
+- 恢复后完整回归通过，记录于 [results/b9_restored_regression.log](results/b9_restored_regression.log)；`git diff --check` 通过。
+- B9 实验快照位于 [results/b9_experimental_sources.tar.gz](results/b9_experimental_sources.tar.gz)，原始计时、资源和功耗数据保留，失败方法不再进入当前运行时。
+- 正式 CSV 未修改，全量 staged + e2e retune 未执行，代码未提交。B7/B8 的原有改动及用户 submodule 变化保持不动。
+
+**后续待办，尚未执行：**
+
+1. 在相同功耗设置和持续负载条件下，结合 ISA/ATT/PMC 定位有效工作量的访存与执行成本，验证降低能耗是否能改善实际吞吐；不以提高功耗或插入空闲替代代码优化。
+2. Gate/Up 保持 PTPC 累加/缩放/BF16 顺序；Down 的布局或流水变更必须连同 inverse 与 reduce 一起测量，避免只优化单个 kernel。
+3. 只有取得同地址多轮稳定收益，并补齐精度、尾部、graph 和相关形状回归后，才执行完整 retune、复核生产选择并更新 CSV。
+
+## B10：750 W 功耗墙下的上限测量与单次启动 Down（2026-10-23）
+
+### 结论
+
+- **当前 MI300X（`rocm-smi`：Max Graphics Package Power 750.0 W）上，两个目标都超过了同机实测的硬件上限，不是继续调度能弥补的差距。** 所有大内核的持续运行都停在 748–750 W，时钟由功耗决定。
+  - Gate/Up 1200 有效 TFLOP/s：同样 FLOPs 的 hipBLASLt 稠密 FP8 GEMM（随机数据）持续只有 **1005.8 TFLOP/s**；8192³ 方阵也只有 1178.5。只有全零权重这类低翻转数据才达到 1190–1242，不能算作代码优化。
+  - Down 理想带宽 4.5 TB/s：同机持续纯写 3.22 GB 只有 **4.581 TB/s**、读写各 1.61 GB 的 copy 为 3.630 TB/s，均已贴住功耗墙；Down 还要额外读 0.68 GB 并做 0.82 TFLOP MFMA 和 epilogue，867 µs 不可达。
+- 本轮保留的代码收益：**单次启动 Down `8x1_single`**，32K 整体 -1.8%（非融合）/ -2.1%（融合 N512），Down 流量从 4.61 GB 降到 3.95 GB（理想 3.90 GB）；8K 及以下变慢，已加入调优空间由 tuner 按形状选择。
+- Gate/Up 在功耗墙下唯一还有证据的空间是 hipBLASLt 的能效差：同样约 79% 的 MFMA 利用率，hipBLASLt 每有效 FLOP 能耗低约 11%，持续时钟 1026 对 945 MHz。
+
+### 方法：持续负载上限探针
+
+新增 [power_probe.py](power_probe.py)：截取一次真实 MoE 调用的 Gate/Up 与 Down launcher 和参数，分别用随机与全零操作数重放；同时运行 hipBLASLt（`torch._scaled_mm`，FP8 e4m3fnuz）和流式 fill/copy。每项先预热，再连续发射约 1 秒，后台线程用 `rocm-smi` 采样时钟与功耗，只保留 GPU use ≥90% 的样本；2 轮正反顺序。未修改任何时钟或功耗设置。
+
+```
+python mytest/power_probe.py --json mytest/results/b10_power_probe.json
+python mytest/power_probe.py --config 128_256_128_True:m128:0 --cases gateup_random gateup_zero_both down_random
+```
+
+32K、`64_256_128_True:8x1_compact:128`，两轮中位（[results/b10_power_probe.json](results/b10_power_probe.json)）：
+
+| 用例 | µs | SCLK MHz | W | 指标 |
+|---|---:|---:|---:|---|
+| Gate/Up 随机 | 1847.1 | 945 | 749.6 | 892.9 有效 TFLOP/s |
+| Gate/Up 权重全零 | 1385.1 | 1289 | 749.4 | 1190.7 |
+| Gate/Up 输入与权重全零 | 1328.3 | 1313 | 749.0 | 1241.7 |
+| Down（compact 三个内核）随机 | 1637.0 | 991 | 748.9 | 2.384 理想 TB/s |
+| Down 全零 | 1356.8 | 1233 | 748.5 | 2.877 |
+| hipBLASLt 262144×512×6144 随机 | 1639.8 | 1026 | 749.5 | 1005.8 TFLOP/s |
+| hipBLASLt 8192³ 随机 | 933.0 | 1181 | 749.9 | 1178.5 |
+| hipBLASLt 8192³ 全零 | 636.5 | 1747 | 748.4 | 1727.4 |
+| fill 3.22 GB BF16 | 703.2 | 1275 | 748.7 | 4.581 TB/s |
+| copy 读写各 1.61 GB | 887.3 | 1278 | 749.2 | 3.630 TB/s |
+
+- 持续值比 bench 的 20 次迭代口径慢（Gate/Up 1.85 对约 1.75 ms），因为后者夹着访存内核、功耗控制器还没压到底；两种口径不混用。
+- 先前一次未过滤采样的快速测量（[results/b10_power_ceiling.json](results/b10_power_ceiling.json)）给出相同排序：随机 Gate/Up 0.89–0.90 PF，输入全零 1.07–1.10、权重全零 1.18–1.20、全零 1.25–1.28；同形状 hipBLASLt 随机 1.00–1.01。[results/b10_hardware_ceilings.json](results/b10_hardware_ceilings.json) 的时钟/功耗样本落在内核结束后，只保留其耗时。
+- MFMA 利用率估算：峰值按 304 CU × 4 SIMD × 1024 FLOP/周期 × SCLK；Gate/Up 硬件 FLOPs 含 4.59% 填充行。Gate/Up 约 79.4%（945 MHz），hipBLASLt 约 78.7%（1026 MHz）。能耗：Gate/Up 0.839 pJ/有效 FLOP，hipBLASLt 0.745。
+- 权重全零比输入全零快得多（1.19 对 1.10 PF）：B 每段由各 wave 从 L2 读入 32 KiB、A 只有 8 KiB，说明数据搬运的翻转能耗占比不小。这是推断，未用功耗计数器逐项拆分。
+
+### 更大 M tile 的能效实验
+
+同一探针、同样持续负载（[b10_power_128_256_128_True_m128_0.json](results/b10_power_128_256_128_True_m128_0.json)、[b10_power_128_256_64_True_m128_0.json](results/b10_power_128_256_64_True_m128_0.json)、[b10_power_64_256_128_True_8x1_single_128.json](results/b10_power_64_256_128_True_8x1_single_128.json)）：
+
+| Gate/Up 配置 | µs | SCLK MHz | 有效 TFLOP/s | pJ/有效 FLOP |
+|---|---:|---:|---:|---:|
+| 64_256_128（当前） | 1846.5 | 943 | 893.2 | 0.839 |
+| 128_256_128（sort128，每 SIMD 1 wave） | 2018.4 | 1367 | 817.1 | 0.917 |
+| 128_256_64（每 CU 2 CTA） | 2190.7 | 967 | 752.8 | 0.996 |
+
+- M128 每 FLOP 的 B 流量减半，时钟升到 1367 MHz，但 MFMA 利用率降到约 52%，单位能耗反而更高：功耗墙下“少搬数据”只有在保持高利用率时才有用。
+- 因此 Gate/Up 若要接近 hipBLASLt 的 1.0 PF，需要新的大 tile 内核：B 在 LDS 中被多个 M wave 共享，同时维持 ≥79% 利用率；现有 1x4 结构与 B7/B9 的变体都做不到。本轮未实现。
+
+### 单次启动 Down（`down_path=8x1_single`，保留）
+
+**问题**：compact 路径先构表，再启动 M256 full 内核与 M64 tail 内核。tail 内核运行时 L2 已不再保有 W2，因此每个专家的 W2 被再读一遍；两者还都写出填充行。32K PMC：full 读 0.7101 / 写 2.6802 GB，tail 读 0.5265 / 写 0.6889 GB，合计 4.606 GB，理想 3.903 GB。
+
+**设计**：
+
+- 新任务表内核 `expert_m256_tasks`（`gemm2_8x1_compact.build_expert_task_table`）：把每个专家连续的 M64 块切成 ⌈块数/4⌉ 个 M256 任务，条目为 `[row_begin, expert | 块数 << 16]`，最后一个任务可只有 1–3 块；`counts[0]` = 任务数 × 256。容量 ⌈元数据块数/4⌉ + E，由 `allocate_expert_tasks` 分配。
+- 8x1 内核新增编译开关 `mask_rows` / `partial_tasks`（仅 K128n，即 inter_dim ∈ {256,384,512,640}）：
+  - sorted id 与 routing 权重的 buffer 只覆盖任务实际行数，越过排序数组末尾的读取返回 0；
+  - 任务外的行在 LDS 中改写为填充 id（token = M），其 A、per-token scale 与 MFMA 输入都为 0，避免用真实数据做无效 MFMA；
+  - 写出时屏蔽填充行和任务外的行：每 lane 负责的 4 行在 prologue 读一次 LDS，打包成 1 个钉住的 VGPR 位掩码（LDS 区域随后被 CShuffle 复用），写出时把无效行的偏移换成越界值，由硬件丢弃；
+  - 同一专家的任务在表中相邻，沿用 8x1 的 XCD 连续映射，同一专家的 W2 在一个 L2 内只读一次。
+- 数值顺序与 compact 相同：`bf16((acc*w_scale)*(a_scale*routing))`，之后 topk 归约不变。compact 路径默认关闭这两个开关，编译结果不变。
+- 资源：Down 内核 192 VGPR、0 AGPR、48 KiB LDS、无 spill，每 CU 1 个 CTA（512 线程）；任务表内核 50 VGPR、6 KiB LDS。
+
+**流量与耗时（32K，3 轮交替，PMC 单独采集，[results/b10_single_32k.json](results/b10_single_32k.json)）**
+
+| 路径 | 构表 µs | Down µs | Down 读 GB | Down 写 GB | 合计 GB |
+|---|---:|---:|---:|---:|---:|
+| compact | 25.2 | 1054.3 + 402.6 | 1.2366 | 3.3691 | 4.606 |
+| single | 24.3 | 1406.2 | 0.7300 | 3.2212 | 3.951 |
+
+写出正好是 262144 条有效路由 × 12288 B；Down 实测流量为理想值的 1.012 倍。
+
+**不同 token 数（整体 µs，同进程 3 轮交替；括号为逐轮胜出数 / 逐轮比值中位）**
+
+| token | 非融合 compact | 非融合 single | 融合 N512 compact | 融合 N512 single |
+|---:|---:|---:|---:|---:|
+| 2048* | 796.4 | 997.5（0/3，0.804） | 810.3 | 1009.4（—） |
+| 4096* | 1066.5 | 1197.7（0/3，0.895） | 1056.8 | 1182.3（—） |
+| 8192 | 1505.5 | 1560.3（0/3，0.975） | 1443.2 | 1538.4（0/3，0.935） |
+| 16384 | 2714.4 | 2695.2（2/3，1.008） | 2688.2 | 2682.6（2/3，1.001） |
+| 32768 | 4881.9 | **4791.6（3/3，1.018）** | 4789.9 | **4687.9（3/3，1.024）** |
+
+\* 2K/4K 为第一版（任务外的行读取 token 0 的真实数据）测得，其余为最终版（任务外的行为零）。第一版 32K 为 4857.4 → 4768.8（3/3）。数据：[b10_candidates_*.json](results/)（第一版 2K–32K）、[b10_zero_partial_*.json](results/)（最终版 8K–32K）。
+
+- 32K 融合 single 的 Down+构表为 1418.9 µs，理想带宽 **2.751 TB/s**；持续负载下 1508 µs、2.588 TB/s。仍远低于 4.5 TB/s。
+- 小 batch 变慢的原因：部分任务固定计算 256 行。8K 时每个专家约 2.7 个 M64 块，单个 M256 任务里一半以上的 MFMA 是空行；compact 的 M64 tail 没有这部分浪费。
+- 调优空间：`get_tune_space()` 新增 5 个 `64_*_*_True:8x1_single:128`。正式 CSV 未改；需要重新调优后由 tuner 按形状选择。
+
+**验证**：
+
+- 新增 `run_single`：用带前后哨兵的任务缓冲替换 `allocate_expert_tasks`，检查任务数等于 Σ⌈块数/4⌉、每个 M64 块恰好被其所属专家的任务覆盖一次、缓冲区前后未被写。
+- 新增边界用例：2048 专家（随机/热点）、单专家 64 个满任务（per_tensor，K384）、257 专家 topk9 K512 的 padding 0/32/64、64 专家 topk4 的 K384/K640；与 compact 同输入对照。16 个 single/compact 用例全部通过，误差为 0。
+- [完整回归](results/b10_final_regression_32k.log)：退出码 0，134 个测试调用，370 条 `checkAllclose` 通过，0 失败（含 72 个量化、19 个任务表、32 个归约、11 个 32K 整体配置、交叉配置与新边界用例）。
+
+### 其他测量
+
+- **BF16 舍入的 VALU 成本**（已有环境变量，未改默认；32K compact，3 轮，[b10_bf16_*.json](results/)）：默认 RTE 4868.8 µs；`AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED=1` 4814.2 µs，输出指标与默认逐位相同（只在 NaN 规范化上不同）；`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1` 4799.2 µs，舍入平局处不同。说明 epilogue 的 VALU 占整体约 1–1.5%。是否放宽 NaN 语义需用户决定，本轮不改。
+- **对 B8 persistent 实验的更正**：B8 的 persistent Gate/Up 发射 `get_cu_num()` = 304 个 worker，而 4-wave N256 内核每 CU 可驻留 2 个 CTA（B9 的 HIP 查询），等于只用了一半驻留，因此 B8 的“persistent 慢 15%”不能说明 persistent 调度本身的效果。本轮未重测；B6 消融显示尾轮空转不超过约 0.6%，persistent/stream-K 的潜在收益也很小。
+
+### 状态与后续
+
+- 运行时新增并保留：`8x1_single` Down、任务表内核、8x1 的 `mask_rows`/`partial_tasks` 开关（compact 默认关闭）、[power_probe.py](power_probe.py)；`bench_mimo.py` 的内核角色表新增 `expert_m256_tasks`。未提交，正式 CSV 未改，未执行全量 retune，用户的 submodule 改动未动。
+- 目标状态：Gate/Up 最佳 0.94 PF（bench 口径）/ 0.89 PF（持续），Down 最佳 2.75 TB/s（bench）/ 2.59（持续）。两个目标都超过了本机 750 W 下厂商 GEMM 和纯写的实测上限。
+- 若必须达到 1200 TFLOP/s / 4.5 TB/s：先在目标硬件（例如更高功耗上限的 MI325X）上运行 `power_probe.py`，确认 hipBLASLt 与 fill 能超过这两个数，再把它们作为可达上限继续优化。
+- 本机上仍有证据支持的方向：(1) Gate/Up 新的大 tile 内核，B 经 LDS 被多个 M wave 共享且保持 ≥79% 利用率，目标接近 hipBLASLt 的 1.0 PF；(2) single Down 让部分任务跳过空行组的 MFMA，或在同一次启动内用 M128 处理专家尾段，以收回 16K 及以下的损失；(3) 选中新配置后重新调优并逐行验证再更新 CSV。

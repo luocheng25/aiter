@@ -16,11 +16,14 @@ from .common import _ptr
 
 
 @functools.cache
-def sorted_sum(TOPK, N, output_padding_bytes=0):
+def sorted_sum(TOPK, N, output_padding_bytes=0, num_threads=None, packed_rows=0):
     assert N % 256 == 0
     assert output_padding_bytes in (0, 32, 64, 128)
+    assert packed_rows in (0, 128) and (not packed_rows or output_padding_bytes == 0)
     input_row_stride = N + output_padding_bytes // 2
-    num_threads = 64 if N % 512 == 0 else 32
+    if num_threads is None:
+        num_threads = 64 if N % 512 == 0 else 32
+    assert num_threads in (32, 64, 128, 256) and N % (num_threads * 8) == 0
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def sorted_sum_kernel(loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer):
@@ -42,11 +45,15 @@ def sorted_sum(TOPK, N, output_padding_bytes=0):
 
         token_ptrs = [
             (A + fx.Int64(token_locs[topk]) * input_row_stride)
+            if not packed_rows
+            else (A + fx.Int64(token_locs[topk] // packed_rows) * (packed_rows * N)
+                  + (token_locs[topk] % packed_rows) * 64)
             for topk in fx.range_constexpr(TOPK)
         ]
 
         def load_atom(topk_id, off):
-            atom = fxh.atom_tensor(token_ptrs[topk_id], fx.Int32(off), copy_bits)
+            offset = off if not packed_rows else (off // 64) * (packed_rows * 64) + off % 64
+            atom = fxh.atom_tensor(token_ptrs[topk_id], fx.Int32(offset), copy_bits)
             frag = fx.make_fragment_like(atom)
             fx.copy(copy_atom, atom, frag)
             return frag

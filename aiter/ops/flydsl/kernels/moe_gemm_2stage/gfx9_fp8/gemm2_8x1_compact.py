@@ -271,3 +271,160 @@ def _build_moe_gemm2_8x1_compact(
 
     launch_compact.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_compact
+
+
+def expert_task_capacity(metadata_capacity, experts):
+    # Each expert adds at most one partial task to the whole-M256 count.
+    return max(1, (metadata_capacity + 3) // 4 + experts)
+
+
+def allocate_expert_tasks(sorted_expert_ids, experts):
+    capacity = expert_task_capacity(sorted_expert_ids.numel(), experts)
+    return (
+        torch.empty((capacity, 2), dtype=torch.int32, device=sorted_expert_ids.device),
+        torch.empty(2, dtype=torch.int32, device=sorted_expert_ids.device),
+    )
+
+
+def build_expert_task_table(experts):
+    """Cut each expert's M64 block run into M256 tasks [row_begin, expert | blocks << 16].
+
+    The last task of an expert may hold 1-3 blocks, so every expert's rows (and
+    weights) stay in one launch; counts[0] is the task count times 256.
+    """
+    assert 0 < experts <= 2048
+    width = max(256, 1 << (experts - 1).bit_length())
+    threads = 256
+    rounds = width // threads
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def expert_m256_tasks(
+        sorted_experts: fx.Pointer,
+        valid_rows: fx.Pointer,
+        tasks: fx.Pointer,
+        counts: fx.Pointer,
+    ):
+        tid = fx.Int32(gpu.thread_idx.x)
+        storage = fx.SharedAllocator().allocate(fx.Array[fx.Int32, width * 3, 16])
+        shared = storage.peek().view(fx.make_layout(width * 3, 1))
+        for part in range_constexpr(rounds):
+            idx = tid + part * threads
+            shared[idx] = fx.Int32(0)
+            shared[width + idx] = fx.Int32(0)
+        gpu.barrier()
+        blocks = valid_rows[0] // 64
+        for base in range(fx.Int32(0), blocks, threads):
+            idx = base + tid
+            if idx < blocks:
+                expert = sorted_experts[idx]
+                if (expert >= 0) & (expert < experts):
+                    prev_idx = fx.arith.select(idx > 0, idx - 1, idx)
+                    next_idx = fx.arith.select(idx + 1 < blocks, idx + 1, idx)
+                    if (idx == 0) | (sorted_experts[prev_idx] != expert):
+                        shared[expert] = idx
+                    if (idx + 1 == blocks) | (sorted_experts[next_idx] != expert):
+                        shared[width + expert] = idx + 1
+        gpu.barrier()
+        for part in range_constexpr(rounds):
+            idx = tid + part * threads
+            shared[2 * width + idx] = (shared[width + idx] - shared[idx] + 3) // 4
+        gpu.barrier()
+        for shift in range_constexpr(width.bit_length() - 1):
+            distance = 1 << shift
+            scanned = []
+            for part in range_constexpr(rounds):
+                idx = tid + part * threads
+                peer = fx.arith.select(idx >= distance, idx - distance, idx)
+                add = fx.arith.select(
+                    idx >= distance, shared[2 * width + peer], fx.Int32(0)
+                )
+                scanned.append(shared[2 * width + idx] + add)
+            gpu.barrier()
+            for part in range_constexpr(rounds):
+                shared[2 * width + tid + part * threads] = scanned[part]
+            gpu.barrier()
+        if tid == 0:
+            counts[0] = shared[3 * width - 1] * 256
+        for part in range_constexpr(rounds):
+            expert = tid + part * threads
+            if expert < experts:
+                start = shared[expert]
+                size = shared[width + expert] - start
+                count = (size + 3) // 4
+                begin = shared[2 * width + expert] - count
+                for index in range(fx.Int32(0), count, 1):
+                    left = size - 4 * index
+                    task_blocks = fx.arith.select(left < 4, left, fx.Int32(4))
+                    tasks[2 * (begin + index)] = (start + 4 * index) * 64
+                    tasks[2 * (begin + index) + 1] = expert | (task_blocks << 16)
+
+    @flyc.jit
+    def launch(
+        sorted_experts: fx.Pointer,
+        valid_rows: fx.Pointer,
+        tasks: fx.Pointer,
+        counts: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        expert_m256_tasks(sorted_experts, valid_rows, tasks, counts).launch(
+            grid=(1, 1, 1), block=(threads, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def _build_moe_gemm2_8x1_single(
+    *, N, K, E, weight_quant_type, act_quant_type, TOPK, padding
+):
+    """One M256 launch per call: an expert's W2 is read once and no padding row is stored."""
+    assert E is not None and 0 < E <= 2048
+    assert K in (256, 384, 512, 640)
+    assert N >= 512 and N % 256 == 0
+    tasks = _build_moe_gemm2_8x1(
+        N=N,
+        K=K,
+        weight_quant_type=weight_quant_type,
+        act_quant_type=act_quant_type,
+        TOPK=TOPK,
+        padding=padding,
+        mask_rows=True,
+        partial_tasks=True,
+    )
+    build = build_expert_task_table(E)
+
+    @flyc.jit
+    def launch_single(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_output: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
+        M: fx.Int32,
+        task_num: fx.Int32,
+        p_tasks: fx.Pointer,
+        p_counts: fx.Pointer,
+        task_capacity: fx.Int32,
+        stream: fx.Stream,
+    ):
+        build(p_sorted_expert_ids, p_num_valid_ids, p_tasks, p_counts, stream)
+        tasks(
+            p_input,
+            p_weight,
+            p_output,
+            p_sorted_ids,
+            p_sorted_weights,
+            p_tasks,
+            p_counts,
+            p_w_scale,
+            p_a_scale,
+            M,
+            task_capacity,
+            stream,
+        )
+
+    launch_single.compile_hints["target_features"] = "-packed-fp32-ops"
+    return launch_single

@@ -13,12 +13,14 @@ op_tests/test_flydsl_moe_gfx942.py against the torch reference.
 import argparse
 import csv
 import glob
+import importlib
 import json
 import os
 import statistics
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 import torch
 
@@ -38,6 +40,7 @@ ROLES = (
     ("quant", "quant"),
     ("gateup", "gateup"),
     ("compact", "compact_m64_tasks"),
+    ("compact", "expert_m256_tasks"),
     ("down_full", "down_prefill_8x1"),
     ("down", "down_prefill_1x4_64x256"),
     ("down", "down_m128"),
@@ -99,10 +102,40 @@ def reference(inputs):
 
 def run(inputs, config, index):
     hidden, weights, ids = inputs["sets"][index % len(inputs["sets"])]
-    return run_flydsl_moe_gfx942(hidden, inputs["w1"], inputs["w2"], weights, ids,
-                                 ActivationType.Silu, QuantType.per_Token,
-                                 inputs["w1_scale"], inputs["w2_scale"], None, None, 0,
-                                 config)
+    config, separator, grid = config.partition("@")
+
+    def call():
+        return run_flydsl_moe_gfx942(hidden, inputs["w1"], inputs["w2"], weights, ids,
+                                     ActivationType.Silu, QuantType.per_Token,
+                                     inputs["w1_scale"], inputs["w2_scale"], None, None, 0,
+                                     config)
+
+    if not separator:
+        return call()
+    if grid == "hipquant":
+        backend = importlib.import_module("aiter.ops.flydsl.fused_moe_gfx942")
+
+        def original_quant(source, quant_dtype):
+            return aiter.get_hip_quant(QuantType.per_Token)(
+                source, scale=None, quant_dtype=quant_dtype, num_rows=None
+            )
+
+        with patch.object(backend, "_quantize_intermediate", original_quant):
+            return call()
+    persistent = grid == "persistent"
+    wave_grid = None if persistent else tuple(int(value) for value in grid.split("x"))
+    assert persistent or (len(wave_grid) == 2 and wave_grid[0] * wave_grid[1] in (4, 8))
+    backend = importlib.import_module("aiter.ops.flydsl.fused_moe_gfx942")
+    original_get = backend._get_compiled_kernel
+
+    def get_wave_kernel(*call_args, **call_kwargs):
+        if call_kwargs.get("stage") == "gateup" and call_kwargs.get("alg") == "prefill_1x4":
+            call_kwargs["wave_grid"] = wave_grid
+            call_kwargs["persistent"] = persistent
+        return original_get(*call_args, **call_kwargs)
+
+    with patch.object(backend, "_get_compiled_kernel", get_wave_kernel):
+        return call()
 
 
 def check(ref, out):
@@ -117,6 +150,57 @@ def check(ref, out):
     ok = bad == 0 and logits < LOGITS_DIFF_LIMIT and token < TOKEN_ERR_LIMIT
     return dict(ok=ok, max_rms_err=element, bad_ratio=bad, logits_diff=logits,
                 token_err=token)
+
+
+def check_quant_contract(inputs, configs):
+    backend = importlib.import_module("aiter.ops.flydsl.fused_moe_gfx942")
+    original_launch = backend._launch
+    hidden = inputs["sets"][0][0]
+    saved_hidden = hidden.clone()
+    captured = {}
+
+    def capture(kernel, *arguments):
+        result = original_launch(kernel, *arguments)
+        if len(arguments) > 2 and arguments[1] is inputs["w1"]:
+            captured["output"] = arguments[2].clone()
+            if arguments[2].dtype == dtypes.fp8:
+                captured["scale"] = arguments[9].clone()
+        return result
+
+    records = []
+    try:
+        for case in ("random", "zero"):
+            hidden.copy_(saved_hidden) if case == "random" else hidden.zero_()
+            with patch.object(backend, "_launch", capture):
+                run(inputs, "64_256_128_True:8x1_compact:128", 0)
+            baseline = captured["output"].reshape(-1, INTER)
+            assert baseline.dtype == dtypes.bf16
+            expected, expected_scale = aiter.get_hip_quant(QuantType.per_Token)(
+                baseline, quant_dtype=dtypes.fp8
+            )
+            for config in configs:
+                if config.split("_", 3)[1] != "512":
+                    continue
+                captured.clear()
+                with patch.object(backend, "_launch", capture):
+                    run(inputs, config, 0)
+                torch.cuda.synchronize()
+                actual = captured["output"].reshape_as(expected)
+                actual_scale = captured["scale"].reshape_as(expected_scale)
+                result = dict(
+                    case=case, config=config,
+                    fp8_equal=torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)),
+                    scale_equal=torch.equal(actual_scale, expected_scale),
+                    fp8_mismatches=int((actual.view(torch.uint8) != expected.view(torch.uint8)).sum()),
+                    scale_mismatches=int((actual_scale != expected_scale).sum()),
+                )
+                print("quant_contract:", json.dumps(result), flush=True)
+                records.append(result)
+                assert result["fp8_equal"] and result["scale_equal"], result
+    finally:
+        hidden.copy_(saved_hidden)
+    assert records, "Supply a full-row BLOCK_N=512 config for --check-quant"
+    return records
 
 
 def profile_config(inputs, config, iters, warmup, gap_cycles=0):
@@ -223,20 +307,94 @@ def main():
     parser.add_argument("--pmc-counters", nargs="*", default=None,
                         help="extra counters (one rocprofv3 pass each), printed for GEMM kernels")
     parser.add_argument("--no-check", action="store_true")
+    parser.add_argument("--check-quant", action="store_true")
+    parser.add_argument(
+        "--dump-compiled", metavar="DIRECTORY",
+        help="Export gfx942 HSACO, ISA and resource notes without running timing",
+    )
+    parser.add_argument("--gateup-wave-grid", nargs=2, type=int, metavar=("M", "N"))
     parser.add_argument("--json", default=None)
     parser.add_argument("--pmc-child", action="store_true")
     args = parser.parse_args()
+    if args.gateup_wave_grid:
+        backend = importlib.import_module("aiter.ops.flydsl.fused_moe_gfx942")
+        original_get = backend._get_compiled_kernel
+
+        def get_wave_kernel(*call_args, **call_kwargs):
+            if call_kwargs.get("stage") == "gateup" and call_kwargs.get("alg") == "prefill_1x4":
+                call_kwargs["wave_grid"] = tuple(args.gateup_wave_grid)
+            return original_get(*call_args, **call_kwargs)
+
+        backend._get_compiled_kernel = get_wave_kernel
     torch.set_default_device("cuda")
     if args.pmc_child:
         return pmc_child(args)
 
     inputs = make_inputs(args.token, args.copies)
+    if args.dump_compiled:
+        from flydsl._mlir import ir
+        from flydsl._mlir.dialects import gpu
+        from flydsl.compiler.jit_function import _create_mlir_context
+
+        backend = importlib.import_module("aiter.ops.flydsl.fused_moe_gfx942")
+        original_launch = backend._launch
+
+        def inspect_compiled(kernel, *arguments):
+            result = original_launch(kernel, *arguments)
+            if arguments[1] is inputs["w1"] or arguments[1] is inputs["w2"]:
+                compiled = kernel._cf
+                stage = "gateup" if arguments[1] is inputs["w1"] else "down"
+                directory = os.path.join(
+                    args.dump_compiled, config.replace(":", "_"), stage
+                )
+                os.makedirs(directory, exist_ok=True)
+                if stage == "gateup":
+                    print(
+                        "max_blocks_per_cu:", compiled.max_blocks_per_cu(), flush=True
+                    )
+
+                def export_binary(operation):
+                    if operation.name == "gpu.binary":
+                        name = ir.StringAttr(operation.attributes["sym_name"]).value
+                        objects = ir.ArrayAttr(operation.attributes["objects"])
+                        binary = gpu.ObjectAttr(objects[0]).object
+                        filename = os.path.join(directory, name + ".hsaco")
+                        with open(filename, "wb") as output:
+                            output.write(binary)
+                        for suffix, command in (
+                            (".s", [
+                                "/opt/rocm/llvm/bin/llvm-objdump", "--disassemble",
+                                "--mcpu=gfx942", filename,
+                            ]),
+                            (".notes", [
+                                "/opt/rocm/llvm/bin/llvm-readobj", "--notes", filename,
+                            ]),
+                        ):
+                            output_path = os.path.join(directory, name + suffix)
+                            with open(output_path, "w") as output:
+                                subprocess.run(command, stdout=output, check=True)
+                        print("exported:", filename, flush=True)
+                    return ir.WalkResult.ADVANCE
+
+                with _create_mlir_context():
+                    module = ir.Module.parse(compiled._keepalive._ir_text)
+                    module.operation.walk(export_binary)
+            return result
+
+        with patch.object(backend, "_launch", inspect_compiled):
+            for config in args.configs:
+                print("config:", config, flush=True)
+                run(inputs, config, 0)
+        torch.cuda.synchronize()
+        return
+    quant_checks = check_quant_contract(inputs, args.configs) if args.check_quant else []
     ref = None if args.no_check else reference(inputs)
     results = {c: dict(profiles=[]) for c in args.configs}
     for c in args.configs:
         out = run(inputs, c, 0)
         torch.cuda.synchronize()
         results[c]["accuracy"] = None if ref is None else check(ref, out)
+        assert ref is None or results[c]["accuracy"]["ok"], results[c]["accuracy"]
     for r in range(args.rounds):
         order = args.configs if r % 2 == 0 else args.configs[::-1]
         for c in order:
@@ -259,8 +417,9 @@ def main():
                     values = ", ".join(f"{k}={entry.get(k, 0):.4g}" for k in args.pmc_counters)
                     print(f"  {row['role']}: {values}")
     if args.json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         with open(args.json, "w") as f:
-            json.dump(dict(token=args.token, results=results), f, indent=1)
+            json.dump(dict(token=args.token, results=results, quant_checks=quant_checks), f, indent=1)
 
 
 if __name__ == "__main__":

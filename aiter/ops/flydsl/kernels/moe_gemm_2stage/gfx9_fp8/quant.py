@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Baseline per-tensor FP8 quantization with cached launchers."""
+"""FP8 quantization with cached launchers."""
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -203,5 +204,133 @@ def flydsl_quant_per_tensor(torch_dtype):
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
         _run_compiled(launch, _ptr(A), _ptr(Amax), _ptr(B), A.numel(), wg_count, stream)
+
+    return callable
+
+
+def per_token_quant_supported(cols):
+    return 128 < cols <= 1024 and cols % 8 == 0
+
+
+@functools.cache
+def flydsl_quant_per_token(torch_dtype, cols):
+    """Quantize several contiguous BF16 rows per wave using the HIP FP8 arithmetic."""
+    assert per_token_quant_supported(cols)
+    assert torch_dtype == torch.float8_e4m3fnuz
+    chunks = cols // 8
+    lanes = math.gcd(chunks, 64)
+    per_lane = chunks // lanes
+    unroll = max(1, 2 // per_lane)
+    threads = 256
+    rows_per_step = threads // lanes
+    rows_per_block = rows_per_step * unroll
+    fmax = torch.finfo(torch_dtype).max
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def quantize_per_token(
+        source: fx.Pointer, output: fx.Pointer, scales: fx.Pointer, rows: fx.Int32
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        row_begin = fx.Int32(fx.block_idx.x) * rows_per_block
+        remaining = rows - row_begin
+        block_rows = (remaining < rows_per_block).select(
+            remaining, fx.Int32(rows_per_block)
+        )
+        lane = tid % lanes
+        row_in_step = tid // lanes
+        source = fx.make_view(
+            source + fx.Int64(row_begin) * cols,
+            fx.make_layout(rows_per_block * cols, 1),
+        )
+        output = fx.make_view(
+            output + fx.Int64(row_begin) * cols,
+            fx.make_layout(rows_per_block * cols, 1),
+        )
+        source = fx.rocdl.make_buffer_tensor(
+            source, max_size=False,
+            num_records_bytes=fx.Int64(block_rows) * cols * 2,
+        )
+        output = fx.rocdl.make_buffer_tensor(
+            output, max_size=False,
+            num_records_bytes=fx.Int64(block_rows) * cols,
+        )
+        source_atoms = fx.logical_divide(source, fx.make_layout(8, 1))
+        output_atoms = fx.logical_divide(output, fx.make_layout(8, 1))
+        read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128), source.dtype)
+        write_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(64), output.dtype)
+        fragments = []
+        for row_group in range_constexpr(unroll):
+            for chunk in range_constexpr(per_lane):
+                atom_index = (
+                    (row_in_step + row_group * rows_per_step) * chunks
+                    + lane + chunk * lanes
+                )
+                fragment = fx.make_fragment_like(source_atoms[None, atom_index])
+                fx.copy(read_atom, source_atoms[None, atom_index], fragment)
+                fragments.append(fragment)
+        for row_group in range_constexpr(unroll):
+            values = [
+                fragments[row_group * per_lane + chunk].load().to(fx.Float32)
+                for chunk in range_constexpr(per_lane)
+            ]
+            amax = fx.Float32(0.0)
+            for value in values:
+                amax = fx.math.absf(value).reduce(fx.ReductionOp.MAX, amax)
+            for step in range_constexpr(lanes.bit_length() - 1):
+                amax = amax.maximumf(amax.shuffle_xor(lanes >> (step + 1), 64))
+            scale = amax * fx.Float32(1.0 / fmax)
+            inverse = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
+            row = row_in_step + row_group * rows_per_step
+            for chunk in range_constexpr(per_lane):
+                quantized = [
+                    fx.math.clampf(
+                        values[chunk][element] * inverse,
+                        fx.Float32(-fmax), fx.Float32(fmax),
+                        fastmath=fx.arith.FastMathFlags.fast,
+                    )
+                    for element in range_constexpr(8)
+                ]
+                words = []
+                for half in range_constexpr(2):
+                    low = rocdl.cvt_pk_fp8_f32(
+                        T.i32, _raw(quantized[4 * half]),
+                        _raw(quantized[4 * half + 1]), fx.Int32(0), False,
+                    )
+                    words.append(rocdl.cvt_pk_fp8_f32(
+                        T.i32, _raw(quantized[4 * half + 2]),
+                        _raw(quantized[4 * half + 3]), low, True,
+                    ))
+                destination = output_atoms[None, row * chunks + lane + chunk * lanes]
+                result = fx.make_fragment_like(destination)
+                result.store(fx.Vector.from_elements(words, fx.Int32).bitcast(output.dtype))
+                fx.copy(write_atom, result, destination)
+            if lane == 0:
+                if row < block_rows:
+                    scales[row_begin + row] = scale
+
+    @flyc.jit
+    def launch(
+        source: fx.Pointer, output: fx.Pointer, scales: fx.Pointer,
+        rows: fx.Int32, stream,
+    ):
+        quantize_per_token(source, output, scales, rows).launch(
+            grid=(fxh.div_up(rows, rows_per_block), 1, 1),
+            block=(threads, 1, 1), stream=stream,
+        )
+
+    def callable(source: torch.Tensor, output: torch.Tensor, scales: torch.Tensor):
+        assert source.dtype == torch.bfloat16
+        assert source.is_contiguous() and source.shape[-1] == cols
+        assert output.dtype == torch_dtype and output.is_contiguous()
+        assert output.numel() == source.numel()
+        rows = source.numel() // cols
+        assert scales.dtype == torch.float32 and scales.is_contiguous()
+        assert scales.numel() == rows
+        assert source.device == output.device == scales.device
+        if rows:
+            _run_compiled(
+                launch, _ptr(source), _ptr(output), _ptr(scales), rows,
+                torch.cuda.current_stream(source.device),
+            )
 
     return callable
