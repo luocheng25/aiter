@@ -194,8 +194,10 @@ def build_moe_down_m128(
     task_rows = PACKED_ROWS * halves
     num_workers = 2 * get_cu_num()
     assert num_workers % 8 == 0
-    # Persistent tasks are transposed with width 4, one-shot CTAs with width 2.
-    width = 4 if persistent else 2
+    # CTA w runs on XCD w % 8; a width-W transpose spreads a block's OC slices over
+    # 8 / W XCDs that each fetch its 128 x K A rows. Width 8 wins once those are
+    # >= 5% of the expert's N x K weights.
+    width = 8 if not persistent and N <= 2560 and oc_splits >= 4 else 4
     # LDS words: B ring, the task's weight-scale slice, sorted IDs, row factors.
     ring_words = slots * sub_bytes // 4
     wscale_offset = ring_words

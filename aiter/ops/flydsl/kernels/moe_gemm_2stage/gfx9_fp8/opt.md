@@ -36,6 +36,7 @@
   2. **FlyDSL 磁盘缓存（`~/.flydsl/cache`）可能返回旧二进制。** 怀疑性能回退时，先用 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 重新编译，对比输出是否逐位一致以及耗时。2026-10-23 的旧缓存已移到 `~/.flydsl/cache_stale_20261023`。
   3. benchmark 运行期间不要修改 kernel 源码（FlyDSL 会延迟编译，并用 getsource 生成缓存键）。
   4. 不同 GPU 并行跑时相差可达几个百分点；小于 5% 的效果要在同一进程内交替 A/B。
+  5. **gfx950 上 rocprofv3 的 `FetchSize` 偏小**：它把 128B 读请求按 64B 计。读流量要用 `TCC_EA0_RDREQ_sum`、`TCC_EA0_RDREQ_128B_sum`、`TCC_EA0_RDREQ_32B_sum` 自己算（128·n128 + 64·(n − n128 − n32) + 32·n32）。
 
 ## 2. Pipeline 与配置
 
@@ -116,6 +117,22 @@
      | sleep（几何平均） | 1.037× | 1.033× | 1.024× | 1.003× | 12/28 |
 
    - 提升最多的是 I 小、expert 多的模型：Qwen3.5-i128 在 1k–4k 快 1.07–1.14×，Qwen397 在 1k–8k 快 1.02–1.12×，MiMo b2b 在 1k–4k 快 1.04–1.06×。Qwen3.8-i640（1k–2k）和 Qwen3.5-i512（1k）的 M128 Down 不比 1x4 Down 快，最优配置不变。
+9. **M128 Down one-shot 的任务顺序（2026-10-23）**
+   - CTA w 固定跑在 XCD w % 8。任务表按宽度 W 转置后，每个 XCD 只走 1/W 段，一个 128 行块的各个 OC 切片分到 8/W 个 XCD 上，每个 XCD 都要读一遍这个块的 A（128×K）。
+   - one-shot 原来 W=2：一个块的 A 被 4 个 XCD 各读一次。改为 N ≤ 2560 且 OC ≥ 4 时 W=8（一个块的所有切片都在同一个 XCD，A 只读一次），其余 W=4。persistent 仍是 W=4。
+   - 判据：块的 A 至少占该 expert 权重（N×K）的 5% 时，A 的重复读取才比权重局部性更重要。
+   - 例：Qwen3.5-i512 4k 的 Down 读流量 0.57 → 0.30 GB（理想约 0.29 GB）。
+   - Down（µs，同进程 A/B，输出逐位一致）：
+
+     | 模型 | 变化 |
+     |---|---|
+     | Qwen3.5-i512 | 2k 96.8 → 93.8；4k 136.1 → 120.3；8k 222.1 → 178.6；16k 321.5 → 287.5 |
+     | Qwen3.8-i640 | 16k 597.9 → 521.3；32k 880.9 → 860.0 |
+     | Qwen3.5-i128 | 4k 56.0 → 53.5；8k 109.2 → 94.2；16k 191.7 → 178.1 |
+     | Qwen397 | 8k 239.0 → 228.7 |
+     | MiniMax-e128 | 16k 338.2 → 320.7；8k 199.4 → 200.9（最大回退 +0.7%） |
+
+   - 其余 one-shot 生产配置在 ±1% 内。
 
 ## 4. 当前状态（2026-10-23）
 
@@ -138,6 +155,7 @@
   - 选中的 kernel：本后端 156 行，ASM 1-stage 17 行，其余 29 行是 aiter 的 CK 等 2-stage kernel（Qwen3.8 BF16 27 行、Qwen3.5-35B 2 行）。
   - 端到端对比 aiter 2-stage 调优的最优配置（只统计被替换的行，同一种 e2e 测法）：MiniMax 1.98×（36/36 行）、Qwen397 1.89×（17/18）、Qwen3.5-35B 1.61×（25/34）、Qwen3.8 FP8 1.53×（39/48）、Qwen3.8 BF16 1.30×（21/48）。Hunyuan3 per-tensor 在 gfx950 上的 staged 调优对所有 shape 都报 no valid candidate（每批 60 个 CK 任务里 30 个 crash 或报错），18 行全用本后端。
   - 全部 202 行都用生产 `fused_moe` 跑过精度检查（`test_moe_2stage.test_fmoe`）。logits_diff 最大 1.2e-3；MiniMax 的 decode 行最大 8.8e-3，原因是 decode kernel 直接读 BF16 激活，而参考结果对激活做了 FP8 量化。
+  - 改了 M128 Down one-shot 的任务顺序后，有 5 行改用 one-shot M128（见变更记录）。
 
 ## 5. 失败或放弃的尝试（不要重复）
 
@@ -156,6 +174,14 @@
   - pyhip 的 PF4 pair-refill：没有收益。
   - one-shot 循环在 barrier 之后重读 LDS 里的 task slot：GPU 挂死，rank 必须保存在寄存器里。
   - K>256 时仍用 OC=8：A 被重读 8 次；Qwen3.5-i512 32k 时 OC=8 为 613 µs，OC=2 为 501 µs。
+- **M128 Down 的任务顺序与权重复用（2026-10-23）**
+  - 去掉 packet 起点轮转（`rotation = worker // 8`）：读流量降低约 20%，但 32k 慢 3–14%。
+  - OC 切得更细（切片 128–384 列），让每个 XCD 在途的权重切片能放进 L2：慢 3–29%。
+  - XCD 内按切片优先遍历（同一切片连续派发不同块）：MiniMax 4k 慢 25%。
+  - 按 sort 块轮流分给各 XCD（同一 expert 的块分散到多个 XCD）：16k–32k 慢 15–32%。
+  - 每个 XCD 取连续一段块（等价于 W=8）对 MiniMax（N=6144）慢 2–9%，对 32k（OC=2）慢 4–9%；所以 W=8 只用在 N ≤ 2560 且 OC ≥ 4。
+  - persistent 用 W=8：与 W=4 持平（±1.5%），保持 W=4。
+  - 读流量与耗时不成正比：例如 Qwen3.8 32k 时 W=8 的读流量比 W=2 多 13%，而 Qwen3.5-i512 4k 少 47%。
 - **M64 Gate/Up 读取 sort256 元数据**
   - 按 expert 顺序把每块的 4 个 tile 相邻派发：小 batch 时空 tile 夹在有效 tile 之间，Gate/Up 慢 17–18%（MiMo 1k 252 → 294 µs，2k 266 → 314 µs）。空 workgroup 跳过 sorted_ids 读取也一样慢。
   - 所有块的 tile 0 先发、其余全部放后段（相当于 lead=1）：4k 时每块有 2 个有效 tile，第二个 tile 要从 HBM 重读权重，MiMo 4k Gate/Up 从 321 µs 涨到 548 µs。
@@ -166,7 +192,7 @@
 
 1. **把 topk reduce 融合进 Down**（原子累加，或按 token 输出的 epilogue）。32k 时占 22–33%，也是 1k 落后于 ASM 1-stage 的主要原因。
 2. **Gate/Up 大余数尾波**（MiniMax-e128 余数约 198，e129 余数 37）：尾块改用更小的 tile（128×512 / 128×256），在单独的同步阶段执行。预计 4–6%。
-3. **K>256 的 M128 Down 提高权重复用**：按 XCD 安排任务顺序，让同一 expert 的块在同一个 L2 内共享权重切片。
+3. **K>256 的 M128 Down 减少权重重读**：16k–32k 时 Down 读流量是理想值的 2–3.5 倍（Qwen3.8 32k：3.6 GB 对 1.07 GB），多数 128 行块要从 MALL 重读自己的权重切片，因为 L2 放不下每个 XCD 在途的切片。调整任务顺序和 OC 切分都没有效果（见 §5），需要让一个 CTA 连续处理同一 expert 的多个块并复用 LDS 里的 B。
 4. **M64 Gate/Up 的空 tile**：小 batch（lead=1）时仍要在最后派发 3×块数×N 块数 个空 workgroup，Gate/Up 仍比 sort64 慢 0–5%。可以让每个块的尾部 tile 由一个 workgroup 循环检查，减少空 workgroup。
 5. **I=192/320 的 N 尾部浪费；K>640 的 M128 Down**（A 会超过 80 个 VGPR，需要换一种切分方式）。
 
@@ -183,6 +209,10 @@
 | `gap_gu4w.py`、`loop_gu4w.py` | 降频测量 |
 | `compile_var.py` | 缓存二进制与重新编译结果的对比 |
 | `ab_bf16_e2e.py` | 同进程 A/B：替换各 kernel 模块里的 `_f32_to_bf16`，清掉 `_get_compiled_kernel`、`_get_gateup_4w_kernel`、`build_moe_gateup_4w` 的缓存后交替测量；`AB_ROUNDS` 设轮数 |
+| `ab_m128_final.py` + `gemm2_4x1_old.py` | M128 Down 同进程 A/B：HEAD 版本（改成绝对 import 的副本）对比工作区版本，并检查输出逐位一致 |
+| `pmc_m128.py` | 单个 arm 的 M128 Down 读请求计数（按 128B/64B/32B 算读流量） |
+| `balance_m128.py` | 用真实 sort 结果离线统计各 XCD 的有效任务数 |
+| `retune950.sh` | 改 kernel 后只重跑 `--e2e_tune`，输出在 `out950r/` |
 
 gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES` 24 个 + `M64_M128_CASES` 10 个）。
 
@@ -211,3 +241,9 @@ gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES
   - ISA：所有调用该函数的 kernel 都改用 `v_cvt_pk_bf16_f32`。4w Gate/Up 的 spill 从 4 个增加到 6 个，新增的 reload 在 K 循环外（每个 tile 一次）。
   - 同进程 A/B（硬件 RNE 对比原 RTA，22 个生产配置，覆盖 decode、M64、4w、1x4、8x1 compact、BF16 default）：Gate/Up 和 Down 都在 ±1.5% 以内，与未改动的 M128 Down 的波动相当；MiniMax-e128 16k 的 4w Gate/Up 快 1.1%（8 轮）。结论：性能持平。
   - 与 RTA 的结果只在舍入平局处相差 1 ulp。202 个调优行重新逐行检查全部通过；op test 34 个用例通过。
+- 2026-10-23：
+  - M128 Down one-shot 的任务转置宽度从 2 改为：N ≤ 2560 且 OC ≥ 4 时取 8，其余取 4；persistent 不变（见 §3.9）。输出逐位不变。
+  - Down：Qwen3.5-i512 2k–16k 快 3–20%，Qwen3.8-i640 16k 快 13%，Qwen3.5-i128 4k–16k 快 4–14%，Qwen397 8k 快 4%，MiniMax-e128 16k 快 5%；其余 one-shot 生产配置在 ±1% 内。
+  - 试过但放弃：去掉 packet 轮转、更细的 OC 切分、切片优先顺序、按 sort 块轮流分配 XCD、persistent 用 W=8（见 §5）。K>256 的权重重读仍未解决，§6 第 3 项改写为新的方向。
+  - 重跑 4 个 FP8 PTPC 模型的 `--e2e_tune`，只替换“改用 one-shot M128 且同一次运行内快 ≥ 1.5%”的 5 行（原地替换，不增加 shape）：Qwen3.5-i512 4k/8k/16k（m128p → m128，快 1.8–3.4%）、Qwen3.8-i640 16k（m128p → m128，快 1.9%）、MiniMax-e128 4k（`256_256_128_True:m128p:0` → `64_256_128_True:m128:0`；bench_moe 5 轮交替 458 → 432 µs）。
+  - 5 行都用生产 `fused_moe` 做了精度检查（logits_diff ≤ 4.5e-6）；shape 冲突检查通过；op test 34 个用例通过。
