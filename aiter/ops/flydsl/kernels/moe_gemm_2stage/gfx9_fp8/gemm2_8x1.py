@@ -58,7 +58,7 @@ def read_a_g2r(a, ids_lds, afragments, copy_atom, lane, wave, k_widths, k_offset
     packed_inputs = [
         [
             [
-                fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float8E4M3FNUZ)
+                fx.make_rmem_tensor(fx.make_layout(16, 1), fxh.fp8_dtype())
                 for _ in range_constexpr(width // 64)
             ]
             for _ in range_constexpr(2)
@@ -203,7 +203,7 @@ def _pin_vgpr(value):
 # ==================== Shared task setup ====================
 def _input_tensor(p_input, M, TOPK, K):
     return fx.rocdl.make_buffer_tensor(
-        fxh.view_as_torch_tensor(p_input, (M, TOPK, K), fx.Float8E4M3FNUZ),
+        fxh.view_as_torch_tensor(p_input, (M, TOPK, K), fxh.fp8_dtype()),
         max_size=False,
         num_records_bytes=fx.Int64(M) * TOPK * K,
     )
@@ -228,7 +228,7 @@ def _routing_scale(p_sorted_weights, row_begin, rows):
 def _expert_weights(p_weight, expert, N, K):
     return fx.rocdl.make_buffer_tensor(
         fx.make_view(
-            fx.recast_iter(fx.Float8E4M3FNUZ, fxh._as_ptr(p_weight))
+            fx.recast_iter(fxh.fp8_dtype(), fxh._as_ptr(p_weight))
             + fx.Int64(expert) * N * K,
             fx.make_layout(N * K, 1),
         ),
@@ -323,7 +323,7 @@ def _weight_scale_buffer(p_w_scale, expert, N):
 
 def _make_a_fragments(mm, a, rows, k_widths):
     """Return the A copy atom and one resident A fragment per K block."""
-    copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float8E4M3FNUZ)
+    copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fxh.fp8_dtype())
     fragments = [
         mm.make_fragment_B(
             fx.make_view(fx.get_iter(a), fx.make_layout((rows, width), (1, rows)))
@@ -747,6 +747,14 @@ def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, paddi
             rank = cu * short + arith.select(cu < long, cu, long) + round_id
             logical = ((xcc + 2) & (xcc_count - 1)) * (per_se * 4) + se * per_se + rank
             e_idx = fx.Int32(arith.select(u < mapped, logical, u))
+        else:
+            # Workgroup w runs on XCD w % xcc_count; contiguous task ranges keep an
+            # expert's full tasks, and so its weights, in one L2.
+            tasks = fxh.div_up(fx.Uint32(valid), BM)
+            chunk = tasks // xcc_count
+            u = fx.Uint32(wg)
+            mapped = (u % xcc_count) * chunk + u // xcc_count
+            e_idx = fx.Int32(arith.select(u < chunk * xcc_count, mapped, u))
 
         if e_idx * BM < valid:
             emit_body(
@@ -864,7 +872,7 @@ def _emit_k128n_body(
 
     shared_allocator = fx.SharedAllocator()
     weight_slots = shared_allocator.allocate(
-        fx.Array[fx.Float8E4M3FNUZ, 2 * BN * BK, 16]
+        fx.Array[fxh.fp8_dtype(), 2 * BN * BK, 16]
     )
     weight_storage_ptrs = [weight_slots.peek().ptr, weight_slots.peek().ptr + BN * BK]
     cshuffle_storage = shared_allocator.allocate(
@@ -877,8 +885,8 @@ def _emit_k128n_body(
         sorted_lds[tid] = sorted_ids[tid]
     gpu.barrier()
 
-    mm = ops.create_thr_mma(fx.Float8E4M3FNUZ, (1, NUM_WAVES, 1))
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+    mm = ops.create_thr_mma(fxh.fp8_dtype(), (1, NUM_WAVES, 1))
+    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fxh.fp8_dtype()))
     c_fake = fx.make_view(
         fx.get_iter(input_tensor), fx.make_ordered_layout((BN, BM), (0, 1))
     )
@@ -904,10 +912,10 @@ def _emit_k128n_body(
         fx.make_view(fx.get_iter(weight_flat), fx.make_layout(16, 1))
     )
     weight_staging = [
-        fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float8E4M3FNUZ)
+        fx.make_rmem_tensor(fx.make_layout(16, 1), fxh.fp8_dtype())
         for _ in range_constexpr(WEIGHT_PREFETCH_SLOTS)
     ]
-    weight_store_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float8E4M3FNUZ)
+    weight_store_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fxh.fp8_dtype())
 
     def weight_lds_quarter_view(pointer, n_quarter):
         return fx.make_view(
@@ -1063,7 +1071,7 @@ def _emit_k128n_body(
     if const_expr(prepare_addresses is not None):
         # Prepare the B template, partition, and base pointers here; pin N0 addresses after the prologue.
         b_template = weight_lds_quarter_view(weight_storage_ptrs[0], 0)
-        b_copy = ops.get_universal_copy_atom(fx.Float8E4M3FNUZ, 128)
+        b_copy = ops.get_universal_copy_atom(fxh.fp8_dtype(), 128)
         b_partition = ops.get_tiled_mma_partition_S(
             mm, b_template, "A", copy_atom_bits=128
         )
@@ -1336,7 +1344,7 @@ def _emit_k192_body(
 
     row_begin = p_sorted_expert_ids[2 * e_idx]
     allocator = fx.SharedAllocator()
-    bslots = allocator.allocate(fx.Array[fx.Float8E4M3FNUZ, 2 * BN * K, 16])
+    bslots = allocator.allocate(fx.Array[fxh.fp8_dtype(), 2 * BN * K, 16])
     # Both slots remain contiguous; precomputed addresses include slot offsets.
     bptr = bslots.peek().ptr
     scratch = allocator.allocate(fx.Array[fx.BFloat16, 4 * 16 * BN, 16])
@@ -1352,8 +1360,8 @@ def _emit_k192_body(
     a = _input_tensor(p_input, M, TOPK, K)
     expert = p_sorted_expert_ids[2 * e_idx + 1]
     weights = _expert_weights(p_weight, expert, N, K)
-    mm = ops.create_thr_mma(fx.Float8E4M3FNUZ, (1, 8, 1))
-    atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
+    mm = ops.create_thr_mma(fxh.fp8_dtype(), (1, 8, 1))
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fxh.fp8_dtype()))
     c = mm.make_fragment_C(
         fx.make_view(fx.get_iter(a), fx.make_ordered_layout((BN, BM), (0, 1)))
     )
@@ -1438,7 +1446,7 @@ def _emit_k192_body(
     b_template = fx.make_view(
         bptr, fx.make_layout(((16, BN // 64), (16, K // 16)), ((16, 16 * K), (1, 256)))
     )
-    b_copy = ops.get_universal_copy_atom(fx.Float8E4M3FNUZ, 128)
+    b_copy = ops.get_universal_copy_atom(fxh.fp8_dtype(), 128)
     b_partition = ops.get_tiled_mma_partition_S(mm, b_template, "A", copy_atom_bits=128)
     b_write_ptr = fx.recast_iter(fx.Uint32, bptr)
     # The Uint32 templates preserve the pointer types/alignments of b_write_ptr and b_write_ptr+2.

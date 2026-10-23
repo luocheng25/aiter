@@ -34,6 +34,7 @@ def compile_moe_gemm2(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    down_n_splits=1,
 ):
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
@@ -53,6 +54,8 @@ def compile_moe_gemm2(
             f"down prefill requires N to be divisible by 256 for paired "
             f"128-wide tiles, got N={N}"
         )
+    if down_n_splits != 1 and down_path != "1x4_64x256":
+        raise ValueError("Only the 1x4_64x256 Down splits N")
     if down_path != "default":
         assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
         assert weight_dtype == "fp8"
@@ -67,7 +70,7 @@ def compile_moe_gemm2(
         if down_path == "1x4_64x256":
             from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
 
-            return _build_moe_gemm2_1x4_n256(**options)
+            return _build_moe_gemm2_1x4_n256(**options, n_splits=down_n_splits)
         if down_path == "8x1_compact":
             from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
 
@@ -88,7 +91,7 @@ def compile_moe_gemm2(
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
-        weight_dtype = fx.Float8E4M3FNUZ
+        weight_dtype = fxh.fp8_dtype()
 
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
         K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK

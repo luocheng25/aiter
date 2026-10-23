@@ -1,0 +1,213 @@
+# gfx950 FP8 MoE（FlyDSL `fused_moe_gfx942` 后端）优化记录
+
+本文件记录 `gfx9_fp8/` 下 MoE kernel 在 gfx950（MI350X）上的优化方法、当前状态和失败尝试。
+**后续每次优化都在文末“变更记录”追加一条**，写明日期、改动、方法、A/B 数据和结论；失败的尝试也要记录。
+
+## 1. 测试方法
+
+- **硬件与环境**
+  - 8× MI350X（gfx950，256 CU，8 XCD），ROCm 7.2，torch 2.9.1，FlyDSL 0.4.0（`/opt/venv`）。
+  - 每个进程使用独立的 `AITER_JIT_DIR`，并设置 `AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1`（该变量现在只影响 gfx942；gfx950 的 BF16 输出固定用硬件 RNE 转换）。
+- **模型**：全部为 PTPC FP8（per-token 激活 × per-channel 权重）。
+
+  | 名称 | D | I | E | topk | 激活 |
+  |---|---:|---:|---:|---:|---|
+  | MiniMax-e128 | 6144 | 384 | 128 | 4 | Swiglu |
+  | MiniMax-e129 | 6144 | 384 | 129 | 5 | Swiglu |
+  | MiMo | 6144 | 256 | 384 | 8 | SiLU |
+  | Qwen3.5-i128 | 2048 | 128 | 257 | 9 | SiLU |
+  | Qwen3.5-i512 | 2048 | 512 | 257 | 9 | SiLU |
+  | Qwen397 | 4096 | 128 | 513 | 11 | SiLU |
+  | Qwen3.8-i640 | 2560 | 640 | 513 | 11 | SiLU |
+
+- **batch**：tokens 取 1024–32768。
+- **计时**
+  - 用 torch profiler 统计每次迭代所有 kernel 的时间之和（sort、输入 quant、Gate/Up、中间 quant、Down、reduce），取中位数。
+  - 每轮 20 次迭代，3 轮交替执行。
+- **两种口径**
+  - b2b：kernel 连续发射。
+  - sleep：每个 kernel 前先跑 1M cycle 的 `torch.cuda._sleep`，与 pyhip cudaPerf 的方法一致。
+- **上限参考**
+  - 带宽：读 5.2 TB/s，写（fill）4.65 TB/s，copy 4.57 TB/s。
+  - FP8 dense：真实数据下约 2.0–2.5 PF。
+  - Down 的理想字节数 = R·I + R·4 + E_act·D·I + E_act·D·4 + R·D·2，其中 R = tokens·topk。
+- **注意事项**
+  1. **持续负载会降频。** 例如 4w Gate/Up 在 MiMo 4k：GPU 刚休息过约 265–275 µs，稳态约 325–330 µs，需要约 150 µs 空闲才能恢复时钟。比较不同实现时迭代次数必须一致：pyhip 测试默认只测 sync 之后的 3 次迭代，相当于“刚休息过”，需设 `PYHIP_ITERS=20`。
+  2. **FlyDSL 磁盘缓存（`~/.flydsl/cache`）可能返回旧二进制。** 怀疑性能回退时，先用 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 重新编译，对比输出是否逐位一致以及耗时。2026-10-23 的旧缓存已移到 `~/.flydsl/cache_stale_20261023`。
+  3. benchmark 运行期间不要修改 kernel 源码（FlyDSL 会延迟编译，并用 getsource 生成缓存键）。
+  4. 不同 GPU 并行跑时相差可达几个百分点；小于 5% 的效果要在同一进程内交替 A/B。
+
+## 2. Pipeline 与配置
+
+配置串格式为 `BLOCK_M_BLOCK_N_BLOCK_K_prefill:down_path:pad`。
+
+| 阶段 | 实现 | 文件 | 配置 |
+|---|---|---|---|
+| sort | aiter `moe_sorting`（opus） | — | block：Down 为 M128 时取 256，否则等于 BLOCK_M（64 或 256） |
+| 输入 quant | aiter per-token | — | — |
+| Gate/Up M64 | prefill 1x4 | `gemm1.py` | `64_{256,128}_{128,256}_True`；使用 sort64 元数据，搭配 M128 Down 时读取 sort256 元数据 |
+| Gate/Up 4 波 | 2×2 波，256×256 tile，persistent，stream-K | `gemm1_2x2.py` | `256_256_128_True`，使用 sort256 元数据 |
+| 中间 quant | FlyDSL 短行 per-token（128 < I ≤ 1024）；其余用 aiter | `quant.py` | — |
+| Down M64 1x4 | 64×256 tile，按 N 切成 n_splits 份 | `gemm2_1x4.py` | `:1x4_64x256:128` |
+| Down 8x1 compact | M256 full + M64 tail 任务 | `gemm2_8x1.py`, `gemm2_8x1_compact.py` | `:8x1_compact:128` |
+| Down M128 | 4×1 波，128 行块，packed 输出 | `gemm2_4x1.py` | `:m128:0`（one-shot），`:m128p:0`（persistent）；Gate/Up 可以是 M64 或 4 波 |
+| topk reduce | `invert_sorted_ids` + `sorted_sum`（M64 Down）；`make_packed_sum`（M128 Down） | `moe_reduce.py`, `gemm2_4x1.py` | — |
+
+- 4w Gate/Up 搭配 M64 Down 时，要用 block 64 重新排序一次，额外开销约 25–65 µs。
+- M128 Down 需要 sort256 元数据；M64 和 4 波 Gate/Up 都能直接读取，不需要重新排序。
+
+## 3. 已完成的优化
+
+1. **gfx950 适配**
+   - `common.py` 新增 `fp8_dtype()`，`get_down_device_config()` 支持 gfx950（xcd=8）。
+2. **M64 Gate/Up（`gemm1.py`）**
+   - task 按 XCD 连续映射（1D grid）。
+   - 使用 `MFMA_Scale(16,16,128)` 的 K128 atom（不带 scale 的 f8f6f4）；仅 TILE_K=128 时使用 K128 交织调度。
+   - `moe_sorting(accumulate=False)`。
+   - MiniMax 32k 时 Gate/Up 从 1352 µs 降到 837 µs。
+   - 8x1 Down 同样改为 XCD 连续映射。
+3. **4 波 Gate/Up（`gemm1_2x2.py`）**
+   - 移植自 pyhip `fp8_gemm_950` 的 4 波 FP8 GEMM。
+   - 256 行 × (128 gate + 128 up) 的 tile。2×2 波，每个波负责 4 个象限各 64×64，累加器占 256 个 AGPR。
+   - persistent：grid = CU 数，带 XCD slot 映射；A/B 通过 LDS DMA 做 ping-pong。
+   - stream-K 只在余数 ≤ C/8 时启用：partial 用 SC1 读写，flag 用 agent 范围的 monotonic 原子。
+   - 32k 时 Gate/Up 达到 1450–2054 TF（原来 1307–1520）。
+4. **中间 quant（`quant.py` `flydsl_quant_per_token`）**
+   - 结果与 aiter per-token kernel 逐位一致。
+   - 约 5 TB/s；aiter 每个 256 线程的 block 只处理 1 行，只有 1.3–2.4 TB/s。
+5. **M64 Down 按 N 切分（`gemm2_1x4.py`）**
+   - 一个任务 = 64 行块 × N/n 列。
+   - host 取 D/256 的最小因子 n，使每个 CU 至少有 6 个任务，用于缓解 wave quantization。
+   - MiniMax-e128 4k 时 Down 从 182 µs 降到 145 µs。
+6. **M128 Down（`gemm2_4x1.py`）**
+   - 移植自 pyhip `moe_multistage_down_m128`，改为 PTPC。
+   - 4 个波 × 32 行；B 通过 LDS DMA ring 预取（4 个槽，提前 3 个 packet），A 常驻寄存器。
+   - 上一个 packet 的 epilogue（scale、BF16 转换、permlane 打包）穿插在当前 packet 的 MFMA 之间。
+   - 输出为 packed 布局 `[block128, N64, row128, col64]`，再由 `make_packed_sum` 做 topk 求和。
+   - `merge_halves`：每个 expert 平均不足 128 条路由时，一个任务处理 sort256 块的两半，后半段只在包含路由时才算。
+   - `m128p`：512 个 CTA，8 个分片原子队列，最后一个领取者把计数器清零。
+   - I ≤ 256 时约 4.0–4.57 TB/s。
+7. **M128 Down 支持 I ≤ 640（2026-10-23）**
+   - K>256 时，每个 N64 packet 拆成 N64×K128 子包流过 ring：K=384/512/640 分别 9/8/5 个 8 KiB 槽（≤72 KiB，每 CU 仍能放 2 个 CTA）。
+   - B 固定 32 个 VGPR，A 占 K/8 个；VGPR 总数分别为 194/201/238，无溢出。
+   - OC 切分在 host 端决定（`fused_moe_gfx942._m128_oc_splits`）：每个切片宽度 ≥ K（因为每个切片都要重读 A），在此前提下取能保证每个 worker ≥ 8 个任务的最少份数。
+   - Down 结果（µs；括号内为理想 TB/s）：
+
+     | 模型 | 32k b2b：原最优 M64 → M128 | 32k sleep：原最优 M64 → M128 |
+     |---|---|---|
+     | MiniMax-e128 | 706 → 565（2.79 → 3.48） | 676 → 501（2.91 → 3.93） |
+     | MiniMax-e129 | 880 → 669（2.71 → 3.57） | 856 → 597（2.78 → 4.00） |
+     | Qwen3.5-i512 | 618 → 501（2.64 → 3.26） | 581 → 449（2.81 → 3.63） |
+     | Qwen3.8-i640 | 1111 → 904（2.63 → 3.23） | 1011 → 864（2.89 → 3.38） |
+
+   - 整体 MoE：32k 时 b2b 快 1.08–1.11×、sleep 快 1.10–1.19×；16k 时 1.04–1.11× / 1.05–1.16×；8k 及以下基本持平。
+8. **M64 Gate/Up 读取 sort256 元数据，小 batch 也能用 M128 Down（2026-10-23）**
+   - 新配置 `64_{256,128}_{128,256}_True:m128:0` / `:m128p:0`：sort 用 256 行块，M64 Gate/Up 把每个块当作 4 个 64 行 tile，expert 取 `sorted_expert_ids[tile / 4]`。sort 把 expert 的路由排在 padding 前面，所以 tile 的第一个 sorted id 是 padding 时整个 tile 为空，直接退出。
+   - **派发顺序决定性能。** 按 expert 顺序把一个块的 4 个 tile 相邻派发时，小 batch 下大部分 tile 为空，空 workgroup 夹在有效 workgroup 之间派发，Gate/Up 慢 17%（MiMo 1k：252 → 294 µs）。让空 workgroup 不读 sorted_ids 也一样慢，开销来自派发本身。
+   - **改为 lead tile 顺序**：每个 XCD 负责连续的一段块，先派发每个块的前 `lead` 个 tile（同一块的 tile 仍然相邻，共享 L2 中的权重），再派发其余 tile（小 batch 时基本为空，放到最后）。
+   - `lead` 在 kernel 内计算：均值 μ = 路由数 / min(块数, E)，超过 57 / 118 / 180 时 lead 分别取 2 / 3 / 4（即 Poisson 计数的 80% 分位达到 k 个 tile 时的均值）。除以 min(块数, E)，是因为路由数刚超过 256 的 expert 会多出一个几乎为空的块，把均值拉低。
+   - `lead` 偏小时，有效 tile 落到后段，要从 HBM 再读一遍权重（MiMo 4k：lead=1 为 548 µs，lead=2 为 321 µs）；偏大时，空 tile 又夹在有效 tile 之间。
+   - Gate/Up 与 sort64 相比（b2b，MiniMax-e128、MiMo、Qwen397）：1k–4k 在 −5%～+5% 之间，8k 慢 3–9%。收益来自 Down + reduce（例如 MiMo 1k：1x4 Down 204 µs + sorted_sum 29 µs → M128 174 µs + packed_sum 24 µs）。
+   - 整体 MoE（同一次运行里，加入新配置前后各自的最优配置；7 个模型）：
+
+     | 口径 | 1k | 2k | 4k | 8k | 提升 >1% 的点 |
+     |---|---:|---:|---:|---:|---:|
+     | b2b（几何平均） | 1.037× | 1.042× | 1.044× | 1.007× | 19/28 |
+     | sleep（几何平均） | 1.037× | 1.033× | 1.024× | 1.003× | 12/28 |
+
+   - 提升最多的是 I 小、expert 多的模型：Qwen3.5-i128 在 1k–4k 快 1.07–1.14×，Qwen397 在 1k–8k 快 1.02–1.12×，MiMo b2b 在 1k–4k 快 1.04–1.06×。Qwen3.8-i640（1k–2k）和 Qwen3.5-i512（1k）的 M128 Down 不比 1x4 Down 快，最优配置不变。
+
+## 4. 当前状态（2026-10-23）
+
+- **对比 pyhip（双方都是 20 次迭代；1k–8k 为加入 M64 Gate/Up + M128 Down 后的结果，16k/32k 沿用之前的结果）**
+
+  | 口径 | 1k | 2k | 4k | 8k | 16k | 32k | 胜出点数 | 范围 |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | b2b（几何平均） | 1.41× | 1.29× | 1.20× | 1.19× | 1.20× | 1.24× | 42/42 | 1.14–1.55× |
+  | sleep（几何平均） | 1.20× | 1.15× | 1.14× | 1.19× | 1.24× | 1.33× | 42/42 | 1.06–1.44× |
+
+- **对比 aiter 自带的 PTPC MoE kernel**（ASM 1-stage、ASM stage1 + CK stage2、CK 2-stage；在 I>256 的 M128 Down 加入之前测得）
+  - 两种口径都是 39/42 胜出；几何平均 b2b 1.46×，sleep 1.53×。
+  - 输掉的 3 个点都在 1k，对手都是 ASM 1-stage：MiMo 0.90×、Qwen397 0.90×、Qwen3.5-i128 0.95×。
+  - 用这些 aiter 数据估算加入 M64 Gate/Up + M128 Down 后的 1k：b2b MiMo 0.95×、Qwen397 0.97×、Qwen3.5-i128 1.03×；sleep MiMo 0.98×、Qwen397 1.00×、Qwen3.5-i128 1.06×。
+- **剩余开销**
+  - 32k 时 topk reduce 占总时间 22–33%。
+  - I>256 时 Down 在 b2b 下仍只有写带宽上限的 69–77%。
+  - 1k–2k 时，M64 Gate/Up 读取 sort256 元数据仍比 sort64 慢 0–5%，空 tile 仍然要派发。
+- **gfx950 调优配置**（2026-10-23）：6 个 model_configs CSV 各补上 gfx950（cu_num 256）行，共 202 行，覆盖 MiniMax-M3、Qwen3.5-35B、Qwen3.5-397B、Qwen3.8 FP8/BF16 和 Hunyuan3 per-tensor。
+  - 选中的 kernel：本后端 156 行，ASM 1-stage 17 行，其余 29 行是 aiter 的 CK 等 2-stage kernel（Qwen3.8 BF16 27 行、Qwen3.5-35B 2 行）。
+  - 端到端对比 aiter 2-stage 调优的最优配置（只统计被替换的行，同一种 e2e 测法）：MiniMax 1.98×（36/36 行）、Qwen397 1.89×（17/18）、Qwen3.5-35B 1.61×（25/34）、Qwen3.8 FP8 1.53×（39/48）、Qwen3.8 BF16 1.30×（21/48）。Hunyuan3 per-tensor 在 gfx950 上的 staged 调优对所有 shape 都报 no valid candidate（每批 60 个 CK 任务里 30 个 crash 或报错），18 行全用本后端。
+  - 全部 202 行都用生产 `fused_moe` 跑过精度检查（`test_moe_2stage.test_fmoe`）。logits_diff 最大 1.2e-3；MiniMax 的 decode 行最大 8.8e-3，原因是 decode kernel 直接读 BF16 激活，而参考结果对激活做了 FP8 量化。
+
+## 5. 失败或放弃的尝试（不要重复）
+
+- **1x4_64x256 Down 改用 K128 MFMA**：VGPR 从 242 增加到 264，occupancy 从 2 降到 1，变慢。
+- **TILE_K=256 时设 `waves_per_eu=3`**：寄存器溢出。
+- **4w Gate/Up**
+  - 让各 CTA 错开 K 的起点：更慢，因为同步共享数据的 CTA 原本可以合并 miss。
+  - half tile 配静态调度：更慢。
+  - 调整 group_m：没有影响。
+  - stream-K 用于大余数：余数 189 时慢 9–17%，因为 slot 区间漂移后失去了同步共享。
+  - 通过 scf.if 传递 256 个累加器：386 个 VGPR 溢出。
+  - 使用 agent 范围的 fence（buffer_wbl2/inv）：多出约 36 µs。
+  - 跳过空下半块的 MFMA：结果逐位一致，但产生 116–322 个溢出；b2b 只快 2–5%，sleep 反而慢 10–13%。
+- **M128 Down**
+  - 两半都有路由时仍合并处理：权重切片被逐出，需要从 HBM 重读。
+  - pyhip 的 PF4 pair-refill：没有收益。
+  - one-shot 循环在 barrier 之后重读 LDS 里的 task slot：GPU 挂死，rank 必须保存在寄存器里。
+  - K>256 时仍用 OC=8：A 被重读 8 次；Qwen3.5-i512 32k 时 OC=8 为 613 µs，OC=2 为 501 µs。
+- **M64 Gate/Up 读取 sort256 元数据**
+  - 按 expert 顺序把每块的 4 个 tile 相邻派发：小 batch 时空 tile 夹在有效 tile 之间，Gate/Up 慢 17–18%（MiMo 1k 252 → 294 µs，2k 266 → 314 µs）。空 workgroup 跳过 sorted_ids 读取也一样慢。
+  - 所有块的 tile 0 先发、其余全部放后段（相当于 lead=1）：4k 时每块有 2 个有效 tile，第二个 tile 要从 HBM 重读权重，MiMo 4k Gate/Up 从 321 µs 涨到 548 µs。
+  - lead 按 Poisson 95% 分位选：均值 171–176（MiMo / Qwen397 8k）时取 4，比取 3 慢 5–11%（479 vs 455 µs，263 vs 237 µs）。改用 80% 分位。
+  - 均值只用 路由数 / 块数：MiniMax-e128 8k 每个 expert 约 256 条路由，一半 expert 多出一个几乎为空的块，均值降到约 171，lead 取 3，满块的第 4 个 tile 落到后段（强制 lead=3 实测 Gate/Up 390 µs，lead=4 为 306 µs）。改为除以 min(块数, E)。
+
+## 6. 待做（按预期收益排序）
+
+1. **把 topk reduce 融合进 Down**（原子累加，或按 token 输出的 epilogue）。32k 时占 22–33%，也是 1k 落后于 ASM 1-stage 的主要原因。
+2. **Gate/Up 大余数尾波**（MiniMax-e128 余数约 198，e129 余数 37）：尾块改用更小的 tile（128×512 / 128×256），在单独的同步阶段执行。预计 4–6%。
+3. **K>256 的 M128 Down 提高权重复用**：按 XCD 安排任务顺序，让同一 expert 的块在同一个 L2 内共享权重切片。
+4. **M64 Gate/Up 的空 tile**：小 batch（lead=1）时仍要在最后派发 3×块数×N 块数 个空 workgroup，Gate/Up 仍比 sort64 慢 0–5%。可以让每个块的尾部 tile 由一个 workgroup 循环检查，减少空 workgroup。
+5. **I=192/320 的 N 尾部浪费；K>640 的 M128 Down**（A 会超过 80 个 VGPR，需要换一种切分方式）。
+
+## 7. 工具（仓库外，`/tmp/e2e_ab_gfx950`）
+
+| 工具 | 用途 |
+|---|---|
+| `bench_moe.py` | 单配置整体 MoE 的分 kernel profile 和精度检查；`SLEEP_BEFORE_KERNEL=1` 切换为 sleep 口径 |
+| `run_e2e3.sh` + `summarize_e2e.py` | 对比 pyhip；`bench_pyhip.py` 设 `PYHIP_ITERS=20` |
+| `run_m128k.sh`、`summarize_m128k.py`、`summarize_down_m128k.py`、`bench_m128.py` | Down 对比和 OC 扫描 |
+| `run_m64m128.sh` + `summarize_m64m128.py` | 1k–8k 时加入 M64 Gate/Up + M128 Down 前后的最优配置对比；`test_m64m128.py` 只跑这组正确性用例 |
+| `tune950.sh`、`val950.sh` + `validate950.py`、`summarize950.py` | gfx950 配置调优（先跑 aiter kernel 的 staged 调优，再跑 `--e2e_tune`）和逐行的生产路径精度检查；输入在 `csv/`，输出在 `out950/` |
+| `ptpc/` | 对比 aiter PTPC kernel：`tune.sh`、`tune_family.sh`、`make_fam.py`、`bench_vs_aiter.py`、`run_vs.sh`、`summarize_vs.py` |
+| `gap_gu4w.py`、`loop_gu4w.py` | 降频测量 |
+| `compile_var.py` | 缓存二进制与重新编译结果的对比 |
+| `ab_bf16_e2e.py` | 同进程 A/B：替换各 kernel 模块里的 `_f32_to_bf16`，清掉 `_get_compiled_kernel`、`_get_gateup_4w_kernel`、`build_moe_gateup_4w` 的缓存后交替测量；`AB_ROUNDS` 设轮数 |
+
+gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES` 24 个 + `M64_M128_CASES` 10 个）。
+
+## 变更记录（只追加）
+
+- 2026-10-22：gfx950 适配；M64 Gate/Up 和 8x1 Down 改为 XCD 连续映射，Gate/Up 改用 K128 MFMA atom。
+- 2026-10-23：
+  - 4w Gate/Up（含 stream-K）。
+  - M128 Down（I ≤ 256，`m128`/`m128p`，merge_halves）。
+  - FlyDSL 短行 per-token quant；1x4 Down 按 N 切分。
+  - 对比 aiter PTPC kernel：39/42 胜出。
+- 2026-10-23：
+  - M128 Down 支持 I ≤ 640（K128 子包），加入 OC 切分策略；op test 增加到 24 个用例。
+  - 修正 pyhip 的 b2b 测量口径（20 次迭代）。重测结果：b2b 42/42（几何平均 1.22×），sleep 42/42（几何平均 1.18×）。
+  - 4w Gate/Up 跳过空半块的尝试已回退。
+  - 文件改名：`gemm1_4w.py` → `gemm1_2x2.py`，`gemm2_m128.py` → `gemm2_4x1.py`。
+- 2026-10-23：
+  - M64 Gate/Up 读取 sort256 元数据，新增 `64_*_True:m128:0` / `:m128p:0` 配置（tune space 增加 6 个）；Gate/Up 按 lead tile 顺序派发。
+  - 1k–8k 整体 MoE：b2b 几何平均快 0.7–4.4%，sleep 快 0.3–3.7%；最多 Qwen3.5-i128 2k 快 13.5%。对比 pyhip 的几何平均：b2b 1.223× → 1.253×，sleep 1.184× → 1.207×。
+  - op test 增加 `M64_M128_CASES`（10 个），共 34 个用例通过。
+- 2026-10-23：
+  - 6 个 model_configs CSV 补上 gfx950 调优行（202 行），流程同 PR #5932：`TUNE_ONLY=flydslv2,cktile,flydsl,asm`、`AITER_FMOE_TUNE_EXCLUDE_KERNELS=fmoe_stage1`、`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1`。
+  - 逐行生产路径精度检查全部通过；按 merged 配置跑 `test_moe_2stage.py --no-legacy --csv-filter impl__flydsl_gfx942` 156/156 通过；shape 冲突检查（`test_config_shape_collision`）通过。
+- 2026-10-23：
+  - gfx950 上 `_f32_to_bf16` 直接用 `.to(fx.BFloat16)`，生成硬件指令 `v_cvt_pk_bf16_f32`（RNE）。`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED`、`AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED` 和 RTE 内联汇编只用于 gfx942。
+  - ISA：所有调用该函数的 kernel 都改用 `v_cvt_pk_bf16_f32`。4w Gate/Up 的 spill 从 4 个增加到 6 个，新增的 reload 在 K 循环外（每个 tile 一次）。
+  - 同进程 A/B（硬件 RNE 对比原 RTA，22 个生产配置，覆盖 decode、M64、4w、1x4、8x1 compact、BF16 default）：Gate/Up 和 Down 都在 ±1.5% 以内，与未改动的 M128 Down 的波动相当；MiniMax-e128 16k 的 4w Gate/Up 快 1.1%（8 轮）。结论：性能持平。
+  - 与 RTA 的结果只在舍入平局处相差 1 ulp。202 个调优行重新逐行检查全部通过；op test 34 个用例通过。

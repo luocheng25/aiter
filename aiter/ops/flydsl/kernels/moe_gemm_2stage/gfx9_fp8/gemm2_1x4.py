@@ -185,9 +185,10 @@ def _store_cshuffle_row_pair(
 
 
 def _build_moe_gemm2_1x4_n256(
-    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, _task_table=False
+    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, _task_table=False, n_splits=1
 ):
     assert padding in (0, 32, 64, 128)
+    assert (N // 256) % n_splits == 0 and not (_task_table and n_splits > 1)
     _, generic_xcd_count = get_down_device_config()
     block_m_per_4wave_group = 64
     activation_bytes = block_m_per_4wave_group * K
@@ -200,7 +201,7 @@ def _build_moe_gemm2_1x4_n256(
     )
     output_row_stride = N + padding // (fx.BFloat16.width // 8)
 
-    weight_dtype = fx.Float8E4M3FNUZ
+    weight_dtype = fxh.fp8_dtype()
     down_ops = FlyObjCache(cache_ir=False)
 
     @flyc.jit
@@ -210,6 +211,7 @@ def _build_moe_gemm2_1x4_n256(
         valid_rows_u32 = fx.Uint32(valid_rows)
         valid_tasks = valid_rows_u32 // task_rows
         valid_tasks += fx.Uint32(valid_rows_u32 % task_rows != 0)
+        valid_tasks *= n_splits
 
         swizzle_chunk = valid_tasks // generic_xcd_count
         swizzle_limit = swizzle_chunk * generic_xcd_count
@@ -236,6 +238,9 @@ def _build_moe_gemm2_1x4_n256(
         """M64xN256: each workgroup uses four waves to compute one M64 task."""
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
         e_idx = _map_down_task(max_valid_id, block_m_per_4wave_group)
+        # Each M64 task covers N / n_splits columns, starting at N256 tile n_begin.
+        n_begin = (e_idx % n_splits) * (N // 256 // n_splits)
+        e_idx = e_idx // n_splits
         e_offset = fx.Int64(e_idx)
         if e_idx * block_m_per_4wave_group < max_valid_id:
             if const_expr(_task_table):
@@ -327,7 +332,7 @@ def _build_moe_gemm2_1x4_n256(
             # (BLOCK_N, BLOCK_K, num_blocks_N, num_blocks_K)
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
             ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
-            nBN = fxh.div_up(N, BLOCK_N)
+            nBN = fxh.div_up(N, BLOCK_N) // n_splits
             nBK = fxh.div_up(K, BLOCK_K)
             mm = down_ops.create_thr_mma(weight_dtype, (4, 1, 1))
 
@@ -528,19 +533,19 @@ def _build_moe_gemm2_1x4_n256(
             # Prologue: stage0 prepares N block 0 / K core 0.
             _set_priority(0)
             frag_weight = down_ops.load_tiled_mma_fragA(
-                mm, weight, [None, None, fx.Int32(0), 0]
+                mm, weight, [None, None, fx.Int32(n_begin), 0]
             )
             frag_pc_scale = None
             next_frag_pc_scale = None
             if const_expr(weight_quant_type == "ptpc"):
-                frag_pc_scale = commit_scale_block_lds(issue_scale_block_global(0))
+                frag_pc_scale = commit_scale_block_lds(issue_scale_block_global(n_begin))
                 next_frag_pc_scale = fx.make_fragment_like(frag_pc_scale)
             frag_weight_slots = [frag_weight, fx.make_fragment_like(frag_weight)]
 
             def overlap_previous_output_store(block_n, k_core, previous_fragC):
                 # Overlap the previous tile's eight store vectors with the two K cores (3 + 5).
                 if const_expr(use_delayed_4wave_store):  # noqa: SIM102
-                    if block_n > 0:
+                    if fx.Int32(block_n) > n_begin:
                         postprocess_store_vector_4wave(
                             previous_fragC,
                             frag_sorted_weight,
@@ -591,7 +596,7 @@ def _build_moe_gemm2_1x4_n256(
             if const_expr(use_delayed_4wave_store):
                 loop_state.append(previous_fragC.load())
             for block_n, state in range(
-                fx.Int64(0), fx.Int64(nBN), fx.Int64(1), init=loop_state
+                fx.Int64(n_begin), fx.Int64(n_begin + nBN), fx.Int64(1), init=loop_state
             ):
                 # Restore the next weight/scale and any delayed output tile.
                 frag_weight_slots[0].store(state[0].bitcast(weight_dtype))
@@ -626,7 +631,7 @@ def _build_moe_gemm2_1x4_n256(
             if const_expr(use_delayed_4wave_store):
                 previous_fragC.store(results[-1])
                 postprocess_store_vector_4wave(
-                    previous_fragC, frag_sorted_weight, fx.Int64(nBN - 1)
+                    previous_fragC, frag_sorted_weight, fx.Int64(n_begin + nBN - 1)
                 )
             _set_priority(0)
 
@@ -659,7 +664,7 @@ def _build_moe_gemm2_1x4_n256(
             M,
             value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
         )
-        kernel.launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
+        kernel.launch(grid=(1, task_num * n_splits, 1), block=(256, 1, 1), stream=stream)
 
     launch_prefill_1x4.compile_hints["target_features"] = "-packed-fp32-ops"
     return launch_prefill_1x4

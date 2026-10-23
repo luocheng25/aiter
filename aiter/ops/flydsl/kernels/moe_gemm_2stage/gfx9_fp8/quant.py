@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Baseline per-tensor FP8 quantization with cached launchers."""
+"""Baseline per-tensor and short-row per-token FP8 quantization with cached launchers."""
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -203,5 +204,116 @@ def flydsl_quant_per_tensor(torch_dtype):
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
         _run_compiled(launch, _ptr(A), _ptr(Amax), _ptr(B), A.numel(), wg_count, stream)
+
+    return callable
+
+
+def per_token_quant_supported(cols):
+    # aiter already quantizes rows of <= 128 with its per-group kernel.
+    return cols % 8 == 0 and 128 < cols <= 1024
+
+
+@functools.cache
+def flydsl_quant_per_token(torch_dtype, cols):
+    """Row-wise FP8 quant of contiguous [rows, cols] BF16 with [rows] FP32 scales.
+
+    Matches aiter's dynamic per-token kernel bit for bit on nonzero rows, but packs
+    several short rows into each wave instead of one row per 256-thread block.
+    """
+    assert per_token_quant_supported(cols)
+    chunks = cols // 8  # 128-bit BF16 loads per row
+    lanes = math.gcd(chunks, 64)
+    per_lane = chunks // lanes
+    unroll = max(1, 2 // per_lane)
+    num_threads = 256
+    rows_per_step = 64 // lanes * (num_threads // 64)
+    rows_per_block = rows_per_step * unroll
+    fmax = torch.finfo(torch_dtype).max
+
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    def quantize_per_token(A: fx.Pointer, B: fx.Pointer, S: fx.Pointer, rows: fx.Int32):
+        tid = fx.Int32(fx.thread_idx.x)
+        row0 = fx.Int32(fx.block_idx.x) * rows_per_block
+        left = rows - row0
+        block_rows = (left < rows_per_block).select(left, fx.Int32(rows_per_block))
+        lane = tid % lanes
+        row_in_step = tid // lanes
+
+        A = fx.make_view(A + fx.Int64(row0) * cols, fx.make_layout(rows_per_block * cols, 1))
+        B = fx.make_view(B + fx.Int64(row0) * cols, fx.make_layout(rows_per_block * cols, 1))
+        A = fx.rocdl.make_buffer_tensor(
+            A, max_size=False, num_records_bytes=fx.Int64(block_rows) * (cols * 2)
+        )
+        B = fx.rocdl.make_buffer_tensor(
+            B, max_size=False, num_records_bytes=fx.Int64(block_rows) * cols
+        )
+        atoms_a = fx.logical_divide(A, fx.make_layout(8, 1))
+        atoms_b = fx.logical_divide(B, fx.make_layout(8, 1))
+        copy_a = fx.make_copy_atom(fx.rocdl.BufferCopy(128), A.dtype)
+        copy_b = fx.make_copy_atom(fx.rocdl.BufferCopy(64), B.dtype)
+
+        frags = []
+        for u in range_constexpr(unroll):
+            for j in range_constexpr(per_lane):
+                atom = (row_in_step + u * rows_per_step) * chunks + lane + j * lanes
+                src = atoms_a[None, atom]
+                frag = fx.make_fragment_like(src)
+                fx.copy(copy_a, src, frag)
+                frags.append(frag)
+
+        clamp_lo = fx.Float32(-fmax)
+        clamp_hi = fx.Float32(fmax)
+        fm_fast = fx.arith.FastMathFlags.fast
+        for u in range_constexpr(unroll):
+            vals = [frags[u * per_lane + j].load().to(fx.Float32) for j in range_constexpr(per_lane)]
+            amax = fx.Float32(0.0)
+            for v in vals:
+                amax = fx.math.absf(v).reduce(fx.ReductionOp.MAX, amax)
+            for k in range_constexpr(lanes.bit_length() - 1):
+                amax = amax.maximumf(amax.shuffle_xor(lanes >> (k + 1), 64))
+            scale = amax * fx.Float32(1.0 / fmax)
+            inv_scale = (amax == 0.0).select(
+                fx.Float32(0.0), fx.Float32(rocdl.rcp(T.f32, scale))
+            )
+            row = row_in_step + u * rows_per_step
+            for j in range_constexpr(per_lane):
+                q = [
+                    fx.math.clampf(vals[j][k] * inv_scale, clamp_lo, clamp_hi, fastmath=fm_fast)
+                    for k in range_constexpr(8)
+                ]
+                words = []
+                for h in range_constexpr(2):
+                    lo = rocdl.cvt_pk_fp8_f32(
+                        T.i32, _raw(q[4 * h]), _raw(q[4 * h + 1]), fx.Int32(0), False
+                    )
+                    words.append(
+                        rocdl.cvt_pk_fp8_f32(
+                            T.i32, _raw(q[4 * h + 2]), _raw(q[4 * h + 3]), lo, True
+                        )
+                    )
+                packed = fx.Vector.from_elements(words, fx.Int32).bitcast(B.dtype)
+                dst = atoms_b[None, row * chunks + lane + j * lanes]
+                out = fx.make_fragment_like(dst)
+                out.store(packed)
+                fx.copy(copy_b, out, dst)
+            if lane == 0:
+                if row < block_rows:
+                    S[row0 + row] = scale
+
+    @flyc.jit
+    def launch(A: fx.Pointer, B: fx.Pointer, S: fx.Pointer, rows: fx.Int32, stream):
+        quantize_per_token(A, B, S, rows).launch(
+            grid=(fxh.div_up(rows, rows_per_block), 1, 1),
+            block=(num_threads, 1, 1),
+            stream=stream,
+        )
+
+    def callable(A: torch.Tensor, B: torch.Tensor, S: torch.Tensor):
+        assert A.dtype == torch.bfloat16 and A.is_contiguous() and A.shape[-1] == cols
+        rows = A.numel() // cols
+        if rows:
+            _run_compiled(
+                launch, _ptr(A), _ptr(B), _ptr(S), rows, torch.cuda.current_stream()
+            )
 
     return callable

@@ -7,14 +7,16 @@ from typing import Any
 import torch
 
 import aiter
-from aiter import ActivationType, QuantType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
+    flydsl_quant_per_token,
     invert_sorted_ids,
+    per_token_quant_supported,
     sorted_sum,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
@@ -32,12 +34,21 @@ class Config:
     use_batch1_algorithm: bool = False
 
     def __post_init__(self):
-        if self.down_path not in ("default", "1x4_64x256", "8x1_compact"):
+        if self.down_path not in (
+            "default",
+            "1x4_64x256",
+            "8x1_compact",
+            "m128",
+            "m128p",
+        ):
             raise ValueError(f"Unsupported Down path: {self.down_path}")
         if self.down_output_padding_bytes not in (0, 32, 64, 128):
             raise ValueError("Down output padding must be 0, 32, 64 or 128 bytes")
-        if self.down_path == "default" and self.down_output_padding_bytes != 0:
-            raise ValueError("The default Down path does not support output padding")
+        if (
+            self.down_path in ("default", "m128", "m128p")
+            and self.down_output_padding_bytes != 0
+        ):
+            raise ValueError(f"The {self.down_path} Down path does not support output padding")
         if self.down_path != "default" and not self.use_prefill:
             raise ValueError("Specialized Down paths require prefill")
         if self.use_batch1_algorithm and (
@@ -81,14 +92,38 @@ class Config:
             use_batch1_algorithm=use_batch1_algorithm == "True",
         )
 
+    @property
+    def four_wave_gateup(self) -> bool:
+        # BLOCK_M=256 prefill selects the gfx950 four-wave 256x256 FP8 Gate/Up.
+        return self.use_prefill and self.BLOCK_M == 256
+
     def unsupported_reason(self, problem: "_Problem") -> str | None:
         if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
             return "direct decoding requires 2 to 8 tokens"
         # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
         if not self.use_prefill and problem.batch == 1 and self.BLOCK_N != 16:
             return "batch 1 uses the 16_16_16 config"
-        if self.down_path != "default":
-            if self.BLOCK_M != 64:
+        if self.four_wave_gateup:
+            reason = _four_wave_gateup_reason(self, problem)
+            if reason is not None:
+                return reason
+        if self.down_path in ("m128", "m128p"):
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+            from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_4x1 import (
+                m128_supported,
+            )
+
+            if get_gfx_runtime() != "gfx950":
+                return "M128 Down requires gfx950"
+            # The M128 Down reads 256-row sort blocks; Gate/Up walks them in BLOCK_M tiles.
+            if 256 % self.BLOCK_M != 0:
+                return "M128 Down needs a Gate/Up BLOCK_M that divides 256"
+            if problem.quant_type not in ("", "ptpc"):
+                return "M128 Down requires per-token FP8 activations and weights"
+            if not m128_supported(problem.model_dim, problem.inter_dim):
+                return "M128 Down needs inter_dim % 128 == 0 <= 640 and N128-pair column slices"
+        elif self.down_path != "default":
+            if self.BLOCK_M != 64 and not self.four_wave_gateup:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
             # The native tuner's empty quant_type is a shape-only probe. The
             # runtime wrapper checks actual FP8 weight and activation support.
@@ -111,7 +146,11 @@ class Config:
                 return "BF16 Gate/Up ping-pong exceeds the 64 KiB LDS capacity"
             if self.BLOCK_M * problem.inter_dim * 2 > 64 * 1024:
                 return "BF16 default Down exceeds the 64 KiB LDS capacity"
-        if self.use_prefill and problem.gateup_dim % self.BLOCK_N != 0:
+        if (
+            self.use_prefill
+            and not self.four_wave_gateup
+            and problem.gateup_dim % self.BLOCK_N != 0
+        ):
             return (
                 f"gateup_dim={problem.gateup_dim} is not divisible by "
                 f"BLOCK_N={self.BLOCK_N}"
@@ -188,7 +227,60 @@ def get_tune_space():
         for path in ("1x4_64x256", "8x1_compact")
         for block_n, block_k in prefill
     )
+    # M64 Gate/Up on the M128 Down's 256-row sort blocks (gfx950).
+    configs.extend(
+        Config(64, block_n, block_k, True, down_path=path)
+        for path in ("m128", "m128p")
+        for block_n, block_k in prefill
+    )
+    # gfx950 four-wave 256x256 Gate/Up; unsupported_reason filters other targets.
+    configs.extend(
+        Config(256, 256, 128, True, down_path=path, down_output_padding_bytes=pad)
+        for path, pad in (
+            ("default", 0),
+            ("1x4_64x256", 128),
+            ("8x1_compact", 128),
+            ("m128", 0),
+            ("m128p", 0),
+        )
+    )
     return [config.to_string() for config in configs]
+
+
+def _four_wave_gateup_reason(config: Config, problem: "_Problem") -> str | None:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm1_2x2 import (
+        gateup_4w_supported,
+    )
+
+    if (config.BLOCK_N, config.BLOCK_K) != (256, 128):
+        return "four-wave Gate/Up uses the 256_256_128 tile"
+    if get_gfx_runtime() != "gfx950":
+        return "four-wave Gate/Up requires gfx950"
+    if problem.quant_type not in ("", "ptpc", "per_tensor"):
+        return "four-wave Gate/Up requires FP8 weights"
+    if not gateup_4w_supported(problem.gateup_dim, problem.hidden_dim):
+        return "four-wave Gate/Up needs inter_dim % 16 == 0 and hidden_dim % 256 == 0 >= 512"
+    return None
+
+
+@cache
+def _get_gateup_4w_kernel(N, K, TOPK, quant_type_str, activation_str, swiglu_limit):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm1_2x2 import (
+        build_moe_gateup_4w,
+    )
+
+    if activation_str == "swiglu":
+        swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
+    return build_moe_gateup_4w(
+        N=N,
+        K=K,
+        TOPK=TOPK,
+        activation=activation_str,
+        swiglu_limit=swiglu_limit,
+        act_quant_type=quant_type_str,
+        weight_quant_type=quant_type_str,
+    )
 
 
 @cache
@@ -209,7 +301,9 @@ def _get_compiled_kernel(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    down_n_splits=1,
     fused_down_clear=False,
+    sort_block_m=None,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
@@ -231,7 +325,9 @@ def _get_compiled_kernel(
         swiglu_limit=swiglu_limit,
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
+        down_n_splits=down_n_splits,
         fused_down_clear=fused_down_clear,
+        sort_block_m=sort_block_m,
     )
 
 
@@ -262,6 +358,50 @@ def _empty_scale(device):
     return torch.empty(0, device=device)
 
 
+def _down_n_splits(problem: _Problem, down_path: str) -> int:
+    """Split each 1x4_64x256 Down task's N until every CU has about six tasks."""
+    if down_path != "1x4_64x256":
+        return 1
+    rows = problem.batch * problem.topk
+    # Each active expert pads half an M64 block on average.
+    tasks = rows / 64 + min(problem.experts, rows) / 2
+    tiles = problem.model_dim // 256
+    for splits in range(1, tiles):
+        if tiles % splits == 0 and tasks * splits >= 6 * get_cu_num():
+            return splits
+    return tiles
+
+
+_DOWN_QUEUE_HEADS = {}
+
+
+def _m128_oc_splits(problem: _Problem, merge_halves: bool) -> int | None:
+    """OC split of an M128 Down above K256 (None keeps the builder default).
+
+    Every OC slice re-reads its block's K-wide A rows, so slices stay at least K
+    columns wide; the narrowest split giving eight tasks per worker wins.
+    """
+    n, k = problem.model_dim, problem.inter_dim
+    if k <= 256:
+        return None
+    rows = problem.batch * problem.topk
+    block_rows = 256 if merge_halves else 128
+    # Each active expert pads half a block on average.
+    blocks = rows / block_rows + min(problem.experts, rows) / 2
+    valid = [oc for oc in (1, 2, 4, 8, 16) if n % oc == 0 and n // oc % 128 == 0 and n // oc >= k]
+    for oc in valid:
+        if blocks * oc >= 8 * 2 * get_cu_num():
+            return oc
+    return valid[-1] if valid else None
+
+
+def _down_queue_heads(device):
+    # Persistent M128 Down task queues; each launch leaves the heads at zero.
+    if device not in _DOWN_QUEUE_HEADS:
+        _DOWN_QUEUE_HEADS[device] = torch.zeros(256, dtype=torch.int32, device=device)
+    return _DOWN_QUEUE_HEADS[device]
+
+
 def _gateup_output(hidden_states: torch.Tensor, problem: _Problem):
     return torch.empty(
         [problem.batch, problem.topk, problem.inter_dim],
@@ -287,17 +427,28 @@ def _run_prefill(
     activation_str: str,
     swiglu_limit: float | None,
 ):
+    m128_down = config.down_path in ("m128", "m128p")
+    # The M128 Down reads 256-row sort blocks; Gate/Up walks them in BLOCK_M tiles.
+    sort_block_m = 256 if m128_down else config.BLOCK_M
+    # sorted_sum writes every output row, so the sort need not zero an output buffer.
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
         problem.model_dim,
         hidden_states.dtype,
-        config.BLOCK_M,
+        sort_block_m,
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        accumulate=False,
     )
+    if cur_out.numel() == 0:
+        cur_out = torch.empty(
+            [problem.batch, problem.model_dim],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
     quant_func = (
@@ -319,23 +470,42 @@ def _run_prefill(
         a_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
     gemm1_out = _gateup_output(hidden_states, problem)
-    gateup_kernel = _get_compiled_kernel(
-        N=problem.gateup_dim,
-        K=problem.hidden_dim,
-        weight_dtype_str=weight_dtype_str,
-        quant_type_str=problem.quant_type,
-        TOPK=problem.topk,
-        BLOCK_TILE_SIZE_M=config.BLOCK_M,
-        BLOCK_TILE_SIZE_N=config.BLOCK_N,
-        BLOCK_TILE_SIZE_K=config.BLOCK_K,
-        stage="gateup",
-        alg="prefill_1x4",
-        E=problem.experts,
-        act_quant_type_str=act_quant_type_str,
-        activation_str=activation_str,
-        swiglu_limit=swiglu_limit,
-    )
+    if config.four_wave_gateup:
+        gateup_kernel = _get_gateup_4w_kernel(
+            problem.gateup_dim,
+            problem.hidden_dim,
+            problem.topk,
+            problem.quant_type,
+            activation_str,
+            swiglu_limit,
+        )
+    else:
+        gateup_kernel = _get_compiled_kernel(
+            N=problem.gateup_dim,
+            K=problem.hidden_dim,
+            weight_dtype_str=weight_dtype_str,
+            quant_type_str=problem.quant_type,
+            TOPK=problem.topk,
+            BLOCK_TILE_SIZE_M=config.BLOCK_M,
+            BLOCK_TILE_SIZE_N=config.BLOCK_N,
+            BLOCK_TILE_SIZE_K=config.BLOCK_K,
+            stage="gateup",
+            alg="prefill_1x4",
+            E=problem.experts,
+            act_quant_type_str=act_quant_type_str,
+            activation_str=activation_str,
+            swiglu_limit=swiglu_limit,
+            sort_block_m=sort_block_m,
+        )
     task_num = int(sorted_expert_ids.shape[0])
+    if config.four_wave_gateup:
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm1_2x2 import (
+            gateup_4w_workspace,
+        )
+
+        stream_k_args = gateup_4w_workspace(hidden_states.device)
+    else:
+        stream_k_args = ()
     _launch(
         gateup_kernel,
         gateup_in,
@@ -347,27 +517,121 @@ def _run_prefill(
         num_valid_ids,
         w1_scale if w1_scale is not None else _empty_scale(hidden_states.device),
         a_scale,
+        *stream_k_args,
         problem.batch,
-        task_num,
+        task_num * (sort_block_m // config.BLOCK_M),
     )
 
     if weight_dtype_str == "fp8":
-        down_in, down_in_scale = quant_func(
-            gemm1_out.view(problem.batch * problem.topk, -1),
-            scale=None,
-            quant_dtype=w2.dtype,
-            num_rows=None,
-        )
+        down_rows = gemm1_out.view(problem.batch * problem.topk, -1)
+        if (
+            quant_type == QuantType.per_Token
+            and down_rows.dtype == torch.bfloat16
+            and per_token_quant_supported(problem.inter_dim)
+        ):
+            down_in = torch.empty_like(down_rows, dtype=w2.dtype)
+            down_in_scale = torch.empty(
+                [down_rows.shape[0], 1],
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            flydsl_quant_per_token(w2.dtype, problem.inter_dim)(
+                down_rows, down_in, down_in_scale
+            )
+        else:
+            down_in, down_in_scale = quant_func(
+                down_rows,
+                scale=None,
+                quant_dtype=w2.dtype,
+                num_rows=None,
+            )
     else:
         down_in = gemm1_out
         down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+
+    w2_scale_arg = (
+        w2_scale if w2_scale is not None else _empty_scale(hidden_states.device)
+    )
+    if m128_down:
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_4x1 import (
+            build_moe_down_m128,
+            make_packed_sum,
+        )
+
+        # Packed [block128, N64, row128, col64] routes, summed per token below.
+        packed = torch.empty(
+            [task_num * sort_block_m, problem.model_dim],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        merge_halves = problem.batch * problem.topk < 128 * problem.experts
+        down_kernel = build_moe_down_m128(
+            N=problem.model_dim,
+            K=problem.inter_dim,
+            TOPK=problem.topk,
+            sort_block_m=sort_block_m,
+            persistent=config.down_path == "m128p",
+            # Under 128 routes per expert on average most second halves are empty.
+            merge_halves=merge_halves,
+            oc_splits=_m128_oc_splits(problem, merge_halves),
+        )
+        _launch(
+            down_kernel,
+            down_in,
+            w2,
+            packed,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            w2_scale_arg,
+            down_in_scale,
+            _down_queue_heads(hidden_states.device),
+            problem.batch,
+            task_num,
+        )
+        loc_ids = torch.empty(
+            [problem.batch, problem.topk],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        invert_sorted_ids(problem.topk)(
+            sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], problem.batch
+        )
+        _launch(
+            make_packed_sum(N=problem.model_dim, TOPK=problem.topk),
+            cur_out,
+            packed,
+            loc_ids,
+            problem.batch,
+            packed.shape[0],
+        )
+        return cur_out
+
+    down_block_m = config.BLOCK_M
+    if config.four_wave_gateup:
+        # The M64 Down kernels index 64-row sorted blocks.
+        down_block_m = 64
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+            topk_ids,
+            topk_weight,
+            problem.experts,
+            problem.model_dim,
+            hidden_states.dtype,
+            down_block_m,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+            accumulate=False,
+        )
+        task_num = int(sorted_expert_ids.shape[0])
 
     output_row_size = (
         problem.model_dim
         + config.down_output_padding_bytes // hidden_states.element_size()
     )
     gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * config.BLOCK_M, output_row_size],
+        [sorted_expert_ids.shape[0] * down_block_m, output_row_size],
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
@@ -377,7 +641,7 @@ def _run_prefill(
         weight_dtype_str=weight_dtype_str,
         quant_type_str=problem.quant_type,
         TOPK=problem.topk,
-        BLOCK_TILE_SIZE_M=config.BLOCK_M,
+        BLOCK_TILE_SIZE_M=down_block_m,
         BLOCK_TILE_SIZE_N=128,
         stage="down",
         alg="prefill_1x4",
@@ -385,6 +649,7 @@ def _run_prefill(
         act_quant_type_str=act_quant_type_str,
         down_path=config.down_path,
         down_output_padding_bytes=config.down_output_padding_bytes,
+        down_n_splits=_down_n_splits(problem, config.down_path),
     )
     down_args = (
         down_in,
@@ -394,7 +659,7 @@ def _run_prefill(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
-        w2_scale if w2_scale is not None else _empty_scale(hidden_states.device),
+        w2_scale_arg,
         down_in_scale,
         problem.batch,
         task_num,
@@ -647,8 +912,8 @@ def run_flydsl_moe_gfx942(
         and quant_type == QuantType.No
     )
     is_fp8 = (
-        w1.dtype == torch.float8_e4m3fnuz
-        and w2.dtype == torch.float8_e4m3fnuz
+        w1.dtype == dtypes.fp8
+        and w2.dtype == dtypes.fp8
         and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
     )
     if (
@@ -766,9 +1031,7 @@ def run_flydsl_moe_gfx942_impl(
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support split-K"
         )
-    quant_dtype = (
-        torch.bfloat16 if request.w1.dtype == torch.bfloat16 else torch.float8_e4m3fnuz
-    )
+    quant_dtype = torch.bfloat16 if request.w1.dtype == torch.bfloat16 else dtypes.fp8
     if request.q_dtype_a not in (None, quant_dtype):
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph activation dtype must match the weight mode"

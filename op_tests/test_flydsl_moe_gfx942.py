@@ -554,6 +554,47 @@ EDGE_CASES = [
 ]
 
 
+# gfx950 four-wave 256x256 Gate/Up and M128 Down: tiny batches leave persistent
+# CTAs idle, inter_dim 192/320 has a partial last N tile, hot routing puts every
+# row on one expert, and the persistent M128 runs twice to check its queue reset.
+FOUR_WAVE_CASES = [
+    *(
+        (token, 2048, 128, 257, 9, "ptpc", "silu", "random", f"256_256_128_True:{path}:0")
+        for token in (1, 7, 300, 16384)
+        for path in ("m128", "m128p", "m128p")
+    ),
+    (4096, 6144, 256, 384, 8, "ptpc", "silu", "hot", "256_256_128_True:m128p:0"),
+    # M128 Down above K256 streams K128 sub-packets: merged halves and OC splits.
+    (300, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "256_256_128_True:m128:0"),
+    (16384, 6144, 384, 129, 5, "ptpc", "swiglu", "random", "256_256_128_True:m128p:0"),
+    (2048, 2048, 512, 257, 9, "ptpc", "silu", "random", "256_256_128_True:m128:0"),
+    (4097, 2048, 512, 257, 9, "ptpc", "silu", "random", "256_256_128_True:m128p:0"),
+    (7, 2560, 640, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128:0"),
+    (8192, 2560, 640, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128p:0"),
+    (4096, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "256_256_128_True:8x1_compact:128"),
+    (4096, 2560, 192, 513, 11, "ptpc", "silu", "random", "256_256_128_True:8x1_compact:128"),
+    (4096, 2560, 320, 513, 11, "ptpc", "silu", "random", "256_256_128_True:1x4_64x256:128"),
+    (4096, 4096, 192, 192, 8, "per_tensor", "silu", "random", "256_256_128_True:default:0"),
+    (2048, 4096, 640, 1, 1, "ptpc", "silu", "hot", "256_256_128_True:1x4_64x256:128"),
+]
+
+# gfx950 M64 Gate/Up walking the M128 Down's 256-row sort blocks: small batches
+# leave most 64-row tiles empty, hot routing fills every tile, and the token
+# counts at or below E / topk take the launcher's route-count bound.
+M64_M128_CASES = [
+    (1, 2048, 128, 257, 9, "ptpc", "silu", "random", "64_128_128_True:m128:0"),
+    (7, 2048, 128, 257, 9, "ptpc", "silu", "random", "64_256_128_True:m128p:0"),
+    (4096, 2048, 128, 257, 9, "ptpc", "silu", "random", "64_128_128_True:m128p:0"),
+    (16384, 2048, 128, 257, 9, "ptpc", "silu", "random", "64_256_128_True:m128p:0"),
+    (300, 6144, 256, 384, 8, "ptpc", "silu", "random", "64_128_256_True:m128:0"),
+    (4096, 6144, 256, 384, 8, "ptpc", "silu", "hot", "64_256_128_True:m128p:0"),
+    (1, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "64_256_128_True:m128:0"),
+    (300, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "64_128_128_True:m128:0"),
+    (2048, 2048, 512, 257, 9, "ptpc", "silu", "random", "64_256_128_True:m128p:0"),
+    (7, 2560, 640, 513, 11, "ptpc", "silu", "random", "64_128_256_True:m128:0"),
+]
+
+
 def summarize(name, rows):
     aiter.logger.info(
         "%s summary (markdown):\n%s", name, pd.DataFrame(rows).to_markdown(index=False)
@@ -561,6 +602,17 @@ def summarize(name, rows):
 
 
 def main():
+    if get_gfx() == "gfx950":
+        # Only the gfx950 Gate/Up and Down paths; shipped rows are gfx942 tunes.
+        test_config_strings()
+        for case in FOUR_WAVE_CASES + M64_M128_CASES:
+            check_moe(*case)
+        aiter.logger.info(
+            "gfx950 cases passed: %d four-wave, %d M64 Gate/Up + M128 Down",
+            len(FOUR_WAVE_CASES),
+            len(M64_M128_CASES),
+        )
+        return
     if get_gfx() != "gfx942":
         aiter.logger.warning(
             "gfx942 FlyDSL whole-MoE backend unsupported on %s; skipping", get_gfx()

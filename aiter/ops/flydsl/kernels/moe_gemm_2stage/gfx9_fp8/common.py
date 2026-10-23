@@ -21,6 +21,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.utility import dtypes
 
 # RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
 #  occur in practice, so use with caution.
@@ -64,6 +65,9 @@ def _f32_to_bf16_rte(value):
 
 
 def _f32_to_bf16(value):
+    # gfx950 converts with RNE in hardware (v_cvt_pk_bf16_f32); the env modes apply to gfx942.
+    if get_gfx_runtime() == "gfx950":
+        return value.to(fx.BFloat16)
     if _SIMPLIFIED_BF16_RTA:
         return _f32_to_bf16_rta(value)
     if isinstance(value, Vec):
@@ -88,10 +92,19 @@ def _ptr(t):
     return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
 
 
+def fp8_dtype():
+    # Must match aiter.dtypes.fp8: FNUZ on gfx942, OCP E4M3FN on gfx950.
+    return {
+        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
+        torch.float8_e4m3fn: fx.Float8E4M3FN,
+    }[dtypes.fp8]
+
+
 def get_down_device_config():
-    if get_gfx_runtime() != "gfx942":
-        raise RuntimeError("specialized Down kernels require gfx942")
-    is_mi308 = get_cu_num() == 80
+    gfx = get_gfx_runtime()
+    if gfx not in ("gfx942", "gfx950"):
+        raise RuntimeError("specialized Down kernels require gfx942 or gfx950")
+    is_mi308 = gfx == "gfx942" and get_cu_num() == 80
     return is_mi308, 4 if is_mi308 else 8
 
 
@@ -487,6 +500,7 @@ class FlyObjCache:
         mfma_N = 16
         mfma_K = {
             fx.Float8E4M3FNUZ: 32,
+            fx.Float8E4M3FN: 32,
             fx.BFloat16: 16,
             fx.Float16: 16,
             fx.Float32: 4,
