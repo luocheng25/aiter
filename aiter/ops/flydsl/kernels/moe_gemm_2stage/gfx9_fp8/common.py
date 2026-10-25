@@ -22,10 +22,10 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
-# RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
-#  occur in practice, so use with caution.
+# Simplified RTA is the default (set the variable to 0 for RTE): it matches standard RTA for
+# finite values and Inf but may reverse NaNs.
 _SIMPLIFIED_BF16_RTA = os.environ.get(
-    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", "0"
+    "AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED", "1"
 ).lower() in ("1", "true")
 _SIMPLIFIED_BF16_RTE = os.environ.get(
     "AITER_FLYDSL_MOE_BF16_RTE_SIMPLIFIED", "0"

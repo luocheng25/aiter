@@ -954,3 +954,274 @@ python mytest/power_probe.py --config 128_256_128_True:m128:0 --cases gateup_ran
 - 目标状态：Gate/Up 最佳 0.94 PF（bench 口径）/ 0.89 PF（持续），Down 最佳 2.75 TB/s（bench）/ 2.59（持续）。两个目标都超过了本机 750 W 下厂商 GEMM 和纯写的实测上限。
 - 若必须达到 1200 TFLOP/s / 4.5 TB/s：先在目标硬件（例如更高功耗上限的 MI325X）上运行 `power_probe.py`，确认 hipBLASLt 与 fill 能超过这两个数，再把它们作为可达上限继续优化。
 - 本机上仍有证据支持的方向：(1) Gate/Up 新的大 tile 内核，B 经 LDS 被多个 M wave 共享且保持 ≥79% 利用率，目标接近 hipBLASLt 的 1.0 PF；(2) single Down 让部分任务跳过空行组的 MFMA，或在同一次启动内用 M128 处理专家尾段，以收回 16K 及以下的损失；(3) 选中新配置后重新调优并逐行验证再更新 CSV。
+
+## B11：全尺寸重新调优与正式 CSV 写回（2026-10-24）
+
+### 范围
+
+- 源码 `e32bd7b9e`（B7–B10 的提交）。重新调优 B0 涉及的 7 个模型 CSV 中全部 gfx942 shape：PR #5932 的 6 个模型共 202 个，MiMo 21 个（16 PTPC + 5 block-scale）；MiMo 的 7 个 MXFP4 需要 gfx950，跳过。合计 223 个。
+- 当前分支的正式 CSV 中**没有任何 MI300（`gfx942,304`）行**：B0 写入的 6 个模型 202 行、MiMo 16 行 PTPC 都没有提交，环境重建后丢失；MiMo 未调优 CSV 里 B0 时新增的 16 行 PTPC 也丢失。本轮把这 16 行（token 1–32768）恢复到 `mimo_v2_5_pro_untuned_fmoe.csv`。
+- whole-MoE 调优空间从 B0 的 12 个配置增至 23 个（新增 BN=512 融合量化与 `8x1_single`）。
+
+### 方法
+
+- 脚本 [retune_all.py](retune_all.py)：由 B0 的 `run_comparison.py`（从会话记录重建）改写，流程不变——staged 从空 CSV 搜索（`TUNE_ONLY=flydslv2,cktile,flydsl,asm`，`AITER_FMOE_TUNE_EXCLUDE_KERNELS=fmoe_stage1`，`--mp 1 --warmup 10 --iters 51 --all`），复制后在副本上 `--e2e_tune` 搜索 whole-MoE，再用 `--run_config` 按固定 shape 顺序交替测三轮（staged/whole、whole/staged、staged/whole）。`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=1` 同 B0。
+- 一个模型一张 GPU（0–6）。每张 GPU 独立 JIT 目录：先复制 `aiter/jit/*.so`，再用 `/tmp/aiter_mimo_resume_jit` 中按当前源码重建的 core 等模块覆盖（仓库里的 `module_aiter_core.so` 已过期）；每张 GPU 独立的全新 FlyDSL 缓存目录，避免旧缓存。
+- 写回规则同 B0：whole-MoE 只有在三轮配对全部胜出且中位加速 >1.03x 时写入，否则写 staged；只追加 MI300 行，不改已有行。
+- 产物在 `results/b11_retune/full/`：`per_shape.csv`、`summary.csv`、`promotion.csv`、`compare_b0.md`、各模型日志与每轮 JSON。
+
+### MiniMax 的 CK swiglu 问题（环境问题，与本分支代码无关）
+
+- 第一次运行时 MiniMax 的 staged 搜索全部失败：CK swiglu stage1 候选误差约 94%，没有任何合法候选。
+- 原因：容器内 `3rdparty/composable_kernel` 检出的是 `fdf4bb7fc`（镜像 5 月），aiter 固定的是 `96afae1d5`。aiter 的 CK 代码生成把 swiglu 映射为 CK 激活值 3（`swiglu_oai_and_mul`），只有 `96afae1d5` 才有。用 `fdf4bb7fc` 现编的 swiglu 内核结果是错的。**在这个容器里，任何现编的 CK swiglu FP8 per-token 模块都会算错。**
+- 另外，调优器 worker 进程以 `ninja -j1` 编译，这个模块串行编译约 30 分钟，超过 1800 s 的任务超时（B0 的 MiniMax staged 耗时 1894 s 也是这个原因）。
+- 处理：不改子模块。用 `git archive 96afae1d5` 导出到 `/tmp/ck_96afae1d5`，`CK_DIR` 指向它，在主进程中 64 路并行预编译（111 s，脚本 `results/b11_retune/prebuild_ck_moe.py`）；单 shape 复查 stage1 误差 0.0%，然后只续跑 MiniMax。错误的模块移到 `/tmp/b11_retune/quarantine/`。
+- 写回的 MiniMax 行中有 8 条 staged（token 64–512）使用 CK swiglu 内核：在本容器使用前，必须先把子模块更新到 `96afae1d5`，或用 `CK_DIR` 指向该版本重新编译 swiglu 模块。
+
+### 结果
+
+每个 shape 取三轮中位数，表中为各 shape 的几何平均（µs）；whole-MoE 列是调优器原始选择，"写回后"是按写回规则逐 shape 取对应臂的时间。
+
+| 模型 | shape | 调优选 whole-MoE | staged | + whole-MoE | 加速 | 写回后 | B0 加速 | whole-MoE 相对 B0 | staged 相对 B0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Hunyuan3 FP8 per-tensor | 18 | 17 | 578.018 | 298.093 | 1.939x | 298.863 | 1.833x | 快 1.053x | 1.005 |
+| MiniMax-M3 FP8 PTPC | 36 | 33 | 480.740 | 367.745 | 1.307x | 367.458 | 1.199x | 快 1.094x | 0.996 |
+| Qwen3.5-35B FP8 PTPC | 34 | 29 | 213.439 | 169.899 | 1.256x | 169.605 | 1.208x | 快 1.025x | 1.014 |
+| Qwen3.5-397B FP8 PTPC | 18 | 16 | 397.209 | 306.541 | 1.296x | 307.789 | 1.241x | 快 1.042x | 1.003 |
+| Qwen3.8-Flash-Next BF16 | 48 | 29 | 554.728 | 487.873 | 1.137x | 487.762 | 1.097x | 快 1.036x | 1.001 |
+| Qwen3.8-Flash-Next FP8 PTPC | 48 | 33 | 344.777 | 277.099 | 1.244x | 277.252 | 1.175x | 快 1.064x | 0.996 |
+| 6 个模型合计 | 202 | 157 | 400.652 | 311.812 | 1.285x | 311.887 | 1.219x | 快 1.053x | 1.001 |
+| MiMo FP8 PTPC | 16 | 9 | 441.318 | 362.266 | 1.218x | 364.550 | 1.162x | 快 1.050x | 0.999 |
+| MiMo block-scale（对照） | 5 | 0 | 1794.350 | 1784.819 | 1.005x | 1794.350 | 1.006x | 1.009x | 0.991 |
+
+- staged 臂与 B0 相差 −0.9% 到 +1.4%，说明测量环境与 B0 一致；whole-MoE 臂相对 B0 的提升来自 B3–B10 的内核改动与新增配置。
+- 全部 223 个 shape：1.273x；token 1–8 的 52 个 shape：1.601x；token ≥2048 的 80 个 shape：2235.7 → 1630.8 µs，1.371x。
+
+MiMo PTPC 逐 shape（µs）：
+
+| token | B0 staged | B0 whole-MoE | B11 staged | B11 whole-MoE | 加速 | 相对 B0 | 三轮胜出 | B11 选择 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 41.349 | 20.187 | 42.643 | 21.783 | 1.958x | 0.927x | 3/3 | decode `16_16_16_False` |
+| 2 | 52.753 | 29.470 | 52.164 | 28.933 | 1.803x | 1.019x | 3/3 | decode `16_16_16_False_True` |
+| 4 | 69.187 | 51.151 | 72.884 | 51.091 | 1.427x | 1.001x | 3/3 | 同上 |
+| 8 | 110.606 | 93.160 | 110.233 | 93.138 | 1.184x | 1.000x | 3/3 | 同上 |
+| 16–1024 | — | — | — | — | 0.988–1.111x | — | — | 保持 staged（CK/ASM） |
+| 2048 | 833.229 | 781.635 | 837.951 | 766.901 | 1.093x | 1.019x | 3/3 | `64_256_128` + 1x4 |
+| 4096 | 1171.197 | 1161.798 | 1176.019 | 1049.057 | 1.121x | 1.107x | 3/3 | `64_512_256` + 1x4 |
+| 8192 | 2272.183 | 1997.470 | 2234.928 | 1493.210 | 1.497x | 1.338x | 3/3 | `64_512_256` + 1x4 |
+| 16384 | 3692.925 | 3216.191 | 3735.153 | 2629.961 | 1.420x | 1.223x | 3/3 | `64_512_256` + 1x4 |
+| 32768 | 6358.439 | 5609.588 | 6338.802 | 4622.414 | 1.371x | 1.214x | 3/3 | `64_512_256` + `8x1_single` |
+
+- token=1 比 B0 慢 1.6 µs，staged 臂同样慢 3%；decode 路径的 launcher 自 B0 未改，按测量波动处理，未单独确认。
+- 16–1024 与 B0 一样仍选 staged，两臂内核相同，0.988–1.111x 是测量波动（B0 在 token=16 也有 1.103x）；完整数值见 `compare_b0.md`。
+
+### 写回
+
+| 模型 | 新增 MI300 行 | whole-MoE | staged | B0 写回（whole/staged） |
+|---|---:|---:|---:|---:|
+| Hunyuan3 FP8 per-tensor | 18 | 16 | 2 | 16 / 2 |
+| MiniMax-M3 FP8 PTPC | 36 | 28 | 8 | 24 / 12 |
+| Qwen3.5-35B FP8 PTPC | 34 | 26 | 8 | 24 / 10 |
+| Qwen3.5-397B FP8 PTPC | 18 | 14 | 4 | 13 / 5 |
+| Qwen3.8-Flash-Next BF16 | 48 | 24 | 24 | 17 / 31 |
+| Qwen3.8-Flash-Next FP8 PTPC | 48 | 29 | 19 | 26 / 22 |
+| MiMo FP8 PTPC | 16 | 9 | 7 | 8 / 8 |
+| 合计 | 218 | 146 | 72 | 128 / 90 |
+
+- MiMo 5 条 block-scale 重新调优后选中的内核与已有正式行完全相同，保持不变；7 条 MI350 MXFP4 行未动。
+- 20 个 shape 调优器选了 whole-MoE，但三轮未确认（0.928–1.022x），写回 staged，例如 MiniMax token=256 E129 为 0.928x。
+- 新增配置的使用：`8x1_single` 7 行（MiniMax E128 token 4096/32768/131072、Qwen3.5-35B 4096、Qwen3.8 FP8 8192/32768、MiMo 32768），`64_512_256` + 1x4 3 行（MiMo 4096–16384）。
+- 新行不含 `nt` 列（均为 0），保持各文件原有列。
+
+### 验证
+
+- 配置 shape 冲突检查 `op_tests.tuning_tests.test_config_shape_collision`：26 项通过。
+- `TestRunConfigCustom`（`TUNE_TEST_FAMILY=fmoe`，7 个正式 CSV）：用默认 BF16 RTE、全新 FlyDSL 缓存在 GPU7 运行，223 个 MI300 shape 全部 OK（`results/b11_retune/full/test_run_config_results.csv`）。该环境的 swiglu 模块用固定版本 CK 编译。
+- whole-MoE decode 路径不量化激活（a16），与量化参考相比逐元素误差比例很高（MiMo token 1–8 约 78–79%），但通过调优器的余弦判据；与 B0 相同的验收口径。
+- 调优计时使用 RTA 简化舍入（与 B0 一致）；默认 RTE 下 FlyDSL prefill 约慢 1–1.5%（B10）。
+
+### 状态
+
+- 修改：7 个模型 `*_tuned_fmoe.csv` 追加 218 行；MiMo 未调优 CSV 恢复 16 行 PTPC；新增 `retune_all.py`。未提交。
+- 调优器的候选调试输出 `aiter/configs/profile_fmoe.csv`（硬编码路径）已移到 `results/b11_retune/full/tuner_debug/`。
+- 子模块未改；需由用户决定是否把 `3rdparty/composable_kernel` 更新到 aiter 固定的 `96afae1d5`。
+
+## B12：Down 4 TB/s 的两条路径——融合 TopK 归约的可行性与 8x1_single 消融（2026-10-24）
+
+目标：Down 理想带宽 4 TB/s（3.903 GB 理想字节）即 ≤ 975.7 µs；当前最快 `8x1_single` 为 1378–1425 µs（2.74–2.83 TB/s）。按用户要求先评估方案 1（融合 TopK 归约），再做方案 2（不改数值的内核优化）。
+
+### 方案 1：把 TopK 归约融合进 Down——原子累加不可行
+
+想法：不再写 3.22 GB 的逐路由 BF16 中间结果、也不再由归约内核读回，而是把每条路由的结果原子加到 token 输出上。先用探针 [atomic_probe.py](atomic_probe.py) 单独测输出路径（真实 MiMo 32K 路由与排序，Triton 64×256 tile，只生成常数，不含 GEMM）。ISA 已确认原子是单条 `buffer_atomic_add_f32` / `global_atomic_pk_add_bf16`（无返回、无 CAS 循环），存储是 `buffer_store_dwordx4`。
+
+| 输出方式 | µs | 载荷 GB | 载荷 TB/s |
+|---|---:|---:|---:|
+| 逐路由 BF16 写出（当前 Down 的写法） | 808.4 | 3.221 | 3.985 |
+| FP32 原子加到 token 输出（设备级） | 18474.4 | 6.442 | 0.349 |
+| 同上，工作组级 scope（结果不正确，仅诊断） | 18471.8 | 6.442 | 0.349 |
+| 同上，累加区缩到 8192 token（201 MB，放得进 Infinity Cache） | 18323.2 | 6.442 | 0.352 |
+| BF16 打包原子加 | 9622.2 | 3.221 | 0.335 |
+| FP32 累加区清零 / FP32→BF16 转换 | 166.1 / 281.7 | — | — |
+
+- 原子的瓶颈是每 lane 原子操作的吞吐（约 870 亿次/s，与 scope、累加区是否命中 Infinity Cache 都无关），不是显存带宽。32K 需要 16.1 亿次 FP32 原子，约 18.5 ms，比"逐路由写出 0.81 ms + 归约约 1.05 ms"慢一个数量级；BF16 原子同样慢且精度更差。
+- 不用原子的融合也不成立：按 token 聚合（每行 8 个专家各自的 W2）会让权重读取爆炸；按 token 分块让中间结果放进 256 MB Infinity Cache，需要 ≥13 块，每块重读 0.6 GB 的 W2，比省下的 6.4 GB 中间流量更多。
+- 现有 prefill `default` 路径也不是融合的（同样写中间结果再归约）：32K 下 Down 2174.8 µs + 归约 1110.2 µs，整体 5324.9 µs，比 `64_512_256 + 8x1_single` 的 4733.6 µs 慢 12.5%（[results/b12_default_vs_single_32k.json](results/b12_default_vs_single_32k.json)）。
+- **结论：MI300X 上方案 1 不可行，保留两遍（逐路由写出 + 排序归约）的结构。** 原始数据 [results/b12_atomic_probe_32k.json](results/b12_atomic_probe_32k.json)。
+
+### 方案 2 的诊断：8x1_single 消融
+
+用猴子补丁做诊断版本（[results/b12_down_ablate.py](results/b12_down_ablate.py)，不改源码，输出无效，`FLYDSL_RUNTIME_ENABLE_CACHE=0`），配置 `64_512_256_True:8x1_single:128`，32K，各自 3 轮：
+
+| 版本 | Down µs | 相对原版 |
+|---|---:|---:|
+| 原版 | 1425.2 | — |
+| 输出全部越界（指令照发，不写显存） | 1292.6 | −9.3% |
+| 去掉 MFMA（编译器同时删掉 B 的 LDS 读和 A 的加载，仍写零） | 1147.9 | −19.5% |
+| 两者都去掉（剩 B 加载/写 LDS、barrier、打包、CShuffle、越界存储） | 615.2 | −56.8% |
+
+ISA 静态指令数（同一编译模块，含很小的构表内核）：原版 512 MFMA、196 ds_read、67 ds_write、58 s_barrier、32 buffer_store；去掉 MFMA 后 ds_read 降到 67（B 操作数读取被删），其余不变。
+
+- **写显存不是主瓶颈**：不写显存只快 9%。即使写出完全免费，Down 也要 1293 µs（3.0 TB/s）。
+- **MFMA 与其余流水线几乎串行**：骨架 615 µs，加上 MFMA 和 B 的 LDS 读取后变成 1293 µs，多出的 ~680 µs 与按 ~1.2 GHz 估算的纯 MFMA 时间（约 0.94 TFLOP 含部分任务空行，约 630 µs）相当。
+- 每个 N128 阶段、每 CU 的估算：MFMA 每 SIMD 4096 周期（每 wave 128 条 16x16x32、2 wave/SIMD）；B 的 LDS 读 8 wave × 32 KiB = 256 KiB（约 2048 周期）；CShuffle 写+读 128 KiB（约 1024 周期）。若完全重叠约 4100 周期/阶段，串行约 7200 周期/阶段，后者与实测吻合。
+- **含义**：方案 2 的空间来自让 MFMA 与 epilogue/同步重叠，以及降低骨架本身（615 µs）的成本；纯写出路径（808 µs）不是当前限制。理论上限（完全重叠、功耗允许）约 0.8–0.9 ms，即 4.3–4.8 TB/s；但 B4/B7/B8 的 M128、子包 ring、延迟 epilogue、寄存器重排等结构性尝试都没有赢过 8x1，需先用 ATT 确认串行的具体原因再改。
+
+### ATT（32K，`64_512_256 + 8x1_single`，SE0/CU0 四个 SIMD，预热后第 4 次 Down）
+
+重新下载 decoder 0.1.6（SHA-256 与 B1 记录一致，只在 `/tmp/att_decoder` 解包）。逐指令统计 [results/b12_att_8x1_single_stats.csv](results/b12_att_8x1_single_stats.csv)：
+
+| 类别 | 指令延迟占比 | 停顿占比 |
+|---|---:|---:|
+| s_barrier | 27.1% | 45.7% |
+| VALU | 25.3% | 2.7% |
+| MFMA | 18.0% | 17.6% |
+| ds_read / ds_write | 7.9% / 4.7% | 9.2% / 1.7% |
+| s_waitcnt（三类合计） | 6.7% | 11.3% |
+| VMEM load / store | 3.9% / 2.0% | 4.3% / 1.5% |
+
+- 主循环里 4 条 `s_barrier`（每个 N128 阶段 4 次）各约 58–68 万周期停顿，是最大热点，其前的 `s_waitcnt vmcnt(7) lgkmcnt(8)` 次之。
+- VALU 与 MFMA 的条数比为 3.28：每个输出元素 6.5 条 VALU——`v_fma_f32`（×w_scale）、`v_mul_f32`（×行 scale）、BF16 RTE 舍入 4 条（`v_cmp_u_f32`、`v_bfe_u32`、`v_add3_u32`、`v_cndmask_b32`）、半条 `v_perm_b32`。Down 内核编译时带 `-packed-fp32-ops`（PR #5932 引入），乘法无法用打包 FP32。
+- 结论：Down 受 CTA 级 barrier 和 epilogue VALU 限制，MFMA 与 epilogue 大部分串行；与消融结果一致。
+
+### 方案 2 计划（未开始实现）
+
+1. 减少 epilogue VALU：BF16 舍入改用已有的 `RTE_SIMPLIFIED`（有限值逐位相同，仅 NaN 规范化不同，需用户确认）可省 2 条/元素；查明 `-packed-fp32-ops` 的原因，若可安全启用，两次乘法用 `v_pk_mul_f32` 减半（还需确认 `fma(a,b,0)` 与 `mul` 在 −0 上的差异）。预计 Down −3–6%。
+2. 减少 barrier：每个 N128 阶段 4 次全 CTA barrier；加深 B 的 LDS ring 或调整 quarter 的发布方式，使下一 quarter 的 `ds_read` 在 barrier 前、MFMA 期间发出，目标每阶段 1–2 次 barrier。若能让 MFMA 与 epilogue 重叠，预计 −15–25%，工作量大、风险高。
+3. 即使两项都成功，估计 Down 约 1.05–1.2 ms（3.3–3.7 TB/s）；本机 750 W 下 4 TB/s 仍不太可能。每一步保持 `bf16((acc*w_scale)*(a_scale*routing))` 与归约顺序，同进程 3 轮交替计时并跑完整回归。
+
+## B13：方案 2 第一步——RTA 默认、按行均摊打包与瓶颈定量（2026-10-24）
+
+目标仍是 Down ≤ 975.7 µs（3.903 GB 理想字节下 4 TB/s）。用户同意 BF16 舍入改用更激进的 RTA（ties away from zero）。计算顺序 `bf16((acc*w_scale)*(a_scale*routing))` 与 TopK 归约顺序不变，未启用 packed FP32，子模块未动。
+
+### 1. RTA 设为默认
+
+- `common.py` 的 `_SIMPLIFIED_BF16_RTA` 默认改为 `1`（`AITER_FLYDSL_MOE_BF16_RTA_SIMPLIFIED=0` 回到 RTE）。舍入为 `(bits + 0x8000) >> 16`，只在被舍弃的低 16 位恰为 `0x8000` 时与 RTE 相差 1 ulp；有限值与 Inf 等同标准 RTA，NaN 不保证保留。影响 gemm1、gemm2、gemm2_8x1、gemm2_1x4、gemm2_m128 的 BF16 输出。
+- 每输出元素的舍入从 4 条 VALU 变为 1 条（`v_add_u32`），ATT 中 VALU/MFMA 条数比 3.28 → 1.78。
+- 32K `64_512_256 + 8x1_single`：Down 1407–1437 → 1221–1229 µs（−13%），`logits_diff` 仍为 8.3595e-6。
+- 按 56 条打包 VALU 重调 `schedule_pack`（每 MFMA 3–4 条）：N512 1209.6–1211.4 µs，N256 1224.8–1230.7 µs。
+
+### 2. 打包按行均摊到两个 packet（保留）
+
+ATT 显示 RTA 后计算相仍为 628 周期，而 32 条 MFMA 只需 512：整条记录的 56 条 VALU 都塞在一个 packet 的 16 条 MFMA 之间，单 wave 发射受限（packet0 约 340 周期，packet1 256）。改为：
+
+- `packing_events` 新表：第 0/1 步打包上一个 N 的记录 2/3，第 KS/KS+1 步打包本 N 的记录 0/1；被打包的记录都已在更早的步完成。`FIRST_UNPACKED` 3 → 2（`run_8x1_tile` 和 `_emit_k128n_body`），记录 2/3 以 FP32 跨过 N 边界，并在下一个 N 的第 KS 步清零前打包；CShuffle 的消费时刻不变。
+- `pack_8x1_record(..., rows=)` 可只打包一行：packet p 打包该记录的第 p 行，每 packet 28 条 VALU（约 1.75 条/MFMA），`schedule_pack` 前 12 条 MFMA 各配 2 条、后 4 条各配 1 条。
+- `vmem_wait_schedule` 由新表自动给出 scale 的 vmcnt 预算；K192 路径不变。
+- 资源：VGPR 192 → 212，无 spill，LDS 48 KB 不变。
+
+| 32K Down µs | B12 末（RTA + 调度） | B13 均摊打包 |
+|---|---:|---:|
+| `64_512_256 + 8x1_single` | 1209.6–1211.4 | 1146.4–1160.4 |
+| `64_256_128 + 8x1_single` | 1224.8–1230.7 | 1151.4–1165.4 |
+
+- 区间来自 5 个（N512）/2 个（N256）独立进程，每个 3 轮；同一代码在不同进程间相差约 1%。
+- N512 当前 **3.36–3.41 TB/s**（B12 开始时 2.74，B12 末 3.23）。精度与此前逐位相同（`logits_diff` 8.3595e-6，`token_err` 0.0328）。
+- 完整回归 `op_tests/test_flydsl_moe_gfx942.py --batch 32768`：396 项通过、0 失败（[results/b13_spread_regression_32k.log](results/b13_spread_regression_32k.log)）。
+
+ATT 阶段（SE0/CU0，中位数，周期；脚本 [results/att_phases.py](results/att_phases.py)）：
+
+| 版本 | 访存相工作 | 访存相 barrier 等待 | 计算相工作 | 计算相 barrier 等待 |
+|---|---:|---:|---:|---:|
+| RTE | 384 | 460 | 828 | 12 |
+| RTA | 388 | 260 | 628 | 20 |
+| RTA + 调度 | 396 | 252 | 628 | 20 |
+| 均摊打包 | 380 | 216 | 564 | 20 |
+
+每步（两相）从 1296 降到约 1180 周期；barrier 占指令延迟 20.6%、停顿 35.5%，MFMA 占 20.0% / 16.7%（[results/b13_att_8x1_single_spread_stats.csv](results/b13_att_8x1_single_spread_stats.csv)）。
+
+### 3. 负结果（均已回退）
+
+- **打包移到访存相**（行 0 放在 B 写 LDS 之后，行 1 放在 CShuffle 与 B 读之后，计算相只剩 MFMA）：Down 1171.0 / 1180.7 µs，更慢。ATT 中计算相即使没有 VALU 也要 556 周期（同 SIMD 另一 wave 的 VALU 与 MFMA 争发射），访存相涨到约 680，成为瓶颈。
+- **MFMA/VALU 交错模式**：循环中的 `s_nop 2` 全部来自 WAR 冒险——寄存器分配让 MFMA 的输出寄存器不同于 SrcC，紧随其后的打包 VALU 写入刚释放的 SrcC 寄存器；16x16 MFMA 没有 tied 形式，源码无法直接约束。把 VALU 前置成每 MFMA 3 条可使循环内 s_nop 从 16 降到 7，但 3 轮交替计时（1145–1161 对 1150–1158 µs）看不出差别。
+- **LLVM `enable-post-misched=false`**：s_nop 总数 386 → 374，循环内冒险不变（工具 [results/b13_llvm_opts.py](results/b13_llvm_opts.py)）。
+
+### 4. 瓶颈定量
+
+- **时钟与利用率**：PMC `GRBM_GUI_ACTIVE` 为 8.074e6（8 个 XCD 之和），即约 1.009e6 周期，对应约 **880 MHz**；`SQ_VALU_MFMA_BUSY_CYCLES` 9.06e8 = 5660 万条 16 周期 MFMA（= 1153 任务 × 8 wave × 48 个 N tile × 128），**MFMA 利用率 73.8%**。
+- **单 CTA**（ATT）：CU0 依次跑 4 个 CTA，每个约 24 万周期。其中序言加 N0/N1 约 1.9–2.4 万（纯序言 0.8–1.0 万），稳态 45 次迭代 × 约 4720，末 N tile 加尾声约 0.8 万。稳态 MFMA 占比 2×512×4/4720 ≈ 87%。
+- **尾轮**：1153 个 M256 任务 / 304 CU = 3.79 轮，第 4 轮有 63 个 CU 空闲，损失约 5.2% 算力。
+- **padding**：11.2% 的行是 padding，7.4% 的 M64 块整块是 padding（842 个满任务，283 个 3 块、27 个 2 块、1 个 1 块），它们的 MFMA 仍然执行。
+- **下限**：880 MHz 下 100% MFMA 利用率（含 padding）也要 848 µs。975.7 µs 要求整体利用率 87%，即等于当前稳态值；必须同时去掉尾轮、序言和 padding 的大部分损失才可能达到。
+
+### 5. 后续方向（尚未实现；估计来自 [results/b13_tail_sim.py](results/b13_tail_sim.py) 的贪心调度模型）
+
+| 方向 | 估计 | 代价/风险 |
+|---|---:|---|
+| 跳过整块 padding 的 MFMA 和打包，并在每个 XCD 内满任务优先 | −3.8% | 按组复制流水线（组 1 或两组只算一个行组）；构表内核按 XCD 重排；仅改执行与顺序，数值不变 |
+| 尾轮按 N 段均衡（前 3 轮整任务，第 4 轮每 CU 约 38 个 N tile） | −3.8%（含多一次序言） | 流水线需支持运行时 N 起止和 ≤2 段循环 |
+| 上两项按代价均衡 | −9.4%（模型上限） | 同上 |
+| persistent 跨任务预取下一任务的 A/行 scale，隐藏序言 | −3–4% | VGPR 212 → 约 244，接近 2 wave/SIMD 上限 |
+| 每次 barrier 发布两包，barrier 减半 | ≤ −4% | 重写 B ring 发布协议 |
+
+乐观叠加约 1000–1030 µs（3.8–3.9 TB/s）。在本机 750 W、约 880 MHz 下，4 TB/s 仍没有可靠的路径。
+
+### 状态
+
+- 修改 `common.py`（RTA 默认）和 `gemm2_8x1.py`（均摊打包、FIRST_UNPACKED=2），未提交。
+- 新增 `results/b13_*`：回归日志、ATT 统计、LLVM 选项实验脚本、任务调度模型。
+
+## B14：执行 B13 列出的全部方案——均衡调度、padding 跳过、persistent 与预取（2026-10-24）
+
+用户要求“完成全部”。逐项实现并在 32K（`64_512_256 + 8x1_single`）上测量，基线为 B13 的 Down 1146–1160 µs。数值顺序与 RTA 舍入不变；所有跑完的变体 `logits_diff` 都与基线逐位相同（8.3595e-6）。
+
+### 1. 实现内容（均已回退，源码与脚本归档在 [results/b14_experimental_sources.tar.gz](results/b14_experimental_sources.tar.gz)）
+
+- **运行时 N 段**：`_emit_k128n_body` 接受段起点与 tile 数，全局 B、scale、输出偏移加段起点，流水线内部索引保持段内相对（KS 为奇数时的 LDS 槽奇偶不受影响）；`_run_8x1_pipeline` 支持运行时 tile 数（尾部单 tile）。已核对段长 ≥3 时各 tile 的 vmcnt 预算与 NT=48 完全相同（K=256/384/512/640）。动态 N 路径本身没有开销（逐任务分派下 1143 对 1148 µs）。
+- **padding 跳过**：wave 组 g 的行组 1 落在第 g+2 个 M64 块；任务块数 < g+3 时该组改走只算行组 0 的流水线变体（MFMA 减半，每 MFMA 配 3–4 条打包 VALU）。
+- **静态 persistent + 尾轮按代价均衡**：304 个 worker（每 XCD 38 个）。先按与硬件分派相同的跨步顺序跑 R = max(n/38 − 1, 0) 轮整任务，再把剩余任务按每 tile 代价（4/3/2/1 块为 20/17/14/14）注水均分成以 4 tile 对齐的 N 段，调度由构表内核计算。抓取 GPU 生成的调度逐 tile 校验，覆盖不重不漏；worker 负载最大值仅比均值高 2.4%。
+- **XCD 块内满任务优先**：构表内核按 XCD 块重排任务表，让 partial 任务排在块尾，作为 padding 跳过后的廉价尾轮任务。
+- **每 XCD 原子队列 persistent**：worker 用原子领取整任务，顺序与硬件分派相同，作为跨任务预取的前提。
+
+### 2. 结果（Down µs）
+
+| 方案 | Down | 相对基线 |
+|---|---:|---:|
+| B13 基线（逐任务硬件分派） | 1144–1160 | — |
+| 静态 persistent + 尾轮均衡（均匀代价） | 1235 | +7% |
+| 静态 persistent + 尾轮均衡 + padding 跳过 | 1228–1263 | +7–9% |
+| 硬件分派 + padding 跳过（专家顺序） | 1156–1165 | 持平 |
+| 硬件分派 + 满任务优先（有/无 padding 跳过） | 1304–1319 | +14% |
+| 原子队列 persistent | GPU0 挂死 | 见第 4 节 |
+
+### 3. 原因
+
+- **静态调度吸收不了 CU 间的速度差**：ATT 中 CU0 的总周期比旧方案少 4.7%，PMC 的读写字节也与旧方案相同（1.32/3.22 GB）。但用 `s_memrealtime` 给每个 worker 打点，每 tile 耗时在 6.27–7.91 µs 之间（最多差 26%），内核结束时间由最慢的 worker 决定。硬件逐任务分派是动态的，天然吸收了这种差异。
+- **W2 局部性是关键**：满任务优先只是把每个专家的 partial 任务移到块尾，就慢了 14%。说明“同一专家的几个任务在同一 XCD 上同时运行、共享 L2 中的 W2”是当前性能的重要来源。凡是打乱这一点的调度（满任务优先、按 N 段切尾轮），损失都大于尾轮与 padding 的收益。
+- **padding 跳过需要重排才有用**：它只让 27% 的 partial 任务变快（整块 padding 的 MFMA 占 7.4%）；硬件分派下最慢的 CU 仍跑 4 个满任务，所以没有收益，而重排又破坏局部性。
+- **功耗墙**：Down 在约 860–880 MHz 运行。让所有 CU 一直忙会进一步压低时钟，所以尾轮均衡和延迟隐藏在本机上的实际收益小于周期数上的估计。
+
+### 4. 原子队列 persistent 使 GPU0 挂死
+
+- 首次运行即触发 `HW Exception ... reason: GPU Hang`。dmesg 之后反复出现 `XCC 0: Queue preemption failed`，GPU0 上连最简单的 torch 运算也会挂起，需要整卡复位（未自行执行）。
+- 静态审查没有找到死锁原因：单线程原子领取经 LDS 广播加 barrier，每个任务两组的 barrier 数相等。由于本机 GPU 挂起后不会自动恢复，没有在其它卡上继续二分。跨任务预取依赖这个队列，因此未实现。
+- 之后的实验改用 GPU1。回退后的 B13 代码在 GPU1 上：Down 1139.1 µs（N512）/ 1147.2 µs（N256），精度不变。
+
+### 5. 两包一起发布（barrier 减半）：未实现
+
+每步约 1168 周期，其中 barrier 本身约 2×24 周期，减半最多省约 2%。它需要重写 B ring 的发布协议，任何错误都会死锁；在挂起不可自动恢复的机器上风险过高。
+
+### 结论与状态
+
+- 本轮方案都没有带来收益，源码全部回退到 B13：Down 1146–1160 µs，即 3.36–3.41 TB/s。B13 的瓶颈定量仍然成立；尾轮（5%）和整块 padding（7.4%）的理论损失，在“XCD 内同专家任务并发”的局部性约束与功耗墙下无法回收。
+- `common.py`、`gemm2_8x1.py` 与用户暂存的 B13 版本相同，`gemm2_8x1_compact.py`、`fused_moe_gfx942.py` 未改。
+- GPU0 需要复位。

@@ -17,6 +17,7 @@ from flydsl.expr.typing import as_ir_value
 
 from . import common as fxh
 from .common import (
+    _SIMPLIFIED_BF16_RTA,
     DOWN_STORE_CACHE_MODIFIER,
     BufferTensor,
     FlyObjCache,
@@ -120,29 +121,26 @@ def _fma_f32(a, b):
     )
 
 
-def pack_8x1_record(pair, scale, *, c, row_scale, weight_quant_type):
-    weighted, rows = [], []
-    for row in range_constexpr(2):
+def pack_8x1_record(pair, scale, *, c, row_scale, weight_quant_type, rows=(0, 1)):
+    """Pack the selected token rows of one N32 record; returns one BF16 vector per row."""
+    records = []
+    for row in rows:
+        words = []
         for ng in range_constexpr(2 * pair, 2 * pair + 2):
             if const_expr(weight_quant_type == "ptpc"):
-                weighted.append(
-                    _fma_f32(
-                        Vec(c[None, ng, row].load()),
-                        Vec(scale[None, ng % 2, row].load()),
-                    )
+                weighted = _fma_f32(
+                    Vec(c[None, ng, row].load()),
+                    Vec(scale[None, ng % 2, row].load()),
                 )
             else:
-                weighted.append(Vec(c[None, ng, row].load()))
+                weighted = Vec(c[None, ng, row].load())
             # Row scales vary only by token row; one shared scalar avoids spilled splat copies.
-            rows.append(Vec(row_scale[None, 0, row].load())[0])
-    records = [[], []]
-    for index in range_constexpr(4):
-        packed = _f32_to_bf16(weighted[index] * rows[index]).bitcast(fx.Uint32)
-        for element in range_constexpr(packed.numel):
-            records[index // 2].append(packed[element])
-    return [
-        Vec.from_elements(record, fx.Uint32).bitcast(fx.BFloat16) for record in records
-    ]
+            row_value = Vec(row_scale[None, 0, row].load())[0]
+            packed = _f32_to_bf16(weighted * row_value).bitcast(fx.Uint32)
+            for element in range_constexpr(packed.numel):
+                words.append(packed[element])
+        records.append(Vec.from_elements(words, fx.Uint32).bitcast(fx.BFloat16))
+    return records
 
 
 def store_8x1_c_r2g(fragments, destinations, lgkmcnt=0, *, store_atom):
@@ -372,17 +370,18 @@ def _b_coords(n, target, ks):
 
 # ==================== Shared 8x1 event accounting and SSA ====================
 def packing_events(k, stage, first=False):
-    """Return (packet, previous-N, super-record), not the current MFMA output fragment."""
+    """Return (previous-N, super-record) packs, not the current MFMA output fragment.
+
+    Each pack starts from a record completed in an earlier step and splits its two
+    token rows across the step's two MFMA packets. Records 2/3 complete in the last
+    step, so the next N packs them before it clears them at stage KS.
+    """
     assert k in (256, 384, 512, 640), "shared 8x1 schedule supports only K128n"
     ks = k // 128
-    if stage == 0 and not first:
-        return ((0, True, 3),)
-    if stage == ks - 1:
-        return ((1, False, 0),)
-    if stage == ks:
-        return ((0, False, 1),)
-    if stage == 2 * ks - 1:
-        return ((1, False, 2),)
+    if stage < 2 and not first:
+        return ((True, 2 + stage),)
+    if ks <= stage < ks + 2:
+        return ((False, stage - ks),)
     return ()
 
 
@@ -422,7 +421,7 @@ def vmem_wait_schedule(k, n_tiles, ptpc=True):
         events.extend([("store", n, stage)] * store_count)
         required = []
         if ptpc:
-            for _, previous, record in packing_events(k, stage, n == 0):
+            for previous, record in packing_events(k, stage, n == 0):
                 required.append(scales[n - int(previous), record])
         budget = min((len(events) - 1 - index for index in required), default=63)
         result.append((b_budget, budget))
@@ -545,7 +544,7 @@ def run_8x1_tile(
     """
     KS = k // 128
     budgets = vmem_wait_schedule(k, n_tiles, ptpc)
-    FIRST_UNPACKED = 3
+    FIRST_UNPACKED = 2
 
     def has_b_target(step, *, ahead, last):
         return not last or step + ahead < 2 * KS
@@ -625,6 +624,8 @@ def run_8x1_tile(
         priority(3)
         rocdl.s_waitcnt(lgkmcnt=0)
         # packet=0/1 selects each half's first/last 32 columns; record=0..3 identifies N32 outputs.
+        # Packet p also packs token row p of the step's completed record.
+        pack_rows = []
         for packet in range_constexpr(2):
             record = 2 * half + packet
             if const_expr(kb == 0):
@@ -635,18 +636,18 @@ def run_8x1_tile(
             else:
                 b_packet = b0 if const_expr(packet == 0) else b1
                 mma(b_packet, kb, record)
-            for pack_packet, from_previous_n, pack_record in events:
-                if const_expr(packet == pack_packet):
-                    if const_expr(from_previous_n):
-                        previous_packed.append(
-                            pack(
-                                pack_record,
-                                previous_scales[pack_record - FIRST_UNPACKED],
-                            )
-                        )
-                    else:
-                        packed.append(pack(pack_record, scales[pack_record]))
-                    schedule_pack()
+            for from_previous_n, pack_record in events:
+                if const_expr(from_previous_n):
+                    pack_scale = previous_scales[pack_record - FIRST_UNPACKED]
+                else:
+                    pack_scale = scales[pack_record]
+                pack_rows.extend(pack(pack_record, pack_scale, rows=(packet,)))
+                schedule_pack()
+        for from_previous_n, _ in events:
+            if const_expr(from_previous_n):
+                previous_packed.append(pack_rows)
+            else:
+                packed.append(pack_rows)
         if const_expr(
             prepare_b_addresses is not None and step == 2 * KS - 1 and not last
         ):
@@ -893,7 +894,7 @@ def _emit_k128n_body(
     NT = N // BN
     K_WIDTHS = (BK,) * KS
     K_OFFSETS = tuple(ks * BK for ks in range(KS))
-    FIRST_UNPACKED = 3
+    FIRST_UNPACKED = 2
     WEIGHT_QUARTER_ATOMS = BN * BK // (16 * 4)
     WEIGHT_PREFETCH_SLOTS = 2
     OUTPUT_STORES_PER_WAVE = WAVE_M * BN * 2 // (64 * 16)
@@ -1222,17 +1223,19 @@ def _emit_k128n_body(
             weight_n_group_begin=2 * (record % 2) if full_half else 0,
         )
 
+    # Scheduler-visible VALU per packed token row; RTE rounding is opaque inline asm.
+    if const_expr(weight_quant_type == "ptpc"):
+        pack_row_valu = 28 if _SIMPLIFIED_BF16_RTA else 20
+    else:
+        pack_row_valu = 20 if _SIMPLIFIED_BF16_RTA else 12
+
     def schedule_pack():
-        # PTPC has 40 VALU instructions, or 24 after scalar-scale fusion; use only long BK128 packets.
+        # Spread one packed row across the packet's 16 MFMAs.
         for index in range_constexpr(16):
             rocdl.sched_group_barrier(0x8, 1, 0)
-            if const_expr(weight_quant_type == "ptpc"):
-                if const_expr(index < 13):
-                    rocdl.sched_group_barrier(0x2, 3, 0)
-                elif const_expr(index == 13):
-                    rocdl.sched_group_barrier(0x2, 1, 0)
-            else:
-                rocdl.sched_group_barrier(0x2, 2 if index < 8 else 1, 0)
+            count = pack_row_valu // 16 + int(index < pack_row_valu % 16)
+            if const_expr(count):
+                rocdl.sched_group_barrier(0x2, count, 0)
         rocdl.sched_barrier(0)
 
     pack = partial(
@@ -1315,7 +1318,7 @@ def _emit_k128n_body(
         save_state=save_state,
     )
 
-    # Pipeline: prologue keeps A resident, LDS=Q0, P0/P1=Q1/Q2; N0 packs C0-C2, leaving FP32 C3.
+    # Pipeline: prologue keeps A resident, LDS=Q0, P0/P1=Q1/Q2; N0 packs C0/C1, leaving FP32 C2/C3.
     b_prefetch = prologue()
     b_addresses = (
         prepare_b_addresses(0) if const_expr(prepare_addresses is not None) else []
