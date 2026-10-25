@@ -19,7 +19,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+from aiter.fused_moe import (
+    AUX_SORT_OPUS,
+    fused_topk,
+    moe_sorting,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.fused_moe_registry import (
     FusedMoeRequest,
     make_fused_moe_impl_kernel_name,
@@ -31,10 +37,7 @@ from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
-    invert_sorted_ids,
-    sorted_sum,
-)
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import sorted_sum
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.shuffle import shuffle_weight
@@ -183,23 +186,26 @@ def test_sorted_sum(token, model_dim, topk, padding):
     ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
     weights = torch.ones((token, topk), dtype=torch.float32)
     storage = torch.full((token * model_dim + 2 * GUARD,), CANARY, dtype=dtype)
-    sorted_ids, _, sorted_experts, valid_rows, output = moe_sorting(
+    _, _, sorted_experts, _, output, _, reverse_sorted = moe_sorting(
         ids,
         weights,
         experts,
         model_dim,
         dtype,
         64,
+        output_aux=AUX_SORT_OPUS,
         output=storage[GUARD:-GUARD].view(token, model_dim),
     )
-    loc_ids = torch.empty_like(ids)
-    invert_sorted_ids(topk)(sorted_ids, loc_ids, valid_rows, sorted_ids.numel(), token)
+    loc_ids = reverse_sorted.view_as(ids)
     # Specialized Down rows carry padding that holds canaries the sum must skip.
     down_output = torch.full(
         (sorted_experts.numel() * 64, model_dim + padding // 2), CANARY, dtype=dtype
     )
     routes = torch.randn((token, topk, model_dim)).to(dtype)
     down_output[loc_ids.long(), :model_dim] = routes
+    loc_ids[::3, -1] = -1
+    loc_ids[::7, :] = -1
+    routes = torch.where((loc_ids >= 0).unsqueeze(-1), routes, 0)
     reference = routes[:, 0].float()
     for route in range(1, topk):
         reference = reference + routes[:, route].float()
@@ -220,7 +226,8 @@ def test_sorted_sum(token, model_dim, topk, padding):
     assert err == 0, "padded sorted reduction is not exact"
     check_guards([storage])
     flops = token * model_dim * (topk - 1)
-    nbytes = token * model_dim * (topk + 1) * output.element_size() + loc_ids.nbytes
+    nbytes = (int((loc_ids >= 0).sum()) + token) * model_dim * output.element_size()
+    nbytes += loc_ids.nbytes
     return {
         "us": us,
         "TFLOPS": flops / us / 1e6,
@@ -455,6 +462,105 @@ def check_moe(
 
 
 @benchmark()
+def test_packed_sum(token, model_dim, topk):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_4x1 import (
+        make_packed_sum,
+    )
+
+    experts = max(4, topk)
+    ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
+    weights = torch.ones((token, topk), dtype=torch.float32)
+    _, _, sorted_experts, _, _, _, reverse_sorted = moe_sorting(
+        ids, weights, experts, model_dim, dtypes.bf16, 256, output_aux=AUX_SORT_OPUS
+    )
+    locations = reverse_sorted.view_as(ids)
+    source_rows = sorted_experts.numel() * 256
+    packed = torch.full(
+        (source_rows // 128, model_dim // 64, 128, 64), CANARY, dtype=dtypes.bf16
+    )
+    routes = torch.randn((token, topk, model_dim)).to(dtypes.bf16)
+    positions = locations.flatten().long()
+    packed[positions // 128, :, positions % 128, :] = routes.reshape(
+        -1, model_dim // 64, 64
+    )
+    locations[::3, -1] = -1
+    locations[::5, 0] = source_rows
+    valid = (locations >= 0) & (locations < source_rows)
+    routes = torch.where(valid.unsqueeze(-1), routes, 0)
+    reference = routes[:, 0].float()
+    for route in range(1, topk):
+        reference = reference + routes[:, route].float()
+    reference = reference.to(dtypes.bf16).float()
+    storage = torch.full((token * model_dim + 2 * GUARD,), CANARY, dtype=dtypes.bf16)
+    output = storage[GUARD:-GUARD].view(token, model_dim)
+    launcher = make_packed_sum(N=model_dim, TOPK=topk)
+    pointers = [_ptr(tensor) for tensor in (output, packed, locations)]
+
+    def run():
+        _run_compiled(
+            launcher, *pointers, token, source_rows, torch.cuda.current_stream()
+        )
+        return output
+
+    candidates = {"packed": run}
+    flops = token * model_dim * (topk - 1)
+    nbytes = int(valid.sum()) * model_dim * routes.element_size()
+    nbytes += output.nbytes + locations.nbytes
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        actual, us = run_perftest(candidate, num_iters=10, num_warmup=2)
+        err = checkAllclose(reference, actual.float(), rtol=0, atol=0, msg=name)
+        assert err == 0, "packed reduction is not exact"
+        check_guards([storage])
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_sort_inverse(token, experts, topk, routing, block_size):
+    ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
+    if routing == "duplicate":
+        ids[:, -1] = ids[:, 0]
+    weights = torch.rand((token, topk), dtype=torch.float32)
+    expert_mask = None
+    num_local_tokens = None
+    if routing == "masked":
+        expert_mask = (torch.arange(experts) % 2 == 0).to(torch.int32)
+        num_local_tokens = torch.tensor([max(token - 3, 0)], dtype=torch.int32)
+    elif routing == "empty":
+        expert_mask = torch.zeros(experts, dtype=torch.int32)
+    candidates = {
+        "sort_inverse": lambda: moe_sorting(
+            ids, weights, experts, 2560, dtypes.bf16, block_size,
+            expert_mask, num_local_tokens,
+            accumulate=False, output_aux=AUX_SORT_OPUS,
+        )
+    }
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        result, us = run_perftest(candidate, num_iters=10, num_warmup=2)
+        sorted_ids, _, _, valid_rows, _, _, inverse = result
+        positions = torch.arange(int(valid_rows[0]), dtype=torch.int64)
+        encoded = sorted_ids[:positions.numel()].to(torch.int64)
+        tokens = encoded & 0xFFFFFF
+        slots = encoded >> 24
+        valid = (tokens < token) & (slots < topk)
+        reference = torch.full((token * topk,), -1, dtype=torch.int32)
+        reference[tokens[valid] * topk + slots[valid]] = positions[valid].to(torch.int32)
+        err = checkAllclose(reference.float(), inverse.float(), rtol=0, atol=0, msg=name)
+        assert torch.equal(reference, inverse), "sorting inverse differs from sorted positions"
+        nbytes = ids.nbytes + weights.nbytes + sum(tensor.nbytes for tensor in result)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = 0.0
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
 def test_moe(token, model_dim, inter_dim, experts, topk, quant, activation, config):
     impl, request, tasks, err = check_moe(
         token, model_dim, inter_dim, experts, topk, quant, activation, "random", config
@@ -605,6 +711,33 @@ def main():
     if get_gfx() == "gfx950":
         # Only the gfx950 Gate/Up and Down paths; shipped rows are gfx942 tunes.
         test_config_strings()
+        summarize(
+            "Packed reduction",
+            [
+                test_packed_sum(token, model_dim, topk)
+                for token, (model_dim, topk) in itertools.product(
+                    (65,), ((512, 1), (2048, 9), (2560, 11), (4608, 4), (6144, 4))
+                )
+            ],
+        )
+        summarize(
+            "Sorting inverse",
+            [
+                test_sort_inverse(token, 7, 3, routing, block_size)
+                for token, routing, block_size in itertools.product(
+                    (1, 65), ("random", "duplicate", "masked", "empty"), (64, 256)
+                )
+            ],
+        )
+        summarize(
+            "Masked sorted reduction",
+            [
+                test_sorted_sum(token, model_dim, topk, padding)
+                for token, (model_dim, topk), padding in itertools.product(
+                    (1, 65), ((256, 1), (2560, 11), (6144, 4)), (0, 128)
+                )
+            ],
+        )
         for case in FOUR_WAVE_CASES + M64_M128_CASES:
             check_moe(*case)
         aiter.logger.info(

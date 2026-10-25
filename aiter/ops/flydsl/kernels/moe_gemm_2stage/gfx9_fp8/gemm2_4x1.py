@@ -732,9 +732,11 @@ def build_moe_down_m128(
 def make_packed_sum(*, N, TOPK):
     """Sum each token's TOPK packed routes; inverse holds sorted positions per route."""
     assert N % 512 == 0 and 0 < TOPK <= 255
-    column_blocks = (N + 2047) // 2048
+    threads = 64 if N % 2048 == 512 else 256
+    columns_per_block = threads * 8
+    column_blocks = (N + columns_per_block - 1) // columns_per_block
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
+    @flyc.kernel(known_block_size=[threads, 1, 1])
     def moe_packed_sum(
         p_output: fx.Pointer,
         p_source: fx.Pointer,
@@ -781,7 +783,7 @@ def make_packed_sum(*, N, TOPK):
                 )
             ).bitcast(fx.BFloat16)
 
-        column = block_col * 2048 + tid * 8
+        column = block_col * columns_per_block + tid * 8
         fragments = [read_route(locations[route], column) for route in range_constexpr(TOPK)]
         accum = fragments[0].to(fx.Float32)
         for route in range_constexpr(1, TOPK):
@@ -805,7 +807,7 @@ def make_packed_sum(*, N, TOPK):
         stream: fx.Stream,
     ):
         moe_packed_sum(p_output, p_source, p_inverse, tokens, source_rows).launch(
-            grid=(tokens * column_blocks, 1, 1), block=(256, 1, 1), stream=stream
+            grid=(tokens * column_blocks, 1, 1), block=(threads, 1, 1), stream=stream
         )
 
     return launch

@@ -247,3 +247,39 @@ gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES
   - 试过但放弃：去掉 packet 轮转、更细的 OC 切分、切片优先顺序、按 sort 块轮流分配 XCD、persistent 用 W=8（见 §5）。K>256 的权重重读仍未解决，§6 第 3 项改写为新的方向。
   - 重跑 4 个 FP8 PTPC 模型的 `--e2e_tune`，只替换“改用 one-shot M128 且同一次运行内快 ≥ 1.5%”的 5 行（原地替换，不增加 shape）：Qwen3.5-i512 4k/8k/16k（m128p → m128，快 1.8–3.4%）、Qwen3.8-i640 16k（m128p → m128，快 1.9%）、MiniMax-e128 4k（`256_256_128_True:m128p:0` → `64_256_128_True:m128:0`；bench_moe 5 轮交替 458 → 432 µs）。
   - 5 行都用生产 `fused_moe` 做了精度检查（logits_diff ≤ 4.5e-6）；shape 冲突检查通过；op test 34 个用例通过。
+- 2026-10-24：按 reduce、Down 权重复用、Gate/Up 尾部、空 tile、融合 quant 的顺序做最小实验；保留 reduce 分块，其余原型已回退，未改调优 CSV。
+  - 测法：GPU 1 空闲时同进程交替 A/B，4 轮，每轮 warmup 5 次、profile 20 次，3 份输入；以下均为 b2b 的中位数，单位 µs。未重跑全量调优、sleep 口径或 pyhip 对比。
+  - **保留 packed reduce 分块**：`N % 2048 == 512` 时采用 64 线程、512 列/CTA，其余维持 256 线程、2048 列。先试过 128 线程、1024 列（Qwen3.8-i640 32k reduce 452.95 → 420.39），最终采用无尾列浪费的 512 列版本：32k reduce 452.89 → 419.11，整体 3009.03 → 2978.15；1k reduce 15.17 → 13.72，整体 654.72 → 653.98。输出逐位一致，求和顺序未变。
+  - **Down 双行组共享 B packet**：8 波 CTA 同时处理两个 M128 行组，只由前 4 波加载 B，保持原 packed 输出布局。K384 32k 输出逐位一致，但 MiniMax-e128 persistent Down 587.91 → 583.50、e129 persistent 710.07 → 703.85，均不足 1%；e128 one-shot 576.04 → 589.61。没有稳定净收益，回退；不能据此断言所有跨块 B 复用方案都无效。
+  - **Gate/Up N64 尾列独立发射**：I192 32k，完整列仍用 4w，尾列复用现有 M64/M128/M256 kernel，精度检查通过。M64 尾列：Gate/Up 501.10 → 488.24，整体 1823.82 → 1822.25；M128 尾列：500.92 → 481.63，整体 1827.76 → 1806.91；M256 尾列：493.51，整体 1815.42。净收益最多约 1.1%，本轮不接入。
+  - **Gate/Up 大余数独立 M128 尾波**：保留短余数 stream-K，大余数时主核只跑完整轮次，剩余 tile 拆成两个 M128。MiniMax-e128 32k 精度通过，但 Gate/Up 686.74 → 723.08，整体 1899.73 → 1933.96，回退。
+  - **M64 在一个 CTA 内顺序检查 sort256 的 4 个 tile**：MiMo 1k 输出逐位一致，Gate/Up 259.48 → 258.31，整体 492.03 → 489.70；约 0.5% 收益不足以引入新派发路径，回退。
+  - **I128 Gate/Up 融合输出 quant**：先保留 BF16 舍入，再跨波归约 absmax、写 FP8 与 scale；实验双方关闭 stream-K。Qwen3.5-i128 8k 输出逐位一致，省去 quant 约 7.38，但 Gate/Up 84.50 → 94.88，整体 302.58 → 304.88，回退。跨波同步和 epilogue 成本仍需降低。
+  - **FP32 标量原子融合 reduce**：Down 将每条 route 舍入到 BF16 后转回 FP32，按 token 做 `llvm.atomicrmw fadd`；包含 FP32 输出清零与 BF16 copy，跳过 inverse/packed sum。Qwen3.8-i640 32k 本次输出逐位一致，但 Down 877.58 → 29215.79，整体 2990.86 → 30739.29，回退。这只说明当前标量原子实现不可用；未验证原生 buffer/packed atomic 的可行性，也不保证原子顺序在其他输入上逐位一致。
+  - **验证**：现有 34 个 gfx950 MoE 用例通过；现有测试文件新增 5 个 packed reduce 用例，覆盖 N=512/2048/2560/4608/6144、TOPK=1/4/9/11、负数与越界 inverse、输出 canary，均精确通过。原型回退后再次检查 K640 Down 与 packed reduce。
+  - **修正分析口径**：Qwen3.5-i512 4k 的 A 仅 0.0189 GB，四个 XCD 各读一次变为一次最多解释 0.0566 GB，而此前实测总读量下降约 0.2681 GB，不能全部归因于 A 重读。TCC 请求量不能单独确定 MALL/HBM 命中来源；理想读写字节数除以时间，也不能直接与纯写带宽上限相比作为利用率。
+- 2026-10-24：借鉴仓库已有实现，依次验证连续输出、原生 packed atomic、重排 epilogue 融合量化、排序直接生成 inverse；新增保留最后一项，前三项原型回退。
+  - **连续 `[token, topk, D]` 输出**：Down 改为 64-bit 地址的向量 scatter store，复用 `kernels/moe_reduce.py` 的 BF16 连续归约，跳过 inverse。Qwen3.8-i640 32k 输出逐位一致，整体 2996.85 → 3112.61 µs；将连续归约也改为 64 线程/512 列后，2999.74 → 3121.42 µs。Down 写出和连续归约都未胜过当前 packed 路径，回退。
+  - **gfx950 原生 BF16 packed atomic**：使用 `BufferAtomicPkAdd(BFloat16)`，每次累加两个 BF16，计入输出清零且无末尾 copy。Qwen3.8-i640 32k 整体 2992.57 → 8148.15 µs，Down 约 885.55 → 6762.84 µs；1k 整体 653.29 → 673.12 µs。32k 与基线相对 RMS 差 0.00452，88 个元素不满足 atol=rtol=0.02；1k 也有 5 个超限元素。虽比标量 FP32 atomic 原型快，仍无净收益且舍入语义不同，回退。
+  - **LDS 行重排后融合 I128 quant**：每次将 64 行 BF16 结果放入行距 136 元素的 LDS 暂存，16-lane 子组处理整行 I128，避免逐段跨波 absmax。双方关闭 stream-K。Qwen3.5-i128 8k 输出逐位一致，整体 304.47 → 303.71 µs，基本持平；32k 严格比较有 1/67108864 个输出相差 0.00390625（一个 BF16 ULP），未继续计时或放宽门槛，回退。
+  - **保留 OPUS sorting inverse 复用**：M128 的 `moe_sorting` 调用使用已有 `output_aux="opus"`，将返回的 `reverse_sorted` 直接作为 `make_packed_sum` 的 loc_ids，不再发射 `invert_sorted_ids`。没有新增 C++ 接口；目前也会生成未消费的 m_indices。OPUS 辅助输出保留调用者的 dispatch_policy，不再将显式单阶段/多阶段重置为自动。无效 route 在排序中设为 -1，packed sum 按零处理。
+  - inverse 对比采用原始顺序的基线（独立 inverse 在 Down 后执行），GPU 1 同进程 6 轮交替，每轮 warmup 5、profile 20 次、3 份输入，以下均为 µs：
+
+    | 模型 / tokens | sort+inverse 旧 → 新 | 整体 MoE 旧 → 新 |
+    |---|---|---|
+    | Qwen3.8-i640 / 1024 | 23.33 → 18.49 | 652.00 → 649.19 |
+    | Qwen3.8-i640 / 32768 | 83.25 → 80.26 | 2988.96 → 2986.64 |
+    | MiniMax-e128 / 1024 | 17.77 → 13.63 | 267.12 → 264.52 |
+    | MiniMax-e128 / 32768 | 69.59 → 66.94 | 1899.20 → 1898.21 |
+    | Qwen3.5-i128 / 8192 | 35.35 → 31.11 | 301.41 → 299.43 |
+
+  - 五个 shape 的整体输出逐位一致；收益是稳定省掉约 2.6–4.8 µs 的排序/inverse 开销，端到端不足 1%，不视为 GEMM 加速。没有测试 sleep 口径或重新调优 CSV。
+  - **验证**：34 个既有 gfx950 MoE + 5 个 packed reduce + 24 个 sorting inverse 用例通过；inverse 用例覆盖 token=1/65、重复 expert、expert mask、num_local_tokens 尾部、全空路由、dispatch_policy=0/1/2。随后为显式策略增加 mock 参数断言，三种策略的 masked 用例再次通过。
+- 2026-10-24：按用户要求撤回 `aiter/fused_moe.py` 的公共 dispatch_policy 修改，改为在本后端统一复用 OPUS inverse。
+  - 所有 prefill reduce 路径使用对应排序返回的 `reverse_sorted`，后端不再调用独立 `invert_sorted_ids`。需要 4w Gate/Up → M64 Down 二次排序时，首次 sort256 不生成辅助数组，使用第二次 sort64 的 inverse；decode/batch1 不额外生成 inverse。使用已有 `AUX_SORT_OPUS` 常量和具名解包，移除 `sort_result[6]`。
+  - 普通 `sorted_sum` 改用有界 buffer copy：负索引使用安全基址和 0 字节可读范围，加载结果为零；有效行只允许读取 N 列，保留原输入行 padding。无需新增零行、清零 kernel 或改变 FP32 求和顺序。旧 `invert_sorted_ids` helper 仍保留供外部兼容，但本后端和本测试文件均不再调用。
+  - 公共排序分发语义保持原状：`output_aux=AUX_SORT_OPUS` 沿用已有自动分发规则；删除前一轮新增的显式策略保持断言。inverse 测试改为覆盖 sort64/sort256，加入普通归约的负索引和全空 route 测试。
+  - GPU 1，4 轮同进程交替、每轮 5 次 warmup + 20 次 profile、3 份输入，基线为独立 inverse + 原裸指针 sorted_sum。整体 MoE（µs）：Qwen3.8 FP8 I192 4k / 1x4：400.52 → 397.25；I192 32k / 4w+8x1 compact（二次排序）：1822.35 → 1817.08；Qwen3.8 BF16 I320 8k / default：1315.47 → 1311.98。三者输出逐位一致。
+  - **验证**：gfx950 测试目标共 67 个用例通过（34 MoE、5 packed reduce、16 sort inverse、12 masked sorted sum）。本机没有 gfx942，普通 sorted_sum 在 gfx942 上的执行与性能仍需该平台回归；未修改 CSV、未重跑全量调优。
+- 2026-10-24：按用户要求，普通 `sorted_sum` 的输入读取改回 `UniversalCopy`，输出仍用原有 `BufferCopy`。移除输入 buffer descriptor；每个 token 先判断是否包含负 inverse，全有效时直接向量加载，仅含负索引时使用零初始化 fragment + 有效性分支跳过读取，保持 FP32 累加顺序。
+  - 逐次判断的初版在全有效输入下约慢 8%，改为 token 级快路径后，同卡 4 轮 A/B（4096 tokens、N=2560、TOPK=11、padding=128）原无保护 UniversalCopy 59.65 µs，新版本 59.91 µs，输出逐位一致。负索引、全空 route、padding、canary 检查通过；该数据是归约单核微测，不是端到端收益。

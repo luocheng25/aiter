@@ -8,14 +8,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
     flydsl_quant_per_token,
-    invert_sorted_ids,
     per_token_quant_supported,
     sorted_sum,
 )
@@ -430,8 +429,15 @@ def _run_prefill(
     m128_down = config.down_path in ("m128", "m128p")
     # The M128 Down reads 256-row sort blocks; Gate/Up walks them in BLOCK_M tiles.
     sort_block_m = 256 if m128_down else config.BLOCK_M
-    # sorted_sum writes every output row, so the sort need not zero an output buffer.
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+    needs_resort = config.four_wave_gateup and not m128_down
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        cur_out,
+        *sort_aux,
+    ) = moe_sorting(
         topk_ids,
         topk_weight,
         problem.experts,
@@ -442,7 +448,11 @@ def _run_prefill(
         num_local_tokens,
         moe_sorting_dispatch_policy,
         accumulate=False,
+        output_aux=False if needs_resort else AUX_SORT_OPUS,
     )
+    reverse_sorted = None
+    if not needs_resort:
+        _, reverse_sorted = sort_aux
     if cur_out.numel() == 0:
         cur_out = torch.empty(
             [problem.batch, problem.model_dim],
@@ -590,14 +600,7 @@ def _run_prefill(
             problem.batch,
             task_num,
         )
-        loc_ids = torch.empty(
-            [problem.batch, problem.topk],
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        invert_sorted_ids(problem.topk)(
-            sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], problem.batch
-        )
+        loc_ids = reverse_sorted.view(problem.batch, problem.topk)
         _launch(
             make_packed_sum(N=problem.model_dim, TOPK=problem.topk),
             cur_out,
@@ -609,10 +612,18 @@ def _run_prefill(
         return cur_out
 
     down_block_m = config.BLOCK_M
-    if config.four_wave_gateup:
+    if needs_resort:
         # The M64 Down kernels index 64-row sorted blocks.
         down_block_m = 64
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            _,
+            _,
+            reverse_sorted,
+        ) = moe_sorting(
             topk_ids,
             topk_weight,
             problem.experts,
@@ -623,6 +634,7 @@ def _run_prefill(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             accumulate=False,
+            output_aux=AUX_SORT_OPUS,
         )
         task_num = int(sorted_expert_ids.shape[0])
 
@@ -687,18 +699,7 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
-    loc_ids = torch.empty(
-        [problem.batch, problem.topk],
-        dtype=torch.int32,
-        device=hidden_states.device,
-    )
-    invert_sorted_ids(problem.topk)(
-        sorted_ids,
-        loc_ids,
-        num_valid_ids,
-        sorted_ids.shape[0],
-        problem.batch,
-    )
+    loc_ids = reverse_sorted.view(problem.batch, problem.topk)
     sorted_sum(problem.topk, problem.model_dim, config.down_output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
     )

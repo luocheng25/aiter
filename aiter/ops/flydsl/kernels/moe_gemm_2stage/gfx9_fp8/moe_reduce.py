@@ -40,33 +40,50 @@ def sorted_sum(TOPK, N, output_padding_bytes=0):
             num_records_bytes=fx.Int64(N) * (B.dtype.width // 8),
         )
 
-        token_ptrs = [
-            (A + fx.Int64(token_locs[topk]) * input_row_stride)
-            for topk in fx.range_constexpr(TOPK)
-        ]
+        token_ptrs = []
+        has_invalid = token_locs[0] < 0
+        for topk in fx.range_constexpr(TOPK):
+            valid = token_locs[topk] >= 0
+            has_invalid = has_invalid | (token_locs[topk] < 0)
+            row = valid.select(token_locs[topk], fx.Int32(0))
+            token_ptrs.append(A + fx.Int64(row) * input_row_stride)
 
-        def load_atom(topk_id, off):
+        def load_atom(topk_id, off, mask_invalid):
             atom = fxh.atom_tensor(token_ptrs[topk_id], fx.Int32(off), copy_bits)
             frag = fx.make_fragment_like(atom)
-            fx.copy(copy_atom, atom, frag)
+            if fx.const_expr(mask_invalid):
+                frag.fill(0)
+                if token_locs[topk_id] >= 0:
+                    fx.copy(copy_atom, atom, frag)
+            else:
+                fx.copy(copy_atom, atom, frag)
             return frag
 
-        for dst, col in fxh.all_copy_atoms(
-            B, col_tensor, atom_bits=copy_bits, num_threads=num_threads
-        ):
-            column = col[0].to_py_value()
-            frag = [load_atom(topk, column) for topk in fx.range_constexpr(TOPK)]
+        def reduce_tokens(mask_invalid):
+            for dst, col in fxh.all_copy_atoms(
+                B, col_tensor, atom_bits=copy_bits, num_threads=num_threads
+            ):
+                column = col[0].to_py_value()
+                frag = [
+                    load_atom(topk, column, mask_invalid)
+                    for topk in fx.range_constexpr(TOPK)
+                ]
 
-            vec_sum = frag[0].load().to(fx.Float32)
-            for m in fx.range_constexpr(1, TOPK):
-                vec = frag[m].load().to(fx.Float32)
-                vec_sum += vec
+                vec_sum = frag[0].load().to(fx.Float32)
+                for m in fx.range_constexpr(1, TOPK):
+                    vec = frag[m].load().to(fx.Float32)
+                    vec_sum += vec
 
-            vec_sum = vec_sum.to(dst.dtype)
+                vec_sum = vec_sum.to(dst.dtype)
 
-            frag = fx.make_fragment_like(dst)
-            frag.store(vec_sum)
-            fx.copy(copy_atom_b, frag, dst)
+                frag = fx.make_fragment_like(dst)
+                frag.store(vec_sum)
+                fx.copy(copy_atom_b, frag, dst)
+
+        if has_invalid:
+            reduce_tokens(True)
+        else:
+            reduce_tokens(False)
 
     @flyc.jit
     def launch(
