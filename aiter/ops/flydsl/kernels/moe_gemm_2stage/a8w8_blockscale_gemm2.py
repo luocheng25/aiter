@@ -22,7 +22,13 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from . import common as fxh
-from .common import _ptr, asm_mark, get_device_cache_key, pin_vgpr, llvm_extract_as_vector
+from .common import (
+    _ptr,
+    asm_mark,
+    get_device_cache_key,
+    pin_vgpr,
+    llvm_extract_as_vector,
+)
 from .gemm2_common import LdsTensor, BufferTensor
 from .a8w8_blockscale_config import m128_down_lds_bytes
 
@@ -78,6 +84,7 @@ def _stage_end():
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
 
+
 def _pack_pair(c0, c1, route):
     words0 = (c0 * route).to(fx.BFloat16).bitcast(fx.Int32)
     words1 = (c1 * route).to(fx.BFloat16).bitcast(fx.Int32)
@@ -88,7 +95,7 @@ def _pack_pair(c0, c1, route):
     hi = rocdl.permlane16_swap(
         pair_type, words0[1].ir_value(), words1[1].ir_value(), False, False
     )
-    return llvm_extract_as_vector(fx.Int32, lo, [0], hi, [0], lo,[1], hi, [1])
+    return llvm_extract_as_vector(fx.Int32, lo, [0], hi, [0], lo, [1], hi, [1])
 
 
 def _pack_output_steps(previous, cached_rows, packed):
@@ -708,6 +715,7 @@ def _compile_m128_down(
         )
 
     return launch
+
 
 @cache
 def make_m128_down(

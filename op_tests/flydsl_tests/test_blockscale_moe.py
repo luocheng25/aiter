@@ -57,6 +57,16 @@ def test_whole_chain(path, tokens):
     check_result(run_torch(request, raw), run(request, config(path)), path)
 
 
+@pytest.mark.parametrize("path", _PATHS)
+@pytest.mark.parametrize("k_rotate", [False, True])
+def test_whole_chain_k_rotate(path, k_rotate):
+    # K=1024 gives 8 K tiles, so rotation reorders the GateUp K loop per expert.
+    request, raw = prepare_case(257, 1024, 256, experts=5, topk=3)
+    cfg = replace(config(path), k_rotate=k_rotate)
+    assert cfg.to_string().endswith(f":{int(k_rotate)}")
+    check_result(run_torch(request, raw), run(request, cfg), path)
+
+
 @pytest.mark.parametrize(
     "path,inter,n,splits",
     [

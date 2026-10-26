@@ -113,6 +113,20 @@ TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
+
+def _expert_balanced_score(token, expert, topk, dtype, device=None):
+    """Round-robin routing scores: slot j of token t goes to expert (t*topk+j) % expert.
+
+    Every expert receives floor or ceil of token*topk/expert rows, and one token's
+    slots hit distinct experts while topk <= expert.
+    """
+    cols = (
+        torch.arange(token, device=device).unsqueeze(1) * topk
+        + torch.arange(topk, device=device)
+    ) % expert
+    score = torch.zeros((token, expert), dtype=dtype, device=device)
+    return score.scatter_(1, cols, 1.0)
+
 COS_DIFF_THRESHOLD = 1e-1
 
 
@@ -1589,13 +1603,7 @@ class FmoeTuner(TunerCommon):
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros((token, expert), dtype=dtype)
-            start_col = 0
-            end_col = topk
-            for token_id in range(token):
-                score[token_id, start_col:end_col] = 1.0
-                start_col = end_col % expert
-                end_col = start_col + topk
+            score = _expert_balanced_score(token, expert, topk, dtype)
         else:
             routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
             if routing_seed is not None:
@@ -4820,7 +4828,10 @@ class FmoeTuner(TunerCommon):
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
 
-                score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                if TUNE_MOE_EXPERT_BALANCE:
+                    score = _expert_balanced_score(token, expert, topk, dtype, "cuda")
+                else:
+                    score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(

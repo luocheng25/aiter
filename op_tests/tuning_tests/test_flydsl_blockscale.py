@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -119,7 +119,7 @@ def _load_cpu_code():
         )
 
     load(
-        "aiter/ops/flydsl/kernels/moe_blockscale_config.py",
+        "aiter/ops/flydsl/kernels/moe_gemm_2stage/a8w8_blockscale_config.py",
         {"m128_down_lds_bytes", "routed_down_lds_bytes"},
     )
     load(
@@ -305,8 +305,58 @@ class TestFlydslBlockscaleTuning(unittest.TestCase):
                         set(_BLOCK_VARIANTS),
                     )
                     self.assertEqual({c.num_oc_splits for c in block}, {1, 2, 4, 8})
+                    # Every Down candidate is tuned with and without stage1 K rotation.
+                    down = {(c.down_path, c.down_block_n, c.num_oc_splits) for c in block}
+                    self.assertEqual(
+                        sorted(
+                            (c.down_path, c.down_block_n, c.num_oc_splits, c.k_rotate)
+                            for c in block
+                        ),
+                        sorted((*d, k) for d in down for k in (False, True)),
+                    )
                 else:
                     self.assertEqual(block, [])
+
+    def test_k_rotate_field_is_optional_and_strict(self):
+        row = _row()
+        for (path, block_n), k_rotate in product(_BLOCK_VARIANTS, (None, False, True)):
+            with self.subTest(path=path, block_n=block_n, k_rotate=k_rotate):
+                config = self._config(
+                    path, down_block_n=block_n, num_oc_splits=2, k_rotate=k_rotate
+                )
+                fields = config.to_string().split(":")
+                # None keeps the five-field spelling of existing tuned CSVs.
+                self.assertEqual(len(fields), 5 if k_rotate is None else 6)
+                if k_rotate is not None:
+                    self.assertEqual(fields[5], str(int(k_rotate)))
+                self.assertEqual(
+                    self.code.Config.from_string(config.to_string()), config
+                )
+                self.assertEqual(
+                    self.code._flydsl_e2e_row_supported(config, row),
+                    self.code._flydsl_e2e_row_supported(
+                        replace(config, k_rotate=None), row
+                    ),
+                )
+        base = self._config().to_string()
+        for text in (
+            f"{base}:2",
+            f"{base}:true",
+            f"{base}:",
+            "16_64_64_False_False:default:0:128:1:1",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.code.Config.from_string(text)
+        for make in (
+            lambda: self._config(k_rotate=1),
+            lambda: self._config(k_rotate="1"),
+            lambda: self.code.Config(16, 64, 64, False, k_rotate=True),
+            lambda: self.code.Config(
+                16, 64, 64, False, down_path="block_a16w8", k_rotate=False
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                make()
 
     def test_decode_candidates_and_shape_bounds(self):
         for gfx in ("gfx942", "gfx950", "gfx1250"):
