@@ -94,22 +94,32 @@ def _wait_groups(groups):
 
 
 def _schedule_compute(group_id, dsrd_ops, vmem_ops):
-    """Interleave a quadrant's 16 MFMAs with its LDS reads and next-tile DMAs."""
-    mfma_prefix = 2
-    dsrd_groups = (dsrd_ops + 1) // 2
-    dsrd_mfmas = min(dsrd_groups, 16 - mfma_prefix - 2 * vmem_ops)
-    mfma_tail = 16 - mfma_prefix - 2 * vmem_ops - dsrd_mfmas
-    rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_prefix, group_id)
-    for i in range_constexpr(max(vmem_ops, dsrd_groups)):
-        if const_expr(i < vmem_ops):
-            rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
-            rocdl.sched_group_barrier(rocdl.mask_mfma, 2, group_id)
-        if const_expr(i < dsrd_groups):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, min(2, dsrd_ops - 2 * i), group_id)
-            if const_expr(i < dsrd_mfmas):
-                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
-    if const_expr(mfma_tail > 0):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, mfma_tail, group_id)
+    """One next-tile DMA, then one LDS read, per MFMA of a quadrant's 16.
+
+    The DMAs precede the reads in program order: the compiler cannot reorder LDS
+    DMA writes and LDS reads it assumes may alias.
+    """
+    rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    for _ in range_constexpr(vmem_ops):
+        rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    for _ in range_constexpr(dsrd_ops):
+        rocdl.sched_group_barrier(rocdl.mask_dsrd, 1, group_id)
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    rocdl.sched_group_barrier(rocdl.mask_mfma, 16 - 1 - dsrd_ops - vmem_ops, group_id)
+
+
+def _schedule_dense(group_id, dsrd_ops, vmem_ops):
+    """Like _schedule_compute, but spreads more than 15 DMAs and reads over the MFMAs."""
+    ops = [rocdl.mask_vmem_rd] * vmem_ops + [rocdl.mask_dsrd] * dsrd_ops
+    rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
+    done = 0
+    for slot in range_constexpr(15):
+        take = (len(ops) - done + 14 - slot) // (15 - slot)
+        for op in ops[done : done + take]:
+            rocdl.sched_group_barrier(op, 1, group_id)
+        done += take
+        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group_id)
 
 
 def _swap_pack(words0, words1):
@@ -141,12 +151,21 @@ def build_moe_gateup_4w(
     group_m=4,
     num_ctas=None,
     stream_k=True,
+    tail_max=4,
+    rows=256,
 ):
-    """FP8 Gate/Up on gfx950; prefill Gate/Up ABI plus the stream-K workspace pair."""
+    """FP8 Gate/Up on gfx950; prefill Gate/Up ABI plus the stream-K workspace pair.
+
+    rows=128 runs half tiles: every sort block's top 128 rows on the usual tile
+    schedule, preceded by the bottom halves that hold routes (most are empty below
+    ~128 routes per expert).
+    """
     assert gateup_4w_supported(N, K), f"4-wave Gate/Up needs N/2 % 16 == 0, K % 256 == 0: {N=} {K=}"
     assert act_quant_type in ("ptpc", "per_tensor")
     assert weight_quant_type in ("ptpc", "per_tensor")
     assert activation in ("silu", "swiglu")
+    assert rows in (128, 256)
+    halves = rows // BLOCK
     num_ctas = num_ctas or get_cu_num()
     assert num_ctas % 8 == 0, "CTA slots are interleaved over eight XCDs"
     inter = N // 2
@@ -154,13 +173,15 @@ def build_moe_gateup_4w(
     n_tail = inter % BLOCK != 0
     num_k_tiles = K // BLOCK
     num_pairs = num_k_tiles // 2
+    max_f = max(1, min(tail_max, num_pairs))
     in_group = group_m * n_tiles
     fp8 = fx.Float8E4M3FN
     # Per quadrant: four 16-byte DMAs (one group) per operand, eight ds_read_b128 per
-    # fragment. Each phase waits for the operand it reads; five groups stay in flight.
+    # fragment. Each phase waits for the operand it reads; five groups stay in flight
+    # (three for half tiles, which issue three groups per K tile).
     a_vmem = b_vmem = 4
     a_dsrd = b_dsrd = 8
-    in_flight = 5
+    in_flight = 5 if halves == 2 else 3
 
     @fx.struct
     class Storage:
@@ -216,10 +237,13 @@ def build_moe_gateup_4w(
         count = (slot < total).select(
             (total - slot + num_ctas - 1) // num_ctas, fx.Int32(0)
         )
+        tail, chunk = slot < 0, fx.Int32(0)
         if const_expr(stream_k):
-            # Slot s owns K pairs [g0, g1) of the last num_ctas + rest tiles. Slot ranges
-            # drift by rest/num_ctas tiles, desynchronizing CTAs that share A/B tiles,
-            # so only short remainders are split.
+            # A short remainder (rest <= num_ctas / 8) splits the last num_ctas + rest
+            # tiles evenly: slot s owns K pairs [g0, g1). Its ranges drift by
+            # rest/num_ctas tiles and desynchronize CTAs sharing A/B tiles, so a longer
+            # one keeps whole rounds data-parallel and splits each remainder tile into
+            # f <= tail_max K ranges, chunk j of tile t on slot t * f + j.
             split = (rounds > 0) & (rest > 0) & (rest * 8 <= num_ctas)
             sk_work = (num_ctas + rest) * num_pairs
             g0 = slot * sk_work // num_ctas
@@ -227,10 +251,42 @@ def build_moe_gateup_4w(
             u0 = g0 // num_pairs
             n_dp = split.select(rounds - 1, count)
             count = n_dp + split.select((g1 - 1) // num_pairs - u0 + 1, fx.Int32(0))
+            f = (rest > 0).select(
+                fx.Int32(num_ctas) // (rest > 0).select(rest, fx.Int32(1)), fx.Int32(1)
+            )
+            f = (f < max_f).select(f, fx.Int32(max_f))
+            tail = (~split) & (f > 1)
+            count = tail.select(rounds + (slot < rest * f).select(fx.Int32(1), fx.Int32(0)), count)
+            chunk = slot % f
 
-        if count > 0:
+        zero = fx.Int32(0)
+
+        def coords(logical):
+            """Logical tile -> (sorted block, N tile); group_m blocks per N sweep."""
+            first_m = logical // in_group * group_m
+            rest_m = n_blocks - first_m
+            size_m = (rest_m < group_m).select(rest_m, fx.Int32(group_m))
+            return first_m + logical % in_group % size_m, logical % in_group // size_m
+
+        # Half tiles: bottom-half candidates j are the CTA's tiles slot + j * num_ctas.
+        bottom_slots = (slot < total).select((total - slot + num_ctas - 1) // num_ctas, zero)
+
+        def bottom_live(j):
+            ok = j < bottom_slots
+            block, _ = coords(ok.select(j * num_ctas + slot, zero))
+            head = sorted_ids[block * SORT_BLOCK_M + BLOCK].bitcast(fx.Uint32)
+            return ok & ((head & 0xFFFFFF) < fx.Uint32(tokens)) & ((head >> 24) < TOPK)
+
+        n_live_b = zero
+        if const_expr(halves == 1):
+            # A single carried value comes back unwrapped after the loop.
+            for j, live_state in range(0, bottom_slots, 1, init=[zero]):
+                live_next = live_state[0] + bottom_live(fx.Int32(j)).select(fx.Int32(1), zero)
+                live_count = yield [live_next]
+            n_live_b = live_count
+
+        if count + n_live_b > 0:
             lds = fx.SharedAllocator().allocate(Storage).peek()
-            zero = fx.Int32(0)
             a_rsrc = _rsrc(fxh._as_ptr(p_input, fx.Uint8), tokens * K)
             out_bytes = tokens * (TOPK * inter * 2)
             o_rsrc = _rsrc(fxh._as_ptr(p_output, fx.Uint8), out_bytes)
@@ -249,20 +305,34 @@ def build_moe_gateup_4w(
                 stop = g1 - u * num_pairs
                 first = in_sk.select((start > 0).select(start, zero), zero)
                 end = in_sk.select((stop < num_pairs).select(stop, fx.Int32(num_pairs)), fx.Int32(num_pairs))
-                return in_sk.select((rounds - 1) * num_ctas + u, logical), first, end
+                logical = in_sk.select((rounds - 1) * num_ctas + u, logical)
+                in_tail = tail & (i >= rounds)
+                first = in_tail.select(chunk * num_pairs // f, first)
+                end = in_tail.select((chunk + 1) * num_pairs // f, end)
+                return in_tail.select(rounds * num_ctas + slot // f, logical), first, end
 
-            def coords(logical):
-                """Logical tile -> (sorted block, N tile); group_m blocks per N sweep."""
-                first_m = logical // in_group * group_m
-                rest_m = n_blocks - first_m
-                size_m = (rest_m < group_m).select(rest_m, fx.Int32(group_m))
-                return first_m + logical % in_group % size_m, logical % in_group // size_m
+            def pick(i, jb):
+                """Job i -> (logical tile, first K pair, end K pair, half); live bottom
+                halves (candidate jb) come first, then the top-half schedule."""
+                logical, first, end = job(i - n_live_b)
+                if const_expr(halves == 2):
+                    return logical, first, end, None
+                is_b = i < n_live_b
+                return (
+                    is_b.select(jb * num_ctas + slot, logical),
+                    is_b.select(zero, first),
+                    is_b.select(fx.Int32(num_pairs), end),
+                    is_b.select(fx.Int32(1), zero),
+                )
 
-            def a_voffsets(block_m):
+            def a_voffsets(block_m, half=None):
                 offsets = []
-                for half in range_constexpr(2):
+                for h in range_constexpr(halves):
+                    base = block_m * SORT_BLOCK_M + h * BLOCK
+                    if const_expr(half is not None):
+                        base = base + half * BLOCK
                     for c in range_constexpr(4):
-                        row = block_m * SORT_BLOCK_M + half * BLOCK + wave + (lane // 8) * 16 + c * 4
+                        row = base + wave + (lane // 8) * 16 + c * 4
                         token = sorted_ids[row] & 0xFFFFFF
                         offsets.append(token * K + (lane % 8) * 16)
                 return offsets
@@ -341,6 +411,9 @@ def build_moe_gateup_4w(
             dst_A_b = copy_a.retile(frag_A_b)
             dst_B_l = copy_b.retile(frag_B_l)
             dst_B_r = copy_b.retile(frag_B_r)
+            # Half tiles read the next K tile's A while the current one is in use.
+            frag_A = [frag_A_t, thr_mma.make_fragment_B(sA_t[0])]
+            dst_A = [dst_A_t, copy_a.retile(frag_A[1])]
 
             def load(src, dst):
                 fx.copy(copy_atom, src, dst, pred=None)
@@ -355,52 +428,89 @@ def build_moe_gateup_4w(
             frag_C_tr = thr_mma.make_fragment_C(c_tile)
             frag_C_bl = thr_mma.make_fragment_C(c_tile)
             frag_C_br = thr_mma.make_fragment_C(c_tile)
-            frags_C = (frag_C_tl, frag_C_tr, frag_C_bl, frag_C_br)
+            frags_C = (frag_C_tl, frag_C_tr, frag_C_bl, frag_C_br)[: 2 * halves]
 
             def run_pair(kk, a_vo, b_rsrc, n_tile):
                 """Compute the two K tiles in LDS; prefetch K tiles kk, kk+1 of a tile."""
+
+                def quadrant(group, read, mma, dma, dsrd, vmem):
+                    _wait_groups(in_flight)
+                    dma()
+                    load(*read)
+                    gemm(*mma)
+                    _schedule_compute(group, dsrd, vmem)
+                    rocdl.sched_barrier(0)
+
+                if const_expr(halves == 1):
+                    for buf in range_constexpr(2):
+                        nxt = 1 - buf
+                        k_pf = kk + buf
+                        # tl: refill B_l and A_t of this buffer, read B_r.
+                        _wait_groups(in_flight)
+                        g2s_b(b_rsrc, k_pf, b_l_dma[buf], n_tile * BLOCK)
+                        g2s_a(k_pf, a_t_dma[buf], a_vo[0:4])
+                        load(src_B_r[buf], dst_B_r)
+                        gemm(frag_C_tl, frag_B_l, frag_A[buf])
+                        _schedule_dense(2 * buf, b_dsrd, 2 * b_vmem)
+                        rocdl.sched_barrier(0)
+                        # tr: refill B_r, read the next K tile's B_l and A_t.
+                        _wait_groups(in_flight)
+                        g2s_b(b_rsrc, k_pf, b_r_dma[buf], n_tile * BLOCK + inter)
+                        load(src_B_l[nxt], dst_B_l)
+                        load(src_A_t[nxt], dst_A[nxt])
+                        gemm(frag_C_tr, frag_B_r, frag_A[buf])
+                        _schedule_dense(2 * buf + 1, b_dsrd + a_dsrd, b_vmem)
+                        rocdl.sched_barrier(0)
+                    return
+
                 for buf in range_constexpr(2):
                     nxt = 1 - buf
                     k_pf = kk + buf
                     # Quadrant order: tl(A_t.B_l), bl(A_b.B_l), tr(A_t.B_r), br(A_b.B_r).
-                    _wait_groups(in_flight)
-                    load(src_A_b[buf], dst_A_b)
-                    gemm(frag_C_tl, frag_B_l, frag_A_t)
-                    g2s_b(b_rsrc, k_pf, b_l_dma[buf], n_tile * BLOCK)
-                    _schedule_compute(4 * buf + 0, a_dsrd, b_vmem)
-                    rocdl.sched_barrier(0)
-
-                    _wait_groups(in_flight)
-                    load(src_B_r[buf], dst_B_r)
-                    gemm(frag_C_bl, frag_B_l, frag_A_b)
-                    g2s_a(k_pf, a_t_dma[buf], a_vo[0:4])
-                    _schedule_compute(4 * buf + 1, b_dsrd, a_vmem)
-                    rocdl.sched_barrier(0)
-
-                    _wait_groups(in_flight)
-                    load(src_B_l[nxt], dst_B_l)
-                    gemm(frag_C_tr, frag_B_r, frag_A_t)
-                    g2s_a(k_pf, a_b_dma[buf], a_vo[4:8])
-                    _schedule_compute(4 * buf + 2, b_dsrd, a_vmem)
-                    rocdl.sched_barrier(0)
-
-                    _wait_groups(in_flight)
-                    load(src_A_t[nxt], dst_A_t)
-                    gemm(frag_C_br, frag_B_r, frag_A_b)
-                    g2s_b(b_rsrc, k_pf, b_r_dma[buf], n_tile * BLOCK + inter)
-                    _schedule_compute(4 * buf + 3, a_dsrd, b_vmem)
-                    rocdl.sched_barrier(0)
+                    quadrant(
+                        4 * buf + 0,
+                        (src_A_b[buf], dst_A_b),
+                        (frag_C_tl, frag_B_l, frag_A_t),
+                        lambda: g2s_b(b_rsrc, k_pf, b_l_dma[buf], n_tile * BLOCK),
+                        a_dsrd,
+                        b_vmem,
+                    )
+                    quadrant(
+                        4 * buf + 1,
+                        (src_B_r[buf], dst_B_r),
+                        (frag_C_bl, frag_B_l, frag_A_b),
+                        lambda: g2s_a(k_pf, a_t_dma[buf], a_vo[0:4]),
+                        b_dsrd,
+                        a_vmem,
+                    )
+                    quadrant(
+                        4 * buf + 2,
+                        (src_B_l[nxt], dst_B_l),
+                        (frag_C_tr, frag_B_r, frag_A_t),
+                        lambda: g2s_a(k_pf, a_b_dma[buf], a_vo[4:8]),
+                        b_dsrd,
+                        a_vmem,
+                    )
+                    quadrant(
+                        4 * buf + 3,
+                        (src_A_t[nxt], dst_A_t),
+                        (frag_C_br, frag_B_r, frag_A_b),
+                        lambda: g2s_b(b_rsrc, k_pf, b_r_dma[buf], n_tile * BLOCK + inter),
+                        a_dsrd,
+                        b_vmem,
+                    )
 
             def epilogue(row_ids, row_scales, ws_gate, ws_up, expert_scale, n_tile, partial=None,
                          enable=None):
                 """Dequant + activation; permlane-pack eight columns per 16-byte store.
 
-                partial: workspace slot whose fp32 partial is added to the accumulators.
+                partial: (first workspace slot, n, live) adds the fp32 partials of n
+                consecutive slots; slots past the dynamic `live` count read as zero.
                 enable: dynamic store predicate.
                 """
                 # Fragment (cr, rr) holds columns cr*32 + wave_n*16 + lg*4 + e and row
                 # rr*32 + wave_m*16 + lane%16 of its quadrant.
-                for qm in range_constexpr(2):
+                for qm in range_constexpr(halves):
                     gate_frag = frags_C[2 * qm]
                     up_frag = frags_C[2 * qm + 1]
                     for rr in range_constexpr(4):
@@ -416,10 +526,13 @@ def build_moe_gateup_4w(
                             gate = gate_frag[None, cr, rr].load()
                             up = up_frag[None, cr, rr].load()
                             if const_expr(partial is not None):
-                                p_gate = load_partial(partial, 2 * qm, cr, rr)
-                                p_up = load_partial(partial, 2 * qm + 1, cr, rr)
-                                gate = [gate[e] + p_gate[e] for e in range_constexpr(4)]
-                                up = [up[e] + p_up[e] for e in range_constexpr(4)]
+                                base, n_parts, live = partial
+                                for k in range_constexpr(n_parts):
+                                    ok = None if live is None else live > k
+                                    p_gate = load_partial(base + k, 2 * qm, cr, rr, ok)
+                                    p_up = load_partial(base + k, 2 * qm + 1, cr, rr, ok)
+                                    gate = [gate[e] + p_gate[e] for e in range_constexpr(4)]
+                                    up = [up[e] + p_up[e] for e in range_constexpr(4)]
                             values = []
                             for e in range_constexpr(4):
                                 if const_expr(weight_quant_type == "ptpc"):
@@ -447,12 +560,14 @@ def build_moe_gateup_4w(
                                 data.ir_value(), o_rsrc, offset.ir_value(), zero.ir_value()
                             )
 
-            def epilogue_operands(block_m, expert, n_tile):
+            def epilogue_operands(block_m, expert, n_tile, half=None):
                 """Row IDs and scales of a tile, loaded before its last K pair."""
                 row_ids = []
-                for qm in range_constexpr(2):
+                for qm in range_constexpr(halves):
                     for rr in range_constexpr(4):
                         row = block_m * SORT_BLOCK_M + qm * BLOCK + rr * 32 + wave_m * 16 + lane % 16
+                        if const_expr(half is not None):
+                            row = row + half * BLOCK
                         row_ids.append(sorted_ids[row].bitcast(fx.Uint32))
                 if const_expr(act_quant_type == "ptpc"):
                     as_rsrc = _rsrc(fxh._as_ptr(p_a_scale, fx.Float32), tokens)
@@ -476,7 +591,7 @@ def build_moe_gateup_4w(
                     tensor_scale = fx.make_view(
                         fxh._as_ptr(p_a_scale, fx.Float32), fx.make_layout(1, 1)
                     )[0]
-                    row_scales = [tensor_scale] * 8
+                    row_scales = [tensor_scale] * (4 * halves)
                 ws_gate = ws_up = expert_scale = None
                 if const_expr(weight_quant_type == "ptpc"):
                     ws_buf = fx.rocdl.make_buffer_tensor(
@@ -540,8 +655,9 @@ def build_moe_gateup_4w(
             def partial_offset(index, q, cr, rr):
                 return index * PARTIAL_BYTES + ((q * 16 + rr * 4 + cr) * 256) * 16 + tid_i * 16
 
-            def publish_partial(index):
-                for q in range_constexpr(4):
+            def publish_partial(index, head):
+                """Store this CTA's partial in slot `index`, then count it on `head`'s flag."""
+                for q in range_constexpr(len(frags_C)):
                     for rr in range_constexpr(4):
                         for cr in range_constexpr(4):
                             chunk = frags_C[q][None, cr, rr].load()
@@ -555,54 +671,81 @@ def build_moe_gateup_4w(
                 rocdl.s_waitcnt(vmcnt=0)
                 rocdl.s_barrier()
                 if tid_i == 0:
-                    flag_store(index, 1)
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        flag_ptr(head),
+                        fx.Int32(1).ir_value(),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                    )
 
-            def load_partial(index, q, cr, rr):
+            def load_partial(index, q, cr, rr, ok=None):
+                offset = partial_offset(index, q, cr, rr)
+                if const_expr(ok is not None):
+                    offset = ok.select(offset, fx.Int32(num_ctas * PARTIAL_BYTES))
                 return fx.Vector(
                     rocdl.raw_ptr_buffer_load(
                         ir.VectorType.get([4], fx.Float32.ir_type),
                         p_rsrc,
-                        partial_offset(index, q, cr, rr).ir_value(),
+                        offset.ir_value(),
                         zero.ir_value(),
                         aux=sc1,
                     )
                 )
 
             # ---- prologue: first two K tiles of the first job ----
-            a_vo = fx.make_rmem_tensor(8, fx.Int32)
-            logical0, first0, _ = job(zero)
+            a_vo = fx.make_rmem_tensor(4 * halves, fx.Int32)
+            # Bottom-half candidate of the current job, carried across iterations.
+            jb0 = zero
+            if const_expr(halves == 1):
+                cur_b = fx.make_rmem_tensor(1, fx.Int32)
+                while (n_live_b > 0) & ~bottom_live(jb0):
+                    jb0 = jb0 + 1
+                cur_b.store(fx.Vector.from_elements([jb0], fx.Int32))
+            logical0, first0, _, half0 = pick(zero, jb0)
             block0, n_tile0 = coords(logical0)
-            a_vo.store(fx.Vector.from_elements(a_voffsets(block0), fx.Int32))
+            a_vo.store(fx.Vector.from_elements(a_voffsets(block0, half0), fx.Int32))
             _, b_rsrc0 = weight_rsrc(block0)
             vo0 = a_vo.load()
-            vo0 = [vo0[i] for i in range_constexpr(8)]
+            vo0 = [vo0[i] for i in range_constexpr(4 * halves)]
             for kk in range_constexpr(2):
                 k0 = 2 * first0 + kk
                 g2s_b(b_rsrc0, k0, b_l_dma[kk], n_tile0 * BLOCK)
                 rocdl.sched_barrier(0)
                 g2s_a(k0, a_t_dma[kk], vo0[0:4])
                 rocdl.sched_barrier(0)
-                g2s_a(k0, a_b_dma[kk], vo0[4:8])
-                rocdl.sched_barrier(0)
+                if const_expr(halves == 2):
+                    g2s_a(k0, a_b_dma[kk], vo0[4:8])
+                    rocdl.sched_barrier(0)
                 g2s_b(b_rsrc0, k0, b_r_dma[kk], n_tile0 * BLOCK + inter)
                 rocdl.sched_barrier(0)
-            _wait_groups(6)
+            # Land the first K tile's B_l and A_t (2 of 2 * (2 + halves) groups).
+            _wait_groups(2 + 2 * halves)
             load(src_B_l[0], dst_B_l)
             load(src_A_t[0], dst_A_t)
             rocdl.sched_barrier(0)
 
-            for it in range(0, count, 1):
+            for it in range(0, count + n_live_b, 1):
                 i = fx.Int32(it)
-                logical, first, end = job(i)
+                jb = jb_n = zero
+                if const_expr(halves == 1):
+                    jb = cur_b.load()[0]
+                    jb_n = jb + 1
+                    while (i + 1 < n_live_b) & ~bottom_live(jb_n):
+                        jb_n = jb_n + 1
+                    cur_b.store(fx.Vector.from_elements([jb_n], fx.Int32))
+                logical, first, end, half = pick(i, jb)
                 block_m, n_tile = coords(logical)
                 expert, b_rsrc = weight_rsrc(block_m)
-                has_next = i + 1 < count
-                logical_n, first_n, _ = job(has_next.select(i + 1, i))
+                has_next = i + 1 < count + n_live_b
+                logical_n, first_n, _, half_n = pick(
+                    has_next.select(i + 1, i), has_next.select(jb_n, jb)
+                )
                 block_n, n_tile_n = coords(logical_n)
                 _, b_rsrc_n = weight_rsrc(block_n)
-                vo_next = a_voffsets(block_n)
+                vo_next = a_voffsets(block_n, half_n)
                 vo = a_vo.load()
-                vo = [vo[j] for j in range_constexpr(8)]
+                vo = [vo[j] for j in range_constexpr(4 * halves)]
                 for frag in frags_C:
                     frag.fill(0)
                 acc_init = [frag.load() for frag in frags_C]
@@ -613,7 +756,7 @@ def build_moe_gateup_4w(
                     results = yield [frag.load() for frag in frags_C]
                 for frag, result in zip(frags_C, results):
                     frag.store(result)
-                operands = epilogue_operands(block_m, expert, n_tile)
+                operands = epilogue_operands(block_m, expert, n_tile, half)
                 # The last pair prefetches the next job; the epilogue overlaps its DMAs.
                 run_pair(2 * first_n, vo_next, b_rsrc_n, n_tile_n)
                 if const_expr(stream_k):
@@ -621,7 +764,7 @@ def build_moe_gateup_4w(
                     # early, a head is always the CTA's last job and is merged below.
                     epilogue(*operands, n_tile, enable=end - first == num_pairs)
                     if first > 0:
-                        publish_partial(slot - 1)
+                        publish_partial(slot, tail.select(slot - chunk, slot - 1))
                 else:
                     epilogue(*operands, n_tile)
                 a_vo.store(fx.Vector.from_elements(vo_next, fx.Int32))
@@ -632,10 +775,11 @@ def build_moe_gateup_4w(
                     head_operands = epilogue_operands(
                         head_block, _scalar(expert_ids[head_block]), head_n
                     )
+                    live = tail.select(f - 1, fx.Int32(1))
                     pending = fx.Int32(1)
                     while pending != 0:
-                        pending = (flag_load(slot) == 0).select(fx.Int32(1), zero)
-                    epilogue(*head_operands, head_n, partial=slot)
+                        pending = (flag_load(slot) < live).select(fx.Int32(1), zero)
+                    epilogue(*head_operands, head_n, partial=(slot + 1, max(max_f - 1, 1), live))
                     rocdl.s_barrier()
                     if tid_i == 0:
                         flag_store(slot, 0)

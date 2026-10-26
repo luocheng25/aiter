@@ -21,6 +21,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.utility import dtypes
 
 # RTA can be enabled if accuracy is acceptable. Simplified RTA may reverse NaNs although it should not
@@ -90,6 +91,26 @@ _TORCH_TO_FX = {
 
 def _ptr(t):
     return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
+
+
+def launch(exe, *args):
+    """Run a FlyDSL launcher on the current stream, passing tensors as pointers.
+
+    After the compiling first call, pointers and the stream go in as raw integers,
+    which the compiled argument fills accept, so no wrapper objects are built.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        _run_compiled(
+            exe,
+            *[_ptr(a) if isinstance(a, torch.Tensor) else a for a in args],
+            torch.cuda.current_stream(),
+        )
+        return
+    cf(
+        *[a.data_ptr() if isinstance(a, torch.Tensor) else a for a in args],
+        torch._C._cuda_getCurrentRawStream(torch._C._cuda_getDevice()),
+    )
 
 
 def fp8_dtype():

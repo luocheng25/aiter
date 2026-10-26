@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -18,8 +18,7 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     per_token_quant_supported,
     sorted_sum,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import launch
 
 
 @dataclass
@@ -93,8 +92,9 @@ class Config:
 
     @property
     def four_wave_gateup(self) -> bool:
-        # BLOCK_M=256 prefill selects the gfx950 four-wave 256x256 FP8 Gate/Up.
-        return self.use_prefill and self.BLOCK_M == 256
+        # BLOCK_M=256 prefill selects the gfx950 four-wave 256x256 FP8 Gate/Up; BLOCK_M=128
+        # runs it on half-height tiles (for blocks of at most 128 routes).
+        return self.use_prefill and self.BLOCK_M in (128, 256)
 
     def unsupported_reason(self, problem: "_Problem") -> str | None:
         if self.use_batch1_algorithm and not 2 <= problem.batch <= 8:
@@ -120,7 +120,7 @@ class Config:
             if problem.quant_type not in ("", "ptpc"):
                 return "M128 Down requires per-token FP8 activations and weights"
             if not m128_supported(problem.model_dim, problem.inter_dim):
-                return "M128 Down needs inter_dim % 128 == 0 <= 640 and N128-pair column slices"
+                return "M128 Down needs inter_dim % 64 == 0 in [128, 640] and N128-pair column slices"
         elif self.down_path != "default":
             if self.BLOCK_M != 64 and not self.four_wave_gateup:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
@@ -232,9 +232,11 @@ def get_tune_space():
         for path in ("m128", "m128p")
         for block_n, block_k in prefill
     )
-    # gfx950 four-wave 256x256 Gate/Up; unsupported_reason filters other targets.
+    # gfx950 four-wave 256x256 Gate/Up (full and half-height tiles); unsupported_reason
+    # filters other targets.
     configs.extend(
-        Config(256, 256, 128, True, down_path=path, down_output_padding_bytes=pad)
+        Config(block_m, 256, 128, True, down_path=path, down_output_padding_bytes=pad)
+        for block_m in (256, 128)
         for path, pad in (
             ("default", 0),
             ("1x4_64x256", 128),
@@ -253,7 +255,7 @@ def _four_wave_gateup_reason(config: Config, problem: "_Problem") -> str | None:
     )
 
     if (config.BLOCK_N, config.BLOCK_K) != (256, 128):
-        return "four-wave Gate/Up uses the 256_256_128 tile"
+        return "four-wave Gate/Up uses the {256,128}_256_128 tiles"
     if get_gfx_runtime() != "gfx950":
         return "four-wave Gate/Up requires gfx950"
     if problem.quant_type not in ("", "ptpc", "per_tensor"):
@@ -264,7 +266,7 @@ def _four_wave_gateup_reason(config: Config, problem: "_Problem") -> str | None:
 
 
 @cache
-def _get_gateup_4w_kernel(N, K, TOPK, quant_type_str, activation_str, swiglu_limit):
+def _get_gateup_4w_kernel(N, K, TOPK, quant_type_str, activation_str, swiglu_limit, rows=256):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm1_2x2 import (
         build_moe_gateup_4w,
     )
@@ -279,6 +281,7 @@ def _get_gateup_4w_kernel(N, K, TOPK, quant_type_str, activation_str, swiglu_lim
         swiglu_limit=swiglu_limit,
         act_quant_type=quant_type_str,
         weight_quant_type=quant_type_str,
+        rows=rows,
     )
 
 
@@ -331,11 +334,17 @@ def _get_compiled_kernel(
 
 
 def _launch(kernel_fn, *args):
-    stream = torch.cuda.current_stream()
-    prepared_args = [
-        _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
-    ]
-    _run_compiled(kernel_fn, *prepared_args, stream)
+    launch(kernel_fn, *args)
+
+
+@cache
+def _parse_config(config_string: str) -> Config:
+    return Config.from_string(config_string)
+
+
+@lru_cache(maxsize=4096)
+def _unsupported_reason(config_string: str, problem: "_Problem") -> str | None:
+    return _parse_config(config_string).unsupported_reason(problem)
 
 
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
@@ -427,8 +436,9 @@ def _run_prefill(
     swiglu_limit: float | None,
 ):
     m128_down = config.down_path in ("m128", "m128p")
-    # The M128 Down reads 256-row sort blocks; Gate/Up walks them in BLOCK_M tiles.
-    sort_block_m = 256 if m128_down else config.BLOCK_M
+    # The M128 Down and the four-wave Gate/Up read 256-row sort blocks; M64 Gate/Up
+    # walks them in BLOCK_M tiles.
+    sort_block_m = 256 if m128_down or config.four_wave_gateup else config.BLOCK_M
     needs_resort = config.four_wave_gateup and not m128_down
     (
         sorted_ids,
@@ -488,6 +498,7 @@ def _run_prefill(
             problem.quant_type,
             activation_str,
             swiglu_limit,
+            rows=config.BLOCK_M,
         )
     else:
         gateup_kernel = _get_compiled_kernel(
@@ -606,6 +617,8 @@ def _run_prefill(
             cur_out,
             packed,
             loc_ids,
+            sorted_weights,
+            down_in_scale,
             problem.batch,
             packed.shape[0],
         )
@@ -906,7 +919,7 @@ def run_flydsl_moe_gfx942(
             raise NotImplementedError(
                 f"gfx942 FlyDSL whole-graph backend requires contiguous {name}"
             )
-    config = Config.from_string(config_string)
+    config = _parse_config(config_string)
     is_bf16 = (
         w1.dtype == torch.bfloat16
         and w2.dtype == torch.bfloat16
@@ -931,7 +944,7 @@ def run_flydsl_moe_gfx942(
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
-    unsupported_reason = config.unsupported_reason(problem)
+    unsupported_reason = _unsupported_reason(config_string, problem)
     if unsupported_reason is not None:
         raise RuntimeError(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "

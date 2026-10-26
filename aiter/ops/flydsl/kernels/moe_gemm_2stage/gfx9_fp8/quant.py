@@ -13,10 +13,7 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
 from . import common as fxh
-from .common import _ptr
 
 
 @functools.cache
@@ -81,7 +78,6 @@ def flydsl_absmax():
         )
 
     def callable(A: torch.Tensor, Amax: torch.Tensor):
-        stream = torch.cuda.current_stream()
         wg_count = (
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
@@ -90,7 +86,7 @@ def flydsl_absmax():
         )
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
-        _run_compiled(launch, _ptr(A), _ptr(Amax), A.numel(), wg_count, stream)
+        fxh.launch(launch, A, Amax, A.numel(), wg_count)
 
     return callable
 
@@ -194,7 +190,6 @@ def flydsl_quant_per_tensor(torch_dtype):
         )
 
     def callable(A: torch.Tensor, Amax: torch.Tensor, B: torch.Tensor):
-        stream = torch.cuda.current_stream()
         wg_count = (
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
@@ -203,7 +198,7 @@ def flydsl_quant_per_tensor(torch_dtype):
         )
         A_bits = A.numel() * A.element_size() * 8
         assert A_bits % 128 == 0, f"{A_bits=} is not aligned to 128 bits"
-        _run_compiled(launch, _ptr(A), _ptr(Amax), _ptr(B), A.numel(), wg_count, stream)
+        fxh.launch(launch, A, Amax, B, A.numel(), wg_count)
 
     return callable
 
@@ -312,8 +307,6 @@ def flydsl_quant_per_token(torch_dtype, cols):
         assert A.dtype == torch.bfloat16 and A.is_contiguous() and A.shape[-1] == cols
         rows = A.numel() // cols
         if rows:
-            _run_compiled(
-                launch, _ptr(A), _ptr(B), _ptr(S), rows, torch.cuda.current_stream()
-            )
+            fxh.launch(launch, A, B, S, rows)
 
     return callable

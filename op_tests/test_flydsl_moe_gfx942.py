@@ -469,8 +469,10 @@ def test_packed_sum(token, model_dim, topk):
 
     experts = max(4, topk)
     ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
-    weights = torch.ones((token, topk), dtype=torch.float32)
-    _, _, sorted_experts, _, _, _, reverse_sorted = moe_sorting(
+    # Power-of-two route factors keep the FP32 sums exact.
+    weights = 2.0 ** torch.randint(-2, 3, (token, topk)).float()
+    scales = 2.0 ** torch.randint(-3, 4, (token * topk,)).float()
+    _, sorted_weights, sorted_experts, _, _, _, reverse_sorted = moe_sorting(
         ids, weights, experts, model_dim, dtypes.bf16, 256, output_aux=AUX_SORT_OPUS
     )
     locations = reverse_sorted.view_as(ids)
@@ -487,14 +489,17 @@ def test_packed_sum(token, model_dim, topk):
     locations[::5, 0] = source_rows
     valid = (locations >= 0) & (locations < source_rows)
     routes = torch.where(valid.unsqueeze(-1), routes, 0)
-    reference = routes[:, 0].float()
+    factors = weights * scales.view(token, topk)
+    reference = routes[:, 0].float() * factors[:, :1]
     for route in range(1, topk):
-        reference = reference + routes[:, route].float()
+        reference = reference + routes[:, route].float() * factors[:, route : route + 1]
     reference = reference.to(dtypes.bf16).float()
     storage = torch.full((token * model_dim + 2 * GUARD,), CANARY, dtype=dtypes.bf16)
     output = storage[GUARD:-GUARD].view(token, model_dim)
     launcher = make_packed_sum(N=model_dim, TOPK=topk)
-    pointers = [_ptr(tensor) for tensor in (output, packed, locations)]
+    pointers = [
+        _ptr(tensor) for tensor in (output, packed, locations, sorted_weights, scales)
+    ]
 
     def run():
         _run_compiled(
@@ -677,11 +682,22 @@ FOUR_WAVE_CASES = [
     (4097, 2048, 512, 257, 9, "ptpc", "silu", "random", "256_256_128_True:m128p:0"),
     (7, 2560, 640, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128:0"),
     (8192, 2560, 640, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128p:0"),
+    # inter_dim % 128 == 64 pads the M128 Down's last K128 step with zero A.
+    (4096, 2560, 192, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128:0"),
+    (300, 2560, 320, 513, 11, "ptpc", "silu", "random", "256_256_128_True:m128p:0"),
     (4096, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "256_256_128_True:8x1_compact:128"),
     (4096, 2560, 192, 513, 11, "ptpc", "silu", "random", "256_256_128_True:8x1_compact:128"),
     (4096, 2560, 320, 513, 11, "ptpc", "silu", "random", "256_256_128_True:1x4_64x256:128"),
     (4096, 4096, 192, 192, 8, "per_tensor", "silu", "random", "256_256_128_True:default:0"),
     (2048, 4096, 640, 1, 1, "ptpc", "silu", "hot", "256_256_128_True:1x4_64x256:128"),
+    # Half-height tiles: bottom halves with routes (hot, MiniMax 4k) run before the
+    # top-half schedule; the rest checks tiny batches, N tails and M64 Down re-sorts.
+    (7, 2048, 128, 257, 9, "ptpc", "silu", "random", "128_256_128_True:m128:0"),
+    (4096, 6144, 256, 384, 8, "ptpc", "silu", "hot", "128_256_128_True:m128p:0"),
+    (4096, 6144, 384, 128, 4, "ptpc", "swiglu", "random", "128_256_128_True:m128:0"),
+    (2048, 2560, 192, 513, 11, "ptpc", "silu", "random", "128_256_128_True:m128p:0"),
+    (300, 2560, 320, 513, 11, "ptpc", "silu", "random", "128_256_128_True:1x4_64x256:128"),
+    (4096, 4096, 192, 192, 8, "per_tensor", "silu", "random", "128_256_128_True:default:0"),
 ]
 
 # gfx950 M64 Gate/Up walking the M128 Down's 256-row sort blocks: small batches

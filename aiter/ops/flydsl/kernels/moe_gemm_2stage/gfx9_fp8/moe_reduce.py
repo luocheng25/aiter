@@ -9,10 +9,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
 from . import common as fxh
-from .common import _ptr
 
 
 @functools.cache
@@ -101,15 +98,7 @@ def sorted_sum(TOPK, N, output_padding_bytes=0):
     def callable(
         loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
-            launch,
-            _ptr(loc_ids),
-            _ptr(A),
-            _ptr(B),
-            batch_size,
-            stream,
-        )
+        fxh.launch(launch, loc_ids, A, B, batch_size)
 
     return callable
 
@@ -160,15 +149,13 @@ def invert_sorted_ids(TOPK):
         num_ids: int,
         batch_size: int,
     ):
-        stream = torch.cuda.current_stream()
-        _run_compiled(
+        fxh.launch(
             launch,
-            _ptr(sorted_ids),
-            _ptr(invert),
-            _ptr(num_valid),
+            sorted_ids,
+            invert,
+            num_valid,
             fx.Uint32(num_ids),
             fx.Uint32(batch_size),
-            stream,
         )
 
     return callable

@@ -8,8 +8,9 @@ block scales) and adapted to per-token activation x per-channel weight scales.
 A task is one 128-row sorted block times N/OC output columns, walked in N64 x K
 packets that a four-slot LDS ring prefetches three packets ahead. Above K256 a
 packet streams through a ring of five to nine N64 x K128 sub-packets, so B stays
-at 32 VGPRs. The output layout is [block128, N64, row128, col64]; reduce it with
-``make_packed_sum``.
+at 32 VGPRs. The output layout is [block128, N64, row128, col64] and leaves out
+each route's activation scale and topk weight; ``make_packed_sum`` applies them
+while it reduces the routes.
 """
 
 import functools
@@ -44,7 +45,7 @@ def m128_oc_splits(n, merge_halves=False):
 
 
 def m128_supported(n, k):
-    return k % 128 == 0 and k <= 640 and m128_oc_splits(n) is not None
+    return k % 64 == 0 and 128 <= k <= 640 and m128_oc_splits(n) is not None
 
 
 def _scalar(value):
@@ -162,14 +163,16 @@ def build_moe_down_m128(
     ``oc_splits`` overrides the default OC split.
     """
     # A holds K/8 VGPRs per lane; past K640 it no longer fits two CTAs per CU.
-    assert K % 128 == 0 and 128 <= K <= 640, "M128 Down supports K = 128..640"
+    assert K % 64 == 0 and 128 <= K <= 640, "M128 Down supports K = 128..640, K % 64 == 0"
     assert sort_block_m in (128, 256)
     if oc_splits is None:
         oc_splits = m128_oc_splits(N, merge_halves)
     assert oc_splits is not None and N % oc_splits == 0 and N // oc_splits % 128 == 0, (
         f"N={N} has no OC split with N128-pair slices"
     )
-    KB = K // 128
+    # K % 128 == 64 pads the last K128 step: its A half past K loads as zero, so the
+    # B bytes read past an N16 group (the next group's, or zero) add nothing.
+    KB = (K + 127) // 128
     n_split = N // oc_splits
     packets = n_split // 64
     pair_count = packets // 2
@@ -198,12 +201,11 @@ def build_moe_down_m128(
     # 8 / W XCDs that each fetch its 128 x K A rows. Width 8 wins once those are
     # >= 5% of the expert's N x K weights.
     width = 8 if not persistent and N <= 2560 and oc_splits >= 4 else 4
-    # LDS words: B ring, the task's weight-scale slice, sorted IDs, row factors.
+    # LDS words: B ring, the task's weight-scale slice, sorted IDs.
     ring_words = slots * sub_bytes // 4
     wscale_offset = ring_words
     ids_offset = wscale_offset + n_split
-    rows_offset = ids_offset + PACKED_ROWS
-    task_offset = rows_offset + PACKED_ROWS
+    task_offset = ids_offset + PACKED_ROWS
     arena_words = task_offset + 1
     attrs = {
         "rocdl.waves_per_eu": 2,
@@ -236,11 +238,9 @@ def build_moe_down_m128(
         wave = _scalar(tid // 64)
         worker = fx.Int32(fx.block_idx.x)
         sorted_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_sorted_ids))
-        sorted_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_sorted_weights))
         expert_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_sorted_expert_ids))
         valid_ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid_ids))
         w_scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_w_scale))
-        a_scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale))
         sort_tasks = (_scalar(valid_ids[0]) // task_rows) * oc_splits
         lds = fx.SharedAllocator().allocate(Storage).peek()
         task_slot = fx.make_view(lds.arena.ptr + task_offset, fx.make_layout(1, 1))
@@ -305,12 +305,7 @@ def build_moe_down_m128(
                 fx.PointerType.get(fx.Float32.ir_type, iptr.memspace, 16), iptr
             )
             ids = fx.make_view(iptr + ids_offset, fx.make_layout(PACKED_ROWS, 1))
-            row_factor = fx.make_view(fptr + rows_offset, fx.make_layout(PACKED_ROWS, 1))
             wscales = fx.make_view(fptr + wscale_offset, fx.make_layout(n_split, 1))
-            asbuf = fx.rocdl.make_buffer_tensor(
-                fx.make_view(a_scale, fx.make_layout(rows, 1)), False
-            )
-            asrsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(asbuf))
             zero = fx.Int32(0).ir_value()
             ws_turns = (n_split + 255) // 256
             if live:
@@ -319,18 +314,7 @@ def build_moe_down_m128(
                     for turn in range_constexpr(ws_turns)
                 ]
                 if tid < PACKED_ROWS:
-                    encoded = sorted_ids[row_begin + tid].bitcast(fx.Uint32)
-                    token, slot = encoded & 0xFFFFFF, encoded >> 24
-                    valid = (token < fx.Uint32(tokens)) & (slot < TOPK)
-                    ids[tid] = encoded.bitcast(fx.Int32)
-                    source = fx.Int32(token) * TOPK + fx.Int32(slot)
-                    offset = valid.select(source * 4, fx.Int32(-1))
-                    act = fx.Float32(
-                        rocdl.raw_ptr_buffer_load(
-                            fx.Float32.ir_type, asrsrc, offset.ir_value(), zero
-                        )
-                    )
-                    row_factor[tid] = act * sorted_weights[row_begin + tid]
+                    ids[tid] = sorted_ids[row_begin + tid]
                 for turn in range_constexpr(ws_turns):
                     index = tid + turn * 256
                     if index < n_split:
@@ -355,10 +339,14 @@ def build_moe_down_m128(
                         tid * 16 // piece * (16 * K) + tid * 16 % piece
                     )
 
+                # Start each task at a worker-dependent N128 pair to spread B reads.
+                rotation = worker // 8 % pair_count
+
                 def packet_index(q):
-                    # Start each task at a worker-dependent N128 pair to spread B reads.
-                    rotation = worker // 8
-                    return ((fx.Int32(q) // 2 + rotation) % pair_count) * 2 + fx.Int32(q) % 2
+                    # q < packets, so the rotated pair needs one conditional wrap.
+                    pair = (fx.Int32(q) >> 1) + rotation
+                    pair = (pair >= pair_count).select(pair - pair_count, pair)
+                    return pair * 2 + (fx.Int32(q) & 1)
 
                 def dma_turn(q, sub, phase, turn):
                     dst = llvm.inttoptr(
@@ -382,7 +370,6 @@ def build_moe_down_m128(
                     rocdl.asyncmark()
                 blds = fxh.LdsTensor(fx.make_view(bptr, fx.make_layout(4, 1)))
                 flds = fxh.LdsTensor(fx.make_view(fptr, fx.make_layout(4, 1)))
-                rlds = fxh.LdsTensor(fx.make_view(fptr, fx.make_layout(1, 1)))
                 abuf = fx.rocdl.make_buffer_tensor(
                     fx.make_view(
                         fx.recast_iter(
@@ -410,7 +397,6 @@ def build_moe_down_m128(
                 awords = fx.make_view(
                     fx.get_iter(a), fx.make_ordered_layout([4, 2, 2, KB], 0)
                 )
-                factors = []
                 out_addresses = []
                 for mi in range_constexpr(2):
                     row = wave * 32 + mi * 16 + lr
@@ -420,19 +406,15 @@ def build_moe_down_m128(
                     source = fx.Int32(token) * TOPK + fx.Int32(slot)
                     for kb in range_constexpr(KB):
                         for part in range_constexpr(2):
-                            offset = valid.select(
-                                source * K + lk * 16 + kb * 128 + part * 64, fx.Int32(-1)
-                            )
-                            awords[None, part, mi, kb].store(
-                                apacket.load(voffset_bytes=offset, soffset_bytes=fx.Int32(0))
-                            )
-                    factors.append(
-                        fx.Float32(
-                            rlds._at(
-                                fx.Int32(fx.ptrtoint(fptr + rows_offset)) + row * 4, 0
-                            ).load()[0]
-                        )
-                    )
+                            if const_expr(kb * 128 + part * 64 >= K):
+                                awords[None, part, mi, kb].store(fx.Vector.filled(4, 0, fx.Int32))
+                            else:
+                                offset = valid.select(
+                                    source * K + lk * 16 + kb * 128 + part * 64, fx.Int32(-1)
+                                )
+                                awords[None, part, mi, kb].store(
+                                    apacket.load(voffset_bytes=offset, soffset_bytes=fx.Int32(0))
+                                )
                     for parity in range_constexpr(2):
                         target = wave * 32 + mi * 16 + lr // 2 * 2 + parity
                         encoded = ids[target].bitcast(fx.Uint32)
@@ -545,8 +527,9 @@ def build_moe_down_m128(
                     kind, pair_id, mi, x, y = item
                     if const_expr(kind == "scale"):
                         ni, element = x, y
-                        value = st["previous"][mi * 4 + ni][element] * st["prev_ws"][ni][element]
-                        st["scaled"][pair_id].append(value * factors[mi])
+                        st["scaled"][pair_id].append(
+                            st["previous"][mi * 4 + ni][element] * st["prev_ws"][ni][element]
+                        )
                     elif const_expr(kind == "bf16"):
                         # Words 0/1 hold ni even, 2/3 ni odd of this pair.
                         st["words"][pair_id].extend(
@@ -651,8 +634,7 @@ def build_moe_down_m128(
                         values = []
                         for ni in (2 * pair, 2 * pair + 1):
                             for element in range_constexpr(4):
-                                value = current[mi * 4 + ni][element] * cur_ws[ni][element]
-                                values.append(value * factors[mi])
+                                values.append(current[mi * 4 + ni][element] * cur_ws[ni][element])
                         w = _bf16_words(values[:4]) + _bf16_words(values[4:])
                         pieces.append(_swap_pack([w[0], w[1]], [w[2], w[3]]))
                     final_packed.extend(_coalesce_output_pairs(pieces[0], pieces[1]))
@@ -730,7 +712,11 @@ def build_moe_down_m128(
 
 @functools.cache
 def make_packed_sum(*, N, TOPK):
-    """Sum each token's TOPK packed routes; inverse holds sorted positions per route."""
+    """Sum each token's TOPK packed routes; inverse holds sorted positions per route.
+
+    Route k of a token is scaled by route_scales[token * TOPK + k] (its activation
+    scale) times sorted_weights at its sorted position.
+    """
     assert N % 512 == 0 and 0 < TOPK <= 255
     threads = 64 if N % 2048 == 512 else 256
     columns_per_block = threads * 8
@@ -741,6 +727,8 @@ def make_packed_sum(*, N, TOPK):
         p_output: fx.Pointer,
         p_source: fx.Pointer,
         p_inverse: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_route_scales: fx.Pointer,
         tokens: fx.Int32,
         source_rows: fx.Int32,
     ):
@@ -748,6 +736,8 @@ def make_packed_sum(*, N, TOPK):
         token = fx.Int32(fx.block_idx.x) // column_blocks
         block_col = fx.Int32(fx.block_idx.x) % column_blocks
         inverse = fx.recast_iter(fx.Int32, fxh._as_ptr(p_inverse))
+        sorted_weights = fx.recast_iter(fx.Float32, fxh._as_ptr(p_sorted_weights))
+        route_scales = fx.recast_iter(fx.Float32, fxh._as_ptr(p_route_scales))
         target = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fxh._as_ptr(p_output, fx.Uint8) + fx.Int64(token) * (N * 2),
@@ -785,9 +775,14 @@ def make_packed_sum(*, N, TOPK):
 
         column = block_col * columns_per_block + tid * 8
         fragments = [read_route(locations[route], column) for route in range_constexpr(TOPK)]
-        accum = fragments[0].to(fx.Float32)
+        factors = []
+        for route in range_constexpr(TOPK):
+            location = locations[route]
+            safe = ((location >= 0) & (location < source_rows)).select(location, fx.Int32(0))
+            factors.append(sorted_weights[safe] * route_scales[token * TOPK + route])
+        accum = fragments[0].to(fx.Float32) * factors[0]
         for route in range_constexpr(1, TOPK):
-            accum = accum + fragments[route].to(fx.Float32)
+            accum = accum + fragments[route].to(fx.Float32) * factors[route]
         offset = (column < N).select(column * 2, fx.Int32(-1))
         rocdl.raw_ptr_buffer_store(
             accum.to(fx.BFloat16).bitcast(fx.Int32).ir_value(),
@@ -802,11 +797,15 @@ def make_packed_sum(*, N, TOPK):
         p_output: fx.Pointer,
         p_source: fx.Pointer,
         p_inverse: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_route_scales: fx.Pointer,
         tokens: fx.Int32,
         source_rows: fx.Int32,
         stream: fx.Stream,
     ):
-        moe_packed_sum(p_output, p_source, p_inverse, tokens, source_rows).launch(
+        moe_packed_sum(
+            p_output, p_source, p_inverse, p_sorted_weights, p_route_scales, tokens, source_rows
+        ).launch(
             grid=(tokens * column_blocks, 1, 1), block=(threads, 1, 1), stream=stream
         )
 
