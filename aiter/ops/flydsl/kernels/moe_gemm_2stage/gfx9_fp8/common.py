@@ -121,6 +121,67 @@ def fp8_dtype():
     }[dtypes.fp8]
 
 
+class Bundle:
+    """Named trace-time helpers of one kernel instance and the values they share.
+
+    A dynamic region (scf.if/for/while) that calls a method of a kernel-body variable
+    carries that variable through the region. The members are closures and values
+    defined before any region that uses them, so a Bundle carries no IR values and
+    passes through unchanged.
+    """
+
+    def __init__(self, **members):
+        self.__dict__.update(members)
+
+    def __get_ir_types__(self):
+        return []
+
+    def __extract_to_ir_values__(self):
+        return []
+
+    @classmethod
+    def __construct_from_ir_values__(cls, values, exemplar=None):
+        return exemplar
+
+
+def scalar(value):
+    """A wave-uniform Int32, moved to an SGPR (readfirstlane)."""
+    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, value.ir_value()))
+
+
+# A sorted ID holds a route's token in bits 0-23 and its top-k slot in bits 24-31;
+# padding entries hold a token >= tokens or a slot >= TOPK.
+def route_token(encoded):
+    return encoded & 0xFFFFFF
+
+
+def split_route(encoded, tokens, topk):
+    """(token, top-k slot, whether it is a route) of a uint32 sorted ID."""
+    token, topk_slot = route_token(encoded), encoded >> 24
+    return token, topk_slot, (token < fx.Uint32(tokens)) & (topk_slot < topk)
+
+
+def is_route(encoded, tokens, topk):
+    """Whether a uint32 sorted ID is a route rather than padding."""
+    return (route_token(encoded) < fx.Uint32(tokens)) & ((encoded >> 24) < topk)
+
+
+def swap_pack(words0, words1):
+    """permlane16_swap two BF16x2 word pairs into one 16-byte store packet."""
+    pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    lo = rocdl.permlane16_swap(pair_type, words0[0], words1[0], False, False)
+    hi = rocdl.permlane16_swap(pair_type, words0[1], words1[1], False, False)
+    return fx.Vector.from_elements(
+        [
+            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, lo, [0])),
+            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, hi, [0])),
+            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, lo, [1])),
+            fx.Int32(llvm.extractvalue(fx.Int32.ir_type, hi, [1])),
+        ],
+        fx.Int32,
+    )
+
+
 def get_down_device_config():
     gfx = get_gfx_runtime()
     if gfx not in ("gfx942", "gfx950"):

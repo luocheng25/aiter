@@ -342,8 +342,65 @@
 | `retune950t.sh` + `apply_retune_t.py` | 加入半高 tile 后的重调：基准 `out950c/`，输出 `out950t/`；只统计改用 `128_256_128_True` 且快 ≥ 1.5% 的行，`--apply` 写回仓库 CSV |
 | `half_ab/` | 同 `asm_ab/`，复核改用半高 tile 的行 |
 | `gap/pmc_kern.py`、`gap/att_kern.py`、`gap/isa_order.py` | 单 kernel 的计数器、ATT 指令级 trace、ISA 中 MFMA / DMA / ds_read 的排列 |
+| `refactor/dump_isa.py` + `refactor/cmp_isa.sh` | 只编译、不运行：导出 25 个特化（12 个 4w Gate/Up、10 个 M128 Down、3 个 packed sum）的最终 ISA（`<目录>/<名字>/<kernel>_0/22_final_isa.s`），再与基线目录逐个比较；纯重构用它确认 ISA 逐字节一致。基线在 `refactor/isa_base/` |
 
 gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES` 32 个，其中 6 个半高；`M64_M128_CASES` 10 个；另有 packed reduce、sort inverse 和 masked sorted sum 用例）。
+
+## 8. 分支总结（`luocheng/moe_gemm_308_opt3-350`，2026-10-26）
+
+本分支在 `luocheng/moe_gemm_308_opt3`（合并点 `e59153bd61`）之上有 4 个提交，都是 gfx950（MI350X）上 FlyDSL `fused_moe_gfx942` 后端的 MoE 优化。以 FP8 PTPC 为主；调优 CSV 也覆盖 Hunyuan3 FP8 per-tensor 和 Qwen3.8 BF16。改动集中在 `gfx9_fp8/`、`fused_moe_gfx942.py`、`op_tests/test_flydsl_moe_gfx942.py` 和 6 个 model_configs CSV。`luocheng/moe_gemm_308_opt3` 之后新增的 `c8e81586f4` 没有合入。
+
+| 提交 | 主要内容 |
+|---|---|
+| `ab90f2bbf2` | gfx950 适配；M64 Gate/Up 的 XCD 映射和 K128 atom；4w Gate/Up；M128 Down（I ≤ 640）；M64 Gate/Up 读 sort256；FlyDSL 中间 quant；1x4 Down 按 N 切分；BF16 改用硬件 RNE；6 个 CSV 补 202 行 gfx950 配置 |
+| `05e2f778a3` | M128 Down one-shot 按 XCD 排任务；重调 5 行 |
+| `f1c4df747d` | 复用 OPUS sort 的 inverse；packed reduce 在 N % 2048 == 512 时用 512 列分块；`sorted_sum` 跳过负索引 |
+| `4e2be2278e` | 4w Gate/Up 的 stream-K 尾部拆分、热循环交织和半高 tile；M128 Down 的 row factor 移到 reduce、支持 K % 64；降低 host 开销；重调 20 行 |
+
+### 8.1 各阶段的改动和效果
+
+| 阶段 | 改动 | 效果（未注明的为 b2b） | 见 |
+|---|---|---|---|
+| Gate/Up M64（`gemm1.py`） | XCD 连续映射、K128 MFMA atom；读 sort256 元数据，按 lead tile 顺序派发 | MiniMax 32k 1352 → 837 µs；小 batch 能搭配 M128 Down，1k–4k 整体快 2.4–4.4%（几何平均），最多 13.5% | §3.2、§3.8 |
+| Gate/Up 4w（`gemm1_2x2.py`） | 移植 pyhip 的 4 波 FP8 GEMM（256×256 tile、persistent、LDS DMA ping-pong）；stream-K 和尾部 tile 按 K 拆分；DMA 在前的热循环交织；半高 tile | 32k 1450–2054 TF（M64 为 1307–1520 TF）；交织后快 3–12%；半高 tile 在 2k–4k 多数点整体快 6–23% | §3.3、§3.10、§3.11、§3.15 |
+| 中间 quant（`quant.py`） | FlyDSL 短行 per-token（128 < I ≤ 1024），与 aiter 逐位一致 | 约 5 TB/s（aiter 为 1.3–2.4 TB/s） | §3.4 |
+| Down 1x4 / 8x1 | 1x4 按 N 切分，每个 CU 至少 6 个任务；8x1 改为 XCD 连续映射 | MiniMax-e128 4k 的 1x4 Down 182 → 145 µs | §3.2、§3.5 |
+| Down M128（`gemm2_4x1.py`） | 移植 pyhip M128 Down 并改为 PTPC：packed 输出、merge_halves、persistent `m128p`；K ≤ 640 的 K128 子包和 OC 切分；one-shot 按 XCD 排任务；row factor 移到 reduce；支持 K % 64 | I ≤ 256 约 4.0–4.6 TB/s；32k 比最优 M64 Down 快 19–24%（I = 384–640）；按 XCD 排任务后 Qwen3.5-i512 2k–16k 快 3–20%；Qwen3.8 i192 / i320 从 2.8–4.1 提高到 3.7–4.3 TB/s | §3.6、§3.7、§3.9、§3.12、§3.13 |
+| reduce（`make_packed_sum`、`moe_reduce.py`） | packed sum 按 N 选分块宽度；复用 OPUS inverse，不再单独求逆；`sorted_sum` 跳过负索引 | packed sum 约 4.7 TB/s；Qwen3.8-i640 32k reduce 453 → 419 µs；省掉求逆的 2.6–4.8 µs | 变更记录 2026-10-24 |
+| BF16 输出 | gfx950 用硬件 RNE 指令 `v_cvt_pk_bf16_f32` | 性能持平；与原 RTA 只在舍入平局处差 1 ulp | 变更记录 2026-10-23 |
+| host | `common.launch` 直接调用编译产物；缓存配置解析、支持性检查和 sort workspace 大小 | 每次调用的 CPU 时间 153–164 → 106–121 µs | §3.14 |
+
+### 8.2 整体结果
+
+- **对比 pyhip**（2026-10-23，7 个模型 × 1k–32k，双方 20 次迭代）：b2b 42/42 胜出，几何平均 1.25×（1.14–1.55×）；sleep 42/42 胜出，几何平均 1.21×（1.06–1.44×）。之后的改动没有重新对比。
+- **对比 aiter 自带的 PTPC kernel**（ASM 1-stage、ASM stage1 + CK stage2、CK 2-stage；在 I > 256 的 M128 Down 加入之前测得）：两种口径都是 39/42 胜出，几何平均 b2b 1.46×、sleep 1.53×。输掉的 3 个点都在 1k，对手是 ASM 1-stage。
+- **调优 CSV**：6 个 CSV 共 202 行 gfx950 配置。
+  - 本后端 156 行（≥ 512 tokens 的 73 行，更小 batch 的 83 行）；ASM 1-stage 17 行；aiter CK 等 2-stage kernel 29 行（Qwen3.8 BF16 27 行、Qwen3.5-35B 2 行）。
+  - ≥ 512 tokens 的 73 行里，Gate/Up 用 4w 的 32 行、半高 4 行、M64 37 行；Down 用 M128 的 56 行（one-shot 42、persistent 14）。
+  - 与 aiter 2-stage 调优的最优配置相比（只统计被替换的行，2026-10-23）：MiniMax 1.98×、Qwen397 1.89×、Qwen3.5-35B 1.61×、Qwen3.8 FP8 1.53×、Qwen3.8 BF16 1.30×。
+- **对照目标**（2026-10-25，54 个点，§4）：
+  - Gate/Up 达标 b2b 17/54、sleep 24/54。16k–32k 基本达标（b2b 1380–2045 TF）；没达标的集中在 8k（主要因为 sort256 的 padding）和 4k 及以下（差 20–35%）。
+  - Down 达标 b2b 6/54、sleep 14/54。多数点 3.4–4.4 TB/s，主要差在 b2b 降频。
+  - §3.14–3.15 之后没有重测。
+
+### 8.3 经验
+
+1. **测量口径**：持续负载会降频（b2b 1.25–1.6 GHz，休息后 1.85–2.1 GHz）。对比时迭代次数必须一致，b2b 和 sleep 都要报告，小于 5% 的差异要在同一进程内交替 A/B。MFMA 更密集的改动可能 b2b 变快、sleep 变慢（§3.11）。
+2. **派发顺序和数据局部性常常比 kernel 内部更关键**。
+   - M64 读 sort256 时，空 tile 夹在有效 tile 之间会慢 17%。
+   - M128 one-shot 按 XCD 排任务后，Qwen3.5-i512 4k 的 Down 读流量从 0.57 GB 降到 0.30 GB。
+   - 均分 stream-K 在余数大时会打乱各 CTA 在 L2 上的同步共享，所以大余数改为把尾部 tile 按 K 拆段。
+3. **4w Gate/Up 受寄存器限制**：通过 scf.if 传递累加器（386 个 VGPR 溢出）和跳过空下半块（116–322 个溢出）都失败了；半高 tile 用独立的 2 象限代码路径才没有溢出。
+4. **调优结果要复核**：`--e2e_tune` 选出的切换里，3 个从 ASM 1-stage 换到本后端的、1 个换成半高 tile 的，用生产 `fused_moe` 交替计时都没有得到确认，没有采用。
+5. **数值**：quant 类改动要用真实数据逐位比较。I=128 的 FlyDSL quant 在随机数据上逐位一致，在真实数据上 45056 行中有 1 行不同。
+6. **工具**：FlyDSL 磁盘缓存可能返回旧的二进制；测量期间不能改 kernel 源码；gfx950 上 rocprofv3 的 `FetchSize` 把 128B 读请求按 64B 计。
+
+### 8.4 未完成
+
+- **性能**（详见 §6，按预期收益排序）：4w Gate/Up 按块混合 256 行和半高 tile，以及半宽 tile；host 剩余开销；sort；输入 quant；K > 256 的 M128 Down；reduce 与下游融合；中间 quant 融合进 Gate/Up；交织后的 sleep 回退和大余数尾波。
+- **非性能**：stream-K 的 workspace 和 m128p 的队列计数器只按设备缓存，多个 stream 并发跑 MoE 不安全；普通 `sorted_sum` 等改动没有在 gfx942 上回归；调度参数只用均匀路由验证过。
+- **代码风格**：本分支改动或新增的 13 个 Python 文件中，`gemm1_2x2.py`、`gemm2_4x1.py`、`common.py` 在 2026-10-26 重构后通过 black 26.10.1 和 ruff 0.16.0；仍有 6 个不符合 black（`__init__.py`、`quant.py`、`gemm2_1x4.py`、`gemm2_8x1.py`、`fused_moe_gfx942.py`、`test_flydsl_moe_gfx942.py`），ruff 剩 `quant.py` 的 1 个 SIM102。CI 用这两个工具检查，提 PR 前要处理。
+- **测试**：`op_tests/test_flydsl_moe_gfx942.py` 在 gfx950 上有 75 个用例（42 个整体 MoE、5 个 packed reduce、16 个 sort inverse、12 个 masked sorted sum），最近一次全部通过；gfx942 部分没有在本机跑。
 
 ## 变更记录（只追加）
 
@@ -449,3 +506,128 @@ gfx950 正确性测试：`op_tests/test_flydsl_moe_gfx942.py`（`FOUR_WAVE_CASES
 
   - 原地替换前 4 行，新配置都是 `128_256_128_True:m128:0`；Qwen3.8-i320 4k 保留原配置。
   - **验证**：op test（32 个 4w 用例 + 10 个 M64/M128 用例 + packed reduce 等）通过；替换的 4 行用生产 `fused_moe` 检查，logits_diff ≤ 4.4e-6；shape 冲突检查通过。没有重跑 54 点扫描、sleep 口径和 pyhip 对比。
+- 2026-10-26：参照 gfx950-gluon-tutorials 的 GEMM（gfx942 的 intra_wave / inter_wave），重构 `gemm1_2x2.py`（4w Gate/Up）和 `gemm2_4x1.py`（M128 Down），让 kernel 主干只写流水线，细节放到 builder 内的工厂函数。
+  - **Gate/Up 主干**：tile 调度 → prologue（首个 job 的 K tile 0/1 → LDS，再读 B_l(0)、A_t(0)）→ 每个 job 的 K pair 循环 → 最后一个 K pair 与 epilogue 重叠并预取下一个 job → stream-K head 等待并合并 partial。
+  - **`k_pair` 按 region 书写**，对应 intra_wave：每个 region 是一个 `with _region(group, in_flight, dma, read)`，里面依次是 DMA fill、LDS read、MFMA。进入时等待 DMA 组，退出时按 `dma` / `read` 的个数把它们交织进 16 条 MFMA。region 表写在模块 docstring 里。
+  - **Down 主干**：任务队列 → 定位任务 → 排序 ID 和 weight scale 写入 LDS → B ring prologue 和 A 行进 VGPR → packet 循环（静态 prologue、动态稳态循环、静态尾部）→ 存最后两个 packet。packet 的 memory / compute 两个 stage 对应 inter_wave 的 `warp_pipeline_stage`，在 docstring 里列成表。
+  - **工厂函数**：
+    - Gate/Up：`kernel_context`、`tile_schedule`、`global_io`、`mma_operands`、`stream_k_exchange`、`epilogue`、`prefetch`、`k_pair`。
+    - Down：`kernel_context`、`task_queue`、`locate`、`slice_scales`、`b_ring`、`lane_rows`、`packet_pipeline`、`next_half_live`。
+    - 工厂函数返回 `common.Bundle`。
+  - **FlyDSL 的约束**：
+    - 动态 `if` / `for` / `while` 只能写在 kernel 函数体里（AST rewriter 不改写 builder 层的函数）。
+    - rewriter 会把在动态区域里被调用方法或下标赋值的变量当作该区域的携带值。装着函数的 `SimpleNamespace` 会报 `Cannot extract IR values`。`Bundle` 实现了 DslType 协议、不含 IR 值，可以穿过动态区域；它不能继承 `SimpleNamespace`，因为 `_promote` 会重建 `SimpleNamespace`。
+    - 编译缓存的 key 包含同目录模块级函数和闭包函数的源码，不包含类方法和属性访问。所以 helper 都写成函数，`_region` 用 `contextlib.ExitStack` 回调模块级的 `_interleave`。
+    - IR 的生成顺序会影响最终 ISA：把 output rsrc 移到 operand 之后，ISA 有 20–392 行不同。所以工厂函数保持原来的生成顺序；拆长表达式时也保持操作数的求值顺序。
+  - **代码风格**：这两个文件和 `common.py` 通过 black 26.10.1 和 ruff 0.16.0；原有的 21 个 B023 随闭包改写消失。`gemm2_4x1.py` 里三处嵌套 `if` 不能合并（两处外层是编译期 guard，一处要先确定线程 0 再读 LDS），都加了带原因的 `# noqa: SIM102`。
+  - **验证**：用 `refactor/dump_isa.py` 只编译 25 个特化，最终 ISA 与重构前逐字节一致（`cmp_isa.sh`：identical=25），所以性能和数值都不变，没有重新计时。25 个特化是：12 个 Gate/Up（rows 128 / 256、SiLU / SwiGLU、per-tensor、关闭 stream-K、I = 192 / 512 / 640、Qwen397）、10 个 Down（one-shot / persistent、merge_halves、OC 切分、K = 128–640、sort128）、3 个 packed sum。另外用 `FLYDSL_RUNTIME_ENABLE_CACHE=0` 重新编译后跑了 op test（32 个 4w 用例 + 10 个 M64/M128 用例等），全部通过。
+- 2026-10-26（续）：逐行对照参考的 `matmul_kernel.py`（intra_wave / inter_wave）复查，又做了一轮重构。
+  - **复查结论**：参考的主循环在 kernel 里逐个 region 写出，每个 region 一个标题、每条访存一行，并在注释里标出 K 下标（`# LR A_bot(k)`、`# GR B_left(k+2)`）。我们的 region 体原来缺这些标注，`_region(4 * buf + 0, in_flight, dma=1, read=1)` 的参数也太多。Down 把上一个 packet 的 epilogue 编码成元组操作队列，再用 `run_op` 分派，读起来不直观；最后一个 packet 的 `pack` 又把同一个 epilogue 写了一遍。
+  - **Gate/Up**：
+    - `k_pair` 按参考主循环的写法改写：每个 region 一行 `with region(...):  # C_tl += B_l A_t`，三条操作分别注明 `# DMA B_l(k+2)`、`# LR A_b(k)`，与 docstring 的 region 表一一对应。
+    - builder 内的 `region(group, dma=1, read=1)` 绑定 `in_flight`。
+    - 主干分成 Prologue、本 job 与下一个 job、Main loop、Last K pair 四段。K 循环写成 `acc0` / `acc` / `yield`。新增 `op.source(tile, a_reg)`，本 job 和下一个 job 的 DMA 来源由 5 行缩为 2 行。
+  - **Down**：
+    - epilogue 改为生成器 `finish_row` / `finish_steps`：按顺序直写，每步之后 `yield`。compute stage 每条 MFMA 后调用 `per_step` 次 `next(steps, None)`，代替原来的操作队列和游标。
+    - 最后一个 packet 也复用 `finish_row`，删除重复的 `pack`。
+    - `packet` 里标出两个 stage 的优先级和内容；两个连续的 `if task.live:` 合成一个；任务循环加了分段标题。
+  - **仍与参考不同的地方**：
+    - FlyDSL 的动态 `if/for/while` 只能写在 kernel 体里，所以半高 tile 的 bottom 候选搜索、stream-K 自旋等待和任务认领仍留在主干。
+    - 主循环体 `k_pair` 是函数，因为每个 job 的最后一个 K pair 要复用它预取下一个 job。
+    - 循环携带值需要显式的 `init` / `yield`。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25），重新编译后 op test 全部通过；black / ruff 通过。
+- 2026-10-27：按参考 `a16w16_intra_wave_gfx942` 的标准再次重构：主流程直接写出流水线，枝节放到 helper 里。
+  - **Gate/Up 主流程**（`moe_gateup_4w`）：
+    - Prologue 逐条写出 job 0 的 K tile 0、1 的 DMA（每个 K tile 有 B_l、A_t、A_b、B_r 各一组，每组每线程 4 × 16 B；半高 tile 没有 A_b），以及 LR B_l(0)、A_t(0)。
+    - 主循环按 region 逐条写出 MFMA、LR、DMA，并标出 K 下标（如 `# LR A_b(k)`、`# DMA B_l(k+2)`）；全高和半高两种 region 序列都直接写出。
+    - 每个 job 的最后一个 K pair 像参考的 peel 一样再写一遍，注明 DMA 的 k+2 是下一个 job 的 K tile 0、1；epilogue 的 VMEM 读放在它前面。
+    - 最后是 epilogue 的 stores 和 stream-K head 的合并。
+  - **Down 主流程**（`moe_down_m128`）：
+    - Prologue 写出 LDS staging、B ring 的 DMA 和 A 行的 VMEM 读。
+    - packet 的静态 prologue、动态主循环和静态尾部都直接写出 `begin`、每个 sub-packet 的 `memory` / `compute` 两个 stage、`end`；两个 stage 的内容（LR、DMA、MFMA，以及 q-1 的 epilogue、q-2 的 stores）写在注释表里。
+  - **隐藏的枝节**：
+    - Gate/Up：半高 tile 的 bottom 候选计数和查找、job 的 A offset 寄存器（`tile_schedule`、`job_cursor`）；stream-K 的发布和 head 合并（`epi.finish` / `epi.merge_head`）。
+    - Down：任务认领和广播（`task_queue` 的 `first_step` / `claim_next` / `next_step` / `drain`）、LDS staging（`stage_task`）。
+    - 这些 helper 含运行时 `if` / `while` / `for`，用 `@flyc.jit` 修饰：kernel trace 期间调用时，FlyDSL 会直接内联执行经 AST 改写的函数（`ir.Context.current` 非空时走 `self.func(...)`），所以动态控制流不必留在 kernel 体内。
+  - **代价**：Gate/Up 主循环与最后一个 K pair 的 region 代码重复一份（两种 tile 各一份），以换取主流程可以直接读出整条流水线。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25），重新编译后 op test 全部通过（76 项 passed）；black / ruff 通过。
+- 2026-10-27（续）：函数之间的衔接改成参考那样以 tensor（数据）为中心；Down 按同样的流水线风格重构。
+  - **Gate/Up**：
+    - 操作数 `A_t` / `A_b` / `B_l` / `B_r` 只提供三个操作：`fill_g2s` / `refill_g2s`（DMA，global → LDS）和 `read_s2r(buf)`（LR，LDS → VGPR，返回 fragment）。
+    - `mma(acc, b, a)` 直接接收 fragment，例如 `mma(C.tl, b_l, a_t)`。
+    - 主流程里的数据流是显式的：prologue 读出 `b_l`、`a_t`；每个 region 读出后面 region 要用的 fragment（`a_b`、`b_r`、`b_l`、`a_t`）；半高 tile 用 `a_t1` 暂存下一个 K tile 的 A_t。
+  - **Down**：
+    - `b_ring(...).fill_g2s(s)` 发出 B sub-packet 的 DMA；`rows_g2r(...)` 返回 A 行 `a`（VGPR）和输出地址 `out`。
+    - `packet_pipeline` 改为数据进、数据出：
+      - `zero_acc()` → `c`；`side_work(q, c1, ws1, out2)` → `side`（q-1 的 epilogue、q-2 的 stores）。
+      - `read_s2r(q, sub)` → `(b, ws)`：memory stage。
+      - `mma(c, a, b, sub, side)`：compute stage。
+      - `end(c, side, ws)` → `(c1, out2, ws1)`；`epilogue(c1, ws1)` → 最后一个 packet 的打包结果；`store_r2g(packed, q)`。
+    - 原来不透明的 `state` / `pk` 拆成显式的 `c1`（C(q-1)）、`out2`（q-2 的打包结果）和 `ws1`（WS(q-1)）；主循环的 `init` / `yield` 也直接传这三者。
+    - 最后两个 packet 的 stores 在主流程直接写出。
+  - **为什么 Down 的每个 stage 仍是一次调用**：
+    - memory stage 每 4 条 LR 之间插一个 DMA turn；compute stage 每条 MFMA 之后插 epilogue 步骤和 stores。
+    - 这些交错靠 IR 的发射顺序实现。把 DMA、LR、MFMA 拆成主流程里各自的调用会改变发射顺序，从而改变 ISA。
+    - 所以 stage 内部的交错留在 helper 里，主流程用数据（`b`、`ws`、`side`）把两个 stage 连起来，各 stage 的内容写在注释表里。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25），重新编译后 op test 全部通过（76 项 passed）；black / ruff 通过。
+- 2026-10-27（再续）：Down 的 stage 内交错改为在主流程里逐 slot 写出，helper 只保留叶子操作。
+  - **原因**：Down 的调度就是程序顺序。编译器不会把 ds_read 提到可能别名的 LDS DMA 写之前，epilogue 步骤又被 `sched_barrier` 固定。所以不能像 2x2 那样分组写、再靠 `sched_group_barrier` 交错；要让主流程看到交错，就得按发射顺序写出。
+  - **主流程**：kernel 内的 `packet(q, cycle, c1, out2, ws1)` 写出一个 packet，静态头部、主循环和静态尾部各调用一次。
+    - memory stage：`B.wait(cur)`；`nxt = B.ahead(cur)` 是 B[s + lookahead]，DMA 进 B[s-1] 的 slot；每个 turn 先 `B.refill_g2s(nxt, t)`，再 `B.read_s2r(cur, t, b)` 读 4 条（K128 t // 2，N32 t % 2）；最后一个 sub-packet 读 `WS.read_s2r(q)`；`B.land(b, ws)`。
+    - compute stage：对 packet 的第 i 条 MFMA，若 `i in store_at` 先 `O.store_r2g(out2, q - 2, store_at[i])`，再 `mma(c[mi * 4 + ni], b[...], a[...])`，然后 `epi.step()`（out(q-1) 的 per_step 个 VALU 步骤）。
+    - packet 返回 `(C(q), out(q-1), WS(q))`；`c1, out2, ws1 = None, [], None` 表示还没有 q-1、q-2。
+  - **helper**：`b_ring` 提供 `at` / `ahead` / `wait` / `refill_g2s` / `fill_g2s`；`packet_operands` 提供 `B.frag` / `B.read_s2r` / `B.land`、`WS.read_s2r`、`O.store_r2g`、`mma`（建在 prologue 之后，固定的 LDS 读地址要排在 A 行加载之后）；`epilogue_steps` 提供 `step` / `pack`。`_epilogue_row`、`_zero_acc`、`_pin_acc`、`_flat` / `_unflat` 移到模块级。删除 `packet_pipeline` 及其 `side_work` / `end` / `start`。
+  - **ISA 不变的两处移动**：sub-packet 的 `asyncmark` 从最后 4 条 LR 之后移到最后一个 DMA turn 之后（组内只有 DMA）；`words` view 改为每次读时现建。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25），重新编译后 op test 全部通过（76 项 passed）；black / ruff 通过。
+- 2026-10-27（命名）：主流程里的叶子操作改为按含义命名，数据流显式。
+  - DMA 统一叫 `load_g2s`：Down 的 `refill_g2s` 和 Gate/Up 的 `refill_g2s` 都改名；prologue 的 `fill_g2s` 保留。
+  - Down：`ahead` → `prefetch_of`（返回预取的 B[s + lookahead]，变量 `pf`）；`wait` → `wait_g2s`；`at` → `subpacket`。
+  - Down 的 LR 改为有返回值：`b += B.read_s2r(cur, t)` 收集在途的 ds_read 结果；`b, ws = B.wait_s2r(b, ws)` 等 lgkmcnt(0)、把它们固定在 VGPR 里并组成 MFMA fragment（取代 `frag` + 原地写 + `land`）。
+  - epilogue 合成一个对象：`epi = epilogue(c1, ws1)`，`epi.run(per_step)` 发出下 per_step 个 VALU 步骤（前后各一道 sched_barrier），`epi.finish()` 跑完剩余步骤并返回 4 个打包记录；最后一个 packet 用 `epilogue(c1, ws1).finish()`，逐行排空后合并，发射顺序与原 `_epilogue` 相同。`_pin_acc` → `_acc_values`。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25），重新编译后 op test 全部通过（76 项 passed）；black / ruff 通过。
+- 2026-10-27（命名 2）：Down 的下标按 M / N / K 方向统一命名。
+  - packet 序号 `q` → `n`（第 n 个处理的 N64 packet；它在 slice 中的位置是 `packet_index(n)`，起点按 worker 旋转）；sub-packet 序号 `sub` → `k`（packet 内沿 K 的切块）；K64 半块 `part` → `kh`；`piece` → `n16_bytes`；ring 的 `phase` → `slot`（`phases_per_base` → `slots_per_base`）；epilogue 里表示 ni 奇偶的局部变量 `half` → `odd`（`half` 只留给 M 方向的 128 行半块）。
+  - pyhip 的 "turn" 改为 LDS DMA 的说法：`_TURN_BYTES` → `_DMA_BYTES`（每线程 16 B，CTA 共 4 KiB），`sub_turns` → `sub_dmas`，循环变量 `t` → `j`；`dma_turn` 并入 `load_g2s(sp, j)`；`ws_turns` → `ws_per_thread`。
+  - `prefetch_of` → `prefetch_target`（只返回预取目标，不发指令）；`_Sub(q, sub, ...)` → `_SubPacket(n, k, ...)`。
+  - 保留：`oc` / `oc_splits`（对外接口，host 端在用），`lr` / `lk`（MFMA lane 坐标，A 的 M 行和 B 的 N 列都用它），`half` / `halves`（M 方向）。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25）；black / ruff 通过。
+- 2026-10-27（命名 3）：Gate/Up 按同样的规则改名（M / N / K 方向用 m / n / k，`n_` 不再表示个数）。
+  - tile 与 job：`_Tile(block, n_tile, first, end, half)` → `_Tile(m_block, n_tile, kp0, kp1, half)`，`_Job` 的 K-pair 区间同样改为 `kp0` / `kp1`；`num_k_tiles` → `k_tiles`，`num_pairs` → `k_pairs`。
+  - 调度：`n_blocks` → `m_blocks`；`n_dp` → `dp_jobs`；`n_bottom` → `bottom_jobs`；stream-K 的 `g0` / `g1` → `w0` / `w1`（拼接后 K-pair 工作量里的区间）；`u0` / `u` → `sk_tile0` / `sk_tile`；`f` / `max_f` → `ranges` / `max_ranges`（tail tile 的 K 区间数）；`chunk` → `k_range`；bottom 候选 `jb` / `jb_n` / `cur_b` / `is_b` → `bottom` / `next_bottom` / `cur_bottom` / `is_bottom`。
+  - 片段下标：epilogue 和 stream-K 里的 `qm` / `rr` / `cr` / `cp` → `mh` / `mi` / `ni` / `ni0`，象限 `q` → `quad`；partial 循环变量 `k` → `j`，`n_parts` → `parts`；`head_block` / `head_n` → `head_m_block` / `head_n_tile`。
+  - 操作数：`b_slot` → `b_voffsets`；组内 DMA 序号 `c` → `j`；`first_row` → `n_first`；`a_offsets` 里的 `h` / `c` → `mh` / `j`；`operand(src, ...)` 的 LDS 源改叫 `srcs`，`fill_g2s(src, ...)` 的 `src` 指 DMA 源。
+  - 主流程：prologue 的 `b0` → `buf0`（和循环体内的 `buf` 不同名，避免动态 job 循环把它当 loop-carried 值）；job 序号 `it` → `i`；`kk` → `k_load`；`nb`（另一个 buffer）→ `next_buf`。
+  - **验证**：25 个特化的最终 ISA 逐字节一致（identical=25）；black / ruff 通过。
+- 2026-10-27（命名规则）：两个 kernel 的模块 docstring 末尾各加一节 `Naming:`，写明 M / N / K 的含义、m / n / k 表示方向、`n_` 前缀只表示 N，以及各自的操作数 / fragment 名、下标字母、数据搬运动词（`*_g2s` / `*_s2r` / `*_r2g`）和注释缩写（DMA、LR）。只改 docstring，不影响生成代码；black / ruff 通过。
+- 2026-10-27（编排规则）：两个模块 docstring 各加一节 `Pipeline rules`，列出改主流程时必须保持的约束。
+  - Gate/Up：region 内先 DMA、再 LR、再 MFMA；DMA group 的发出顺序和 `in_flight` 的计数（5 / 3，prologue 6 / 4 = 所读 group 之后已发出的 group 数）；LDS 写后读（DMA 至少在该 buffer 最后一次读的下一个 region，靠 region 开头的 lgkmcnt(0) + s_barrier）；VGPR 写后读（region r 读的 fragment 从 r + 1 起才用，读只能覆盖已用完的 fragment，所以半高 tile 用 a_t1）；预取距离 2 和跨 job 预取；epilogue 的 VMEM 读在最后一个 K pair 之前、store 在之后；结束时的 merge 和 drain。
+  - Down：程序顺序即调度；ring 的 slot 复用和 barrier；每个 sub-packet 一个 async group 及等待计数；memory / compute stage 内的顺序与优先级；per_step 的条件；三级 packet 流水和携带量；动态循环的起止条件；pin 的位置；task 结束的 drain 与 LDS 交接。原先单独的 "Program order is the schedule" 段并入第 1 条。
+  - 只改 docstring；black / ruff 通过。
+- 2026-10-27（易读性整理）：按易读性审查的第 1–12 条整理两个 kernel；第 13 条（拆分 Gate/Up 的 `epilogue.store` 和 `mma_operands`）按要求未做。
+  - 公共原语收进 common.py：`scalar`、`swap_pack`（不 pin 的版本；Down 在外面套 `_pin_packet`），以及路由解码 `route_token` / `split_route`（返回 token、topk_slot、是否为路由）/ `is_route`。两个 kernel 里原来手写的 `& 0xFFFFFF`、`>> 24` 和有效性判断都改为调用它们。保留两个判断函数是为了让 IR 发射顺序与原来完全一致。
+  - Gate/Up 结构：
+    - 主循环和最后一个 K pair 共用 kernel 内的 `k_pair(src, k_load, b_l, a_t)`，region 序列（全高 / 半高）只写一次。
+    - `in_flight = 2 * groups - 3`（`groups = 2 + halves`）、prologue 等待 `2 * groups - 2`，推导写在定义旁边。
+    - `tile_schedule` 的 docstring 列出一个 CTA 的 job 序列；stream-K 的规划收进 `stream_k_plan(count)`，返回 `plan`。
+    - `epi.prepare` 返回具名的 `_EpilogueIn`。
+    - 主循环加注释：C 在 AGPR 里，K 循环携带的是它的值。
+  - Down 结构：
+    - ring 几何收进纯 Python 的 `_ring_plan(K, packets)`，返回 `_RingPlan`，并把编排规则写成断言：一个 DMA 配四个 LR；ring 不超过 9 个 8 KiB slot；`per_step * 8 * KB >= 44`；主循环从 ring cycle 边界开始，且循环内每个 sub-packet 都还在预取。
+    - packet 间的携带量改为 `_Carry(c1, ws1, out2)`，带 `has_out2` / `flat()` / `unflat()`。原来散在各处的哨兵值和 8/4/4 拆分现在都收在这个类里。
+    - B 只构造一次，A 行加载之后显式调用 `B.pin_read_bases()`。
+    - `packet()` 的默认参数加注释，说明它们绑定的是当前 task 的操作数。
+    - `next_half_live` 移进使用它的 `task_queue`。
+    - 魔数起名：`_N16_K16_BYTES`、`_N16_K64_BYTES`、`_N16_K128_BYTES`、`_EPILOGUE_STEPS`、`_OUT_PACKET_BYTES`。
+  - 命名：
+    - 两个 kernel 的 `kc` → `ctx`。
+    - Gate/Up：`job` → `cursor`，`op` → `operands`，`rows` → `epi_in`，`slot_id` → `topk_slot`。
+    - Down：`t` → `task`，LDS 广播字 → `claim_word`，路由 slot → `topk_slot`。
+    - Gate/Up 的 `tid` / `tid_i` 加注释说明各自的用途。
+  - docstring 统一为：概述 → 布局 / 输出 → 调度 → 流水线表 → `Naming` → `Pipeline rules`。表格只写"做什么"，规则只写"必须保持什么"。
+    - Gate/Up：K step 段落不再重复规则 1–2；`in_flight` 的推导移到定义旁边。
+    - Down：Output 移到 Task 之后，新增 Schedule 段；Stages 表写出 prio、WS(n) 和 store_at；规则 4–6 只保留不变量（DMA 与 LR 的配对、epilogue 在 packet n 内结束、`_Carry` 携带）；规则 8 改为"A 行加载之后 pin"。
+  - 可选的调度单测（host 端模型，检查每个 (tile, K pair) 恰好被覆盖一次）未加。
+  - **验证**：
+    - 25 个特化的最终 ISA 逐字节一致（identical=25）。
+    - 重新编译后 op test 全部通过（rc=0，76 项 passed，"32 four-wave, 10 M64 Gate/Up + M128 Down"）。
+    - black / ruff 通过。
