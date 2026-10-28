@@ -587,6 +587,9 @@ def shipped_rows():
     """Every shipped FlyDSL row as test_moe arguments, grouped by shape."""
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     df = df[df["kernelName1"].astype(str).str.startswith(f"impl__{IMPL}__")]
+    if "gfx" in df:
+        # The shipped CSVs also hold gfx950 rows whose configs gfx942 rejects.
+        df = df[df["gfx"].astype(str) == get_gfx()]
     if "_tag" in df:
         df = df[df["_tag"].fillna("").astype(str).str.strip() == ""]
     quants = {"No": "no", "per_Tensor": "per_tensor", "per_Token": "ptpc"}

@@ -6220,7 +6220,7 @@ class FmoeTuner(TunerCommon):
                 status = results_cur[result_index]["status"]
                 err_ratio = results_cur[result_index].get("err_ratio", 0)
                 # skip invalid kernel
-                if e2e_us < 0 or status != "ok":
+                if e2e_us <= 0 or status != "ok":
                     print(
                         f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
                     )
