@@ -149,6 +149,11 @@ def scalar(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, value.ir_value()))
 
 
+def readlane_i32(value, lane):
+    """Lane `lane`'s Int32 value of a VGPR, broadcast as an SGPR."""
+    return fx.Int32(rocdl.readlane(fx.Int32.ir_type, value.ir_value(), lane))
+
+
 # A sorted ID holds a route's token in bits 0-23 and its top-k slot in bits 24-31;
 # padding entries hold a token >= tokens or a slot >= TOPK.
 def route_token(encoded):
@@ -827,15 +832,12 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
             tid,
             is_read_from_mem=True,
             TOPK=None,
-            is_atomic_write=False,
         ):
-            assert not (is_atomic_write and is_read_from_mem)
             self.view = view
             self.tile_m = tile_m
             self.tile_k = tile_k
             self.is_read_from_mem = is_read_from_mem
             self.TOPK = TOPK
-            self.is_atomic_write = is_atomic_write
             self.index_frag = index_frag
 
             rank = fx.get_shape(self.view).rank
@@ -880,35 +882,19 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
                         self.index_frag[0, m] & 0xFFFFFF,
                         (self.index_frag[0, m] >> 24),
                     ]
-                if const_expr(not self.is_atomic_write):
-                    for k in range_constexpr(rep_k):
-                        offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
-                        offset_block_k = offset_block // self.tile_m
-                        offset_k_in_tile = offset_block_k + self.offset_thread_k
-                        reg = frag[None, m, k]
-                        mem = fx.make_view(
-                            fx.get_iter(tensor_sub_block) + offset_k_in_tile,
-                            fx.make_layout(value_size, stride_size),
-                        )
-                        if const_expr(self.is_read_from_mem):
-                            fx.copy(copy_atom, mem, reg)
-                        else:
-                            fx.copy(copy_atom, reg, mem)
-                else:
-                    # UniversalAtomic cannot lower this packed BF16 operation.
-                    if (self.index_frag[0, m] >> 24) < TOPK:
-                        for k in range_constexpr(rep_k):
-                            offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
-                            offset_block_k = offset_block // self.tile_m
-                            offset_k_in_tile = offset_block_k + self.offset_thread_k
-                            reg = frag[None, m, k]
-                            mem = fx.make_view(
-                                fx.get_iter(tensor_sub_block) + offset_k_in_tile,
-                                fx.make_layout(value_size, stride_size),
-                            )
-                            reg_vec = reg.load()
-                            ptr_base = fx.get_iter(mem)
-                            atomic_add_bf16(ptr_base, reg_vec)
+                for k in range_constexpr(rep_k):
+                    offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
+                    offset_block_k = offset_block // self.tile_m
+                    offset_k_in_tile = offset_block_k + self.offset_thread_k
+                    reg = frag[None, m, k]
+                    mem = fx.make_view(
+                        fx.get_iter(tensor_sub_block) + offset_k_in_tile,
+                        fx.make_layout(value_size, stride_size),
+                    )
+                    if const_expr(self.is_read_from_mem):
+                        fx.copy(copy_atom, mem, reg)
+                    else:
+                        fx.copy(copy_atom, reg, mem)
 
     def _read_sorted_index(
         tiled_copy_index, tid, lds_index, index_size=None, index_offset=0

@@ -20,6 +20,10 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import launch
 
+# Split-K decode kernels stream each expert's weights once per M tile; beyond this
+# batch the FP8 prefill kernels are faster.
+_DECODE_MAX_BATCH = 2048
+
 
 @dataclass
 class Config:
@@ -35,6 +39,7 @@ class Config:
         if self.down_path not in (
             "default",
             "1x4_64x256",
+            "1x4_atomic",
             "8x1_compact",
             "m128",
             "m128p",
@@ -43,7 +48,7 @@ class Config:
         if self.down_output_padding_bytes not in (0, 32, 64, 128):
             raise ValueError("Down output padding must be 0, 32, 64 or 128 bytes")
         if (
-            self.down_path in ("default", "m128", "m128p")
+            self.down_path in ("default", "1x4_atomic", "m128", "m128p")
             and self.down_output_padding_bytes != 0
         ):
             raise ValueError(f"The {self.down_path} Down path does not support output padding")
@@ -102,6 +107,8 @@ class Config:
         # Batch 1 runs the batch-1 kernels for any tile; tune it only as 16_16_16.
         if not self.use_prefill and problem.batch == 1 and self.BLOCK_N != 16:
             return "batch 1 uses the 16_16_16 config"
+        if not self.use_prefill and problem.batch > _DECODE_MAX_BATCH:
+            return f"decode kernels handle at most {_DECODE_MAX_BATCH} tokens"
         if self.four_wave_gateup:
             reason = _four_wave_gateup_reason(self, problem)
             if reason is not None:
@@ -124,6 +131,8 @@ class Config:
         elif self.down_path != "default":
             if self.BLOCK_M != 64 and not self.four_wave_gateup:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
+            if self.down_path == "1x4_atomic" and self.four_wave_gateup:
+                return "atomic Down reads the M64 Gate/Up sort without re-sorting"
             # The native tuner's empty quant_type is a shape-only probe. The
             # runtime wrapper checks actual FP8 weight and activation support.
             if problem.quant_type not in ("", "ptpc", "per_tensor"):
@@ -217,6 +226,7 @@ def get_tune_space():
         Config(16, 16, 16, False),
         Config(16, 16, 16, False, use_batch1_algorithm=True),
         Config(16, 128, 64, False),
+        Config(32, 128, 64, False),
     ]
     configs.extend(Config(64, block_n, block_k, True) for block_n, block_k in prefill)
     configs.extend(
@@ -224,6 +234,11 @@ def get_tune_space():
             64, block_n, block_k, True, down_path=path, down_output_padding_bytes=128
         )
         for path in ("1x4_64x256", "8x1_compact")
+        for block_n, block_k in prefill
+    )
+    # Down adds routes into the zeroed output; no per-route rows or topk reduce.
+    configs.extend(
+        Config(64, block_n, block_k, True, down_path="1x4_atomic")
         for block_n, block_k in prefill
     )
     # M64 Gate/Up on the M128 Down's 256-row sort blocks (gfx950).
@@ -368,7 +383,7 @@ def _empty_scale(device):
 
 def _down_n_splits(problem: _Problem, down_path: str) -> int:
     """Split each 1x4_64x256 Down task's N until every CU has about six tasks."""
-    if down_path != "1x4_64x256":
+    if down_path not in ("1x4_64x256", "1x4_atomic"):
         return 1
     rows = problem.batch * problem.topk
     # Each active expert pads half an M64 block on average.
@@ -436,6 +451,7 @@ def _run_prefill(
     swiglu_limit: float | None,
 ):
     m128_down = config.down_path in ("m128", "m128p")
+    atomic_down = config.down_path == "1x4_atomic"
     # The M128 Down and the four-wave Gate/Up read 256-row sort blocks; M64 Gate/Up
     # walks them in BLOCK_M tiles.
     sort_block_m = 256 if m128_down or config.four_wave_gateup else config.BLOCK_M
@@ -457,11 +473,12 @@ def _run_prefill(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
-        accumulate=False,
-        output_aux=False if needs_resort else AUX_SORT_OPUS,
+        # The atomic Down adds into the output the sort zeroes.
+        accumulate=atomic_down,
+        output_aux=False if needs_resort or atomic_down else AUX_SORT_OPUS,
     )
     reverse_sorted = None
-    if not needs_resort:
+    if not needs_resort and not atomic_down:
         _, reverse_sorted = sort_aux
     if cur_out.numel() == 0:
         cur_out = torch.empty(
@@ -655,10 +672,14 @@ def _run_prefill(
         problem.model_dim
         + config.down_output_padding_bytes // hidden_states.element_size()
     )
-    gemm2_out = torch.empty(
-        [sorted_expert_ids.shape[0] * down_block_m, output_row_size],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    gemm2_out = (
+        cur_out
+        if atomic_down
+        else torch.empty(
+            [sorted_expert_ids.shape[0] * down_block_m, output_row_size],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
     )
     down_kernel = _get_compiled_kernel(
         N=problem.model_dim,
@@ -712,6 +733,8 @@ def _run_prefill(
     else:
         _launch(down_kernel, *down_args)
 
+    if atomic_down:
+        return cur_out
     loc_ids = reverse_sorted.view(problem.batch, problem.topk)
     sorted_sum(problem.topk, problem.model_dim, config.down_output_padding_bytes)(
         loc_ids, gemm2_out, cur_out, problem.batch
@@ -981,7 +1004,7 @@ def run_flydsl_moe_gfx942(
             activation_str,
             swiglu_limit,
         )
-    if 2 <= problem.batch <= 256:
+    if 2 <= problem.batch <= _DECODE_MAX_BATCH:
         return _run_decode(
             hidden_states,
             w1,

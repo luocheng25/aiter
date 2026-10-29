@@ -258,6 +258,7 @@ def test_config_strings():
         "16_16_16_False_True_False:default:0",
         "16_16_16_True_True:default:0",
         "16_16_16_False_True:1x4_64x256:128",
+        "64_256_128_True:1x4_atomic:128",
     ):
         try:
             Config.from_string(invalid)
@@ -665,6 +666,17 @@ EDGE_CASES = [
         for path in ("8x1_compact", "1x4_64x256")
         for padding in (0, 32, 64)
     ),
+    # Atomic Down: K192/384 tiles, the delayed K256 store, per-tensor, SwiGLU and
+    # every route of a token adding into one hot output row set.
+    (2048, 2560, 192, 513, 11, "ptpc", "silu", "random", "64_128_128_True:1x4_atomic:0"),
+    (4096, 6144, 256, 384, 8, "ptpc", "silu", "hot", "64_256_128_True:1x4_atomic:0"),
+    (1024, 4096, 192, 192, 8, "per_tensor", "silu", "random", "64_128_256_True:1x4_atomic:0"),
+    (2048, 6144, 384, 129, 5, "ptpc", "swiglu", "random", "64_128_256_True:1x4_atomic:0"),
+    # Decode tiles above 256 tokens: 64- and 128-column Down rows, BF16 weights.
+    (2048, 2048, 128, 257, 9, "ptpc", "silu", "random", "16_16_16_False:default:0"),
+    (1024, 2560, 320, 513, 11, "ptpc", "silu", "random", "32_128_64_False:default:0"),
+    (2048, 6144, 384, 128, 4, "ptpc", "swiglu", "hot", "32_128_64_False:default:0"),
+    (512, 2560, 192, 513, 11, "no", "silu", "random", "32_128_64_False:default:0"),
 ]
 
 

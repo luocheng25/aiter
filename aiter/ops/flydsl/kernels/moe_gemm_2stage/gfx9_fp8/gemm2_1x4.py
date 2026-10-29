@@ -185,10 +185,20 @@ def _store_cshuffle_row_pair(
 
 
 def _build_moe_gemm2_1x4_n256(
-    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, _task_table=False, n_splits=1
+    *,
+    N,
+    K,
+    weight_quant_type,
+    act_quant_type,
+    TOPK,
+    padding,
+    _task_table=False,
+    n_splits=1,
+    atomic_output=False,
 ):
     assert padding in (0, 32, 64, 128)
     assert (N // 256) % n_splits == 0 and not (_task_table and n_splits > 1)
+    assert not (atomic_output and (_task_table or padding))
     _, generic_xcd_count = get_down_device_config()
     block_m_per_4wave_group = 64
     activation_bytes = block_m_per_4wave_group * K
@@ -226,7 +236,7 @@ def _build_moe_gemm2_1x4_n256(
     def moe_2stage_down_prefill_1x4_64x256(
         p_input: fx.Pointer,  # fp8 [M, TOPK, K]            K = HIDDEN_STATES//TP
         p_weight: fx.Pointer,  # quantized/bf16 [E, N, K]   N = HIDDEN_STATES
-        p_output: fx.Pointer,  # bf16 [M, TOPK, N]
+        p_output: fx.Pointer,  # bf16 sorted rows [tasks * 64, N + pad]; atomic: [M, N]
         p_sorted_ids: fx.Pointer,  # int32 [num_tokens_sorted]
         p_sorted_weights: fx.Pointer,  # f32 [num_tokens_sorted]
         p_sorted_expert_ids: fx.Pointer,  # int32 [num_blocks] num_tokens_sorted <= num_blocks * BLOCK_TILE_SIZE_M
@@ -277,6 +287,10 @@ def _build_moe_gemm2_1x4_n256(
 
             arg_p_sorted_ids = sorted_rows(p_sorted_ids, fx.Int32)
             arg_p_sorted_weights = sorted_rows(p_sorted_weights, fx.Float32)
+            lane_route = None
+            if const_expr(atomic_output):
+                # Lane l holds task row l's sorted ID; the epilogue reads rows by readlane.
+                lane_route = arg_p_sorted_ids[fx.Int32(fx.thread_idx.x % 64)]
             expert_id = (
                 p_sorted_expert_ids[2 * e_idx + 1]
                 if const_expr(_task_table)
@@ -443,15 +457,63 @@ def _build_moe_gemm2_1x4_n256(
             write_cshuffle_vector = partial(
                 _write_cshuffle_vector, cshuffle_lds, cshuffle_copy_atom
             )
-            store_cshuffle_row_pair = partial(
-                _store_cshuffle_row_pair,
-                cshuffle_lds,
-                cshuffle_copy_atom,
-                output_store_rsrc,
-                block_n_size=BLOCK_N,
-                wave_n=WAVE_N,
-                row_stride=output_row_stride,
-            )
+            if const_expr(atomic_output):
+                output_tokens = fxh._as_ptr(p_output, fx.BFloat16)
+                pair_atom = down_ops.get_universal_copy_atom(fx.BFloat16, 32)
+
+                def store_cshuffle_row_pair(
+                    wave_lds_base, lane_id, wave_id, row_pair, block_n
+                ):
+                    # Adds the M16 row pair to its tokens: each instruction covers two
+                    # rows, a half-wave per row and one BF16 pair per lane.
+                    row_parity = lane_id // 32
+                    pair_in_row = lane_id % 32
+                    column = (
+                        fx.Int64(block_n) * BLOCK_N
+                        + fx.Int64(wave_id) * WAVE_N
+                        + fx.Int64(pair_in_row) * 2
+                    )
+                    for step in range_constexpr(8):
+                        row_in_8 = (2 * step) % 8 + row_parity
+                        lds_offset = (
+                            wave_lds_base
+                            + (
+                                ((2 * step) // 8 * 8 + row_in_8) * 8
+                                + ((pair_in_row // 4) ^ row_in_8)
+                            )
+                            * 8
+                            + (pair_in_row % 4) * 2
+                        )
+                        source = fx.make_view(
+                            fx.get_iter(cshuffle_lds) + lds_offset,
+                            fx.make_layout(2, 1),
+                        )
+                        fragment = fx.make_fragment_like(source)
+                        fx.copy(pair_atom, source, fragment)
+                        task_row = row_pair * 16 + 2 * step
+                        encoded = fx.Uint32(
+                            (row_parity == 0).select(
+                                fxh.readlane_i32(lane_route, task_row),
+                                fxh.readlane_i32(lane_route, task_row + 1),
+                            )
+                        )
+                        token, _, valid = fxh.split_route(encoded, M, TOPK)
+                        if valid:
+                            fxh.atomic_add_bf16(
+                                output_tokens + (fx.Int64(token) * N + column),
+                                fragment.load(),
+                            )
+
+            else:
+                store_cshuffle_row_pair = partial(
+                    _store_cshuffle_row_pair,
+                    cshuffle_lds,
+                    cshuffle_copy_atom,
+                    output_store_rsrc,
+                    block_n_size=BLOCK_N,
+                    wave_n=WAVE_N,
+                    row_stride=output_row_stride,
+                )
 
             def store_cshuffle_n256(output, block_n):
                 lane_id = fx.Int32(fx.thread_idx.x % 64)

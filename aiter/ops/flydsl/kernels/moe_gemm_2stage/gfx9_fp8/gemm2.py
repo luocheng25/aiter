@@ -54,7 +54,7 @@ def compile_moe_gemm2(
             f"down prefill requires N to be divisible by 256 for paired "
             f"128-wide tiles, got N={N}"
         )
-    if down_n_splits != 1 and down_path != "1x4_64x256":
+    if down_n_splits != 1 and down_path not in ("1x4_64x256", "1x4_atomic"):
         raise ValueError("Only the 1x4_64x256 Down splits N")
     if down_path != "default":
         assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
@@ -67,10 +67,14 @@ def compile_moe_gemm2(
             "TOPK": TOPK,
             "padding": down_output_padding_bytes,
         }
-        if down_path == "1x4_64x256":
+        if down_path in ("1x4_64x256", "1x4_atomic"):
             from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
 
-            return _build_moe_gemm2_1x4_n256(**options, n_splits=down_n_splits)
+            return _build_moe_gemm2_1x4_n256(
+                **options,
+                n_splits=down_n_splits,
+                atomic_output=down_path == "1x4_atomic",
+            )
         if down_path == "8x1_compact":
             from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
 
@@ -83,10 +87,14 @@ def compile_moe_gemm2(
         assert (
             K % TILE_K == 0
         ), f"down split-K requires K to be divisible by {TILE_K}, got K={K}"
+        assert BLOCK_TILE_SIZE_N in (64, 128), "split-K Down rows are 64 or 128 wide"
+        # Padded rows keep the M16 staging writes off a single LDS bank.
+        stage_row_stride = BLOCK_TILE_SIZE_N + 4
 
         @fx.struct
         class SharedStorage:
             sorted_lds: fx.Array[fx.Int32, 256, 16]
+            stage_lds: fx.Array[fx.BFloat16, 16 * stage_row_stride, 16]
 
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
@@ -242,7 +250,52 @@ def compile_moe_gemm2(
 
             c_frag_bf16 = _cvt_f32_to_bf16(c_frag)
 
-            if const_expr(not USE_ATOMIC_WRITE):
+            if const_expr(USE_ATOMIC_WRITE):
+                # Stage each M16 block through LDS, then add whole output rows with one
+                # BF16 pair per lane, so each atomic instruction covers contiguous rows.
+                pairs_per_row = BLOCK_TILE_SIZE_N // 2
+                rows_per_step = 64 // pairs_per_row
+                stage = lds.stage_lds.ptr
+                sorted_view = fx.make_view(
+                    lds.sorted_lds.ptr, fx.make_layout(BLOCK_TILE_SIZE_M, 1)
+                )
+                quad_atom = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+                pair_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.BFloat16)
+                output_rows = (
+                    fxh._as_ptr(p_output, fx.BFloat16)
+                    + fx.Int64(blk_n) * BLOCK_TILE_SIZE_N
+                )
+                pair = tid % pairs_per_row
+                for m in range_constexpr(BLOCK_TILE_SIZE_M // 16):
+                    # MFMA C: lane l holds channels 4 * (l // 16) + i of row l % 16.
+                    for n in range_constexpr(BLOCK_TILE_SIZE_N // 16):
+                        dst = fx.make_view(
+                            stage
+                            + (
+                                (tid % 16) * stage_row_stride + n * 16 + (tid // 16) * 4
+                            ),
+                            fx.make_layout(4, 1),
+                        )
+                        quad = fx.make_fragment_like(dst)
+                        quad.store(c_frag_bf16[None, m, n].load())
+                        fx.copy(quad_atom, quad, dst)
+                    for step in range_constexpr(16 // rows_per_step):
+                        row = step * rows_per_step + tid // pairs_per_row
+                        src = fx.make_view(
+                            stage + (row * stage_row_stride + pair * 2),
+                            fx.make_layout(2, 1),
+                        )
+                        values = fx.make_fragment_like(src)
+                        fx.copy(pair_atom, src, values)
+                        token, _, valid = fxh.split_route(
+                            fx.Uint32(sorted_view[m * 16 + row]), M, TOPK
+                        )
+                        if valid:
+                            fxh.atomic_add_bf16(
+                                output_rows + (fx.Int64(token) * N + pair * 2),
+                                values.load(),
+                            )
+            else:
                 arg_p_output = fx.make_view(
                     fxh._as_ptr(p_output),
                     fx.make_layout((M, TOPK, N), (TOPK * N, N, 1)),
@@ -253,37 +306,27 @@ def compile_moe_gemm2(
                     num_records_bytes=fx.Int64(M) * (TOPK * N * fx.BFloat16.width // 8),
                 )
                 cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
-                is_atomic_write = False
-            else:
-                arg_p_output = fx.make_view(
-                    fxh._as_ptr(p_output), fx.make_layout((M, N), (N, 1))
+                c_tiled_g = fx.make_tiled_copy(
+                    cp_atom_w,
+                    fx.make_layout(((16, 4), 4), ((1, 64), 16)),
+                    fx.make_tile(16, 16),
                 )
-                cp_atom_w = fx.make_copy_atom(
-                    fx.UniversalAtomic(fx.AtomicOp.Add, fx.BFloat16), fx.BFloat16
+                c_index_frag = _read_sorted_index(
+                    tiled_copy_sortid_lds, tid, lds.sorted_lds
                 )
-                is_atomic_write = True
-            c_tiled_g = fx.make_tiled_copy(
-                cp_atom_w,
-                fx.make_layout(((16, 4), 4), ((1, 64), 16)),
-                fx.make_tile(16, 16),
-            )
-            c_index_frag = _read_sorted_index(
-                tiled_copy_sortid_lds, tid, lds.sorted_lds
-            )
-            c_tensor = TensorWithIndex(
-                arg_p_output,
-                BLOCK_TILE_SIZE_M,
-                BLOCK_TILE_SIZE_N,
-                c_index_frag,
-                c_tiled_g,
-                tid,
-                is_read_from_mem=False,
-                TOPK=TOPK,
-                is_atomic_write=is_atomic_write,
-            )
-            c_tensor.copy(
-                cp_atom_w, blk_n, c_tiled_g.get_slice(tid).retile(c_frag_bf16)
-            )
+                c_tensor = TensorWithIndex(
+                    arg_p_output,
+                    BLOCK_TILE_SIZE_M,
+                    BLOCK_TILE_SIZE_N,
+                    c_index_frag,
+                    c_tiled_g,
+                    tid,
+                    is_read_from_mem=False,
+                    TOPK=TOPK,
+                )
+                c_tensor.copy(
+                    cp_atom_w, blk_n, c_tiled_g.get_slice(tid).retile(c_frag_bf16)
+                )
 
     @flyc.kernel
     def moe_2stage_down_batch1(
