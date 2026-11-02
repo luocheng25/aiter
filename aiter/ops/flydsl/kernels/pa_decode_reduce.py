@@ -1,425 +1,519 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Combine normalized PA decode partition outputs without changing their ABI."""
+"""Partitioned-softmax reduction kernel for FlyDSL paged attention."""
 
-import functools
+from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 
-from .kernels_common import LOG2E
-from .pa_decode_common import (
-    copy_load as _copy_load,
-)
-from .pa_decode_common import (
-    copy_store as _copy_store,
-)
-from .pa_decode_common import (
-    exp2_f32_fast,
-    rcp_f32,
-    udiv_const,
-    urem_const,
-)
-from .tensor_shim import ptr_buf_tensor
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
-WARP_SIZE = 64
-_FLAT_BUFFER_ELEMENTS = 1 << 30
+from .tensor_shim import _FX_ELEM, buf_base_i64, buf_copy_load, ptr_buf_tensor
+from .utils import rcp_f32, udiv_const, urem_const
+
+WAVE = 64
+# Above this partition bound the CTA reduces in LDS; at most DUAL_REGISTER
+# live partitions still take its register branch.
+REGISTER_PARTITIONS = 64
+DUAL_REGISTER_PARTITIONS = 32
+MAX_CTA_WAVES = 16
 
 
-@functools.lru_cache(maxsize=256)
-def compile_pa_decode_sw_reduce(
+def _shuffle_offsets(parts):
+    width = 1 if parts == 1 else 1 << (parts - 1).bit_length()
+    return tuple(o for o in (32, 16, 8, 4, 2, 1) if o < width)
+
+
+def _fast_div(value, magic):
+    """floor(value / d) for magic = ceil(2**30 / d), exact while value * d <= 2**30."""
+    return fx.Int32((fx.Int64(value) * fx.Int64(magic)) >> 30)
+
+
+@lru_cache(maxsize=256)
+def compile_pa_decode_ps_reduce(
     *,
+    architecture: str | None = None,
     max_context_partition_num: int,
-    query_seq_len: int,
-    query_group_size: int,
     head_size: int,
     output_dtype_str: str,
-    logits_dtype_str: str = "bf16",
+    logits_dtype_str: str,
+    sink_dtype_str: str,
+    use_sinks: bool,
+    query_group_size: int,
+    pairs: bool = False,
+    parallel_groups: int = 1,
+    num_xcds: int = 0,
 ):
-    # Partition partials (`logits`) are read at this dtype; defaults to bf16
-    # (this kernel's original, still-default behavior for existing callers).
-    # Callers with an fp8 query should still keep this at bf16 (fp8 has too
-    # little precision for a re-accumulated intermediate) -- only real f16/f32
-    # queries should pick a matching non-bf16 value here.
-    if logits_dtype_str == "f32":
-        LOGITS_DTYPE = fx.Float32
-    elif logits_dtype_str == "f16":
-        LOGITS_DTYPE = fx.Float16
+    """Build PA decode's partitioned-softmax reducer.
+
+    One CTA reduces one (sequence, KV head, query row). Logits are packed
+    [KV heads, capacity, rows, D] rows whose span of NP partitions per sequence
+    is at most INT32_MAX bytes: a per-sequence buffer bound zero-fills
+    inactive partitions without reading adjacent sequences or NaN padding.
+
+    NP up to the wave size builds a register-only CTA: lane p owns partition
+    p's statistics and a CTA-uniform count branch selects one unrolled rung.
+    Larger bounds build a dual-mode CTA of ``parallel_groups`` partition groups.
+    Up to 32 live partitions, group 0 runs the register ladder; above, wave 0
+    publishes the softmax weights to LDS, each group sums a contiguous chunk
+    and group 0 adds the partials.
+
+    ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
+    four-byte aligned base and even strides); output stores stay scalar.
+    ``num_xcds`` > 0 launches a 1-D grid that gives each XCD a contiguous run
+    of CTAs; the launch then needs ``rows_magic`` and ``seq_magic`` =
+    ceil(2**30 / d) for d = rows and rows * KV heads, valid while
+    batch * (rows * KV heads)**2 <= 2**30.
+    Sinks are per-head zero-value logits: include them in the shared maximum
+    and add their denominator mass once.
+    """
+    architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    if architecture not in ("gfx942", "gfx950", "gfx1250"):
+        raise NotImplementedError(f"PA decode reducer does not support {architecture}")
+    wave = 32 if architecture == "gfx1250" else WAVE
+    register_partitions = min(REGISTER_PARTITIONS, wave)
+    max_cta_waves = MAX_CTA_WAVES * WAVE // wave
+    partitions = max_context_partition_num
+    if partitions < 1:
+        raise ValueError(
+            f"max_context_partition_num must be positive, got {partitions}"
+        )
+    if head_size <= 0 or head_size > 1024 or head_size % 64:
+        raise ValueError(
+            f"head_size must be a multiple of 64 in [64, 1024], got {head_size}"
+        )
+    for dtype_str in (output_dtype_str, logits_dtype_str, sink_dtype_str):
+        if dtype_str not in ("f32", "f16", "bf16"):
+            raise ValueError(f"Unsupported FlyDSL dtype: {dtype_str!r}")
+    if query_group_size <= 0:
+        raise ValueError(f"query_group_size must be positive, got {query_group_size}")
+    if pairs and (head_size % 128 or logits_dtype_str not in ("bf16", "f16")):
+        raise ValueError("pairs requires D % 128 == 0 and bf16/f16 logits")
+    elems = 2 if pairs else 1
+    group_waves = head_size // elems // wave
+    dual = partitions > register_partitions
+    groups = parallel_groups
+    if groups < 1 or groups & (groups - 1):
+        raise ValueError(f"parallel_groups must be a power of two, got {groups}")
+    if groups > 1 and not dual:
+        raise ValueError(f"parallel_groups > 1 requires NP > {register_partitions}")
+    if groups * group_waves > max_cta_waves:
+        raise ValueError(f"{groups} groups of {group_waves} waves exceed the CTA")
+    if num_xcds < 0:
+        raise ValueError(f"num_xcds must be nonnegative, got {num_xcds}")
+
+    output_dtype = _FX_ELEM[output_dtype_str]
+    logits_dtype = _FX_ELEM[logits_dtype_str]
+    sink_dtype = _FX_ELEM[sink_dtype_str]
+    log2e = 1.4426950408889634
+
+    low_rungs = high_rungs = dual_rungs = lds_rungs = ()
+    if not dual:
+        block = [head_size // elems, 1, 1]
+        # NP <= 8 is one rung; above, test c > 8 first, then the largest rung
+        # in each half.
+        low_rungs = (1, 2, 4, 8)
+        high_rungs = tuple(r for r in (16, 32) if r < partitions) + (partitions,)
     else:
-        LOGITS_DTYPE = fx.BFloat16
-    if output_dtype_str == "f32":
-        OUTPUT_DTYPE = fx.Float32
-    elif output_dtype_str == "f16":
-        OUTPUT_DTYPE = fx.Float16
-    else:
-        OUTPUT_DTYPE = fx.BFloat16
-    block_threads = head_size
-    assert block_threads > 0, "head_size must be positive"
-    assert block_threads <= 1024, "head_size must fit in one workgroup"
-    reduce_width = (
-        1
-        if max_context_partition_num <= 1
-        else 1 << ((max_context_partition_num - 1).bit_length())
-    )
-    reduce_shuffle_offsets = [off for off in [32, 16, 8, 4, 2, 1] if off < reduce_width]
-    red_slots = max(1, (block_threads + WARP_SIZE - 1) // WARP_SIZE)
+        block = [wave, group_waves * groups, 1]
+        dual_rungs = (1, 2, 4, 8, 16, DUAL_REGISTER_PARTITIONS)
+        # Group g owns partitions [g * R, (g + 1) * R) for the selected rung R.
+        # Above 32 live partitions the first rung covers up to 64.
+        per_group = -(-partitions // groups)
+        rung = max(1, 2 * DUAL_REGISTER_PARTITIONS // groups)
+        while rung < per_group:
+            lds_rungs += (rung,)
+            rung *= 2
+        lds_rungs += (per_group,)
+    # Bounds above 32 leave 1-2 live partitions in rungs whose first load LLVM
+    # would otherwise hoist above the count branch; issuing rung 2's loads in
+    # reverse keeps them inside it.
+    reverse_pair = not dual and partitions > 32
+    # Groups tile whole wave-sized weight chunks, so their slots stay in range.
+    weight_chunks = -(-partitions // wave)
 
     @fx.struct
     class SharedStorage:
-        red: fx.Array[fx.Float32, red_slots, 16]
-        part_weights: fx.Array[fx.Float32, max_context_partition_num, 16]
+        weights: fx.Array[fx.Float32, weight_chunks * wave, 16]
+        partials: fx.Array[fx.Float32, max(1, (groups - 1) * head_size), 16]
 
-    @flyc.kernel(known_block_size=(block_threads, 1, 1))
-    def pa_decode_sw_reduce_kernel(
-        # Raw-pointer kernargs: bare i64 data_ptr() (strides are explicit args).
-        output_ptr: fx.Int64,
-        exp_sums_ptr: fx.Int64,
-        max_logits_ptr: fx.Int64,
-        logits_ptr: fx.Int64,
+    kernel_name = (
+        f"pa_decode_reduce_kernel_o{output_dtype_str}_d{head_size}"
+        f"_np{partitions}_gqa{query_group_size}"
+    )
+    if use_sinks:
+        kernel_name += "_sinks"
+    if pairs:
+        kernel_name += "_pairs"
+    if groups > 1:
+        kernel_name += f"_g{groups}"
+    if num_xcds:
+        kernel_name += f"_xcd{num_xcds}"
+
+    @flyc.kernel(name=kernel_name, known_block_size=block)
+    def pa_decode_reduce_kernel(
+        output_ptr: fx.Pointer,
+        exp_sums_ptr: fx.Pointer,
+        max_logits_ptr: fx.Pointer,
+        logits_ptr: fx.Pointer,
+        sink_token_ptr: fx.Pointer,
         stride_output_bs: fx.Int32,
         stride_output_len: fx.Int32,
         stride_output_kv_head: fx.Int32,
         stride_output_group_size: fx.Int32,
-        stride_exp_sums_seq: fx.Int32,
         stride_exp_sums_head: fx.Int32,
         stride_exp_sums_part: fx.Int32,
-        stride_logits_seq: fx.Int32,
         stride_logits_head: fx.Int32,
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
+        reduce_info_ptr: fx.Pointer,
+        query_rows: fx.Int32,
+        num_kv_heads: fx.Int32,
+        num_ctas: fx.Int32,
+        rows_magic: fx.Int32,
+        seq_magic: fx.Int32,
     ):
-        tid = fx.Int32(gpu.thread_id("x"))
-        batch_idx = fx.Int32(gpu.block_id("x"))
-        kv_head_idx = fx.Int32(gpu.block_id("y"))
-        eqgs_idx = fx.Int32(gpu.block_id("z"))
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        red_scratch = lds.red.view(fx.make_layout(red_slots, 1))
-        if const_expr(max_context_partition_num > WARP_SIZE):
-            part_weights_lds = lds.part_weights.view(
-                fx.make_layout(max_context_partition_num, 1)
+        if fx.const_expr(num_xcds > 0):
+            # Hardware deals linear workgroup ids round-robin over XCDs. Give
+            # each XCD a contiguous run of (sequence, KV head, row) so rows
+            # whose statistics share cache lines share an L2.
+            linear = fx.block_idx.x
+            xcd = urem_const(linear, num_xcds)
+            per_xcd = udiv_const(num_ctas, num_xcds)
+            extra = urem_const(num_ctas, num_xcds)
+            logical = (
+                xcd * per_xcd
+                + (xcd < extra).select(xcd, extra)
+                + udiv_const(linear, num_xcds)
             )
-
-        def _divide_addr(addr, dtype):
-            return fx.logical_divide(
-                ptr_buf_tensor(addr, elem=dtype, n=_FLAT_BUFFER_ELEMENTS),
-                fx.make_layout(1, 1),
-            )
-
-        output = _divide_addr(output_ptr, OUTPUT_DTYPE)
-        exp_sums = _divide_addr(exp_sums_ptr, fx.Float32)
-        max_logits = _divide_addr(max_logits_ptr, fx.Float32)
-        logits = _divide_addr(logits_ptr, LOGITS_DTYPE)
-
-        copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        copy_logits = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy32b()
-                if LOGITS_DTYPE.width == 32
-                else fx.rocdl.BufferCopy16b()
-            ),
-            LOGITS_DTYPE,
-        )
-        copy_output = fx.make_copy_atom(
-            (
-                fx.rocdl.BufferCopy32b()
-                if OUTPUT_DTYPE.width == 32
-                else fx.rocdl.BufferCopy16b()
-            ),
-            OUTPUT_DTYPE,
-        )
-        f32_register = fx.make_rmem_tensor(1, fx.Float32)
-        logits_register = fx.make_rmem_tensor(1, LOGITS_DTYPE)
-        output_register = fx.make_rmem_tensor(1, OUTPUT_DTYPE)
-
-        c_zero_f = fx.Float32(0.0)
-        c_one_f = fx.Float32(1.0)
-        c_neg_inf = fx.Float32(float("-inf"))
-        c_log2e = fx.Float32(LOG2E)
-        fm_fast = arith.FastMathFlags.fast
-
-        c_w = fx.Int32(WARP_SIZE)
-        c_wave_mask = fx.Int32(WARP_SIZE - 1)
-        c_red_slots = fx.Int32(red_slots)
-        lane = tid & c_wave_mask
-        wave = fx.Int32(tid >> fx.Int32(6))
-
-        def _wave_reduce_max_full(val):
-            red = val
-            for sh in [32, 16, 8, 4, 2, 1]:
-                red = fx.max(red, red.shuffle_xor(fx.Int32(sh), c_w))
-            return red
-
-        def _wave_reduce_sum_full(val):
-            red = val
-            for sh in [32, 16, 8, 4, 2, 1]:
-                red = red.addf(
-                    red.shuffle_xor(fx.Int32(sh), c_w),
-                    fastmath=fm_fast,
-                )
-            return red
-
-        def _block_reduce(val, mode):
-            if const_expr(red_slots == 1):
-                return (
-                    _wave_reduce_max_full(val)
-                    if const_expr(mode == "max")
-                    else _wave_reduce_sum_full(val)
-                )
-
-            neutral = c_neg_inf if const_expr(mode == "max") else c_zero_f
-            w = (
-                _wave_reduce_max_full(val)
-                if const_expr(mode == "max")
-                else _wave_reduce_sum_full(val)
-            )
-
-            if lane == 0:
-                wave_idx = fx.Int32(wave)
-                fx.memref_store(w, red_scratch, wave_idx)
-            gpu.barrier()
-
-            if wave == 0:
-                in_range = lane < c_red_slots
-                lane_safe = in_range.select(lane, 0)
-                lane_safe_idx = fx.Int32(lane_safe)
-                red_val = fx.memref_load(red_scratch, lane_safe_idx)
-                red_val = in_range.select(red_val, neutral)
-                red_val = (
-                    _wave_reduce_max_full(red_val)
-                    if const_expr(mode == "max")
-                    else _wave_reduce_sum_full(red_val)
-                )
-                if lane == 0:
-                    fx.memref_store(red_val, red_scratch, 0)
-            gpu.barrier()
-
-            return fx.memref_load(red_scratch, 0)
-
-        if const_expr(max_context_partition_num <= WARP_SIZE):
-            c_part_num = fx.Int32(max_context_partition_num)
-            c_reduce_width = fx.Int32(reduce_width)
-
-            def _wave_reduce_max(val):
-                red = val
-                for sh in reduce_shuffle_offsets:
-                    red = fx.max(red, red.shuffle_xor(fx.Int32(sh), c_w))
-                return red
-
-            def _wave_reduce_sum(val):
-                red = val
-                for sh in reduce_shuffle_offsets:
-                    red = red.addf(
-                        red.shuffle_xor(fx.Int32(sh), c_w),
-                        fastmath=fm_fast,
-                    )
-                return red
-
-            lane_in_range = lane < c_part_num
-            lane_in_reduce = lane < c_reduce_width
-            part_sum = c_zero_f
-            part_max = c_neg_inf
-            if lane_in_reduce:
-                part_i32 = lane_in_range.select(lane, 0)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
-                part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = lane_in_range.select(part_sum_raw, c_zero_f)
-                part_max = lane_in_range.select(part_max_raw, c_neg_inf)
-
-            global_max = _wave_reduce_max(part_max)
-            part_scale = lane_in_range.select(
-                exp2_f32_fast((part_max - global_max) * c_log2e), c_zero_f
-            )
-            scaled_sum = part_sum * part_scale
-            global_exp_sum = _wave_reduce_sum(scaled_sum)
-            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
-                global_exp_sum, c_one_f
-            )
-            inv_global_exp_sum = rcp_f32(safe_global_exp_sum)
-            weight_local = scaled_sum * inv_global_exp_sum
-            weight_local_i32 = weight_local.bitcast(fx.Int32)
-
-            acc = c_zero_f
-            for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = fx.Int32(part_idx)
-                bcast_addr = part_i32 * 4
-                weight_i32 = rocdl.ds_bpermute(
-                    T.i32, bcast_addr.ir_value(), weight_local_i32.ir_value()
-                )
-                weight = fx.Int32(weight_i32).bitcast(fx.Float32)
-                logits_off = (
-                    batch_idx * stride_logits_seq
-                    + kv_head_idx * stride_logits_head
-                    + part_i32 * stride_logits_part
-                    + eqgs_idx * stride_logits_group
-                    + tid
-                )
-                part_logits_raw = _copy_load(
-                    logits, logits_off, copy_logits, logits_register
-                )[0]
-                part_logits = fx.Float32(part_logits_raw)
-                acc = acc + part_logits * weight
+            batch_idx = _fast_div(logical, seq_magic)
+            inner = logical - batch_idx * (query_rows * num_kv_heads)
+            kv_head_idx = _fast_div(inner, rows_magic)
+            row_idx = inner - kv_head_idx * query_rows
         else:
-            # More than one wave is needed when NP exceeds 64.
-            global_max = c_neg_inf
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = fx.Int32(chunk_size)
-                c_chunk_base = fx.Int32(chunk_base)
-                in_chunk = tid < c_chunk_size
-                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_max = in_chunk.select(part_max_raw, c_neg_inf)
-                chunk_max = _block_reduce(part_max, "max")
-                global_max = fx.max(global_max, chunk_max)
+            batch_idx = fx.block_idx.x
+            kv_head_idx = fx.block_idx.y
+            row_idx = fx.block_idx.z
 
-            global_exp_sum = c_zero_f
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = fx.Int32(chunk_size)
-                c_chunk_base = fx.Int32(chunk_base)
-                in_chunk = tid < c_chunk_size
-                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
-                part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = in_chunk.select(part_sum_raw, c_zero_f)
-                part_max = in_chunk.select(part_max_raw, c_neg_inf)
-                part_scale = in_chunk.select(
-                    exp2_f32_fast((part_max - global_max) * c_log2e), c_zero_f
-                )
-                chunk_sum = _block_reduce(part_sum * part_scale, "sum")
-                global_exp_sum = global_exp_sum + chunk_sum
+        output = fx.recast_iter(output_dtype, output_ptr)
+        exp_sums = fx.recast_iter(fx.Float32, exp_sums_ptr)
+        max_logits = fx.recast_iter(fx.Float32, max_logits_ptr)
+        reduce_info = fx.recast_iter(fx.Int32, reduce_info_ptr)
 
-            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
-                global_exp_sum, c_one_f
-            )
-            inv_global_exp_sum = rcp_f32(safe_global_exp_sum)
-
-            for chunk_base in range(0, max_context_partition_num, block_threads):
-                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = fx.Int32(chunk_size)
-                c_chunk_base = fx.Int32(chunk_base)
-                in_chunk = tid < c_chunk_size
-                part_i32 = in_chunk.select(tid + c_chunk_base, 0)
-                es_off = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + part_i32 * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                part_sum_raw = _copy_load(exp_sums, es_off, copy_f32, f32_register)[0]
-                part_max_raw = _copy_load(max_logits, es_off, copy_f32, f32_register)[0]
-                part_sum = in_chunk.select(part_sum_raw, c_zero_f)
-                part_max = in_chunk.select(part_max_raw, global_max)
-                part_scale = exp2_f32_fast((part_max - global_max) * c_log2e)
-                weight = part_sum * part_scale * inv_global_exp_sum
-                if in_chunk:
-                    part_idx_idx = fx.Int32(part_i32)
-                    fx.memref_store(weight, part_weights_lds, part_idx_idx)
-
-            gpu.barrier()
-
-            acc = c_zero_f
-            for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = fx.Int32(part_idx)
-                part_idx_idx = fx.Int32(part_idx)
-                weight = fx.memref_load(part_weights_lds, part_idx_idx)
-                logits_off = (
-                    batch_idx * stride_logits_seq
-                    + kv_head_idx * stride_logits_head
-                    + part_i32 * stride_logits_part
-                    + eqgs_idx * stride_logits_group
-                    + tid
-                )
-                part_logits_raw = _copy_load(
-                    logits, logits_off, copy_logits, logits_register
-                )[0]
-                part_logits = fx.Float32(part_logits_raw)
-                acc = acc + part_logits * weight
-
-        query_idx = udiv_const(eqgs_idx, query_group_size)
-        group_idx = urem_const(eqgs_idx, query_group_size)
-        out_off = (
+        zero_f = fx.Float32(0.0)
+        one_f = fx.Float32(1.0)
+        neg_inf = fx.Float32(float("-inf"))
+        c_log2e = fx.Float32(log2e)
+        zero_i = fx.Int32(0)
+        c_wave = fx.Int32(wave)
+        lane = fx.thread_idx.x & fx.Int32(wave - 1)
+        group_idx = urem_const(row_idx, query_group_size)
+        query_idx = udiv_const(row_idx, query_group_size)
+        output_base = (
             batch_idx * stride_output_bs
             + query_idx * stride_output_len
             + kv_head_idx * stride_output_kv_head
             + group_idx * stride_output_group_size
-            + tid
         )
-        out_val = acc if const_expr(output_dtype_str == "f32") else acc.to(OUTPUT_DTYPE)
-        _copy_store(
-            output,
-            out_off,
-            copy_output,
-            output_register,
-            fx.Vector.from_elements([out_val], dtype=OUTPUT_DTYPE),
+        if fx.const_expr(use_sinks):
+            sink_token = fx.recast_iter(sink_dtype, sink_token_ptr)
+            sink_value = fx.Float32(
+                sink_token[kv_head_idx * fx.Int32(query_group_size) + group_idx]
+            )
+
+        first_part = fx.Int32(reduce_info[batch_idx * 2])
+        part_count = fx.Int32(reduce_info[batch_idx * 2 + 1])
+        # Empty sequences may point past packed storage; clamped loads need
+        # slot 0. Every inactive value is masked before arithmetic.
+        first_part = (part_count > zero_i).select(first_part, zero_i)
+        stats_seq_offset = first_part * stride_exp_sums_part
+        # Rebase in i64 before narrowing: packed storage can exceed 2 GiB. A
+        # count of 0 gives a zero-sized descriptor that returns zeros.
+        logits_item_bytes = logits_dtype.width // 8
+        logits_buffer = ptr_buf_tensor(
+            buf_base_i64(logits_ptr)
+            + (
+                fx.Int64(first_part) * fx.Int64(stride_logits_part)
+                + fx.Int64(kv_head_idx) * fx.Int64(stride_logits_head)
+            )
+            * logits_item_bytes,
+            logits_dtype,
+            unit_elems=elems,
+            unit_stride=1,
+            num_records_bytes=fx.Int64(part_count)
+            * fx.Int64(stride_logits_part)
+            * logits_item_bytes,
         )
 
+        def _zero():
+            if fx.const_expr(pairs):
+                return fx.full(2, 0.0, fx.Float32)
+            return zero_f
+
+        def _load_logits(part, unit):
+            return buf_copy_load(
+                logits_buffer,
+                part * stride_logits_part
+                + row_idx * stride_logits_group
+                + unit * fx.Int32(elems),
+                logits_dtype,
+                unit_elems=elems,
+            )
+
+        def _to_f32(value):
+            if fx.const_expr(pairs):
+                return value.to(fx.Float32)
+            return fx.Float32(value)
+
+        def _store(acc, unit):
+            # Output rows need only element alignment, so pairs store scalars.
+            offset = output_base + unit * fx.Int32(elems)
+            if fx.const_expr(pairs):
+                output[offset] = acc[0].to(output_dtype)
+                output[offset + fx.Int32(1)] = acc[1].to(output_dtype)
+            else:
+                output[offset] = acc.to(output_dtype)
+
+        def _lane_stats(chunk):
+            # Lane l owns partition l + wave * chunk; part_count <= NP.
+            part = lane + fx.Int32(chunk * wave)
+            live = part < part_count
+            offset = (
+                stats_seq_offset
+                + kv_head_idx * stride_exp_sums_head
+                + live.select(part, zero_i) * stride_exp_sums_part
+                + row_idx
+            )
+            part_sum = live.select(fx.Float32(exp_sums[offset]), zero_f)
+            part_max = live.select(fx.Float32(max_logits[offset]), neg_inf)
+            return part_sum, part_max
+
+        def _softmax_weights(sums, maxes, offsets):
+            lane_max = maxes[0]
+            for part_max in maxes[1:]:
+                lane_max = lane_max.maximumf(part_max)
+            for offset in offsets:
+                lane_max = lane_max.maximumf(
+                    lane_max.shuffle_xor(fx.Int32(offset), c_wave)
+                )
+            if fx.const_expr(use_sinks):
+                lane_max = lane_max.maximumf(sink_value)
+            safe_max = (lane_max > neg_inf).select(lane_max, zero_f)
+            scaled = []
+            for part_sum, part_max in zip(sums, maxes):
+                scale = (part_max > neg_inf).select(
+                    fx.exp2((part_max - safe_max) * c_log2e, fastmath="fast"), zero_f
+                )
+                scaled.append(part_sum * scale)
+            exp_sum = scaled[0]
+            for value in scaled[1:]:
+                exp_sum = exp_sum + value
+            for offset in offsets:
+                exp_sum = fx.Float32(
+                    exp_sum.addf(
+                        exp_sum.shuffle_xor(fx.Int32(offset), c_wave),
+                        fastmath="fast",
+                    )
+                )
+            if fx.const_expr(use_sinks):
+                # +inf sinks have unit mass at the shared max and suppress KV;
+                # -inf contributes zero, including for an empty request.
+                shift = (sink_value == safe_max).select(zero_f, sink_value - safe_max)
+                exp_sum = exp_sum + fx.exp2(shift * c_log2e, fastmath="fast")
+            inv_exp_sum = fx.Float32(rcp_f32((exp_sum > zero_f).select(exp_sum, one_f)))
+            return [value * inv_exp_sum for value in scaled]
+
+        def _reduce_register(rung, unit):
+            part_sum, part_max = _lane_stats(0)
+            order = range(rung)
+            if fx.const_expr(reverse_pair and rung == 2):
+                order = (1, 0)
+            # Loads stay in the logits dtype until accumulation, so a rung
+            # holds half the registers of its FP32 values.
+            logits = [None] * rung
+            for part in order:
+                logits[part] = _load_logits(fx.Int32(part), unit)
+            # Wave32 reductions broadcast statistics to every output lane,
+            # including lanes without a live partition.
+            offsets = _shuffle_offsets(wave if architecture == "gfx1250" else rung)
+            (weight,) = _softmax_weights([part_sum], [part_max], offsets)
+            acc = _zero()
+            for part in fx.range_constexpr(rung):
+                part_weight = fx.gpu.shuffle_idx(weight, part, wave)
+                # Preserve increasing-part order and separate multiply/add rounding.
+                acc = acc + _to_f32(logits[part]) * part_weight
+            return acc
+
+        def _top_first(rungs, reduce, unit, scale=1):
+            # CTA-uniform count: the largest rung is the first test and the
+            # smallest the fall-through. Branches carry the same acc type.
+            acc = _zero()
+            if fx.const_expr(len(rungs) == 1):
+                acc = reduce(rungs[0], unit)
+            else:
+                if part_count > fx.Int32(rungs[-2] * scale):
+                    acc = reduce(rungs[-1], unit)
+                else:
+                    acc = _top_first(rungs[:-1], reduce, unit, scale)
+            return acc
+
+        def _bottom_first(rungs, reduce, unit):
+            acc = _zero()
+            if fx.const_expr(len(rungs) == 1):
+                acc = reduce(rungs[0], unit)
+            else:
+                if part_count <= fx.Int32(rungs[0]):
+                    acc = reduce(rungs[0], unit)
+                else:
+                    acc = _bottom_first(rungs[1:], reduce, unit)
+            return acc
+
+        if fx.const_expr(not dual):
+            # Select one unrolled rung, so loads past it are skipped rather
+            # than masked.
+            unit = fx.thread_idx.x
+            acc = _zero()
+            if fx.const_expr(partitions <= 8):
+                acc = _reduce_register(partitions, unit)
+            else:
+                if part_count > 8:
+                    acc = _top_first(high_rungs, _reduce_register, unit)
+                else:
+                    acc = _top_first(low_rungs, _reduce_register, unit)
+            _store(acc, unit)
+        else:
+            worker = fx.thread_idx.y
+            partition_group = udiv_const(worker, group_waves)
+            unit = urem_const(worker, group_waves) * c_wave + lane
+
+            def _reduce_lds():
+                # Every thread reaches each barrier; the count is CTA-uniform.
+                storage = fx.SharedAllocator().allocate(SharedStorage).peek()
+                weights = storage.weights
+                partials = storage.partials.view(
+                    fx.make_layout((max(1, groups - 1), head_size), (head_size, 1))
+                )
+                if worker == zero_i:
+                    sums, maxes = [], []
+                    for chunk in fx.range_constexpr(weight_chunks):
+                        part_sum, part_max = _lane_stats(chunk)
+                        sums.append(part_sum)
+                        maxes.append(part_max)
+                    chunk_weights = _softmax_weights(
+                        sums, maxes, _shuffle_offsets(wave)
+                    )
+                    for chunk in fx.range_constexpr(weight_chunks):
+                        weights[lane + fx.Int32(chunk * wave)] = chunk_weights[chunk]
+                fx.gpu.barrier()
+
+                def _group_sum(rung, unit):
+                    # Inactive slots have zero weight and load zero past the
+                    # sequence bound, so they add exactly +0.
+                    group_acc = _zero()
+                    begin = partition_group * fx.Int32(rung)
+                    if begin < part_count:
+                        for local in fx.range_constexpr(rung):
+                            part = begin + fx.Int32(local)
+                            weight = fx.Float32(weights[part])
+                            group_acc = (
+                                group_acc + _to_f32(_load_logits(part, unit)) * weight
+                            )
+                    return group_acc
+
+                acc = _top_first(lds_rungs, _group_sum, unit, groups)
+                if fx.const_expr(groups > 1):
+                    # Idle groups publish +0, so the combine needs no range checks.
+                    if partition_group > zero_i:
+                        if fx.const_expr(pairs):
+                            partials[partition_group - 1, unit * 2] = acc[0]
+                            partials[partition_group - 1, unit * 2 + 1] = acc[1]
+                        else:
+                            partials[partition_group - 1, unit] = acc
+                    fx.gpu.barrier()
+                    if partition_group == zero_i:
+                        for other in fx.range_constexpr(1, groups):
+                            if fx.const_expr(pairs):
+                                acc = acc + fx.Vector.from_elements(
+                                    [
+                                        partials[other - 1, unit * 2],
+                                        partials[other - 1, unit * 2 + 1],
+                                    ],
+                                    dtype=fx.Float32,
+                                )
+                            else:
+                                acc = acc + fx.Float32(partials[other - 1, unit])
+                return acc
+
+            if part_count <= fx.Int32(DUAL_REGISTER_PARTITIONS):
+                # Few live partitions skip LDS and both barriers.
+                if partition_group == zero_i:
+                    register_acc = _bottom_first(dual_rungs, _reduce_register, unit)
+                    _store(register_acc, unit)
+            else:
+                lds_acc = _reduce_lds()
+                if partition_group == zero_i:
+                    _store(lds_acc, unit)
+
     @flyc.jit
-    def launch_pa_decode_sw_reduce(
-        output: fx.Int64,
-        exp_sums: fx.Int64,
-        max_logits: fx.Int64,
-        logits: fx.Int64,
-        stride_output_bs,
-        stride_output_len,
-        stride_output_kv_head,
-        stride_output_group_size,
-        stride_exp_sums_seq,
-        stride_exp_sums_head,
-        stride_exp_sums_part,
-        stride_logits_seq,
-        stride_logits_head,
-        stride_logits_part,
-        stride_logits_group,
-        batch_size,
-        num_kv_heads,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL ABI default.
+    def launch_pa_decode_ps_reduce_kernel(
+        output: fx.Pointer,
+        exp_sums: fx.Pointer,
+        max_logits: fx.Pointer,
+        logits: fx.Pointer,
+        sink_token: fx.Pointer,
+        stride_output_bs: fx.Int32,
+        stride_output_len: fx.Int32,
+        stride_output_kv_head: fx.Int32,
+        stride_output_group_size: fx.Int32,
+        stride_exp_sums_head: fx.Int32,
+        stride_exp_sums_part: fx.Int32,
+        stride_logits_head: fx.Int32,
+        stride_logits_part: fx.Int32,
+        stride_logits_group: fx.Int32,
+        query_seq_len: fx.Int32,
+        batch_size: fx.Int32,
+        num_kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
+        rows_magic: fx.Int32,
+        seq_magic: fx.Int32,
+        stream: fx.Stream,
     ):
-        pa_decode_sw_reduce_kernel(
+        query_rows = query_seq_len * fx.Int32(query_group_size)
+        num_ctas = batch_size * num_kv_heads * query_rows
+        pa_decode_reduce_kernel(
             output,
             exp_sums,
             max_logits,
             logits,
+            sink_token,
             stride_output_bs,
             stride_output_len,
             stride_output_kv_head,
             stride_output_group_size,
-            stride_exp_sums_seq,
             stride_exp_sums_head,
             stride_exp_sums_part,
-            stride_logits_seq,
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
+            reduce_info,
+            query_rows,
+            num_kv_heads,
+            num_ctas,
+            rows_magic,
+            seq_magic,
         ).launch(
-            grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
-            block=(block_threads, 1, 1),
+            grid=(
+                (num_ctas, 1, 1)
+                if num_xcds > 0
+                else (batch_size, num_kv_heads, query_rows)
+            ),
+            block=tuple(block),
             stream=stream,
         )
 
     return {
-        "launch": launch_pa_decode_sw_reduce,
-        "kernel": pa_decode_sw_reduce_kernel,
+        "launch": launch_pa_decode_ps_reduce_kernel,
+        "kernel": pa_decode_reduce_kernel,
     }

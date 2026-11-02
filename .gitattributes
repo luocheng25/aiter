@@ -1,1 +1,4 @@
 *.csv text eol=lf
+# Preserve the exact bytes pinned by the MiMo qualification evidence.
+/mimo_v2.6_flash_decode_adaptive_a8w4.csv -text
+/mimo_v2.6_flash_tp4_tp8_mixed_eval.csv -text

@@ -18,7 +18,7 @@ from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+from .kernels_common import get_warp_size
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -47,7 +47,7 @@ def ptr_rsrc(ptr, num_records_bytes=None):
     ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
     zero-fills rather than reading stale bytes.
     """
-    from aiter.ops.flydsl.kernels import buffer_ops
+    from . import buffer_ops
 
     return buffer_ops.create_buffer_resource_from_addr(
         fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
@@ -56,7 +56,7 @@ def ptr_rsrc(ptr, num_records_bytes=None):
 
 def buf_load_scalar(rsrc, dword_index, dwords=4):
     """Uniform load of ``dwords`` dwords from *rsrc*, landing directly in SGPRs."""
-    from aiter.ops.flydsl.kernels import buffer_ops
+    from . import buffer_ops
 
     return buffer_ops.buffer_load(rsrc, dword_index, vec_width=dwords, is_scalar=True)
 

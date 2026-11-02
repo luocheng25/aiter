@@ -1,295 +1,450 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Full-attention PA decode with BF16 or FP8 vectorized KV caches.
+"""FP8 or BF16 paged-attention decode on gfx942/gfx950/gfx1250.
 
-Packed query/output rows have a uniform query length per request. Context
-lengths include those query tokens; masking is bottom-right causal.
-Small physical pages (16/64) are supported. The optimized gfx950 Q8 path
-uses GQA16, page64 and D128/V128 or D192/V128.
-gfx942 BF16 Q8/GQA16/page64 D192/V128 uses four query splits with native
-K16 BF16 MFMA and the existing normalized-partial reduction.
-
-Metadata and KV caches must be dense on the query device. Pass GPU scalar
-FP8 scales and preallocated partials before graph capture. Explicit NP16 is
-recommended for the measured B96/C65536 BF16 workload; automatic splits retain
-the existing cap of eight. FP8 storage uses BF16 computation for contexts <=512
-on the optimized Q8 path. BF16 D128/V128 additionally supports causal sliding
-windows and per-head sinks. FP8 remains full-attention only; query lengths
-are uniform within a batch.
-
-This module does not change AITER's existing attention dispatcher.
+Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
+OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
+MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
+K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
-from dataclasses import replace
-
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
-from packaging.version import Version
 
-from . import _base_version
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.utility import dtypes
 
-if _base_version < Version("0.3.2"):
-    raise ImportError("FlyDSL PA decode requires flydsl >= 0.3.2")
-
-from flydsl.runtime.device import get_rocm_arch
-
-from .kernels.pa_decode_kernel import compile_pa_decode_tile
-from .kernels.pa_decode_plan import (
-    KV_COMPUTE_BLOCK as KV_COMPUTE_BLOCK,  # noqa: PLC0414 - Compatibility export.
+from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_plan import PADecodePlan
+from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
+from .kernels.pa_decode_reduce import (
+    DUAL_REGISTER_PARTITIONS,
+    REGISTER_PARTITIONS,
+    compile_pa_decode_ps_reduce,
 )
-from .kernels.pa_decode_plan import (
-    get_recommended_splits as get_recommended_splits,  # noqa: PLC0414 - Compatibility export.
-)
-from .kernels.pa_decode_plan import make_pa_decode_plan
-from .kernels.tensor_shim import _run_compiled
-
-_PA_DECODE_PS_SMALL_BLOCK_SIZES = (16, 64)
+from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
-def _is_current_stream_capturing() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return torch.cuda.is_current_stream_capturing()
-    except RuntimeError:
-        return False
+def _flydsl_pointer_dtype(dtype: torch.dtype):
+    return {
+        torch.float32: fx.Float32,
+        torch.float16: fx.Float16,
+        torch.bfloat16: fx.BFloat16,
+        torch.float8_e4m3fn: fx.Float8E4M3FN,
+        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
+        torch.int32: fx.Int32,
+    }[dtype]
 
 
-def _prepare_scale_tensor(
-    name: str,
-    scale,
-    *,
-    device: torch.device,
-    is_graph_capturing: bool,
-) -> torch.Tensor:
-    if isinstance(scale, torch.Tensor):
-        if is_graph_capturing:
-            if scale.device != device:
-                raise ValueError(
-                    f"CUDA graph capture requires `{name}` to already be on {device}, "
-                    f"got {scale.device}."
-                )
-            if scale.dtype != torch.float32:
-                raise ValueError(
-                    f"CUDA graph capture requires `{name}` to already be float32, "
-                    f"got {scale.dtype}."
-                )
-            return scale
-        return scale.to(device=device, dtype=torch.float32)
-
-    if is_graph_capturing:
-        raise ValueError(
-            f"CUDA graph capture requires `{name}` to be passed as a pre-created "
-            "float32 tensor on the target device."
-        )
-
-    return torch.tensor(
-        [float(1.0 if scale is None else scale)], device=device, dtype=torch.float32
-    )
-
-
-def _require_stream_scale_tensors(device, key_scale, value_scale):
-    for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
-        if (
-            not isinstance(scale, torch.Tensor)
-            or scale.device != device
-            or scale.dtype != torch.float32
-        ):
-            raise ValueError(
-                f"Explicit-stream PA decode requires pre-created float32 {name} on {device}"
-            )
-
-
-def _get_output_dtype_str(output: torch.Tensor) -> str:
-    if output.dtype == torch.bfloat16:
-        return "bf16"
-    if output.dtype == torch.float16:
-        return "f16"
-    if output.dtype == torch.float32:
-        return "f32"
-    raise ValueError(
-        f"Unsupported output dtype for pa_decode_ps_launch reduce: {output.dtype}. "
-        "Expected bf16, f16, or f32."
-    )
-
-
-def _validate_metadata(query, block_tables, context_lengths):
-    if context_lengths.ndim != 1 or context_lengths.numel() == 0:
-        raise ValueError(
-            "pa_decode_tile: context_lengths must be a non-empty 1D tensor, "
-            f"got shape {tuple(context_lengths.shape)}"
-        )
-    num_seqs = context_lengths.shape[0]
-    if (
-        block_tables.ndim != 2
-        or block_tables.shape[0] != num_seqs
-        or block_tables.shape[1] == 0
-    ):
-        raise ValueError(
-            f"pa_decode_tile: block_tables must have shape [{num_seqs}, max_blocks > 0], "
-            f"got {tuple(block_tables.shape)}"
-        )
-    for name, metadata in (
-        ("block_tables", block_tables),
-        ("context_lengths", context_lengths),
-    ):
-        if metadata.device != query.device:
-            raise ValueError(
-                f"pa_decode_tile: {name} must be on {query.device}, got {metadata.device}"
-            )
-        if not metadata.is_contiguous():
-            raise ValueError(
-                f"pa_decode_tile: {name} must be contiguous, got strides {metadata.stride()}"
-            )
-
-
-def pa_decode_tile(
+def launch_pa_decode_ps_reduce(
     output: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    context_lengths: torch.Tensor,
-    key_scale: float | torch.Tensor | None,
-    value_scale: float | torch.Tensor | None,
-    softmax_scale: float | None = None,
-    stream=None,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    logits: torch.Tensor,
+    sink_token: torch.Tensor | None,
+    stride_output_bs: int,
+    stride_output_len: int,
+    stride_output_kv_head: int,
+    stride_output_group_size: int,
+    stride_exp_sums_head: int,
+    stride_exp_sums_part: int,
+    stride_logits_head: int,
+    stride_logits_part: int,
+    stride_logits_group: int,
     *,
-    num_partitions: int | None = None,
-    pmax: torch.Tensor | None = None,
-    psum: torch.Tensor | None = None,
-    pout: torch.Tensor | None = None,
+    query_seq_len: int,
+    query_group_size: int,
+    head_size: int,
+    max_partitions: int,
+    stream: torch.cuda.Stream,
+    reduce_info: torch.Tensor,
+) -> None:
+    """Reduce packed partials; every sequence has at most ``max_partitions``."""
+    props = torch.cuda.get_device_properties(output.device)
+    if max_partitions > props.multi_processor_count:
+        raise ImportError(
+            "FlyDSL pa_decode reduce supports at most "
+            f"{props.multi_processor_count} partitions"
+        )
+    arch = get_gfx_runtime()
+    wave = props.warp_size
+    register_partitions = min(REGISTER_PARTITIONS, wave)
+    max_cta_waves = 1024 // wave
+    batch, kv_heads = output.shape[0], output.shape[2]
+    rows = query_seq_len * query_group_size
+    # Exact bounds keep the register ladder short; above a wave a power of two
+    # bounds the specialization count. Per-sequence buffer bounds zero-fill
+    # partitions beyond the live count, so rounding past the bound is safe.
+    partitions = max_partitions
+    if partitions > register_partitions:
+        partitions = min(
+            props.multi_processor_count, 1 << (partitions - 1).bit_length()
+        )
+    # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
+    # including inactive partitions, below 2**32, so out-of-bounds reads
+    # cannot wrap back into valid data.
+    if not (
+        stride_logits_group == head_size
+        and stride_logits_part == rows * head_size
+        and 0 <= stride_logits_head <= 2**31 - 1
+        and partitions * stride_logits_part * logits.element_size() <= 2**31 - 1
+    ):
+        raise NotImplementedError(
+            "FlyDSL pa_decode reduce requires packed partial rows spanning at "
+            "most 2**31 - 1 bytes per sequence"
+        )
+    # Paired loads need dword alignment; scalar output stores do not. The
+    # register-only kernel pairs only D128/D256: at larger heads, halving its
+    # waves costs more latency hiding than the wider loads save.
+    dual = partitions > register_partitions
+    pairs = (
+        (head_size % 128 == 0 if dual else head_size in (128, 256))
+        and logits.dtype in (torch.bfloat16, torch.float16)
+        and logits.data_ptr() % 4 == 0
+        and stride_logits_head % 2 == 0
+    )
+    ctas = batch * kv_heads * rows
+    groups, num_xcds = 1, 0
+    if dual:
+        # Partition groups fill the CTA while the grid stays within 16 waves
+        # per CU. D128 sequences averaging at most 32 partitions keep one.
+        group_waves = head_size // wave // (2 if pairs else 1)
+        budget = max_cta_waves * props.multi_processor_count
+        if head_size != 128 or exp_sums.shape[1] > DUAL_REGISTER_PARTITIONS * batch:
+            while (
+                2 * groups * group_waves <= max_cta_waves
+                and 2 * groups * group_waves * ctas <= budget
+            ):
+                groups *= 2
+        per_seq = rows * kv_heads
+        if ctas * group_waves >= budget and batch * per_seq * per_seq <= 2**30:
+            num_xcds = get_num_xcds()
+    num_xcds = num_xcds if num_xcds > 1 else 0
+    compiled = compile_pa_decode_ps_reduce(
+        architecture=arch,
+        max_context_partition_num=partitions,
+        head_size=head_size,
+        output_dtype_str=get_dtype_str(output.dtype),
+        logits_dtype_str=get_dtype_str(logits.dtype),
+        sink_dtype_str=get_dtype_str(
+            output.dtype if sink_token is None else sink_token.dtype
+        ),
+        use_sinks=sink_token is not None,
+        query_group_size=query_group_size,
+        pairs=pairs,
+        parallel_groups=groups,
+        num_xcds=num_xcds,
+    )
+    sink_ptr = (
+        flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
+        if sink_token is None
+        else ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
+    )
+    _run_compiled(
+        compiled["launch"],
+        ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+        ptr_arg(exp_sums, fx.Float32),
+        ptr_arg(max_logits, fx.Float32),
+        ptr_arg(logits, _flydsl_pointer_dtype(logits.dtype)),
+        sink_ptr,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group,
+        query_seq_len,
+        batch,
+        kv_heads,
+        ptr_arg(reduce_info, fx.Int32),
+        -(-(1 << 30) // rows),
+        -(-(1 << 30) // (rows * kv_heads)),
+        stream,
+    )
+
+
+def pa_decode(
+    output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, value_head_size]
+    query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, value_head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, value_head_size, x]
+    context_lengths: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    softmax_scale: float,
+    query_length: int,
+    *,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype | None = None,
+    query_scale: torch.Tensor = None,
+    key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
+    value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
+    exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
+    max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
+    temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, value_head_size]
+    alibi_slopes: torch.Tensor = None,
+    sinks: torch.Tensor = None,
     sliding_window: int = 0,
-    sinks: torch.Tensor | None = None,
+    work_plan: PADecodePlan,
+    max_context_length: int | None = None,
+    mask_unowned_kv: bool = True,
     query_splits: int | None = None,
 ) -> None:
-    """Host entry point. See module docstring for tensor layouts.
+    """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
-    ``num_partitions``/``pmax``/``psum``/``pout`` are optional caller overrides
-    (e.g. for CUDA-graph capture, where nothing may be allocated on-the-fly);
-    when omitted they are picked/allocated here.
+    ``query_splits`` optionally overrides the compiler's query splitting.
+    It must be a positive divisor of ``query_length``; the compiler also
+    checks the selected layout's shared-memory requirements. None retains
+    the existing automatic policy.
 
-    BF16 D128/V128 supports a positive ``sliding_window`` measured in visible
-    keys including the current query. ``sinks`` contains one unscaled natural
-    logit per query head; it contributes to the denominator, not the value sum.
+    Supports page sizes 16/64/128. On gfx942/gfx950, BF16 and FP8 head
+    dimensions are multiples of 64 up to 1024. gfx1250 supports 64 and
+    multiples of 128 up to 1024.
+    K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+    A non-transposed 4D key cache is not implemented.
+
+    The gfx950 FP8 head-256 page-16/64 pipe supports both packed V layouts,
+    per-tensor or per-token scales, and sliding windows, with at most 32
+    query rows (query_length times the GQA group size).
+
+    ``compute_type=None`` infers compute from the cache dtype. BF16 K/V requires
+    no K/V scales and uses x=8; FP8 uses x=16. gfx942/gfx950 require BF16 queries
+    and vectorized 5D BF16 caches. gfx1250 also supports FP16 queries and plain
+    BF16 V caches, with head dimensions 64 or multiples of 128 up to 1024.
+    BF16 Q/P operands stay
+    in BF16 and softmax statistics and MFMA accumulation stay in FP32.
+    gfx942/gfx950 BF16 automatically splits query positions to keep each CTA
+    within 64 KiB of LDS; a single query's GQA rows must fit that limit. gfx1250
+    splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
+    into separate query CTAs. Q/K and V/output head dimensions normally match.
+    gfx942/gfx950 also support Q/K192-V128 with scalar or per-token FP8 KV
+    or native BF16 KV for full attention or any positive sliding window.
+    ALiBi and externally quantized queries are unsupported.
+
+    MTP lengths include the query tokens and use dense causal masking.
+    Independently selected sparse queries need separate table rows and
+    query_length=1. Positive ``sliding_window`` includes each query's own
+    position; nonpositive values disable it.
+
+    ``work_plan`` is required and must be built with ``plan_pa_decode`` before
+    calling decode. ``pa_decode_tuning.prepare_pa_decode_plan`` uses native
+    FlyDSL autotune to select its budget before graph capture. A cache miss uses
+    the device CU count for the gfx950 head-256 pipe shapes and twice that
+    otherwise; ``tune=True`` forces a search during preparation.
+    Decode and graph replay use the explicit plan without accessing autotune. Set its
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, a cap
+    of one writes output directly when sinks are absent and query/output strides
+    match. Other plans use packed scratch and reduction.
+
+    ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
+    query device: unscaled zero-value logits shared across batch/MTP positions.
+    Each contributes once, independently of the window; -inf disables it and
+    +inf suppresses the head's output.
+
+    Refresh ``work_plan`` on the current stream after changing lengths. Its
+    max_partitions is bounded by device CUs. Match sliding_window and, for
+    windowed plans, query_length. Scratch is [KV heads, capacity, query rows
+    (, D)], with query rows = query_length * query_group_size.
+
+    ``max_context_length`` selects the scheduling bound, rounded up to
+    whole pages as in tuning. This keeps the selected specialization independent
+    of extra block-table padding. It is the caller's contract, including for
+    graph replay: every context length that will run must be at most
+    ``max_context_length``. A smaller value still covers the real context:
+    page ids outside the staged window are read from the block table.
+
+    ``mask_unowned_kv`` (default True) zeroes, on gfx942/gfx950, V bytes and
+    K/V scales of tokens at or past each sequence's context length before PV,
+    so pinned block-0 pages and the unwritten tail of the last page may hold
+    any bytes, including NaN. False skips that masking (slightly faster on
+    tiny boundary-tile-only calls); the caller must then keep those bytes and
+    scales finite. gfx1250 ignores it and always requires finite bytes.
+
+    GPU lengths and table entries are not checked. Callers must ensure
+    0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
+    block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    _validate_metadata(query, block_tables, context_lengths)
-    if query.ndim != 3 or output.ndim != 3 or min(query.shape) <= 0:
-        raise ValueError("pa_decode_tile: query/output must be non-empty 3D tensors")
-    if query.device.type != "cuda" or query.device.index != torch.cuda.current_device():
-        raise ValueError("pa_decode_tile: query must be on the current CUDA/HIP device")
-    for name, tensor in (
+    if not isinstance(work_plan, PADecodePlan):
+        raise TypeError("work_plan must be a PADecodePlan")
+    if context_partition_size != KV_COMPUTE_BLOCK:
+        raise NotImplementedError(
+            "pa_decode only supports context_partition_size=256, "
+            f"got {context_partition_size}"
+        )
+    if query_scale is not None:
+        raise NotImplementedError(
+            "pa_decode does not support externally quantized FP8 queries"
+        )
+    if alibi_slopes is not None:
+        raise NotImplementedError("pa_decode does not support ALiBi")
+    if not isinstance(sliding_window, int):
+        raise TypeError("sliding_window must be an int")
+    sliding_window = max(sliding_window, 0)
+    if not isinstance(query_length, int):
+        raise TypeError("query_length must be an int")
+    if query_length < 1:
+        raise ValueError(f"query_length must be positive, got {query_length}")
+    if query_splits is not None and (
+        type(query_splits) is not int
+        or query_splits < 1
+        or query_length % query_splits
+    ):
+        raise ValueError("query_splits must be a positive integer dividing query_length")
+
+    required_tensors = (
         ("output", output),
+        ("query", query),
         ("key_cache", key_cache),
         ("value_cache", value_cache),
-    ):
-        if tensor.device != query.device:
-            raise ValueError(f"pa_decode_tile: {name} must be on {query.device}")
-    for name, tensor in (("key_cache", key_cache), ("value_cache", value_cache)):
-        if not tensor.is_contiguous():
-            raise ValueError(f"pa_decode_tile: {name} must be contiguous")
-    if key_cache.ndim != 5 or value_cache.ndim not in (4, 5):
-        raise ValueError("pa_decode_tile: expected 5D K and 4D/5D V caches")
-    if key_cache.shape[0] != value_cache.shape[0] or min(key_cache.shape) <= 0:
-        raise ValueError(
-            "pa_decode_tile: K/V must have matching, non-empty page counts"
-        )
-    if num_partitions is not None and (
-        isinstance(num_partitions, bool)
-        or not isinstance(num_partitions, int)
-        or num_partitions < 0
-    ):
-        raise ValueError(
-            "pa_decode_tile: num_partitions must be a positive integer, or None/0 for automatic splits"
-        )
-    if stream is not None and (
-        not isinstance(stream, torch.cuda.Stream) or stream.device != query.device
-    ):
-        raise ValueError(
-            "pa_decode_tile: stream must be a torch.cuda.Stream on the query device"
-        )
-    is_graph_capturing = _is_current_stream_capturing()
-    num_seqs = context_lengths.shape[0]
-
-    total_q_rows, num_q_heads, head_dim = query.shape
-    value_head_dim = output.shape[-1]
-    assert (
-        total_q_rows % num_seqs == 0
-    ), f"query.shape[0] ({total_q_rows}) must be a multiple of context_lengths.shape[0] ({num_seqs})"
-    query_length = total_q_rows // num_seqs
-    if (
-        isinstance(sliding_window, bool)
-        or not isinstance(sliding_window, int)
-        or sliding_window < 0
-    ):
-        raise ValueError("sliding_window must be a non-negative integer token count")
-    if sliding_window and (head_dim, value_head_dim) != (128, 128):
-        raise ValueError("FlyDSL draft sliding-window decode requires D128/V128")
-    if sinks is not None and (
-        sinks.device != query.device
-        or sinks.dtype not in (torch.float32, torch.bfloat16)
-        or sinks.shape != (num_q_heads,)
-        or not sinks.is_contiguous()
-    ):
-        raise ValueError(
-            "sinks must be contiguous FP32/BF16 [num_query_heads] on the query device"
-        )
-    _, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
-    arch = str(get_rocm_arch()).split(":", 1)[0]
-    fp8_dtype = torch.float8_e4m3fn if "gfx95" in arch else torch.float8_e4m3fnuz
-    if key_cache.dtype not in (torch.bfloat16, fp8_dtype):
-        raise ValueError(
-            f"pa_decode_tile supports BF16 or {fp8_dtype} KV cache on {arch}, got {key_cache.dtype}"
-        )
-    is_bf16_kv = key_cache.dtype == torch.bfloat16
-    if (sliding_window or sinks is not None) and not is_bf16_kv:
-        raise ValueError("FlyDSL window/sink PA decode requires BF16 KV")
-    kv_dtype = "bf16" if is_bf16_kv else "fp8"
-
-    expected_vector = 8 if is_bf16_kv else 16
-    assert (
-        num_hgroups == head_dim // expected_vector and hgroup_width == expected_vector
-    ), (
-        f"key_cache shape {tuple(key_cache.shape)} does not match head_dim={head_dim}, "
-        f"vector_width={expected_vector}"
+        ("context_lengths", context_lengths),
+        ("block_tables", block_tables),
     )
-    assert block_size in (
-        16,
-        64,
-    ), f"pa_decode_tile only supports block_size in (16, 64), got {block_size}"
+    for name, tensor in required_tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
+            )
+
+    expected_ranks = (
+        ("output", output, (3,)),
+        ("query", query, (3,)),
+        ("key_cache", key_cache, (4, 5)),
+        ("value_cache", value_cache, (4, 5)),
+        ("context_lengths", context_lengths, (1,)),
+        ("block_tables", block_tables, (2,)),
+    )
+    for name, tensor, ranks in expected_ranks:
+        if tensor.dim() not in ranks:
+            expected = " or ".join(f"{rank}D" for rank in ranks)
+            raise ValueError(
+                f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
+            )
+
+    trans_k = key_cache.dim() == 5
+    if not trans_k:
+        raise NotImplementedError("Non-transposed key cache is not implemented")
+
+    num_seqs = context_lengths.shape[0]
+    total_q_rows, num_q_heads, head_dim = query.shape
+    if query.device.type != "cuda":
+        raise ValueError(f"query must be on a CUDA device, got {query.device}")
+    if num_q_heads < 1:
+        raise ValueError(f"query must contain at least one head, got {num_q_heads}")
+    if total_q_rows != num_seqs * query_length:
+        raise ValueError(
+            f"query.shape[0] ({total_q_rows}) must equal "
+            f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
+        )
+    if output.shape[:2] != query.shape[:2]:
+        raise ValueError(
+            f"output token/head shape {tuple(output.shape[:2])} must match "
+            f"query token/head shape {tuple(query.shape[:2])}"
+        )
+    value_dim = output.shape[-1]
+    asymmetric_value = value_dim != head_dim
+    if block_tables.shape[0] != num_seqs:
+        raise ValueError(
+            f"block_tables.shape[0] ({block_tables.shape[0]}) must match "
+            f"context_lengths.shape[0] ({num_seqs})"
+        )
 
     trans_v = value_cache.dim() == 5
+    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    if num_kv_heads < 1:
+        raise ValueError(
+            f"key_cache must contain at least one KV head, got {num_kv_heads}"
+        )
+
+    arch = get_gfx_runtime()
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
+        raise NotImplementedError(
+            f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
+        )
+    is_bf16_kv = key_cache.dtype == torch.bfloat16
+    kv_dtype = "bf16" if is_bf16_kv else "fp8"
+    expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
+    compute_type = key_cache.dtype if compute_type is None else compute_type
+    if compute_type != expected_kv_dtype:
+        raise NotImplementedError(
+            f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
+            f"on {arch}, got {compute_type}"
+        )
+    vector_width = 8 if is_bf16_kv else 16
+
+    # Enforce the tile geometry and the reducer's 1024-thread limit.
+    if not (
+        64 <= head_dim <= 1024
+        and head_dim % 64 == 0
+        and (arch != "gfx1250" or head_dim == 64 or head_dim % 128 == 0)
+    ):
+        raise NotImplementedError(
+            f"pa_decode does not support head_dim={head_dim}; supported values "
+            + (
+                "are multiples of 64 in [64, 1024] on gfx942/gfx950"
+                if arch != "gfx1250"
+                else "are 64 and multiples of 128 in [128, 1024] on gfx1250"
+            )
+        )
+    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+        raise ValueError(
+            "key_cache shape must be "
+            f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
+            f"block_size, {vector_width}], "
+            f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+        )
+    if block_size not in (16, 64, 128):
+        raise ValueError(
+            f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
+        )
+
+    if is_bf16_kv and arch != "gfx1250" and not trans_v:
+        raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
     if trans_v:
-        _, v_num_kv_heads, v_subblocks, v_head_dim, v_width = value_cache.shape
-        assert (
-            v_head_dim == value_head_dim
-            and v_width == expected_vector
-            and v_subblocks == block_size // expected_vector
-        ), (
-            f"value_cache shape {tuple(value_cache.shape)} doesn't match "
-            f"block_size={block_size}, value_head_dim={value_head_dim}"
-        )
+        v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
+        expected_v_tail = (block_size // vector_width, value_dim, vector_width)
+        if tuple(value_cache.shape[2:]) != expected_v_tail:
+            raise ValueError(
+                "transposed value_cache shape must be "
+                f"[num_blocks, num_kv_heads, block_size // {vector_width}, "
+                f"value_dim, {vector_width}], "
+                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
+                f"value_dim={value_dim}"
+            )
     else:
-        assert not is_bf16_kv, "BF16 KV requires the vectorized-5D value-cache layout"
-        _, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        assert v_head_dim == value_head_dim and v_block_size == block_size, (
-            f"value_cache shape {tuple(value_cache.shape)} doesn't match "
-            f"block_size={block_size}, value_head_dim={value_head_dim}"
+        v_num_blocks, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
+        if v_head_dim != value_dim or v_block_size != block_size:
+            raise ValueError(
+                "value_cache shape must be "
+                "[num_blocks, num_kv_heads, value_dim, block_size], "
+                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
+                f"value_dim={value_dim}"
+            )
+    # Packed V is a shifted view and may span fewer blocks than K.
+    if v_num_blocks > num_blocks:
+        raise ValueError(
+            f"value_cache must not span more blocks than key_cache, "
+            f"got {num_blocks} and {v_num_blocks}"
         )
-    assert v_num_kv_heads == num_kv_heads
-    assert (
-        value_cache.dtype == key_cache.dtype
-    ), f"key/value cache dtype mismatch: {key_cache.dtype} vs {value_cache.dtype}"
-    assert num_q_heads % num_kv_heads == 0, (
-        f"num_q_heads ({num_q_heads}) must be divisible by "
-        f"num_kv_heads ({num_kv_heads})"
-    )
-    assert (
-        block_tables.dtype == torch.int32
-    ), f"block_tables must be int32, got {block_tables.dtype}"
-    assert (
-        context_lengths.dtype == torch.int32
-    ), f"context_lengths must be int32, got {context_lengths.dtype}"
+    if v_num_kv_heads != num_kv_heads:
+        raise ValueError(
+            "key_cache and value_cache must have the same number of KV heads, "
+            f"got {num_kv_heads} and {v_num_kv_heads}"
+        )
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_q_heads ({num_q_heads}) must be divisible by "
+            f"num_kv_heads ({num_kv_heads})"
+        )
+
+    if block_tables.dtype != torch.int32:
+        raise TypeError(f"block_tables must be int32, got {block_tables.dtype}")
+    if context_lengths.dtype != torch.int32:
+        raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
     if query.dtype == torch.bfloat16:
@@ -297,407 +452,351 @@ def pa_decode_tile(
     elif query.dtype == torch.float16:
         query_dtype = "f16"
     else:
-        raise ValueError(
-            f"pa_decode_tile only supports f16/bf16 query, got {query.dtype}"
+        raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
+    if is_bf16_kv and arch != "gfx1250" and query.dtype != torch.bfloat16:
+        raise NotImplementedError("BF16 KV requires bfloat16 queries")
+    if output.dtype != query.dtype:
+        raise TypeError(
+            "pa_decode requires output.dtype == query.dtype, "
+            f"got {output.dtype} vs {query.dtype}"
         )
-    assert (
-        output.dtype == query.dtype
-    ), f"pa_decode_tile requires output.dtype == query.dtype, got {output.dtype} vs {query.dtype}"
-    assert output.shape == (total_q_rows, num_q_heads, value_head_dim), (
-        "pa_decode_tile output must be [total_q_rows, num_q_heads, value_head_dim], "
-        f"got {tuple(output.shape)}"
-    )
 
-    assert (
-        query.stride(2) == 1
-    ), f"pa_decode_tile requires a contiguous head_dim axis, got strides {query.stride()}"
-    assert output.stride(2) == 1, (
-        "pa_decode_tile requires a contiguous value_head_dim axis, "
-        f"got strides {output.stride()}"
-    )
+    if key_cache.dtype != expected_kv_dtype:
+        raise TypeError(
+            f"pa_decode requires {expected_kv_dtype} key cache on {arch}, "
+            f"got {key_cache.dtype}"
+        )
+    if value_cache.dtype != expected_kv_dtype:
+        raise TypeError(
+            f"pa_decode requires {expected_kv_dtype} value cache on {arch}, "
+            f"got {value_cache.dtype}"
+        )
+
+    if query.stride(2) != 1:
+        raise ValueError(
+            "pa_decode requires a contiguous query head_dim axis, "
+            f"got strides {query.stride()}"
+        )
+    if output.stride(2) != 1:
+        raise ValueError(
+            "pa_decode requires a contiguous output head_dim axis, "
+            f"got strides {output.stride()}"
+        )
 
     dev = query.device
+    if sinks is not None:
+        if not isinstance(sinks, torch.Tensor):
+            raise TypeError("sinks must be a torch.Tensor")
+        if sinks.shape != (num_q_heads,):
+            raise ValueError("sinks must have shape [num_query_heads]")
+        if sinks.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError("sinks must have dtype bfloat16, float16, or float32")
+        if sinks.device != dev:
+            raise ValueError("sinks must be on the same device as query")
+        if not sinks.is_contiguous():
+            raise ValueError("sinks must be contiguous")
+    for name, tensor in (
+        ("output", output),
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_tables", block_tables),
+        ("context_lengths", context_lengths),
+    ):
+        if tensor.device != dev:
+            raise ValueError(
+                f"{name} must be on the same device as query ({dev}), "
+                f"got {tensor.device}"
+            )
+    for name, tensor in (
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_tables", block_tables),
+        ("context_lengths", context_lengths),
+    ):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    def normalize_scale(scale, name):
+        if scale is None:
+            return torch.ones(1, dtype=torch.float32, device=dev)
+        if not isinstance(scale, torch.Tensor):
+            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+        if scale.numel() == 1:
+            return scale.reshape(1)
+        if scale.dim() == 4:
+            if scale.shape[-1] != 1:
+                raise ValueError(
+                    f"{name} must have a trailing singleton dimension, "
+                    f"got shape {tuple(scale.shape)}"
+                )
+            return scale.squeeze(-1)
+        if scale.dim() != 3:
+            raise ValueError(
+                f"{name} must be scalar or have shape "
+                "[num_blocks, num_kv_heads, block_size, 1]"
+            )
+        return scale
+
     if is_bf16_kv:
         if key_scale is not None or value_scale is not None:
             raise ValueError(
                 "BF16 KV is unscaled; key_scale and value_scale must be None"
             )
-        # The BF16 specialization does not dereference scale pointers. Reuse an
-        # existing tensor so the host path stays allocation- and graph-free.
-        key_scale_t = query
-        value_scale_t = query
+        # The native BF16 specialization never dereferences scale pointers.
+        # Null pointers avoid allocating dummy scales during graph capture.
+        key_scale_t = value_scale_t = None
         per_token_kv = False
+        stride_ks_block = stride_ks_head = 0
     else:
-        if key_scale is None or value_scale is None:
-            raise ValueError("FP8 KV requires key_scale and value_scale")
-        if stream is not None:
-            _require_stream_scale_tensors(dev, key_scale, value_scale)
-        if is_graph_capturing and not all(
-            isinstance(scale, torch.Tensor) for scale in (key_scale, value_scale)
-        ):
+        if (key_scale is None) != (value_scale is None):
             raise ValueError(
-                "CUDA graph capture requires pre-created FP8 scale tensors"
+                "key_scale and value_scale must either both be provided or both be None"
             )
-        key_scale_t = (
-            key_scale
-            if isinstance(key_scale, torch.Tensor)
-            else torch.tensor([float(key_scale)], dtype=torch.float32, device=dev)
-        )
-        value_scale_t = (
-            value_scale
-            if isinstance(value_scale, torch.Tensor)
-            else torch.tensor([float(value_scale)], dtype=torch.float32, device=dev)
-        )
-        per_token_kv = key_scale_t.dim() > 1
-        for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
-            if not scale.is_contiguous():
-                raise ValueError(f"pa_decode_tile: {name} must be contiguous")
-            if not per_token_kv and scale.numel() != 1:
+        key_scale_t = normalize_scale(key_scale, "key_scale")
+        value_scale_t = normalize_scale(value_scale, "value_scale")
+        per_token_kv = key_scale_t.numel() > 1
+        if per_token_kv != (value_scale_t.numel() > 1):
+            raise ValueError(
+                "key_scale and value_scale must both be per-tensor or both be per-token"
+            )
+        if per_token_kv:
+            if key_scale_t.shape != value_scale_t.shape:
                 raise ValueError(
-                    f"pa_decode_tile: scalar {name} must contain one element"
+                    "key_scale/value_scale shape mismatch: "
+                    f"{tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
                 )
-    if per_token_kv:
-        assert (
-            value_scale_t.dim() > 1
-        ), "value_scale must also be per-token (dim>1) when key_scale is per-token"
-        assert (
-            key_scale_t.shape == value_scale_t.shape
-        ), f"key_scale/value_scale shape mismatch: {tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
-        assert key_scale_t.shape == (key_cache.shape[0], num_kv_heads, block_size), (
-            "per-token key_scale/value_scale must be [num_blocks, num_kv_heads, block_size] "
-            f"matching the KV cache, got {tuple(key_scale_t.shape)}"
-        )
-        stride_ks_block = int(key_scale_t.stride(0))
-        stride_ks_head = int(key_scale_t.stride(1))
-    else:
-        stride_ks_block = 0
-        stride_ks_head = 0
-    if not is_bf16_kv:
-        assert (
-            key_scale_t.dtype == torch.float32 and key_scale_t.device == dev
-        ), f"key_scale tensor must be float32 on {dev}, got {key_scale_t.dtype} on {key_scale_t.device}"
-        assert (
-            value_scale_t.dtype == torch.float32 and value_scale_t.device == dev
-        ), f"value_scale tensor must be float32 on {dev}, got {value_scale_t.dtype} on {value_scale_t.device}"
+            expected_scale_shape = (num_blocks, num_kv_heads, block_size)
+            if key_scale_t.shape != expected_scale_shape:
+                raise ValueError(
+                    "per-token key_scale/value_scale must be "
+                    "[num_blocks, num_kv_heads, block_size] matching the KV cache, "
+                    f"got {tuple(key_scale_t.shape)}"
+                )
+            stride_ks_block = int(key_scale_t.stride(0))
+            stride_ks_head = int(key_scale_t.stride(1))
+            if key_scale_t.stride(2) != 1:
+                raise ValueError(
+                    "per-token key_scale token dimension must be contiguous, "
+                    f"got strides {key_scale_t.stride()}"
+                )
+            if value_scale_t.stride() != key_scale_t.stride():
+                raise ValueError(
+                    "per-token key_scale and value_scale must have matching strides, "
+                    f"got {key_scale_t.stride()} vs {value_scale_t.stride()}"
+                )
+        else:
+            stride_ks_block = 0
+            stride_ks_head = 0
+        for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
+            if scale.dtype != torch.float32:
+                raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
+            if scale.device != dev:
+                raise ValueError(
+                    f"{name} tensor must be on the same device as query ({dev}), "
+                    f"got {scale.device}"
+                )
 
-    plan = make_pa_decode_plan(
-        arch=arch,
-        num_seqs=num_seqs,
-        num_kv_heads=num_kv_heads,
-        query_group_size=query_group_size,
-        query_length=query_length,
-        head_dim=head_dim,
-        value_head_dim=value_head_dim,
-        block_size=block_size,
-        query_dtype=query_dtype,
-        kv_dtype=kv_dtype,
-        per_token_kv=per_token_kv,
-        trans_v=trans_v,
-        softmax_scale=softmax_scale,
-        num_partitions=num_partitions,
-    )
-    num_partitions = plan.num_partitions
-    if sliding_window or sinks is not None or query_splits is not None:
-        plan = replace(plan, kernel="tile")
-    if (
-        query_splits is None
-        and sliding_window
-        and arch == "gfx942"
-        and (head_dim, value_head_dim, query_length, query_group_size)
-        == (128, 128, 8, 8)
-    ):
-        # Match query splitting to useful window tiles, rather than the full context.
-        window_tiles = (
-            sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
-        ) // KV_COMPUTE_BLOCK + 1
-        grid = num_seqs * num_kv_heads * min(num_partitions, window_tiles)
-        cus = torch.cuda.get_device_properties(dev).multi_processor_count
-        query_splits = 4 if 4 * grid <= 2 * cus else 2 if 2 * grid <= 3 * cus else 1
-
-    supplied = (pmax, psum, pout)
-    if (
-        num_partitions > 1
-        and any(t is not None for t in supplied)
-        and not all(t is not None for t in supplied)
-    ):
-        raise ValueError("pa_decode_tile: provide all of pmax/psum/pout, or none")
-    for name, tensor, dtype in (
-        ("pmax", pmax, torch.float32),
-        ("psum", psum, torch.float32),
-        ("pout", pout, output.dtype),
-    ):
-        if tensor is not None and (
-            tensor.device != dev
-            or tensor.dtype != dtype
-            or not tensor.is_contiguous()
-            or tensor.numel() == 0
+    schedule_context_length = int(max_blocks_per_seq) * int(block_size)
+    if max_context_length is not None:
+        if (
+            isinstance(max_context_length, bool)
+            or not isinstance(max_context_length, int)
+            or not 0 <= max_context_length <= max_blocks_per_seq * block_size
         ):
             raise ValueError(
-                f"pa_decode_tile: {name} must be non-empty, contiguous {dtype} on {dev}"
+                "max_context_length must be a nonnegative host integer within "
+                "block-table capacity"
             )
+        schedule_context_length = (
+            (max_context_length + block_size - 1) // block_size * block_size
+        )
+    work_plan.validate(num_seqs, num_kv_heads, dev)
+    if work_plan.sliding_window != sliding_window:
+        raise ValueError("sliding_window must match work_plan.sliding_window")
+    if sliding_window > 0 and work_plan.query_length != query_length:
+        raise ValueError("query_length must match work_plan.query_length")
+    if asymmetric_value and not (
+        arch in ("gfx942", "gfx950") and head_dim == 192 and value_dim == 128
+    ):
+        raise NotImplementedError(
+            "asymmetric value width requires gfx942/gfx950 Q/K192-V128"
+        )
+    num_partitions = work_plan.max_partitions
+    pmax = max_logits
+    psum = exp_sums
+    pout = temporary_output
+    direct_output = (
+        arch == "gfx1250"
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    )
 
-    if plan.kernel == "bf16_wave":
-        from .kernels.pa_decode_bf16_wave import compile_pa_decode_bf16_wave
+    # Bound byte offsets as well as element indices for 16-bit BF16 caches.
+    cache_extent = max(
+        key_cache.numel() * key_cache.element_size(),
+        value_cache.numel() * value_cache.element_size(),
+    )
+    wide_kv_addressing = cache_extent >= 2**31
+    kv_buffer_u32 = cache_extent < 2**32
 
-        compiled = compile_pa_decode_bf16_wave(head_dim, num_partitions, softmax_scale)
-    elif plan.kernel == "fp8_small":
-        from .kernels.pa_decode_fp8_small import compile_pa_decode_fp8_small
-
-        compiled = compile_pa_decode_fp8_small(head_dim, num_partitions, softmax_scale)
-    elif plan.kernel == "fp8_wave":
-        from .kernels.pa_decode_fp8_wave import compile_pa_decode_fp8_wave
-
-        compiled = compile_pa_decode_fp8_wave(head_dim, num_partitions, softmax_scale)
-    else:
+    with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
+            architecture=arch,
             head_dim=head_dim,
-            v_head_dim=value_head_dim,
+            value_dim=value_dim,
             query_group_size=query_group_size,
             block_size=int(block_size),
+            num_seqs=num_seqs,
+            num_kv_heads=num_kv_heads,
+            num_compute_units=torch.cuda.get_device_properties(
+                dev
+            ).multi_processor_count,
             num_partitions=num_partitions,
             softmax_scale=softmax_scale,
             query_dtype=query_dtype,
+            kv_dtype=kv_dtype,
             per_token_kv=per_token_kv,
             query_length=query_length,
             trans_v=trans_v,
-            kv_dtype=kv_dtype,
-            query_splits=query_splits,
+            wide_kv_addressing=wide_kv_addressing,
+            kv_buffer_u32=kv_buffer_u32,
+            work_capacity=work_plan.capacity,
+            max_context_length=schedule_context_length,
             sliding_window=sliding_window,
-            use_sinks=sinks is not None,
-            sink_dtype=(
-                "bf16" if sinks is not None and sinks.dtype == torch.bfloat16 else "f32"
-            ),
+            direct_output=direct_output,
+            trans_k=trans_k,
+            mask_unowned_kv=mask_unowned_kv,
+            query_splits=query_splits,
         )
-    if num_partitions == 1:
-        # NP1 writes output directly; supplied buffers serve only as dummy arguments.
-        if pmax is None:
-            if is_graph_capturing:
-                raise ValueError(
-                    "CUDA graph capture requires preallocated `pmax`/`psum`/`pout` "
-                    "even when num_partitions==1 (nothing may be allocated mid-capture)."
-                )
-            pmax = psum = pout = torch.empty(1, dtype=torch.float32, device=dev)
-        else:
-            # The launch still needs dummy pointer arguments; NP1 never reads them.
-            psum = pmax if psum is None else psum
-            pout = pmax if pout is None else pout
-    else:
-        expected_scalar_shape = plan.scalar_shape
-        if pmax is None or psum is None or pout is None:
-            if is_graph_capturing:
-                raise ValueError(
-                    "CUDA graph capture requires preallocated `pmax`/`psum`/`pout` "
-                    "for num_partitions>1 (nothing may be allocated mid-capture)."
-                )
-            pmax = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
-            psum = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
-            pout = torch.empty(
-                *expected_scalar_shape,
-                value_head_dim,
-                dtype=output.dtype,
-                device=dev,
+
+    total_rows = query_length * query_group_size
+    expected_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)
+    if pmax is None:
+        pmax = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
+    if psum is None:
+        psum = torch.empty(*expected_scalar_shape, dtype=torch.float32, device=dev)
+    if pout is None:
+        pout = torch.empty(
+            *expected_scalar_shape, value_dim, dtype=output.dtype, device=dev
+        )
+    for name, tensor in (
+        ("max_logits", pmax),
+        ("exp_sums", psum),
+        ("temporary_output", pout),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
             )
-        else:
-            assert (
-                pmax.shape == expected_scalar_shape
-            ), f"pmax shape {tuple(pmax.shape)} != {expected_scalar_shape}"
-            assert (
-                psum.shape == expected_scalar_shape
-            ), f"psum shape {tuple(psum.shape)} != {expected_scalar_shape}"
-            assert (
-                pout.shape == plan.output_shape
-            ), f"pout shape {tuple(pout.shape)} != {plan.output_shape}"
-    s = stream or torch.cuda.current_stream()
-    if stream is not None:
-        for tensor in (
-            output,
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            key_scale_t,
-            value_scale_t,
-            pmax,
-            psum,
-            pout,
-        ):
-            tensor.record_stream(s)
-
-    launch_tensors = [
-        output,
-        pmax.view(-1),
-        psum.view(-1),
-        pout.view(-1),
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        context_lengths,
-        key_scale_t,
-        value_scale_t,
-    ]
-    if compiled.get("accepts_sinks", False):
-        launch_tensors.append(query if sinks is None else sinks)
-    if stream is not None and sinks is not None:
-        sinks.record_stream(s)
-    _run_compiled(
-        compiled["launch"],
-        *launch_tensors,
-        int(max_blocks_per_seq),
-        int(num_seqs),
-        int(num_kv_heads),
-        stride_ks_block,
-        stride_ks_head,
-        int(query.stride(0)),
-        int(query.stride(1)),
-        s,
-    )
-    if num_partitions > 1:
-        from aiter.ops.flydsl.kernels.pa_decode_reduce import (
-            compile_pa_decode_sw_reduce,
+    if pmax.shape != expected_scalar_shape:
+        raise ValueError(
+            f"max_logits shape {tuple(pmax.shape)} != {expected_scalar_shape}"
         )
-
-        reduce_compiled = compile_pa_decode_sw_reduce(
-            max_context_partition_num=num_partitions,
-            query_seq_len=query_length,
-            query_group_size=query_group_size,
-            head_size=value_head_dim,
-            output_dtype_str=_get_output_dtype_str(output),
-            logits_dtype_str=_get_output_dtype_str(pout),
+    if psum.shape != expected_scalar_shape:
+        raise ValueError(
+            f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
         )
+    expected_output_shape = (*expected_scalar_shape, value_dim)
+    if pout.shape != expected_output_shape:
+        raise ValueError(
+            f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
+        )
+    if pmax.dtype != torch.float32:
+        raise TypeError(f"max_logits must be float32, got {pmax.dtype}")
+    if psum.dtype != torch.float32:
+        raise TypeError(f"exp_sums must be float32, got {psum.dtype}")
+    if pout.dtype != output.dtype:
+        raise TypeError(
+            f"temporary_output dtype {pout.dtype} must match output dtype "
+            f"{output.dtype}"
+        )
+    for name, tensor in (
+        ("max_logits", pmax),
+        ("exp_sums", psum),
+        ("temporary_output", pout),
+    ):
+        if tensor.device != dev:
+            raise ValueError(
+                f"{name} must be on the same device as query ({dev}), "
+                f"got {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    with torch.cuda.device(dev):
+        s = torch.cuda.current_stream(dev)
         _run_compiled(
-            reduce_compiled["launch"],
-            output.data_ptr(),
-            psum.data_ptr(),  # exp_sums
-            pmax.data_ptr(),  # max_logits
-            pout.data_ptr(),  # logits (already-normalized query_dtype partials)
-            query_length
-            * output.stride(
-                0
-            ),  # stride_output_bs: per TRUE seq, spans all query_length rows
-            output.stride(
-                0
-            ),  # stride_output_len: per MTP position (query_length==1: unused, multiplied by 0)
-            query_group_size * output.stride(1),
-            output.stride(1),
+            compiled["launch"],
+            (
+                ptr_arg(work_plan.reduce_info, fx.Float32)
+                if direct_output
+                else ptr_arg(pmax, fx.Float32)
+            ),
+            ptr_arg(psum, fx.Float32),
+            ptr_arg(
+                output if direct_output else pout, _flydsl_pointer_dtype(pout.dtype)
+            ),
+            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
+            ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
+            ptr_arg(block_tables, fx.Int32),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if is_bf16_kv
+                else ptr_arg(key_scale_t, fx.Float32)
+            ),
+            (
+                flyc.from_c_void_p(fx.Float32, 0)
+                if is_bf16_kv
+                else ptr_arg(value_scale_t, fx.Float32)
+            ),
+            int(max_blocks_per_seq),
+            int(num_seqs),
+            int(num_kv_heads),
+            stride_ks_block,
+            stride_ks_head,
+            int(query.stride(0)),
+            int(query.stride(1)),
+            ptr_arg(work_plan.work_info, fx.Int32),
+            work_plan.capacity,
+            s,
+        )
+        if direct_output:
+            return
+        output_5d = output.reshape(
+            num_seqs, query_length, num_kv_heads, query_group_size, value_dim
+        )
+        # Bound the reducer without shrinking the reusable plan or scratch.
+        max_partitions = min(
+            num_partitions,
+            work_plan.capacity,
+            max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK)),
+        )
+        if sliding_window > 0:
+            # Bound the unaligned MTP window without shrinking the reusable plan.
+            window_tiles = (
+                sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1
+            ) // KV_COMPUTE_BLOCK + 1
+            max_partitions = min(max_partitions, window_tiles)
+        launch_pa_decode_ps_reduce(
+            output_5d,
+            psum,
+            pmax,
+            pout,
+            sinks,
+            output_5d.stride(0),
+            output_5d.stride(1),
+            output_5d.stride(2),
+            output_5d.stride(3),
             pmax.stride(0),
             pmax.stride(1),
-            pmax.stride(2),
             pout.stride(0),
             pout.stride(1),
             pout.stride(2),
-            pout.stride(3),
-            int(num_seqs),
-            int(num_kv_heads),
-            s,
+            query_seq_len=query_length,
+            query_group_size=query_group_size,
+            head_size=value_dim,
+            max_partitions=max_partitions,
+            stream=s,
+            reduce_info=work_plan.reduce_info,
         )
-
-
-def pa_decode_ps_launch(
-    output: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    context_lengths: torch.Tensor,
-    kv_page_indices: torch.Tensor,  # [total_pages] int32
-    kv_indptr: torch.Tensor,  # [num_seqs + 1] int32
-    softmax_scale: float,
-    key_scale: torch.Tensor = None,
-    value_scale: torch.Tensor = None,
-    *,
-    sliding_window: int = 0,
-    metadata: dict | None = None,
-    block_tables: torch.Tensor = None,  # [num_seqs, max_blocks_per_seq] i32
-    max_context_partition_num: int = 0,
-    exp_sums: torch.Tensor = None,
-    max_logits: torch.Tensor = None,
-    temporary_output: torch.Tensor = None,
-    stream=None,
-) -> str:
-    """Small-page compatibility entrypoint using the normalized-partial ABI.
-
-    ``block_tables`` is authoritative; CSR indices/indptr and ``metadata`` are
-    accepted for call-site compatibility but are not read or constructed.
-    """
-    if (
-        sliding_window != 0
-        or key_cache.shape[-2] not in _PA_DECODE_PS_SMALL_BLOCK_SIZES
-    ):
-        raise ValueError(
-            "BF16 KV and asymmetric value dimensions currently require "
-            "block_size 16 or 64 with sliding_window=0; this API is full-attention only."
-        )
-    if block_tables is None:
-        raise ValueError("pa_decode_ps_launch: page size 16/64 requires `block_tables`")
-    _validate_metadata(query, block_tables, context_lengths)
-    num_query_heads = query.shape[1]
-    num_kv_heads = key_cache.shape[1]
-    batch_size = context_lengths.shape[0]
-    if query.shape[0] % batch_size != 0:
-        raise ValueError(
-            f"query.shape[0] ({query.shape[0]}) must be divisible by "
-            f"batch_size ({batch_size})"
-        )
-    if num_query_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"num_query_heads ({num_query_heads}) must be divisible by "
-            f"num_kv_heads ({num_kv_heads})"
-        )
-    block_size = key_cache.shape[-2]
-    dev = query.device
-    is_graph_capturing = _is_current_stream_capturing()
-    s = stream or torch.cuda.current_stream()
-    if stream is not None and key_cache.dtype != torch.bfloat16:
-        _require_stream_scale_tensors(dev, key_scale, value_scale)
-
-    if max_context_partition_num <= 0:
-        raise ValueError("max_context_partition_num must be positive.")
-
-    tile_key_scale = key_scale
-    tile_value_scale = value_scale
-    if key_cache.dtype != torch.bfloat16:
-        tile_key_scale = _prepare_scale_tensor(
-            "key_scale",
-            key_scale,
-            device=dev,
-            is_graph_capturing=is_graph_capturing,
-        )
-        tile_value_scale = _prepare_scale_tensor(
-            "value_scale",
-            value_scale,
-            device=dev,
-            is_graph_capturing=is_graph_capturing,
-        )
-        if tile_key_scale.ndim > 1:
-            num_blocks = key_cache.shape[0]
-            tile_key_scale = tile_key_scale.reshape(
-                num_blocks, num_kv_heads, block_size
-            )
-            tile_value_scale = tile_value_scale.reshape(
-                num_blocks, num_kv_heads, block_size
-            )
-
-    pa_decode_tile(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        context_lengths,
-        tile_key_scale,
-        tile_value_scale,
-        softmax_scale=softmax_scale,
-        stream=s,
-        num_partitions=max_context_partition_num,
-        pmax=max_logits,
-        psum=exp_sums,
-        pout=temporary_output,
-    )
-    return "ps_small_block"
-
-
-flydsl_pa_decode_tile = pa_decode_tile
-flydsl_pa_decode_ps = pa_decode_ps_launch
-
-__all__ = ["flydsl_pa_decode_ps", "flydsl_pa_decode_tile"]

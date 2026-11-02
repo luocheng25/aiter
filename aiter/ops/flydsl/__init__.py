@@ -93,6 +93,8 @@ _LAZY_IMPORTS = {
         "gather_kv_b_proj_flydsl_supported",
     ),
     "mxfp4_to_fp8_128block": (".mxfp4_fp8", "mxfp4_to_fp8_128block"),
+    "pa_decode": (".pa_decode", "pa_decode"),
+    "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
 }
 
 __all__ = [
@@ -120,6 +122,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
     "mxfp4_to_fp8_128block",
+    "pa_decode",
+    "prepare_pa_decode_plan",
 ]
 
 

@@ -713,14 +713,15 @@ def get_flydsl_stage1_kernels_a8w4(out_dtype: str) -> dict[str, dict]:
     runs the a16w4 port gemm1 built with ``a_dtype="fp8r"`` (runtime K loop, swizzled
     A-LDS). Suffixes: ``_bnt{b}`` (b != 2), ``_xcd{x}``, ``_ftz`` (flush_tiny).
 
-    Prefill-only (32 names): A8W4 pays a per-row activation quant that only amortizes
+    Evaluation extension includes tile_m16/32 for native decode tuning.
+    Original prefill selection: A8W4 pays a per-row activation quant that only amortizes
     over many tokens, so the decode/small-batch axes are not registered -- tile_m
     16/32, narrow tile_n=64, slice-K (k_wave>1), occupancy hints (waves_per_eu) and
     nt/streaming W loads (b_nt=2, no weight reuse). tile_k is 256 (K=model_dim).
     """
     kernels = {}
     tk = 256
-    for tm in (64, 128):
+    for tm in (64, 128, 16, 32):
         for tn in (128, 256):
             for bnt in (0, 1):
                 for xcd in (0, 1):
@@ -759,17 +760,21 @@ def get_flydsl_stage2_kernels_a8w4(out_dtype: str) -> dict[str, dict]:
     a16w4: fused_moe treats it as atomic); no ``_persist`` (the a16w branch does not
     forward it). Suffixes: ``_bnt{b}`` (b != 0), ``_xcd{x}``, ``_ftz``.
 
-    Prefill-only (48 names), same pruning as stage1: tile_m 64/128, tile_n 128/256,
+    Evaluation extension includes valid tile_m16/32 configurations.
+    Original prefill selection: tile_m64/128, tile_n128/256,
     no waves_per_eu, b_nt in {0 cached, 2 nt} (the down-proj tuned best is nt).
     tile_k keeps 128 so 128- but not 256-aligned inter_dim (e.g. 384) stays tunable.
     """
     kernels = {}
-    for tm in (64, 128):
+    for tm in (64, 128, 16, 32):
         for tn in (128, 256):
             # The f32 epilogue tile (tm*tn*4) must fit LDS: drops t128x256.
             if tm * tn * 4 > _MAX_LDS_BYTES:
                 continue
             for tk in (128, 256):
+                # FP8 A-loader threads each move a complete 16-byte vector.
+                if tm * tk % 4096:
+                    continue
                 for bnt in (0, 2):
                     for xcd in (0, 1):
                         for ftz in (False, True):
