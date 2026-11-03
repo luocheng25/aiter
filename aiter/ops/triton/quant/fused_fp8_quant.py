@@ -174,6 +174,9 @@ def fused_rms_fp8_group_quant(
     output_unquantized_inp1=False,
     transpose_scale=False,
     is_x_scale_strided: bool = False,
+    *,
+    out_fp8: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ):
     """
     This op contains several steps:
@@ -194,6 +197,10 @@ def fused_rms_fp8_group_quant(
                           (num_bs_cols, 1). Equivalent to scale.transpose(0,1).contiguous().view(*scale.shape).
                         True: strided column-major view, shape (M, num_bs_cols), strides (1, M).
                           Equivalent to scale.transpose(0,1).contiguous().transpose(0,1).
+    - out_fp8, out_scale: Optional caller-owned output views with unit column
+                      stride. Row padding is supported, including disjoint views
+                      into one communication buffer. out_scale requires
+                      transpose_scale=False and has logical shape (M, groups).
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -210,14 +217,36 @@ def fused_rms_fp8_group_quant(
     if inp2 is not None:
         M2, N2 = inp2.shape
         BLOCK_SIZE_N = max(triton.next_power_of_2(N2), BLOCK_SIZE_N)
-        assert (
-            M == M2
-        ), "The leading dimension should be identical between inp1 and inp2"
+        assert M == M2, (
+            "The leading dimension should be identical between inp1 and inp2"
+        )
     else:
         N2 = 0
-    out1_fp8 = torch.empty((M, N1), dtype=dtype_quant, device=inp1.device)
     num_bs_cols = (N1 + group_size - 1) // group_size
-    if transpose_scale:
+    for output, shape, dtype in (
+        (out_fp8, (M, N1), dtype_quant),
+        (out_scale, (M, num_bs_cols), torch.float32),
+    ):
+        if output is not None and (
+            output.shape != shape
+            or output.dtype != dtype
+            or output.device != inp1.device
+            or output.stride(-1) != 1
+            or output.stride(0) < shape[1]
+        ):
+            raise ValueError(
+                f"Invalid fused RMSNorm/FP8 output: expected {shape}/{dtype} with non-overlapping rows"
+            )
+    if out_scale is not None and transpose_scale:
+        raise ValueError("Caller-owned out_scale requires transpose_scale=False")
+    out1_fp8 = (
+        out_fp8
+        if out_fp8 is not None
+        else torch.empty((M, N1), dtype=dtype_quant, device=inp1.device)
+    )
+    if out_scale is not None:
+        out1_bs = out_scale
+    elif transpose_scale:
         # Create with transposed shape for direct transposed storage
         out1_bs = torch.empty(
             (num_bs_cols, M),
@@ -259,9 +288,9 @@ def fused_rms_fp8_group_quant(
     out_res1_col_stride = 0
     if res1 is not None:
         Mr, Nr = res1.shape
-        assert (
-            M == Mr and N1 == Nr
-        ), "The shape should be identical between inp1 and res1"
+        assert M == Mr and N1 == Nr, (
+            "The shape should be identical between inp1 and res1"
+        )
         out_res1 = torch.empty((M, N1), dtype=inp1.dtype, device=inp1.device)
         res1_row_stride = res1.stride(0)
         res1_col_stride = res1.stride(1)

@@ -19,6 +19,50 @@ from aiter.test_common import (
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
 
+@pytest.mark.parametrize("rows", [0, 17, 256])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_fused_rms_fp8_group_quant_packed_outputs(rows, with_residual):
+    hidden, groups = 4096, 32
+    x = torch.randn((rows, hidden), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if with_residual else None
+    expected, _, _, expected_residual = fused_rms_fp8_group_quant(
+        x, weight, 1e-6, res1=residual, dtype_quant=rocm_aiter_fp8_dtype
+    )
+    packet = torch.empty(
+        (rows, hidden // 4 + groups), device="cuda", dtype=torch.float32
+    )
+    q = packet.view(torch.uint8)[:, :hidden].view(rocm_aiter_fp8_dtype)
+    scale = packet[:, hidden // 4 :]
+    result, _, _, actual_residual = fused_rms_fp8_group_quant(
+        x,
+        weight,
+        1e-6,
+        res1=residual,
+        dtype_quant=rocm_aiter_fp8_dtype,
+        out_fp8=q,
+        out_scale=scale,
+    )
+    assert result[0].data_ptr() == q.data_ptr()
+    assert result[1].data_ptr() == scale.data_ptr()
+    assert torch.equal(result[0].view(torch.uint8), expected[0].view(torch.uint8))
+    torch.testing.assert_close(result[1], expected[1], rtol=0, atol=0)
+    if with_residual:
+        torch.testing.assert_close(actual_residual, expected_residual, rtol=0, atol=0)
+    else:
+        assert actual_residual is None
+
+
+def test_fused_rms_fp8_group_quant_invalid_output_views():
+    x = torch.zeros((2, 256), device="cuda", dtype=torch.bfloat16)
+    w = torch.ones(256, device="cuda", dtype=torch.bfloat16)
+    scale = torch.empty((2, 2), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="transpose_scale"):
+        fused_rms_fp8_group_quant(x, w, 1e-6, out_scale=scale, transpose_scale=True)
+    with pytest.raises(ValueError, match="Invalid"):
+        fused_rms_fp8_group_quant(x, w, 1e-6, out_fp8=torch.empty_like(x))
+
+
 def rmsnorm(input, weight, eps=1e-6):
     row_norm = input * input
     row_norm = torch.sum(row_norm, dim=-1)

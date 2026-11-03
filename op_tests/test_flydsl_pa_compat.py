@@ -5,6 +5,7 @@
 
 import importlib
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,39 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.pa_decode import compat
 from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan
 from op_tests.test_flydsl_pa_decode import _make_inputs, _reference
+
+
+@pytest.mark.parametrize("native_property", [True, False])
+def test_planner_lds_limit_with_rocm_device_properties(monkeypatch, native_property):
+    import triton.runtime as runtime
+
+    planner = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_plan")
+    properties = SimpleNamespace(multi_processor_count=304)
+    if native_property:
+        properties.shared_memory_per_block = 65536
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
+
+    def query_device(device):
+        assert device == 1
+        return {"max_shared_mem": 65536}
+
+    monkeypatch.setattr(
+        runtime, "driver",
+        SimpleNamespace(active=SimpleNamespace(
+            utils=SimpleNamespace(get_device_properties=query_device)
+        )),
+    )
+    lengths = SimpleNamespace(
+        device=torch.device("cuda:1"), dtype=torch.int32, ndim=1,
+        is_contiguous=lambda: True, numel=lambda: 16385,
+    )
+    planner._shared_memory_per_block.cache_clear()
+    try:
+        assert planner._shared_memory_per_block(1) == 65536
+        with pytest.raises(ValueError, match="device supports 65536 bytes per block"):
+            planner.plan_pa_decode(lengths, 1, max_batch_size=20000)
+    finally:
+        planner._shared_memory_per_block.cache_clear()
 
 
 @pytest.mark.parametrize("size", [0, 65536])

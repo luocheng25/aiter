@@ -18,6 +18,21 @@ _PLAN_SCAN_LDS_BYTES = 512
 
 
 @cache
+def _shared_memory_per_block(device_index: int) -> int:
+    properties = torch.cuda.get_device_properties(device_index)
+    capacity = getattr(properties, "shared_memory_per_block", None)
+    if capacity is None:
+        # Some ROCm PyTorch builds omit this property; query the HIP driver
+        # through Triton once per device, including before graph capture.
+        from triton.runtime import driver
+
+        capacity = driver.active.utils.get_device_properties(device_index)[
+            "max_shared_mem"
+        ]
+    return int(capacity)
+
+
+@cache
 def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
     """Allocate packed tasks with one block-wide scan, without GPU readback."""
     threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
@@ -245,12 +260,13 @@ def plan_pa_decode(
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
     num_compute_units = properties.multi_processor_count
+    shared_memory_per_block = _shared_memory_per_block(dev.index)
     task_end_bytes = (batch * 4 + 15) // 16 * 16
-    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > properties.shared_memory_per_block:
+    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > shared_memory_per_block:
         raise ValueError(
             f"batch={batch} exceeds planner LDS capacity: requires up to "
             f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
-            f"{properties.shared_memory_per_block} bytes per block"
+            f"{shared_memory_per_block} bytes per block"
         )
     if max_partitions is None:
         max_partitions = num_compute_units if plan is None else plan.max_partitions
