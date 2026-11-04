@@ -176,6 +176,7 @@ class PADecodePlan:
     sliding_window: int = 0
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
+    query_splits: int | None = None
 
     @property
     def capacity(self) -> int:
@@ -195,6 +196,11 @@ class PADecodePlan:
             raise ValueError(f"plan max_partitions must be in [1, {num_compute_units}]")
         if self.sliding_window < 0 or self.query_length < 1:
             raise ValueError("invalid plan sliding_window or query_length")
+        if self.query_splits is not None and (
+            type(self.query_splits) is not int or self.query_splits < 1
+            or self.query_length % self.query_splits
+        ):
+            raise ValueError("plan query_splits must divide its query_length")
         if self.reduce_info.shape != (batch_size, 2):
             raise ValueError("reduce_info must have shape [batch_size, 2]")
         if self.work_info.ndim != 2 or self.work_info.shape[1] != 4:

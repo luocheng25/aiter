@@ -5,6 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
@@ -42,6 +43,13 @@ class PaDecodeLds:
         return fx.ptr_load(
             self.pointer(byte_off, elem_ty), result_type=fx.Vector.make_type(n, elem_ty)
         )
+
+    def load_volatile(self, byte_off, elem_ty, n):
+        ptr = fx.to_llvm_ptr(self.pointer(byte_off, elem_ty))
+        return fx.Vector(llvm.LoadOp(
+            fx.Vector.make_type(n, elem_ty), fx.as_ir_value(ptr),
+            alignment=16, volatile_=True,
+        ).res)
 
     def store(self, byte_off, elem_ty, vec):
         fx.ptr_store(vec, self.pointer(byte_off, elem_ty))
@@ -222,14 +230,18 @@ class PaDecodeQueryLoader:
                             self.ctx.ZERO_F,
                         )
 
-    def load_operands(self):
+    def load_operands(self, selected_m=-1):
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
         for m in range_constexpr(self.traits.M_TILES):
+            if selected_m >= 0 and m != selected_m:
+                q_ops_all.extend([fx.Int64(0)] * self.traits.N_SUBCHUNKS)
+                continue
             q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
             for qkhe in range_constexpr(self.traits.QKHE_LOOP):
                 he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-                chunk = self.lds.load(
+                load_query = self.lds.load_volatile if self.traits.stream_query_from_lds else self.lds.load
+                chunk = load_query(
                     q_row_off
                     + (
                         self.ctx.lane16 * self.traits.head_dim

@@ -43,6 +43,14 @@ class PaDecodePipeline:
         self.epilogue = PaDecodeEpilogue(ctx)
 
     @flyc.jit
+    def qk(self, k_cur, q_ops_all, m):
+        if const_expr(getattr(self.traits, "stream_query_from_lds", False)):
+            operands = self.query.load_operands(m)
+        else:
+            operands = q_ops_all
+        return self.gemm.qk(k_cur, operands, m)
+
+    @flyc.jit
     def pv(self, v_ops, p_ops, m):
         residual = None
         if const_expr(self.policy.residual_tokens > 0):
@@ -108,7 +116,10 @@ class PaDecodePipeline:
         self.query.stage(q_units_prefetched)
         gpu.barrier()
         v_page_pf0 = self.kv.read_v_pages()
-        q_ops_all = self.query.load_operands()
+        if const_expr(getattr(self.traits, "stream_query_from_lds", False)):
+            q_ops_all = [fx.Int64(0)] * (self.traits.M_TILES * self.traits.N_SUBCHUNKS)
+        else:
+            q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         self.epilogue.store(self.mainloop(k_pf0, v_page_pf0, q_ops_all))
@@ -285,7 +296,7 @@ class PaDecodePipeline:
             ]
 
         for m in range_constexpr(self.traits.M_TILES):
-            frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
+            frag_Ss = self.qk(k_cur, q_ops_all, m)
 
             scale = (
                 self.ctx.scale_qk
@@ -560,7 +571,7 @@ class PaDecodePipeline:
             ostate[self.traits.l_slot(m)] for m in range_constexpr(self.traits.M_TILES)
         ]
         frag_Ss = [
-            self.gemm.qk(k_cur, q_ops_all, m)
+            self.qk(k_cur, q_ops_all, m)
             for m in range_constexpr(self.traits.M_TILES)
         ]
         k_next = k_cur

@@ -173,9 +173,9 @@ def test_legacy_autotune_resolves_without_default_launch_and_validates_search(
     prepare = tuning._PADecodeAutotuneResources.prepare
     calls = []
 
-    def track_prepare(self, budget):
-        calls.append(budget)
-        return prepare(self, budget)
+    def track_prepare(self, budget, partition_count=None, query_splits=None):
+        calls.append((budget, partition_count, query_splits))
+        return prepare(self, budget, partition_count, query_splits)
 
     monkeypatch.setattr(tuning._PADecodeAutotuneResources, "prepare", track_prepare)
     args = (query, key, value, lengths, table, 192**-0.5, 4)
@@ -185,6 +185,7 @@ def test_legacy_autotune_resolves_without_default_launch_and_validates_search(
     assert plan.capacity == 2 and calls == []
     tuning.prepare_pa_decode_plan(*args, **options, tune=True)
     assert len(calls) >= 2
+    assert any(parts is not None and splits is not None for _, parts, splits in calls)
     assert (tmp_path / "gfx942" / "_pa_decode_autotuner.json").is_file()
     calls.clear()
     tuning.prepare_pa_decode_plan(*args, **options)

@@ -11,6 +11,7 @@ import inspect
 import os
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import replace
 from functools import cache
 from hashlib import sha256
 from pathlib import Path
@@ -26,6 +27,7 @@ from .kernels.pa_decode_plan import (
     plan_pa_decode,
 )
 from .pa_decode import pa_decode
+from .pa_decode_config import calibrated_pa_config, validate_pa_config
 
 _PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
@@ -35,6 +37,7 @@ def _tuning_cache_tag():
     """Invalidate tuning results when either kernels or tuning policy changes."""
     digest = sha256(implementation_cache_tag().encode())
     digest.update(Path(__file__).read_bytes())
+    digest.update(Path(__file__).with_name("pa_decode_config.py").read_bytes())
     return digest.hexdigest()
 
 
@@ -62,8 +65,14 @@ class _PADecodeAutotuneResources:
         self.workspaces = {}
         self.reference = None
 
-    def prepare(self, workgroup_budget):
-        if workgroup_budget in self.graphs:
+    def key(self, workgroup_budget, partition_count=None, query_splits=None):
+        return (workgroup_budget, self.max_partitions if partition_count is None else partition_count,
+                self.options.get("query_splits") if query_splits is None else query_splits)
+
+    def prepare(self, workgroup_budget, partition_count=None, query_splits=None):
+        config_key = self.key(workgroup_budget, partition_count, query_splits)
+        _, partition_count, query_splits = config_key
+        if config_key in self.graphs:
             return
         key, value, lengths, table, scale, query_length = self.args
         if key.dtype != torch.bfloat16:
@@ -86,7 +95,7 @@ class _PADecodeAutotuneResources:
         plan = plan_pa_decode(
             lengths,
             num_kv_heads,
-            max_partitions=self.max_partitions,
+            max_partitions=partition_count,
             max_batch_size=self.max_batch_size,
             workgroup_budget=workgroup_budget,
             sliding_window=self.options["sliding_window"],
@@ -116,6 +125,7 @@ class _PADecodeAutotuneResources:
         }
 
         def launch():
+            options = dict(self.options, query_splits=query_splits)
             pa_decode(
                 output,
                 self.query,
@@ -126,7 +136,7 @@ class _PADecodeAutotuneResources:
                 scale,
                 query_length,
                 work_plan=plan,
-                **self.options,
+                **options,
                 **workspace,
             )
 
@@ -144,11 +154,11 @@ class _PADecodeAutotuneResources:
         stream.synchronize()
         if not torch.isfinite(output).all().item():
             raise ArithmeticError("PA autotune candidate produced nonfinite output")
-        self.outputs[workgroup_budget] = output
-        self.graphs[workgroup_budget] = graph
+        self.outputs[config_key] = output
+        self.graphs[config_key] = graph
         # Graph replay uses the original pointers, so retain all backing tensors.
-        self.plans[workgroup_budget] = plan
-        self.workspaces[workgroup_budget] = workspace
+        self.plans[config_key] = plan
+        self.workspaces[config_key] = workspace
         if self.reference is None:
             self.reference = output.clone()
         else:
@@ -156,41 +166,61 @@ class _PADecodeAutotuneResources:
 
 
 def _pa_decode_configs(*args, resources, num_cu, **kwargs):
-    # Keep a validated 2*CU baseline; deduplicate identical plan capacities.
+    # Keep the old 2*CU reference, then search both budget and Q/P choices.
     baseline = 2 * num_cu
     resources.prepare(baseline)
     batch = resources.args[2].numel()
     kv_heads = _cache_geometry(resources.args[0])[0]
+    query_length = resources.args[-1]
+    requested = resources.options.get("query_splits")
+    splits = ([requested] if requested is not None else
+              [None] + [q for q in (1, 2, 4, 8) if query_length % q == 0])
     capacities = {}
-    for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
+    candidates = [(budget, resources.max_partitions)
+                  for budget in (baseline, 128, 256, 512, 1024, 2048, 4096)]
+    # Retain the previous search's bounded workspace scale. Candidate graphs
+    # keep their buffers alive, so an unrestricted B*P cross product is costly.
+    max_budget = max(4096, baseline, batch * kv_heads)
+    candidates += [(batch * kv_heads * p, p)
+                   for p in (1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 128)
+                   if p <= resources.max_partitions and batch * kv_heads * p <= max_budget]
+    for budget, partitions in candidates:
         capacity = min(
-            batch * resources.max_partitions,
+            batch * partitions,
             max(batch, (budget + kv_heads - 1) // kv_heads),
         )
-        capacities.setdefault(capacity, Config(workgroup_budget=budget))
+        for split in splits:
+            capacities.setdefault((capacity, partitions, split),
+                Config(workgroup_budget=budget, partition_count=partitions, query_splits=split))
     return list(capacities.values())
 
 
 def _pa_decode_default(*args, num_cu, **kwargs):
-    return Config(workgroup_budget=2 * num_cu)
+    selected = calibrated_pa_config(num_cu=num_cu, **kwargs)
+    return Config(**selected) if selected is not None else Config(workgroup_budget=2 * num_cu)
 
 
 @contextmanager
 def _validate_pa_decode_config(arguments):
     resources = arguments["resources"]
     budget = arguments["workgroup_budget"]
-    resources.prepare(budget)
-    resources.outputs[budget].fill_(float("nan"))
+    partitions = arguments.get("partition_count")
+    splits = arguments.get("query_splits")
+    resources.prepare(budget, partitions, splits)
+    key = resources.key(budget, partitions, splits)
+    resources.outputs[key].fill_(float("nan"))
     yield
     torch.cuda.current_stream().synchronize()
     torch.testing.assert_close(
-        resources.outputs[budget], resources.reference, atol=5e-3, rtol=5e-3
+        resources.outputs[key], resources.reference, atol=5e-3, rtol=5e-3
     )
 
 
 @autotune(
     configs=_pa_decode_configs,
     key=[
+        "arch",
+        "requested_query_splits",
         "num_seqs",
         "num_kv_heads",
         "query_group_size",
@@ -216,6 +246,8 @@ def _validate_pa_decode_config(arguments):
     ),
 )
 def _pa_decode_autotuner(
+    arch,
+    requested_query_splits,
     num_seqs,
     num_kv_heads,
     query_group_size,
@@ -235,17 +267,28 @@ def _pa_decode_autotuner(
     resources,
     *,
     workgroup_budget,
+    partition_count=None,
+    query_splits=None,
 ):
-    resources.graphs[workgroup_budget].replay()
+    resources.graphs[resources.key(workgroup_budget, partition_count, query_splits)].replay()
 
 
-def _resolve_pa_decode_config(tuner, **arguments):
+def _resolve_pa_decode_config(tuner, *, cache_only=False, **arguments):
     """Resolve without a decode launch, including on FlyDSL 0.3.2.
 
     Older native autotuners lack resolve_config/validate_hook. Reuse their
     cache, pruning and benchmark machinery, validating each candidate once
     outside the timed replay loop. Never discard candidate validation.
     """
+    if cache_only:
+        key = tuner._make_key((), arguments)
+        if key in tuner.cache:
+            return tuner.cache[key]
+        artifact = tuner._artifact_ref((), arguments, required=False)
+        cached = tuner._load_artifact(artifact, (), arguments)
+        if cached is not None:
+            return cached
+        return tuner.default(**arguments)
     resolve = getattr(tuner, "resolve_config", None)
     if resolve is not None:
         return resolve(**arguments)
@@ -327,11 +370,14 @@ def prepare_pa_decode_plan(
     max_context_length: int | None = None,
     tune: bool = False,
     config_dir: str | Path | None = None,
+    query_splits: int | None = None,
+    cache_only: bool = False,
 ) -> PADecodePlan:
-    """Select a work budget using native FlyDSL autotune, then build a plan.
+    """Select budget, partition cap and query splits, then build a reusable plan.
 
     Call outside graph capture with the actual decode tensors/options. Native
-    cache hits and misses with the 2*CU default do not launch candidates.
+    cache hits and defaults do not launch candidates. Calibrated gfx942 MiMo
+    Q8 shapes have joint P/QS defaults; other shapes retain the 2*CU policy.
     Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
     FlyDSL's default benchmark and fastest-config selection. Candidates must
     agree with the 2*CU baseline before timing.
@@ -342,6 +388,10 @@ def prepare_pa_decode_plan(
     ``tune=True`` searches even when a result is cached and saves the winner.
     ``config_dir`` selects a root containing per-architecture cache directories
     and takes precedence over the environment's cache-directory override.
+    ``cache_only=True`` forbids candidate timing even when FLYDSL_AUTOTUNE=1;
+    use it when preparing serving graphs from dummy inputs. ``query_splits``
+    restricts the search when explicitly supplied. The returned plan stores
+    the selected split for pa_decode to consume when no decode override exists.
     ``max_batch_size`` sets the planner's batch cap (default 4096); the returned
     plan retains it for refreshes. Larger batches must fit the device's LDS.
 
@@ -355,6 +405,12 @@ def prepare_pa_decode_plan(
     invokes autotune. Workspace sizes follow the returned plan.capacity.
     """
     with torch.cuda.device(query.device):
+        if cache_only and tune:
+            raise ValueError("cache_only and tune=True are mutually exclusive")
+        if query_splits is not None and (
+            type(query_splits) is not int or query_splits < 1 or query_length % query_splits
+        ):
+            raise ValueError("query_splits must be a positive divisor of query_length")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
         properties = torch.cuda.get_device_properties(query.device)
@@ -377,6 +433,7 @@ def prepare_pa_decode_plan(
             "sinks": sinks,
             "sliding_window": default_plan.sliding_window,
             "max_context_length": max_context_length,
+            "query_splits": query_splits,
         }
         resources = _PADecodeAutotuneResources(
             query,
@@ -397,6 +454,8 @@ def prepare_pa_decode_plan(
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
+            "arch": arch,
+            "requested_query_splits": query_splits,
             "num_seqs": context_lengths.numel(),
             "num_kv_heads": num_kv_heads,
             "query_group_size": query.shape[1] // num_kv_heads,
@@ -430,27 +489,27 @@ def prepare_pa_decode_plan(
             config = _resolve_pa_decode_config(search, **tuning_args)
             tuner.cache.update(search.cache)
         else:
-            config = _resolve_pa_decode_config(tuner, **tuning_args)
-        budget = config.kwargs.get("workgroup_budget")
+            config = _resolve_pa_decode_config(tuner, cache_only=cache_only, **tuning_args)
+        budget, partitions, splits = validate_pa_config(
+            config.all_kwargs(), max_partitions=limit, query_length=query_length,
+            requested_query_splits=query_splits)
         if (
-            set(config.all_kwargs()) != {"workgroup_budget"}
-            or type(budget) is not int
-            or budget < 1
-            or config.compiler_opts()
+            config.compiler_opts()
             or config.pre_hook is not None
         ):
-            raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
-        if budget == 2 * num_cu:
-            return default_plan
-        return plan_pa_decode(
+            raise ValueError("Invalid PA partition/query configuration in FlyDSL autotune cache")
+        if budget == 2 * num_cu and partitions == limit:
+            return replace(default_plan, query_splits=splits)
+        selected_plan = plan_pa_decode(
             context_lengths,
             num_kv_heads,
-            max_partitions=limit,
+            max_partitions=partitions,
             max_batch_size=default_plan.max_batch_size,
             workgroup_budget=budget,
             sliding_window=default_plan.sliding_window,
             query_length=query_length,
         )
+        return replace(selected_plan, query_splits=splits)
 
 
 def _positive_int(value):
@@ -498,6 +557,8 @@ def _parse_args(argv=None):
         "--sink-dtype", choices=("none", "bf16", "fp16", "fp32"), default="none"
     )
     parser.add_argument("--max-partitions", type=_positive_int)
+    parser.add_argument("--query-splits", type=_positive_int,
+                        help="Restrict query splitting; default searches legal splits.")
     parser.add_argument("--device", type=int, default=0, help="Visible GPU index.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -508,6 +569,8 @@ def _parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.batch_size > args.max_batch_size:
         parser.error(f"--batch-size must be at most {args.max_batch_size}")
+    if args.query_splits is not None and args.query_length % args.query_splits:
+        parser.error("--query-splits must divide --query-length")
     if args.num_query_heads % args.num_kv_heads:
         parser.error("--num-query-heads must be divisible by --num-kv-heads")
     if not 64 <= args.head_dim <= 1024 or args.head_dim % 64:
@@ -622,6 +685,7 @@ def _make_tuning_inputs(args, device, kv_dtype):
         "max_partitions": args.max_partitions,
         "max_batch_size": args.max_batch_size,
         "max_context_length": max_length,
+        "query_splits": args.query_splits,
     }
 
 
@@ -669,7 +733,8 @@ def main(argv=None):
     cache_file = _get_pa_decode_autotuner(arch, args.output_dir)._cache_file
     print(f"Saved configuration to {cache_file}")
     print(
-        f"Selected plan capacity={plan.capacity}, max partitions={plan.max_partitions}"
+        f"Selected plan capacity={plan.capacity}, max partitions={plan.max_partitions}, "
+        f"query splits={plan.query_splits}"
     )
 
 

@@ -1,25 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Generic FlyDSL paged decode correctness test.
+"""FlyDSL paged decode correctness and tuning-policy tests.
 
-Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+Run all tests: python -m pytest -q op_tests/test_flydsl_pa_decode.py
+CPU policy/cache tests: python -m pytest -q op_tests/test_flydsl_pa_decode.py::TestPAConfig
 """
 
+import ast
 import importlib.util
+import unittest
 from itertools import product
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
-
-from aiter import per_tensor_quant, pertoken_quant
-from aiter.jit.utils.chip_info import get_gfx_runtime
 
 
 @pytest.fixture
 def device(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
     if get_gfx_runtime() not in ("gfx942", "gfx950", "gfx1250"):
         pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
     if importlib.util.find_spec("flydsl") is None:
@@ -742,6 +746,309 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
 
 
 @pytest.mark.parametrize(
+    "batch,parts,splits,full_budget",
+    [
+        (1, 2, 8, True),
+        (7, 4, 4, True),
+        (8, 8, 2, True),
+        (9, 16, 4, True),
+        (12, 64, 2, True),
+        (17, 128, 4, True),
+        (33, 8, 1, True),
+        (9, 16, 4, False),
+    ],
+)
+def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits, full_budget):
+    """Interleaved Q groups preserve packed ownership and empty-row outputs."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("MiMo query-grid scheduling is specific to gfx942")
+    from aiter.ops.flydsl.kernels.pa_decode.traits import (
+        PaDecodeSchedule,
+        PaDecodeTraits,
+    )
+
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(814)
+    pattern = (0, 1, 7, 8, 127, 255, 256, 257, 511, 1025, 4097)
+    lengths = tuple(pattern[i % len(pattern)] for i in range(batch))
+    # Keep a nonempty allocation even for the all-empty B1 entry.
+    initial = tuple(max(length, 4097) for length in lengths)
+    query, key, value, table, context = _make_inputs(
+        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device,
+        initial, table_width=16384,
+    )
+    # Reserve block zero for padded table reads, and poison every unowned token.
+    key = torch.cat([torch.zeros_like(key[:1]), key])
+    value = torch.cat([torch.zeros_like(value[:1]), value])
+    used_pages = (4097 + 63) // 64
+    table[:, :used_pages].add_(1)
+    pages = key.shape[0]
+    kc = torch.empty((pages, 1, 24, 64, 8), dtype=key.dtype, device=device)
+    vc = torch.empty((pages, 1, 8, 128, 8), dtype=value.dtype, device=device)
+
+    def refresh_cache():
+        owned = torch.zeros((pages, 64), dtype=torch.bool, device=device)
+        for seq, length in enumerate(context.tolist()):
+            tokens = torch.arange(length, device=device)
+            owned[table[seq, tokens // 64].long(), tokens % 64] = True
+        poisoned_key = key.masked_fill(~owned[:, None, :, None], float("nan"))
+        poisoned_value = value.masked_fill(~owned[:, None, :, None], float("nan"))
+        kc.copy_(poisoned_key.view(pages, 1, 64, 24, 8).permute(0, 1, 3, 2, 4))
+        vc.copy_(poisoned_value.view(pages, 1, 8, 8, 128).permute(0, 1, 2, 4, 3))
+
+    context.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+    refresh_cache()
+    plan = pa.plan_pa_decode(
+        context, 1, max_partitions=parts,
+        workgroup_budget=batch * (parts if full_budget else 3), query_length=8,
+    )
+    shape = (1, plan.capacity, 128)
+    pmax = torch.empty(shape, dtype=torch.float32, device=device)
+    psum = torch.empty_like(pmax)
+    pout = torch.empty((*shape, 128), dtype=torch.bfloat16, device=device)
+    guarded = torch.full((batch * 8 + 2, 16, 128), 19.0, dtype=query.dtype, device=device)
+    output = guarded[1:-1]
+    compiled = []
+    original_compile = pa.compile_pa_decode_tile
+
+    def compile_spy(**kwargs):
+        selected = {k: v for k, v in kwargs.items() if k not in ("architecture", "direct_output")}
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**selected))
+        compiled.append(traits.query_first_plan_grid)
+        return original_compile(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", compile_spy)
+
+    def launch():
+        pa.plan_pa_decode(context, 1, plan=plan, query_length=8)
+        pa.pa_decode(
+            output, query, kc, vc, context, table, 192**-0.5, 8,
+            work_plan=plan, query_splits=splits, max_context_length=1048576,
+            max_logits=pmax, exp_sums=psum, temporary_output=pout,
+        )
+
+    def check():
+        reference = _reference(query, key.float(), value.float(), table, context, 8, 0, None)
+        _check_output(output, reference, 5e-3)
+        assert bool((guarded[0] == 19).all() and (guarded[-1] == 19).all())
+
+    launch()
+    check()
+    assert compiled and all(flag == full_budget for flag in compiled)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        launch()
+    for state in ("all-empty", "mixed", "remapped"):
+        if state == "all-empty":
+            context.zero_()
+        else:
+            new_lengths = tuple(pattern[(batch - i) % len(pattern)] for i in range(batch))
+            context.copy_(torch.tensor(new_lengths, dtype=torch.int32, device=device))
+        if state == "remapped":
+            table.copy_(table.roll(1, dims=0))
+            query.neg_()
+        refresh_cache()
+        output.fill_(float("nan"))
+        graph.replay()
+        check()
+
+
+_PA_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "aiter/ops/flydsl"
+_pa_config_spec = importlib.util.spec_from_file_location("pa_config_under_test", _PA_CONFIG_ROOT / "pa_decode_config.py")
+_pa_config_policy = importlib.util.module_from_spec(_pa_config_spec)
+_pa_config_spec.loader.exec_module(_pa_config_policy)
+
+
+class _PAConfigStub:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _pa_tuning_function(name, **namespace):
+    source = _PA_CONFIG_ROOT / "pa_decode_tuning.py"
+    fn = next(n for n in ast.parse(source.read_text()).body
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    fn.decorator_list = []
+    exec(compile(ast.unparse(fn), str(source), "exec"), namespace)
+    return namespace[name]
+
+
+class TestPAConfig(unittest.TestCase):
+    """CPU-only selection/cache contracts; independent of the GPU fixture."""
+
+    def geometry(self, batch=12, **changes):
+        values = dict(arch="gfx942", num_seqs=batch, num_kv_heads=1,
+            query_group_size=16, head_dim=192, value_dim=128, block_size=64,
+            query_length=8, query_dtype="torch.bfloat16", kv_dtype="torch.bfloat16",
+            per_token_kv=False, trans_v=True, sink_dtype=None, sliding_window=0,
+            max_partitions=304, num_cu=304, requested_query_splits=None)
+        values.update(changes)
+        return values
+
+    def test_selected_serving_defaults(self):
+        for batch, expected in [(12,(24,1)),(24,(64,2)),(40,(64,2)),(96,(3,1)),
+                                (152,(2,1)),(208,(8,2)),(240,(4,2)),(256,(4,2))]:
+            with self.subTest(batch=batch):
+                result = _pa_config_policy.calibrated_pa_config(**self.geometry(batch))
+                self.assertEqual((result['partition_count'],result['query_splits']),expected)
+                self.assertEqual(result['workgroup_budget'],batch*expected[0])
+
+    def test_untuned_geometry_and_explicit_cap(self):
+        for changes in [dict(arch="gfx950"),dict(num_cu=256),
+                        dict(query_length=4),dict(sliding_window=128),dict(sink_dtype="torch.float32"),
+                        dict(kv_dtype="torch.float8_e4m3fnuz"),dict(num_kv_heads=2),
+                        dict(trans_v=False)]:
+            with self.subTest(changes=changes):
+                self.assertIsNone(_pa_config_policy.calibrated_pa_config(**self.geometry(**changes)))
+        for changes, parts in [(dict(num_seqs=13),16),(dict(max_partitions=16),16),
+                                (dict(max_partitions=8),8)]:
+            values=self.geometry(**changes)
+            result=_pa_config_policy.calibrated_pa_config(**values)
+            self.assertEqual(result,dict(partition_count=parts,query_splits=None,
+                                        workgroup_budget=values['num_seqs']*parts))
+
+    def test_explicit_split(self):
+        result = _pa_config_policy.calibrated_pa_config(**self.geometry(requested_query_splits=2))
+        self.assertEqual(result['query_splits'],2)
+
+    def test_old_budget_cache_compatibility(self):
+        self.assertEqual(_pa_config_policy.validate_pa_config({'workgroup_budget':608},
+            max_partitions=304,query_length=8),(608,304,None))
+
+    def test_invalid_cache_values(self):
+        bad = [{}, {'workgroup_budget':True}, {'workgroup_budget':0},
+            {'workgroup_budget':608,'partition_count':305},
+            {'workgroup_budget':608,'partition_count':False},
+            {'workgroup_budget':608,'query_splits':3},
+            {'workgroup_budget':608,'query_splits':True},
+            {'workgroup_budget':608,'unknown':1}]
+        for values in bad:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                _pa_config_policy.validate_pa_config(values,max_partitions=304,query_length=8)
+        with self.assertRaises(ValueError):
+            _pa_config_policy.validate_pa_config({'workgroup_budget':288,'query_splits':2},
+                max_partitions=304,query_length=8,requested_query_splits=1)
+
+    def test_joint_candidates_are_not_deduplicated_by_capacity(self):
+        prepare_calls=[]
+        resources=SimpleNamespace(args=(object(),object(),SimpleNamespace(numel=lambda:12),None,None,8),
+            options={'query_splits':None},max_partitions=128,prepare=lambda *a:prepare_calls.append(a))
+        fn=_pa_tuning_function('_pa_decode_configs',Config=_PAConfigStub,_cache_geometry=lambda key:(1,64))
+        results=[x.kwargs for x in fn(resources=resources,num_cu=304)]
+        self.assertIn(dict(workgroup_budget=288,partition_count=24,query_splits=1),results)
+        self.assertIn(dict(workgroup_budget=288,partition_count=24,query_splits=2),results)
+        self.assertTrue(prepare_calls)
+        resources.options['query_splits']=1
+        self.assertTrue(all(x.kwargs['query_splits']==1 for x in fn(resources=resources,num_cu=304)))
+
+    def test_cache_only_does_not_search(self):
+        fn=_pa_tuning_function('_resolve_pa_decode_config')
+        cached=_PAConfigStub(workgroup_budget=288,partition_count=24,query_splits=1)
+        calls=[]
+        tuner=SimpleNamespace(_make_key=lambda *a:'key',cache={'key':cached},
+            _artifact_ref=lambda *a,**kw:None,_load_artifact=lambda *a:None,
+            default=lambda **kw:calls.append('default') or cached,
+            resolve_config=lambda **kw:(_ for _ in ()).throw(AssertionError('Search called')))
+        self.assertIs(fn(tuner,cache_only=True),cached)
+        self.assertEqual(calls,[])
+        tuner.cache.clear()
+        self.assertIs(fn(tuner,cache_only=True),cached)
+        self.assertEqual(calls,['default'])
+
+
+@pytest.mark.parametrize("batch,parts,splits", [(12,24,1),(24,64,2),(40,64,2),(96,3,1),
+    (152,2,1),(208,8,2),(240,4,2),(256,4,2),(7,16,None)])
+def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, splits):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942" or torch.cuda.get_device_properties(device).multi_processor_count != 304:
+        pytest.skip("Calibrated MiMo defaults require gfx942")
+    from aiter.ops.flydsl import pa_decode_tuning as tuning
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(813)
+    q,k,v,table,lengths = _make_inputs(8,1,16,192,128,64,torch.bfloat16,
+        "random",device,(256,)*batch,table_width=64)
+    lengths.copy_(torch.tensor([128+(i%3)*57 for i in range(batch)],device=device,dtype=torch.int32))
+    kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
+    vc=v.view(v.shape[0],1,8,8,128).permute(0,1,2,4,3).contiguous()
+    monkeypatch.setenv("FLYDSL_AUTOTUNE","1")
+    def no_search(*args,**kwargs):
+        raise AssertionError("Serving cache-only preparation launched tuning candidates")
+    monkeypatch.setattr(tuning._PADecodeAutotuneResources,"prepare",no_search)
+    plan=tuning.prepare_pa_decode_plan(q,kc,vc,lengths,table,192**-.5,8,
+        max_batch_size=batch,max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (plan.max_partitions,plan.query_splits)==(parts,splits)
+    shape=(1,plan.capacity,128)
+    pmax=torch.empty(shape,device=device,dtype=torch.float32)
+    psum=torch.empty_like(pmax)
+    pout=torch.empty((*shape,128),device=device,dtype=torch.bfloat16)
+    output=torch.empty((batch*8,16,128),device=device,dtype=torch.bfloat16)
+    pointers=(plan.work_info.data_ptr(),plan.reduce_info.data_ptr())
+    def run():
+        assert pa.plan_pa_decode(lengths,1,plan=plan,query_length=8) is plan
+        pa.pa_decode(output,q,kc,vc,lengths,table,192**-.5,8,work_plan=plan,
+            max_context_length=4096,max_logits=pmax,exp_sums=psum,temporary_output=pout)
+    def check():
+        reference=_reference(q,k.float(),v.float(),table,lengths,8,0,None)
+        _check_output(output,reference,5e-3)
+    run();check()
+    graph=torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):run()
+    for state in ("mixed_empty","remapped"):
+        if state=="mixed_empty":lengths[::2]=0
+        else:
+            lengths.fill_(185)
+            table.copy_(table.roll(1,dims=0))
+            q.neg_()
+        output.fill_(float("nan"))
+        graph.replay();check()
+    assert pointers==(plan.work_info.data_ptr(),plan.reduce_info.data_ptr())
+    assert plan.query_splits==splits
+
+
+def test_mimo_joint_tuning_cache_and_resources(device, monkeypatch, tmp_path):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942" or torch.cuda.get_device_properties(device).multi_processor_count != 304:
+        pytest.skip("Calibrated MiMo defaults require gfx942")
+    from aiter.ops.flydsl import pa_decode_tuning as tuning
+    from flydsl.autotune import Config
+    q,k,v,table,lengths=_make_inputs(8,1,16,192,128,64,torch.bfloat16,
+        "random",device,(256,)*12,table_width=64)
+    kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
+    vc=v.view(v.shape[0],1,8,8,128).permute(0,1,2,4,3).contiguous()
+    arguments=(q,kc,vc,lengths,table,192**-.5,8)
+    captured={}
+    original=tuning._resolve_pa_decode_config
+    def observe(tuner,**kwargs):
+        captured.update(tuner=tuner,args={k:v for k,v in kwargs.items() if k!='cache_only'})
+        return original(tuner,**kwargs)
+    monkeypatch.setattr(tuning,'_resolve_pa_decode_config',observe)
+    plan=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
+        max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (plan.max_partitions,plan.query_splits)==(24,1)
+    tuner=captured['tuner'];key=tuner._make_key((),captured['args'])
+    tuner.cache[key]=Config(workgroup_budget=96,partition_count=8,query_splits=2)
+    tuner._save_disk_cache();tuner.cache.clear();tuner._load_disk_cache()
+    cached=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
+        max_context_length=4096,cache_only=True,config_dir=tmp_path)
+    assert (cached.max_partitions,cached.query_splits,cached.capacity)==(8,2,96)
+    options=dict(compute_type=None,key_scale=None,value_scale=None,sinks=None,
+                 sliding_window=0,max_context_length=4096,query_splits=None)
+    resources=tuning._PADecodeAutotuneResources(q,arguments[1:],options,304,12)
+    for budget,parts,splits in [(608,304,None),(288,24,1),(288,24,2)]:
+        resources.prepare(budget,parts,splits)
+    assert len(resources.graphs)==3
+    for key,graph in resources.graphs.items():
+        graph.replay();torch.cuda.synchronize()
+        torch.testing.assert_close(resources.outputs[key],resources.reference,atol=5e-3,rtol=5e-3)
+
+
+@pytest.mark.parametrize(
     "case",
     [
         *[
@@ -800,6 +1107,9 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
 )
 def test_pa_decode(case, device, monkeypatch):
     """FP8/BF16 decode shares input, reference, planning and replay checks."""
+    from aiter import per_tensor_quant, pertoken_quant
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
     case = dict(
         {
             "query_length": 1,
@@ -1014,6 +1324,8 @@ def test_pa_decode(case, device, monkeypatch):
 
 @pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
 def test_asymmetric_multihead_large_address(kv_dtype, device):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
     if get_gfx_runtime() not in ("gfx942", "gfx950"):
         pytest.skip("asymmetric Q/K and V widths require gfx942/gfx950")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
@@ -1101,6 +1413,9 @@ def test_pa_decode_unowned_kv_rows(
     image); P is zero there but 0 * NaN is NaN in PV.
     ``mask_unowned_kv=False`` skips the masking and matches it on clean input.
     """
+    from aiter import per_tensor_quant, pertoken_quant
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
     if get_gfx_runtime() == "gfx1250":
         pytest.skip("gfx1250 pipelines still require finite unowned V rows")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")

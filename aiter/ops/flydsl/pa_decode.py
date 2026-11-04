@@ -199,8 +199,9 @@ def pa_decode(
 
     ``query_splits`` optionally overrides the compiler's query splitting.
     It must be a positive divisor of ``query_length``; the compiler also
-    checks the selected layout's shared-memory requirements. None retains
-    the existing automatic policy.
+    checks the selected layout's shared-memory requirements. None uses a
+    matching plan's tuned query split, or the existing compiler policy when
+    the plan has no selection for this query length.
 
     Supports page sizes 16/64/128. On gfx942/gfx950, BF16 and FP8 head
     dimensions are multiples of 64 up to 1024. gfx1250 supports 64 and
@@ -611,6 +612,8 @@ def pa_decode(
             (max_context_length + block_size - 1) // block_size * block_size
         )
     work_plan.validate(num_seqs, num_kv_heads, dev)
+    if query_splits is None and work_plan.query_length == query_length:
+        query_splits = work_plan.query_splits
     if work_plan.sliding_window != sliding_window:
         raise ValueError("sliding_window must match work_plan.sliding_window")
     if sliding_window > 0 and work_plan.query_length != query_length:

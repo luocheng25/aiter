@@ -56,7 +56,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
 from .pa_decode.compat import check_smem_capacity
-from .pa_decode.context import PaDecodeContext
+from .pa_decode.context import PaDecodeContext, query_first_plan_coordinates
 from .pa_decode.pipeline import Gfx1250Bf16Pipeline, Gfx1250Pipeline, PaDecodePipeline
 from .pa_decode.traits import (
     FP8_PACK_K,
@@ -371,7 +371,9 @@ def compile_pa_decode_tile(
 
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
-        if const_expr(traits.batch_first_plan_grid):
+        if const_expr(traits.query_first_plan_grid):
+            slot, _ = query_first_plan_coordinates(traits.query_splits)
+        elif const_expr(traits.batch_first_plan_grid):
             slot = fx.Int32(
                 fx.Uint32(gpu.block_id("x")) * fx.Uint32(gpu.grid_dim.z)
                 + fx.Uint32(gpu.block_id("z"))
@@ -433,6 +435,12 @@ def compile_pa_decode_tile(
             ).launch(
                 grid=(
                     (
+                        num_seqs * traits.query_splits,
+                        num_kv_heads,
+                        work_capacity // num_seqs,
+                    )
+                    if traits.query_first_plan_grid
+                    else (
                         num_seqs,
                         num_kv_heads * traits.query_splits,
                         work_capacity // num_seqs,

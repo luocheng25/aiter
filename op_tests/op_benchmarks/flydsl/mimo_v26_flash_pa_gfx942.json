@@ -1,0 +1,44 @@
+{
+  "full": {
+    "4096": {
+      "partitions": 4,
+      "query_splits": 2
+    },
+    "8192": {
+      "partitions": 4,
+      "query_splits": 2
+    },
+    "16384": {
+      "partitions": 4,
+      "query_splits": 2
+    },
+    "32768": {
+      "partitions": 8,
+      "query_splits": 2
+    },
+    "65536": {
+      "partitions": 8,
+      "query_splits": 2
+    },
+    "131072": {
+      "partitions": 64,
+      "query_splits": 2
+    },
+    "262144": {
+      "partitions": 64,
+      "query_splits": 2
+    },
+    "524288": {
+      "partitions": 64,
+      "query_splits": 2
+    },
+    "786432": {
+      "partitions": 128,
+      "query_splits": 2
+    },
+    "1040000": {
+      "partitions": 24,
+      "query_splits": 1
+    }
+  }
+}

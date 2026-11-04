@@ -13,6 +13,26 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from .traits import LOG2E, MFMA_MNK, WAVE
 
 
+def query_first_plan_coordinates(query_splits):
+    """Map the interleaved physical x axis back to a packed slot and Q group.
+
+    Rows group packed plan slots, not logical sequences. The plan record still
+    supplies sequence/tile ownership, including mixed and empty contexts.
+    """
+    x = fx.Int32(gpu.block_id("x"))
+    rows = fx.Int32(gpu.grid_dim.x) // query_splits
+    group = x // (8 * query_splits)
+    within = x % (8 * query_splits)
+    live_rows = fx.min(rows - group * 8, fx.Int32(8))
+    query = within // live_rows
+    row = group * 8 + within % live_rows
+    slot = fx.Int32(
+        fx.Uint32(row) * fx.Uint32(gpu.grid_dim.z)
+        + fx.Uint32(gpu.block_id("z"))
+    )
+    return slot, query
+
+
 class PaDecodeContext:
     def __init__(
         self,
@@ -66,6 +86,18 @@ class PaDecodeContext:
         self.warp = self.tid // WAVE  # 0..NWARP-1
         self.lane = self.tid - self.warp * WAVE  # 0..63
         self.seq = self.planned_seq
+        if const_expr(getattr(self.traits, "query_first_plan_grid", False)):
+            self.part, query = query_first_plan_coordinates(self.traits.query_splits)
+            self.kv_h = fx.Int32(gpu.block_id("y"))
+            self.n_kv = fx.Int32(gpu.grid_dim.y)
+            self.kv_query = self.kv_h * self.traits.query_splits + query
+            self.query_begin = query * self.traits.QUERIES_PER_CTA
+            capacity = fx.Int32(
+                (fx.Uint32(gpu.grid_dim.x) // self.traits.query_splits)
+                * fx.Uint32(gpu.grid_dim.z)
+            )
+            self.partial_slot = self.kv_h * capacity + self.part
+            return
         self.kv_query = fx.Int32(gpu.block_id("y"))
         self.kv_h = self.kv_query // self.traits.query_splits
         self.query_begin = (

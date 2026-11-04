@@ -456,6 +456,22 @@ class PaDecodeSchedule:
                 num_seqs > 8 and num_seqs % 8 in (2, 4, 6) and window_tiles % 2 == 0
             )
         )
+        # MiMo Q8 full attention interleaves sibling query groups within small
+        # blocks of packed rows. Plan records still supply the actual sequence
+        # and tile ownership for mixed lengths.
+        batch_first_plan_grid = batch_first_plan_grid or (
+            arch == "gfx942"
+            and is_bf16_kv
+            and head_dim == 192
+            and value_dim == 128
+            and num_kv_heads == 1
+            and query_group_size == 16
+            and query_length == 8
+            and block_size == 64
+            and sliding_window == 0
+            and num_seqs > 0
+            and work_capacity == num_seqs * num_partitions
+        )
         cache_key = (
             head_dim,
             value_dim,
@@ -584,6 +600,24 @@ class PaDecodeTraits:
     sVScaleMax_off: int
     sPages_off: int
     total_bytes: int
+
+    @property
+    def query_first_plan_grid(self) -> bool:
+        """Interleave MiMo's sibling query groups within eight packed rows."""
+        return (
+            self.batch_first_plan_grid
+            and self.is_bf16_kv
+            and self.head_dim == 192
+            and self.value_dim == 128
+            and self.query_group_size == 16
+            and self.query_length == 8
+            and self.block_size == 64
+            and self.sliding_window == 0
+        )
+
+    @property
+    def stream_query_from_lds(self) -> bool:
+        return self.query_first_plan_grid and self.query_splits == 1
 
     def o_slot(self, m: int, vh: int) -> int:
         return 2 + self.STATE_PER_M * m + vh
@@ -786,9 +820,15 @@ class PaDecodeTraits:
         # PV output and online-softmax state remain in registers.
         f32 = 4
         sQ_bytes = ROWS_PADDED * head_dim * QP_ELEM_BYTES
+        separate_qp = (
+            batch_first_plan_grid and is_bf16_kv and head_dim == 192
+            and value_dim == 128 and query_group_size == 16
+            and query_length == 8 and query_splits == 1
+            and block_size == 64 and sliding_window == 0
+        )
         # First-QK's max barrier retires all sQ reads before P overwrites it.
         # Still-live Q scales stay outside the aliased, 16-byte-aligned Q/P regions.
-        sP_off = 0
+        sP_off = sQ_bytes if separate_qp else 0
         # Padding avoids 32-bank conflicts while preserving ds_read_b128 alignment.
         SP_ROW_BYTES = TILE_TOK * QP_ELEM_BYTES + 16
         if FP8_WINDOW_RESIDUAL:
@@ -797,7 +837,7 @@ class PaDecodeTraits:
             # Keep 16 bytes of bank padding after the compact residual range.
             SP_ROW_BYTES += FP8_RESIDUAL_TOKENS
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
-        sQscale_off = max(sQ_bytes, sP_bytes)
+        sQscale_off = sP_off + sP_bytes if separate_qp else max(sQ_bytes, sP_bytes)
         sQscale_bytes = 0 if is_bf16_kv else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = NWARP if TUNE_PAGE128 or PER_TOKEN_M1 or MTP4_FUSED else NWARP + 1
