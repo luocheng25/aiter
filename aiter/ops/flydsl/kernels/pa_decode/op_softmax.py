@@ -3,13 +3,48 @@
 
 """PA score masking, online softmax, and BF16/FP8 probability staging."""
 
+from functools import cache
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import ReductionOp
+from flydsl.runtime.device import get_rocm_arch
 
 from ..utils import rcp_f32
 from .traits import MFMA_ACC_ELEMS, MFMA_MNK, WAVE
+
+
+@cache
+def _software_bf16_cvt():
+    return str(get_rocm_arch()).startswith("gfx94")
+
+
+def _pack_probability_bf16(values):
+    """Finite probabilities to BF16 words, element i in the low half.
+
+    gfx94x has no FP32->BF16 instruction; fptrunc's NaN quieting doubles the
+    software RNE to 5.5 VALU per value. Without it this is 2.5 and bit-exact.
+    """
+    if not _software_bf16_cvt():
+        return values.to(fx.BFloat16)
+    bits = fx.Vector(values).bitcast(fx.Uint32)
+    rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
+    selector = fx.Int32(0x07060302)
+    words = [
+        fx.Int32(
+            llvm.inline_asm(
+                fx.Int32.ir_type,
+                [rounded[i + 1].ir_value(), rounded[i].ir_value(), selector.ir_value()],
+                "v_perm_b32 $0, $1, $2, $3",
+                "=v,v,v,s",
+                has_side_effects=True,
+            )
+        )
+        for i in range(0, values.numel, 2)
+    ]
+    return fx.Vector.from_elements(words, fx.Int32).bitcast(fx.BFloat16)
 
 
 class PaDecodeSoftmax:
@@ -112,8 +147,8 @@ class PaDecodeSoftmax:
                 frag_Ss[a] * scale_b for a in range_constexpr(self.traits.NCHUNK)
             ]
 
-        if const_expr(self.traits.MTP4_FUSED):
-            # Interior tiles need no mask for any of the four queries.
+        if const_expr(self.traits.MTP4_FUSED or self.traits.sliding_window == 0):
+            # Interior tiles need no mask for any query.
             masked_all = fx.Vector.from_elements(
                 [
                     scaled_frags[a][r]
@@ -376,7 +411,7 @@ class PaDecodeSoftmax:
             else:
                 p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
-                p_scaled.to(fx.BFloat16)
+                _pack_probability_bf16(p_scaled)
                 if const_expr(self.traits.is_bf16_kv)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
@@ -480,7 +515,7 @@ class PaDecodeSoftmax:
             else:
                 p_scaled = Pa * fx.full(4, self.traits.FP8_MAX, fx.Float32)
             words.append(
-                p_scaled.to(fx.BFloat16)
+                _pack_probability_bf16(p_scaled)
                 if const_expr(self.traits.is_bf16_kv)
                 else self.gemm.fp8_words(p_scaled)[0]
             )
