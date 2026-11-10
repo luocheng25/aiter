@@ -1081,6 +1081,156 @@ def fused_moe_(
     )
 
 
+_FLYDSL_GFX942_FP8_BLOCKSCALE_ENV = "AITER_FMOE_FP8_BLOCKSCALE_FLYDSL"
+
+
+@functools.cache
+def _log_flydsl_gfx942_fp8_blockscale_fallback(reason):
+    logger.warning(
+        f"[fused_moe] {_FLYDSL_GFX942_FP8_BLOCKSCALE_ENV}=1 but {reason}; using the default path"
+    )
+
+
+def _flydsl_gfx942_fp8_blockscale_unsupported(
+    hidden_states,
+    w1,
+    w2,
+    topk_ids,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    activation,
+    quant_type,
+    q_dtype_a,
+    q_dtype_w,
+    isG1U1,
+    doweight_stage1,
+    dtype,
+    gate_mode,
+    has_extras,
+):
+    """'' when the pyhip FlyDSL GateUp + Down can replace fmoe_fp8_blockscale_g1u1, else why not."""
+    M, topk = topk_ids.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if get_gfx() != "gfx942":
+        return f"{get_gfx()} is not gfx942"
+    if (
+        quant_type != QuantType.per_1x128
+        or q_dtype_w != dtypes.fp8
+        or q_dtype_a != dtypes.fp8
+        or w2.dtype != dtypes.fp8
+    ):
+        return f"{quant_type} with {q_dtype_a} x {q_dtype_w} is not FP8 128x128 block scale"
+    if (
+        not isG1U1
+        or activation != ActivationType.Silu
+        or doweight_stage1
+        or dtype != dtypes.bf16
+    ):
+        return "only g1u1 SiLU, routing weights applied in Down and BF16 output are supported"
+    if gate_mode != GateMode.SEPARATED or has_extras:
+        return (
+            "gate interleave, bias, padding, swiglu_limit, a2_scale, stage2_scatter "
+            "and internal overrides are not supported"
+        )
+    if hidden_states.dtype == dtypes.fp8:
+        if (
+            a1_scale is None
+            or a1_scale.dtype != dtypes.fp32
+            or tuple(a1_scale.shape) != (M, model_dim // 128)
+        ):
+            return "FP8 input needs an FP32 a1_scale [tokens, hidden_dim / 128]"
+    elif hidden_states.dtype != dtypes.bf16 or a1_scale is not None:
+        return f"{hidden_states.dtype} input with a static a1_scale is not supported"
+    scales_ok = (
+        w1_scale is not None
+        and w2_scale is not None
+        and w1_scale.dtype == dtypes.fp32
+        and w2_scale.dtype == dtypes.fp32
+        and w1_scale.numel() == E * (2 * inter_dim // 128) * (model_dim // 128)
+        and w2_scale.numel() == E * (model_dim // 128) * (inter_dim // 128)
+    )
+    if not scales_ok:
+        return "weight scales must be FP32 [E, 2I/128, H/128] and [E, H/128, I/128]"
+    if not all(t.is_contiguous() for t in (hidden_states, w1, w2, w1_scale, w2_scale)):
+        return "activations, weights and weight scales must be contiguous"
+    min_tokens = int(
+        os.environ.get(f"{_FLYDSL_GFX942_FP8_BLOCKSCALE_ENV}_MIN_TOKENS", "4096")
+    )
+    if M < min_tokens:
+        return f"tokens < {_FLYDSL_GFX942_FP8_BLOCKSCALE_ENV}_MIN_TOKENS={min_tokens}"
+    try:
+        from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import (
+            unsupported_reason,
+        )
+    except ImportError as error:
+        return f"pyhip is not importable ({error})"
+    return unsupported_reason(M, model_dim, inter_dim, topk, E)
+
+
+def _fused_moe_flydsl_gfx942_fp8_blockscale(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask,
+    num_experts,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    num_local_tokens,
+    dispatch_policy,
+    dtype,
+    output,
+):
+    from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import (
+        SORT_BLOCK_M,
+        fused_moe_a8w8_blockscale_gfx942,
+    )
+
+    M, topk = topk_ids.shape
+    model_dim = w2.shape[1]
+    device = topk_ids.device
+    a1 = hidden_states
+    if hidden_states.dtype != dtypes.fp8:
+        a1, a1_scale = get_quant(QuantType.per_1x128)(
+            hidden_states, quant_dtype=dtypes.fp8, num_rows=num_local_tokens
+        )
+    # Stride M: partial_transpose would use num_local_tokens as the stride.
+    a1_scale_t = a1_scale.t().contiguous()
+    # An empty moe_buf keeps the sort from zeroing the output; the pipeline clears what it does not store.
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids,
+        topk_weight,
+        num_experts,
+        model_dim,
+        dtype,
+        SORT_BLOCK_M,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+        output=torch.empty((0, 0), dtype=dtype, device=device),
+    )
+    if output is None:
+        output = torch.empty((M, model_dim), dtype=dtype, device=device)
+    return fused_moe_a8w8_blockscale_gfx942(
+        a1,
+        a1_scale_t,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        output,
+        topk,
+        num_rows=num_local_tokens,
+    )
+
+
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1272,6 +1422,59 @@ def _fused_moe_impl(
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+
+    if os.environ.get(_FLYDSL_GFX942_FP8_BLOCKSCALE_ENV, "0") == "1":
+        has_extras = (
+            bias1 is not None
+            or bias2 is not None
+            or bool(hidden_pad)
+            or bool(intermediate_pad)
+            or bool(swiglu_limit)
+            or a2_scale is not None
+            or a1_scale_is_transposed
+            or stage2_scatter is not None
+            or _metadata_transform is not None
+            or _metadata_config_file is not None
+            or _stage1_extra_args is not None
+            or _stage2_extra_args is not None
+            or _stage2_override is not None
+        )
+        reason = _flydsl_gfx942_fp8_blockscale_unsupported(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            activation,
+            quant_type,
+            q_dtype_a,
+            q_dtype_w,
+            isG1U1,
+            doweight_stage1,
+            dtype,
+            gate_mode,
+            has_extras,
+        )
+        if not reason:
+            return _fused_moe_flydsl_gfx942_fp8_blockscale(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                expert_mask,
+                global_E,
+                w1_scale,
+                w2_scale,
+                a1_scale,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                dtype,
+                output,
+            )
+        _log_flydsl_gfx942_fp8_blockscale_fallback(reason)
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
