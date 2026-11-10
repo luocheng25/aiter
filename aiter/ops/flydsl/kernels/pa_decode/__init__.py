@@ -24,6 +24,7 @@ def implementation_cache_tag():
         "dpp_utils.py",
         "kernels_common.py",
         "pa_decode_kernel.py",
+        "pa_decode_mimo.py",
         "pa_decode_plan.py",
         "pa_decode_reduce.py",
         "tensor_shim.py",

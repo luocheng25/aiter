@@ -493,12 +493,13 @@ def prepare_pa_decode_plan(
         budget, partitions, splits = validate_pa_config(
             config.all_kwargs(), max_partitions=limit, query_length=query_length,
             requested_query_splits=query_splits)
+        balanced = config.all_kwargs().get("balanced", False)
         if (
             config.compiler_opts()
             or config.pre_hook is not None
         ):
             raise ValueError("Invalid PA partition/query configuration in FlyDSL autotune cache")
-        if budget == 2 * num_cu and partitions == limit:
+        if budget == 2 * num_cu and partitions == limit and not balanced:
             return replace(default_plan, query_splits=splits)
         selected_plan = plan_pa_decode(
             context_lengths,
@@ -508,6 +509,7 @@ def prepare_pa_decode_plan(
             workgroup_budget=budget,
             sliding_window=default_plan.sliding_window,
             query_length=query_length,
+            balanced=balanced,
         )
         return replace(selected_plan, query_splits=splits)
 

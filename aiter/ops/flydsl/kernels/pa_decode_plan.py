@@ -15,6 +15,8 @@ from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
 DEFAULT_MAX_BATCH_SIZE = 4096
 # Two warp scans and one reduction use at most 512 bytes at 1024 wave32 threads.
 _PLAN_SCAN_LDS_BYTES = 512
+# The balanced split alternates between two reductions: 128 more bytes at 1024 wave32 threads.
+_PLAN_BALANCED_LDS_BYTES = 128
 
 
 @cache
@@ -33,7 +35,7 @@ def _shared_memory_per_block(device_index: int) -> int:
 
 
 @cache
-def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length):
+def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_length, balanced=False):
     """Allocate packed tasks with one block-wide scan, without GPU readback."""
     threads = max(64, min(1024, 1 << (capacity - 1).bit_length()))
     items = (batch + threads - 1) // threads
@@ -44,6 +46,46 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
     @fx.struct
     class TaskStorage:
         ends: fx.Array[fx.Int32, batch, 16]
+
+    def balanced_counts(tiles, storages, scan_storage):
+        """Tasks for the smallest per-task tile bound X with sum(min(ceil(tiles / X), max_parts)) <= capacity.
+
+        X is at least ceil(longest / max_parts): the capped longest sequence already
+        holds that many tiles per task, so finer splits elsewhere would only add tasks.
+        Leftover slots go, in sequence order, to the sequences that split further at X - 1.
+        """
+        spans = [fx.Int32(tile) for tile in tiles]
+        limit, slots = fx.Int32(max_parts), fx.Int32(capacity)
+
+        def tasks(bound):
+            return [fx.min((span + bound - 1) // bound, limit) for span in spans]
+
+        def total(values, storage):
+            return reduce_rows(fx.Vector.from_elements(values), fx.ReductionOp.ADD, storage=storage)
+
+        longest = reduce_rows(fx.Vector.from_elements(spans), fx.ReductionOp.MAX, storage=storages[1])
+        low = fx.max((longest + limit - 1) // limit, fx.Int32(1))
+        high = fx.max(longest, fx.Int32(1))
+        # Tiles of int32 lengths stay below 2**24. Alternating storages keeps one barrier per reduction.
+        for step in range(24):
+            middle = (low + high) // 2
+            fits = total(tasks(middle), storages[step % 2]) <= slots
+            high = fits.select(middle, high)
+            low = fits.select(low, middle + 1)
+        counts = tasks(high)
+        leftover = slots - total(counts, storages[0])
+        finer = tasks(fx.max(high - 1, fx.Int32(1)))
+        split = high > fx.Int32(1)
+        extras = [split.select(fine - count, fx.Int32(0)) for fine, count in zip(finer, counts)]
+        before, _ = scan_counts.exclusive_with_aggregate(
+            fx.Vector.from_elements(extras), fx.ReductionOp.ADD, storage=scan_storage
+        )
+        granted = []
+        for item, (count, extra) in enumerate(zip(counts, extras)):
+            granted.append((before[item] + extra <= leftover).select(count + extra, count))
+        # The caller scans scan_storage again.
+        fx.gpu.barrier()
+        return granted
 
     @flyc.kernel(known_block_size=[threads, 1, 1])
     def pa_decode_plan_kernel(
@@ -60,6 +102,9 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
         count_storage = smem.allocate(scan_counts.SharedStorage).peek()
         row_storage = smem.allocate(reduce_rows.SharedStorage).peek()
         task_ends = smem.allocate(TaskStorage).peek().ends
+        search_storage = None
+        if fx.const_expr(balanced):
+            search_storage = smem.allocate(reduce_rows.SharedStorage).peek()
         tiles = []
         nonempty = []
         # Consecutive per-thread items preserve sequence order in vector scans.
@@ -79,22 +124,25 @@ def compile_pa_decode_plan(batch, capacity, max_parts, sliding_window, query_len
             tiles.append(count)
             nonempty.append(fx.Int32(count > 0))
 
-        cumulative, total = scan_tiles.inclusive_with_aggregate(
-            fx.Vector.from_elements(tiles), fx.ReductionOp.ADD, storage=tile_storage
-        )
-        total = fx.max(total, fx.Int64(1))
-        remaining = capacity - reduce_rows(
-            fx.Vector.from_elements(nonempty), fx.ReductionOp.ADD, storage=row_storage
-        )
-        counts = []
-        for item in fx.range_constexpr(items):
-            upper = cumulative[item] * fx.Int64(remaining) // total
-            lower = (cumulative[item] - tiles[item]) * fx.Int64(remaining) // total
-            count = fx.min(
-                fx.min(fx.Int64(nonempty[item]) + upper - lower, tiles[item]),
-                fx.Int64(max_parts),
+        if fx.const_expr(balanced):
+            counts = balanced_counts(tiles, (search_storage, row_storage), count_storage)
+        else:
+            cumulative, total = scan_tiles.inclusive_with_aggregate(
+                fx.Vector.from_elements(tiles), fx.ReductionOp.ADD, storage=tile_storage
             )
-            counts.append(fx.Int32(count))
+            total = fx.max(total, fx.Int64(1))
+            remaining = capacity - reduce_rows(
+                fx.Vector.from_elements(nonempty), fx.ReductionOp.ADD, storage=row_storage
+            )
+            counts = []
+            for item in fx.range_constexpr(items):
+                upper = cumulative[item] * fx.Int64(remaining) // total
+                lower = (cumulative[item] - tiles[item]) * fx.Int64(remaining) // total
+                count = fx.min(
+                    fx.min(fx.Int64(nonempty[item]) + upper - lower, tiles[item]),
+                    fx.Int64(max_parts),
+                )
+                counts.append(fx.Int32(count))
         starts, total_tasks = scan_counts.exclusive_with_aggregate(
             fx.Vector.from_elements(counts), fx.ReductionOp.ADD, storage=count_storage
         )
@@ -167,6 +215,7 @@ class PADecodePlan:
     ``work_info`` is [capacity, 4]: sequence, begin/end absolute 256-token tile,
     original context length. Tile ranges are half-open and cover the MTP union.
     ``reduce_info`` is [batch, 2]: first packed task, actual task count.
+    ``balanced`` selects the min-max task split of ``plan_pa_decode``.
     """
 
     work_info: torch.Tensor
@@ -177,6 +226,7 @@ class PADecodePlan:
     query_length: int = 1
     max_batch_size: int = DEFAULT_MAX_BATCH_SIZE
     query_splits: int | None = None
+    balanced: bool = False
 
     @property
     def capacity(self) -> int:
@@ -223,6 +273,7 @@ def plan_pa_decode(
     workgroup_budget: int | None = None,
     sliding_window: int = 0,
     query_length: int = 1,
+    balanced: bool | None = None,
     plan: PADecodePlan | None = None,
 ) -> PADecodePlan:
     """Build/refresh GPU work metadata on the current stream without readback.
@@ -235,6 +286,14 @@ def plan_pa_decode(
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
     Larger batches require four LDS bytes per sequence plus scan storage and
     must fit the device's per-block shared-memory capacity.
+
+    By default each nonempty sequence gets one task plus a tile-proportional
+    share of the remaining budget. ``balanced=True`` instead gives each sequence
+    ceil(tiles / X) tasks for the smallest X that fits the budget, but no less
+    than the tiles per task of the longest sequence at the cap, so mixed
+    lengths share one bound on the tiles per task; leftover slots go to the
+    sequences that would split further, in sequence order. Both cap tasks at
+    ``max_partitions``; refreshes keep the plan's choice.
 
     Lengths include MTP tokens. Positive windows include each query's position;
     nonpositive windows disable them. Plans cover the MTP window union: match
@@ -263,15 +322,20 @@ def plan_pa_decode(
         raise ValueError(f"plan supports batches in [1, {max_batch_size}]")
     if num_kv_heads < 1:
         raise ValueError("num_kv_heads must be positive")
+    if balanced is None:
+        balanced = False if plan is None else plan.balanced
+    if type(balanced) is not bool:
+        raise TypeError("balanced must be a bool")
     dev = context_lengths.device
     properties = torch.cuda.get_device_properties(dev)
     num_compute_units = properties.multi_processor_count
     shared_memory_per_block = _shared_memory_per_block(dev.index)
     task_end_bytes = (batch * 4 + 15) // 16 * 16
-    if task_end_bytes + _PLAN_SCAN_LDS_BYTES > shared_memory_per_block:
+    scan_bytes = _PLAN_SCAN_LDS_BYTES + (_PLAN_BALANCED_LDS_BYTES if balanced else 0)
+    if task_end_bytes + scan_bytes > shared_memory_per_block:
         raise ValueError(
             f"batch={batch} exceeds planner LDS capacity: requires up to "
-            f"{task_end_bytes + _PLAN_SCAN_LDS_BYTES} bytes, device supports "
+            f"{task_end_bytes + scan_bytes} bytes, device supports "
             f"{shared_memory_per_block} bytes per block"
         )
     if max_partitions is None:
@@ -295,6 +359,7 @@ def plan_pa_decode(
             sliding_window,
             query_length,
             max_batch_size,
+            balanced=balanced,
         )
     else:
         if workgroup_budget is not None:
@@ -303,6 +368,8 @@ def plan_pa_decode(
             raise ValueError("max_partitions must match the reused plan")
         if max_batch_size != plan.max_batch_size:
             raise ValueError("max_batch_size must match the reused plan")
+        if balanced != plan.balanced:
+            raise ValueError("balanced must match the reused plan")
         if sliding_window != plan.sliding_window:
             raise ValueError("sliding_window must match the reused plan")
         if sliding_window > 0 and query_length != plan.query_length:
@@ -316,6 +383,7 @@ def plan_pa_decode(
             # Clamp windows to int32 lengths; dense plans share one specialization.
             min(sliding_window, 2**31 - 1),
             query_length if sliding_window > 0 else 1,
+            plan.balanced,
         )
         _run_compiled(
             launch,

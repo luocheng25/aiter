@@ -9,6 +9,8 @@ MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -18,6 +20,7 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_mimo import compile_mimo_verify_tile, supports_mimo_verify
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -265,6 +268,13 @@ def pa_decode(
     any bytes, including NaN. False skips that masking (slightly faster on
     tiny boundary-tile-only calls); the caller must then keep those bytes and
     scales finite. gfx1250 ignores it and always requires finite bytes.
+
+    On gfx942 the MiMo block-8 verify shape (BF16, Q/K 192, V 128, page 64,
+    16 query heads per KV head, query_length 8, one KV head, no window or
+    sinks, one query split, masked unowned KV) runs a kernel that keeps the
+    probabilities in registers; ``AITER_PA_MIMO_REGP=0`` selects the tile
+    kernel instead. Set it before ``prepare_pa_decode_plan``: the calibrated
+    plan defaults of this shape follow the selected kernel.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -643,35 +653,45 @@ def pa_decode(
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
+    # Register-P masks unscaled scores and divides by the scale; the tile kernel takes any other scale.
+    use_regp = os.environ.get("AITER_PA_MIMO_REGP", "1") != "0" and supports_mimo_verify(
+        arch=arch, kv_dtype=kv_dtype, query_dtype=query_dtype, head_dim=head_dim, value_dim=value_dim,
+        block_size=int(block_size), query_group_size=query_group_size, query_length=query_length,
+        num_kv_heads=num_kv_heads, trans_v=trans_v, per_token_kv=per_token_kv,
+        sliding_window=sliding_window, query_splits=query_splits,
+    ) and sinks is None and not direct_output and mask_unowned_kv and softmax_scale > 0
     with torch.cuda.device(dev):
-        compiled = compile_pa_decode_tile(
-            architecture=arch,
-            head_dim=head_dim,
-            value_dim=value_dim,
-            query_group_size=query_group_size,
-            block_size=int(block_size),
-            num_seqs=num_seqs,
-            num_kv_heads=num_kv_heads,
-            num_compute_units=torch.cuda.get_device_properties(
-                dev
-            ).multi_processor_count,
-            num_partitions=num_partitions,
-            softmax_scale=softmax_scale,
-            query_dtype=query_dtype,
-            kv_dtype=kv_dtype,
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
-            wide_kv_addressing=wide_kv_addressing,
-            kv_buffer_u32=kv_buffer_u32,
-            work_capacity=work_plan.capacity,
-            max_context_length=schedule_context_length,
-            sliding_window=sliding_window,
-            direct_output=direct_output,
-            trans_k=trans_k,
-            mask_unowned_kv=mask_unowned_kv,
-            query_splits=query_splits,
-        )
+        if use_regp:
+            compiled = compile_mimo_verify_tile(softmax_scale=softmax_scale)
+        else:
+            compiled = compile_pa_decode_tile(
+                architecture=arch,
+                head_dim=head_dim,
+                value_dim=value_dim,
+                query_group_size=query_group_size,
+                block_size=int(block_size),
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                num_compute_units=torch.cuda.get_device_properties(
+                    dev
+                ).multi_processor_count,
+                num_partitions=num_partitions,
+                softmax_scale=softmax_scale,
+                query_dtype=query_dtype,
+                kv_dtype=kv_dtype,
+                per_token_kv=per_token_kv,
+                query_length=query_length,
+                trans_v=trans_v,
+                wide_kv_addressing=wide_kv_addressing,
+                kv_buffer_u32=kv_buffer_u32,
+                work_capacity=work_plan.capacity,
+                max_context_length=schedule_context_length,
+                sliding_window=sliding_window,
+                direct_output=direct_output,
+                trans_k=trans_k,
+                mask_unowned_kv=mask_unowned_kv,
+                query_splits=query_splits,
+            )
 
     total_rows = query_length * query_group_size
     expected_scalar_shape = (num_kv_heads, work_plan.capacity, total_rows)

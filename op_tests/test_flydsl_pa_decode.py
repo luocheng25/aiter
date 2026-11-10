@@ -9,10 +9,12 @@ CPU policy/cache tests: python -m pytest -q op_tests/test_flydsl_pa_decode.py::T
 
 import ast
 import importlib.util
+import os
 import unittest
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -32,6 +34,7 @@ def device(monkeypatch):
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize("balanced", [False, True])
 @pytest.mark.parametrize(
     "batch,max_parts,budget,window,query_length",
     [
@@ -43,7 +46,7 @@ def device(monkeypatch):
         (4096, None, 8192, 0, 1),
     ],
 )
-def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
+def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length, balanced):
     """Packed tasks cover every visible tile and remain valid after graph refresh."""
     from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
 
@@ -51,12 +54,14 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         info = plan.reduce_info.cpu().tolist()
         work = plan.work_info.cpu().tolist()
         cursor = 0
+        tiles = []
         for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
             assert start == cursor
             first = (
                 max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
             )
             last = (max(ctx, 0) + 255) // 256
+            tiles.append(last - first)
             assert 0 <= count <= min(last - first, plan.max_partitions)
             assert (count > 0) == (last > first)
             tile = first
@@ -69,6 +74,10 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
             cursor += count
         assert cursor <= plan.capacity
         assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+        if balanced:
+            assert [count for _, count in info] == _balanced_counts(
+                tiles, plan.capacity, plan.max_partitions
+            )
 
     pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
@@ -80,8 +89,14 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         workgroup_budget=budget,
         sliding_window=window,
         query_length=query_length,
+        balanced=balanced,
     )
     check(plan, lengths)
+    with pytest.raises(ValueError, match="balanced"):
+        plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length, plan=plan,
+            balanced=not balanced,
+        )
     pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -98,10 +113,34 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
-def _reference(query, key, value, table, lengths, query_length, window, sinks):
+def _balanced_counts(tiles, capacity, cap):
+    """Min-max task counts of plan_pa_decode(balanced=True)."""
+
+    def tasks(bound):
+        return [min(-(-tile // bound), cap) for tile in tiles]
+
+    low, high = max(1, -(-max(tiles + [0]) // cap)), max(tiles + [1])
+    while low < high:
+        middle = (low + high) // 2
+        if sum(tasks(middle)) <= capacity:
+            high = middle
+        else:
+            low = middle + 1
+    counts, finer = tasks(high), tasks(max(high - 1, 1))
+    leftover, before = capacity - sum(counts), 0
+    for seq, (count, fine) in enumerate(zip(counts, finer)):
+        extra = fine - count if high > 1 else 0
+        if before + extra <= leftover:
+            counts[seq] += extra
+        before += extra
+    return counts
+
+
+def _reference(query, key, value, table, lengths, query_length, window, sinks, scale=None):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
     heads, dim = query.shape[1:]
+    scale = dim**-0.5 if scale is None else scale
     kv_heads, page_size = key.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
@@ -118,7 +157,7 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
         pages = table[seq, tokens // page_size].long()
         offsets = tokens % page_size
         keys, values = key[pages, :, offsets], value[pages, :, offsets]
-        scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * dim**-0.5
+        scores = torch.einsum("qhgd,khd->qhgk", queries[seq], keys) * scale
         visible = length - query_length + 1 + positions
         masked = tokens[None, :] >= visible[:, None]
         if window > 0:
@@ -746,19 +785,24 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
 
 
 @pytest.mark.parametrize(
-    "batch,parts,splits,full_budget",
+    "batch,parts,splits,budget,regp",
     [
-        (1, 2, 8, True),
-        (7, 4, 4, True),
-        (8, 8, 2, True),
-        (9, 16, 4, True),
-        (12, 64, 2, True),
-        (17, 128, 4, True),
-        (33, 8, 1, True),
-        (9, 16, 4, False),
+        (1, 2, 8, None, False),
+        (7, 4, 4, None, False),
+        (8, 8, 2, None, False),
+        (9, 16, 4, None, False),
+        (12, 64, 2, None, False),
+        (17, 128, 4, None, False),
+        (33, 8, 1, None, False),
+        (9, 16, 4, 27, False),
+        # Register-P kernel: batch-first grid, and a flat grid for capacity 28 (not a batch multiple).
+        (1, 2, 1, None, True),
+        (12, 64, 1, None, True),
+        (33, 8, 1, None, True),
+        (9, 16, 1, 28, True),
     ],
 )
-def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits, full_budget):
+def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits, budget, regp):
     """Interleaved Q groups preserve packed ownership and empty-row outputs."""
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -769,6 +813,8 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
         PaDecodeTraits,
     )
 
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "1" if regp else "0")
+    full_budget = budget is None
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(814)
     pattern = (0, 1, 7, 8, 127, 255, 256, 257, 511, 1025, 4097)
@@ -802,7 +848,7 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
     refresh_cache()
     plan = pa.plan_pa_decode(
         context, 1, max_partitions=parts,
-        workgroup_budget=batch * (parts if full_budget else 3), query_length=8,
+        workgroup_budget=batch * parts if full_budget else budget, query_length=8,
     )
     shape = (1, plan.capacity, 128)
     pmax = torch.empty(shape, dtype=torch.float32, device=device)
@@ -811,7 +857,9 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
     guarded = torch.full((batch * 8 + 2, 16, 128), 19.0, dtype=query.dtype, device=device)
     output = guarded[1:-1]
     compiled = []
+    regp_compiled = []
     original_compile = pa.compile_pa_decode_tile
+    original_regp_compile = pa.compile_mimo_verify_tile
 
     def compile_spy(**kwargs):
         selected = {k: v for k, v in kwargs.items() if k not in ("architecture", "direct_output")}
@@ -819,7 +867,12 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
         compiled.append(traits.query_first_plan_grid)
         return original_compile(**kwargs)
 
+    def regp_compile_spy(**kwargs):
+        regp_compiled.append(kwargs)
+        return original_regp_compile(**kwargs)
+
     monkeypatch.setattr(pa, "compile_pa_decode_tile", compile_spy)
+    monkeypatch.setattr(pa, "compile_mimo_verify_tile", regp_compile_spy)
 
     def launch():
         pa.plan_pa_decode(context, 1, plan=plan, query_length=8)
@@ -836,7 +889,10 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
 
     launch()
     check()
-    assert compiled and all(flag == full_budget for flag in compiled)
+    if regp:
+        assert regp_compiled and not compiled
+    else:
+        assert compiled and all(flag == full_budget for flag in compiled) and not regp_compiled
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
@@ -854,6 +910,86 @@ def test_mimo_query_grid_dynamic_graph(device, monkeypatch, batch, parts, splits
         output.fill_(float("nan"))
         graph.replay()
         check()
+
+
+@pytest.mark.parametrize("scale", [192**-0.5, 0.0, -(192**-0.5)])
+def test_mimo_regp_softmax_scale(device, monkeypatch, scale):
+    """Only positive scales take the register-P kernel; the tile kernel scales before masking."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("the register-P kernel is specific to gfx942")
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "1")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    torch.manual_seed(815)
+    lengths = (64, 257, 1027, 4097)
+    query, key, value, table, context = _make_inputs(
+        8, 1, 16, 192, 128, 64, torch.bfloat16, "random", device, lengths
+    )
+    pages = key.shape[0]
+    kc = key.view(pages, 1, 64, 24, 8).permute(0, 1, 3, 2, 4).contiguous()
+    vc = value.view(pages, 1, 8, 8, 128).permute(0, 1, 2, 4, 3).contiguous()
+    selected = []
+    original = pa.compile_mimo_verify_tile
+
+    def regp_spy(**kwargs):
+        selected.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_mimo_verify_tile", regp_spy)
+    batch = len(lengths)
+    plan = pa.plan_pa_decode(
+        context, 1, max_partitions=4, workgroup_budget=batch * 4, query_length=8
+    )
+    output = torch.empty((batch * 8, 16, 128), dtype=query.dtype, device=device)
+    pa.pa_decode(
+        output, query, kc, vc, context, table, scale, 8, work_plan=plan, query_splits=1
+    )
+    assert bool(selected) == (scale > 0)
+    reference = _reference(
+        query, key.float(), value.float(), table, context, 8, 0, None, scale
+    )
+    _check_output(output, reference)
+
+
+def test_mimo_regp_packed_output_past_int32(device, monkeypatch):
+    """Register-P partials past 2**31 packed elements land in their own slots."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("the register-P kernel is specific to gfx942")
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "1")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    # 2049 identical sequences of 64 tiles take 2049 x 64 slots of 128 x 128 outputs, so
+    # the last sequence's partials start at element 2**31 (4 GiB of BF16 scratch).
+    batch, parts, pages = 2049, 64, 256
+    torch.manual_seed(816)
+    query = torch.empty((8, 16, 192), dtype=torch.bfloat16, device=device)
+    query = query.uniform_(-0.5, 0.5).repeat(batch, 1, 1)
+    key = torch.empty((pages, 1, 24, 64, 8), dtype=torch.bfloat16, device=device)
+    value = torch.empty((pages, 1, 8, 128, 8), dtype=torch.bfloat16, device=device)
+    key.uniform_(-0.5, 0.5)
+    value.uniform_(-0.5, 0.5)
+    table = torch.arange(pages, dtype=torch.int32, device=device).repeat(batch, 1)
+    context = torch.full((batch,), pages * 64, dtype=torch.int32, device=device)
+    plan = pa.plan_pa_decode(
+        context, 1, max_partitions=parts, workgroup_budget=batch * parts, query_length=8
+    )
+    assert plan.capacity == batch * parts
+    pmax = torch.empty((1, plan.capacity, 128), dtype=torch.float32, device=device)
+    psum = torch.empty_like(pmax)
+    pout = torch.full(
+        (*pmax.shape, 128), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    # The reducer caps a KV head's partials at 2**31 - 1 elements; this tests the PA kernel.
+    monkeypatch.setattr(pa, "launch_pa_decode_ps_reduce", lambda *args, **kwargs: None)
+    output = torch.empty((batch * 8, 16, 128), dtype=query.dtype, device=device)
+    pa.pa_decode(
+        output, query, key, value, context, table, 192**-0.5, 8, work_plan=plan,
+        query_splits=1, max_logits=pmax, exp_sums=psum, temporary_output=pout,
+    )
+    for scratch in (pout, pmax, psum):
+        torch.testing.assert_close(scratch[0, -parts:], scratch[0, :parts], atol=0, rtol=0)
 
 
 _PA_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "aiter/ops/flydsl"
@@ -876,6 +1012,7 @@ def _pa_tuning_function(name, **namespace):
     return namespace[name]
 
 
+@mock.patch.dict(os.environ, {"AITER_PA_MIMO_REGP": "1"})
 class TestPAConfig(unittest.TestCase):
     """CPU-only selection/cache contracts; independent of the GPU fixture."""
 
@@ -889,33 +1026,48 @@ class TestPAConfig(unittest.TestCase):
         return values
 
     def test_selected_serving_defaults(self):
-        for batch, expected in [(12,(24,1)),(24,(64,2)),(40,(64,2)),(96,(3,1)),
-                                (152,(2,1)),(208,(8,2)),(240,(4,2)),(256,(4,2))]:
+        for batch, parts in [(10,30),(12,25),(20,15),(24,25),(40,15),(88,10),(96,3),
+                             (152,2),(208,7),(240,5),(256,2)]:
             with self.subTest(batch=batch):
                 result = _pa_config_policy.calibrated_pa_config(**self.geometry(batch))
-                self.assertEqual((result['partition_count'],result['query_splits']),expected)
-                self.assertEqual(result['workgroup_budget'],batch*expected[0])
+                self.assertEqual(result,dict(workgroup_budget=batch*parts,partition_count=64,query_splits=1,
+                                             balanced=True))
 
     def test_untuned_geometry_and_explicit_cap(self):
-        for changes in [dict(arch="gfx950"),dict(num_cu=256),
+        for changes in [dict(arch="gfx950"),
                         dict(query_length=4),dict(sliding_window=128),dict(sink_dtype="torch.float32"),
                         dict(kv_dtype="torch.float8_e4m3fnuz"),dict(num_kv_heads=2),
                         dict(trans_v=False)]:
             with self.subTest(changes=changes):
                 self.assertIsNone(_pa_config_policy.calibrated_pa_config(**self.geometry(**changes)))
-        for changes, parts in [(dict(num_seqs=13),16),(dict(max_partitions=16),16),
-                                (dict(max_partitions=8),8)]:
+        for changes, parts, cap in [(dict(num_seqs=13),23,64),(dict(max_partitions=16),16,16),
+                                    (dict(max_partitions=8),8,8),(dict(num_seqs=10,num_cu=256),25,64)]:
             values=self.geometry(**changes)
             result=_pa_config_policy.calibrated_pa_config(**values)
-            self.assertEqual(result,dict(partition_count=parts,query_splits=None,
+            self.assertEqual(result,dict(partition_count=cap,query_splits=1,balanced=True,
                                         workgroup_budget=values['num_seqs']*parts))
 
+    def test_tile_kernel_defaults(self):
+        with mock.patch.dict(os.environ, AITER_PA_MIMO_REGP="0"):
+            for changes, parts, splits in [
+                    (dict(batch=12),24,1),(dict(batch=24),64,2),(dict(batch=40),64,2),(dict(batch=96),3,1),
+                    (dict(batch=152),2,1),(dict(batch=208),8,2),(dict(batch=240),4,2),(dict(batch=256),4,2),
+                    (dict(batch=13),16,None),(dict(max_partitions=16),16,None),(dict(max_partitions=8),8,None)]:
+                with self.subTest(changes=changes):
+                    values=self.geometry(**changes)
+                    self.assertEqual(_pa_config_policy.calibrated_pa_config(**values),
+                        dict(partition_count=parts,query_splits=splits,workgroup_budget=values['num_seqs']*parts))
+            self.assertIsNone(_pa_config_policy.calibrated_pa_config(**self.geometry(num_cu=256)))
+
     def test_explicit_split(self):
+        # A split > 1 runs the tile kernel, so its table applies.
         result = _pa_config_policy.calibrated_pa_config(**self.geometry(requested_query_splits=2))
-        self.assertEqual(result['query_splits'],2)
+        self.assertEqual((result['partition_count'],result['query_splits']),(24,2))
 
     def test_old_budget_cache_compatibility(self):
         self.assertEqual(_pa_config_policy.validate_pa_config({'workgroup_budget':608},
+            max_partitions=304,query_length=8),(608,304,None))
+        self.assertEqual(_pa_config_policy.validate_pa_config({'workgroup_budget':608,'balanced':True},
             max_partitions=304,query_length=8),(608,304,None))
 
     def test_invalid_cache_values(self):
@@ -924,6 +1076,7 @@ class TestPAConfig(unittest.TestCase):
             {'workgroup_budget':608,'partition_count':False},
             {'workgroup_budget':608,'query_splits':3},
             {'workgroup_budget':608,'query_splits':True},
+            {'workgroup_budget':608,'balanced':1},
             {'workgroup_budget':608,'unknown':1}]
         for values in bad:
             with self.subTest(values=values), self.assertRaises(ValueError):
@@ -959,9 +1112,12 @@ class TestPAConfig(unittest.TestCase):
         self.assertEqual(calls,['default'])
 
 
-@pytest.mark.parametrize("batch,parts,splits", [(12,24,1),(24,64,2),(40,64,2),(96,3,1),
-    (152,2,1),(208,8,2),(240,4,2),(256,4,2),(7,16,None)])
-def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, splits):
+@pytest.mark.parametrize("batch,parts,splits,regp", [
+    (12,25,1,True),(24,25,1,True),(40,15,1,True),(96,3,1,True),(152,2,1,True),
+    (208,7,1,True),(240,5,1,True),(256,2,1,True),(7,43,1,True),
+    (12,24,1,False),(24,64,2,False),(40,64,2,False),(96,3,1,False),(152,2,1,False),
+    (208,8,2,False),(240,4,2,False),(256,4,2,False),(7,16,None,False)])
+def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, splits, regp):
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
     if get_gfx_runtime() != "gfx942" or torch.cuda.get_device_properties(device).multi_processor_count != 304:
@@ -974,13 +1130,15 @@ def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, split
     lengths.copy_(torch.tensor([128+(i%3)*57 for i in range(batch)],device=device,dtype=torch.int32))
     kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
     vc=v.view(v.shape[0],1,8,8,128).permute(0,1,2,4,3).contiguous()
+    monkeypatch.setenv("AITER_PA_MIMO_REGP","1" if regp else "0")
     monkeypatch.setenv("FLYDSL_AUTOTUNE","1")
     def no_search(*args,**kwargs):
         raise AssertionError("Serving cache-only preparation launched tuning candidates")
     monkeypatch.setattr(tuning._PADecodeAutotuneResources,"prepare",no_search)
     plan=tuning.prepare_pa_decode_plan(q,kc,vc,lengths,table,192**-.5,8,
         max_batch_size=batch,max_context_length=4096,cache_only=True,config_dir=tmp_path)
-    assert (plan.max_partitions,plan.query_splits)==(parts,splits)
+    assert (plan.capacity,plan.max_partitions,plan.query_splits)==(batch*parts,64 if regp else parts,splits)
+    assert plan.balanced==regp
     shape=(1,plan.capacity,128)
     pmax=torch.empty(shape,device=device,dtype=torch.float32)
     psum=torch.empty_like(pmax)
@@ -998,14 +1156,18 @@ def test_mimo_auto_joint_plan(device, monkeypatch, tmp_path, batch, parts, split
     graph=torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):run()
-    for state in ("mixed_empty","remapped"):
+    for state in ("mixed_empty","remapped","one_long"):
         if state=="mixed_empty":lengths[::2]=0
-        else:
+        elif state=="remapped":
             lengths.fill_(185)
             table.copy_(table.roll(1,dims=0))
             q.neg_()
+        else:
+            lengths.zero_();lengths[0]=4096
         output.fill_(float("nan"))
         graph.replay();check()
+    # A lone 16-tile sequence takes min(16, cap) partitions: more than P under the register-P cap.
+    assert plan.reduce_info[0,1].item()==min(16,plan.max_partitions)
     assert pointers==(plan.work_info.data_ptr(),plan.reduce_info.data_ptr())
     assert plan.query_splits==splits
 
@@ -1017,6 +1179,7 @@ def test_mimo_joint_tuning_cache_and_resources(device, monkeypatch, tmp_path):
         pytest.skip("Calibrated MiMo defaults require gfx942")
     from aiter.ops.flydsl import pa_decode_tuning as tuning
     from flydsl.autotune import Config
+    monkeypatch.setenv("AITER_PA_MIMO_REGP","1")
     q,k,v,table,lengths=_make_inputs(8,1,16,192,128,64,torch.bfloat16,
         "random",device,(256,)*12,table_width=64)
     kc=k.view(k.shape[0],1,64,24,8).permute(0,1,3,2,4).contiguous()
@@ -1030,13 +1193,13 @@ def test_mimo_joint_tuning_cache_and_resources(device, monkeypatch, tmp_path):
     monkeypatch.setattr(tuning,'_resolve_pa_decode_config',observe)
     plan=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
         max_context_length=4096,cache_only=True,config_dir=tmp_path)
-    assert (plan.max_partitions,plan.query_splits)==(24,1)
+    assert (plan.max_partitions,plan.capacity,plan.query_splits,plan.balanced)==(64,300,1,True)
     tuner=captured['tuner'];key=tuner._make_key((),captured['args'])
     tuner.cache[key]=Config(workgroup_budget=96,partition_count=8,query_splits=2)
     tuner._save_disk_cache();tuner.cache.clear();tuner._load_disk_cache()
     cached=tuning.prepare_pa_decode_plan(*arguments,max_batch_size=12,
         max_context_length=4096,cache_only=True,config_dir=tmp_path)
-    assert (cached.max_partitions,cached.query_splits,cached.capacity)==(8,2,96)
+    assert (cached.max_partitions,cached.query_splits,cached.capacity,cached.balanced)==(8,2,96,False)
     options=dict(compute_type=None,key_scale=None,value_scale=None,sinks=None,
                  sliding_window=0,max_context_length=4096,query_splits=None)
     resources=tuning._PADecodeAutotuneResources(q,arguments[1:],options,304,12)
@@ -1257,6 +1420,8 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
+    # This test pins the tile kernel's specialization; the register-P MiMo kernel has its own test.
+    monkeypatch.setenv("AITER_PA_MIMO_REGP", "0")
     compile_kwargs = []
     compile_tile = pa.compile_pa_decode_tile
 
