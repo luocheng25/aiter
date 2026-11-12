@@ -7,8 +7,6 @@ wave then needs no K-data bpermutes or PV byte permutations. Original public
 KV tensors remain unchanged; private scratch is refreshed on every call.
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
@@ -400,7 +398,7 @@ def _body(
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     TOPK: fx.Constexpr[int],
 ):
     storage = (
@@ -446,7 +444,6 @@ def _body(
     o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
-    scale = fx.Float32(SCALE * math.log2(math.e))
     cached = fx.Int32(blocks[row * TOPK + lane])
     rocdl.s_waitcnt(vmcnt=0)
     offset0 = _key_offset(cached, lane & 15, visible, extent, HK, TOPK)
@@ -485,7 +482,7 @@ def _body(
         rocdl.s_waitcnt(vmcnt=8)
         rocdl.sched_barrier(0)
         scores0, scores1 = _qk(q, kval0, kval1)
-        scaled0, scaled1 = _scale_scores(scores0, scores1, count, t, lane, scale)
+        scaled0, scaled1 = _scale_scores(scores0, scores1, count, t, lane, SCALE_LOG2)
         scores = [scaled0[i] for i in range(4)] + [scaled1[i] for i in range(4)]
         candidate = fx.Float32(_MAX_FLOOR)
         for score in scores:
@@ -581,7 +578,7 @@ def _kernel(
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
     GATED: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     TOPK: fx.Constexpr[int],
 ):
     task = fx.block_idx.x
@@ -602,7 +599,7 @@ def _kernel(
                 H,
                 HK,
                 NQ,
-                SCALE,
+                SCALE_LOG2,
                 TOPK,
             )
     else:
@@ -618,7 +615,7 @@ def _kernel(
             H,
             HK,
             NQ,
-            SCALE,
+            SCALE_LOG2,
             TOPK,
         )
 
@@ -630,6 +627,7 @@ def _launch(
     V: fx.Tensor,
     OUT: fx.Tensor,
     SLOTS: fx.Tensor,
+    SCALE_LOG2: fx.Float32,
     PK: fx.Tensor,
     PV: fx.Tensor,
     SOURCES: fx.Tensor,
@@ -647,7 +645,6 @@ def _launch(
     TILES: fx.Int32,
     TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
@@ -676,7 +673,7 @@ def _launch(
             HK,
             NQ,
             GATED,
-            SCALE,
+            SCALE_LOG2,
             TOPK,
             value_attrs={"llvm.target_features": _target_features()},
         )
@@ -688,7 +685,8 @@ def _launch(
 
 def launch_args(inputs, prepared, out, tasks, stream):
     # A raw plan compiles this path ahead of time with its public KV as stand-ins. The fifth
-    # argument is the slot table (a stand-in without one).
+    # argument is the slot table (a stand-in without one), the sixth the FP32
+    # softmax_scale * log2(e).
     packed_key = inputs.k if prepared.packed_key is None else prepared.packed_key
     packed_value = inputs.v if prepared.packed_value is None else prepared.packed_value
     sources = (
@@ -703,6 +701,7 @@ def launch_args(inputs, prepared, out, tasks, stream):
         inputs.v,
         out.view(-1),
         slots,
+        inputs.scale_log2,
         packed_key,
         packed_value,
         sources,
@@ -720,7 +719,6 @@ def launch_args(inputs, prepared, out, tasks, stream):
         prepared.union_tiles,
         tasks,
         prepared.gated,
-        inputs.scale,
         inputs.topk,
         prepared.slotted,
         stream,

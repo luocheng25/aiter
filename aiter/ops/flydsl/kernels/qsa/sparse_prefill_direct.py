@@ -23,7 +23,6 @@ order and RNE probability packing are unchanged.
 """
 
 import functools
-import math
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -350,7 +349,7 @@ def _body(
     TASKS: fx.Int32,
     TASK: fx.Int32,
     GATED: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
@@ -399,7 +398,6 @@ def _body(
     o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
-    scale = fx.Float32(SCALE * math.log2(math.e))
     # One block ID per lane; each BN32 step consumes eight of these IDs.
     cached_blocks = fx.Int32(blocks[row * TOPK + lane])
     ids = [cached_blocks]
@@ -488,7 +486,9 @@ def _body(
             for i in fx.range_constexpr(4):
                 col = t * BN + segment * 16 + (lane >> 4) * 4 + i
                 all_scores.append(
-                    (col < count).select(scores[i] * scale, fx.Float32(float("-inf")))
+                    (col < count).select(
+                        scores[i] * SCALE_LOG2, fx.Float32(float("-inf"))
+                    )
                 )
         candidate = fx.Float32(_MAX_FLOOR)
         for score in all_scores:
@@ -613,7 +613,7 @@ def _kernel(
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
@@ -644,7 +644,7 @@ def _kernel(
                 TASKS,
                 task,
                 GATED,
-                SCALE,
+                SCALE_LOG2,
                 TOPK,
                 SLOTTED,
                 WIDE,
@@ -669,7 +669,7 @@ def _kernel(
             TASKS,
             fx.block_idx.x,
             GATED,
-            SCALE,
+            SCALE_LOG2,
             TOPK,
             SLOTTED,
             WIDE,
@@ -683,6 +683,7 @@ def _launch(
     V: fx.Tensor,
     OUT: fx.Tensor,
     SLOTS: fx.Tensor,
+    SCALE_LOG2: fx.Float32,
     BLOCKS: fx.Tensor,
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
@@ -697,7 +698,6 @@ def _launch(
     THREADS: fx.Constexpr[int],
     TASKS: fx.Int32,
     GATED: fx.Constexpr[bool],
-    SCALE: fx.Constexpr[float],
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
@@ -724,7 +724,7 @@ def _launch(
             THREADS,
             TASKS,
             GATED,
-            SCALE,
+            SCALE_LOG2,
             TOPK,
             SLOTTED,
             WIDE,
@@ -738,7 +738,8 @@ _COMPILED = {}
 def _bound(inputs, prepared, out, stream):
     """(compiled launcher, its arguments) of the packed or raw variant for this plan.
 
-    The fifth argument is the slot table (a stand-in without one); launchers take it per call.
+    The fifth argument is the slot table (a stand-in without one) and the sixth the FP32
+    softmax_scale * log2(e); launchers take both per call.
     """
     tasks = prepared.num_tiles * inputs.k.shape[1]
     slots = inputs.kv_slots if prepared.slotted else prepared.metadata.view(-1)
@@ -748,6 +749,7 @@ def _bound(inputs, prepared, out, stream):
         inputs.v,
         out.view(-1),
         slots,
+        inputs.scale_log2,
         prepared.source_blocks.view(-1),
         prepared.metadata.view(-1),
         prepared.active,
@@ -766,18 +768,17 @@ def _bound(inputs, prepared, out, stream):
         256,
         tasks,
         prepared.gated,
-        inputs.scale,
         inputs.topk,
         prepared.slotted,
         prepared.wide,
         stream,
     )
+    # The softmax scale is a kernel argument, not part of the key.
     key = (
         inputs.q.device,
         inputs.q.shape[1],
         inputs.k.shape[1],
         prepared.gated,
-        inputs.scale,
         inputs.topk,
         prepared.slotted,
     )
@@ -791,7 +792,7 @@ def _bound(inputs, prepared, out, stream):
             if key not in _COMPILED:
                 _COMPILED[key] = packed.compile_launch(inputs, prepared, out, stream)
             compiled = _COMPILED[(*key, prepared.wide)] = flyc.compile(
-                _launch, *args[:17], 0, *args[18:]
+                _launch, *args[:18], 0, *args[19:]
             )
     if prepared.packed_key is not None:
         return _COMPILED[key], packed.launch_args(inputs, prepared, out, tasks, stream)
@@ -809,8 +810,8 @@ def run(*, inputs, prepared: DirectPlan, out: torch.Tensor):
 
 
 def launcher(*, inputs, prepared: DirectPlan, out: torch.Tensor):
-    """launch(q, k, v, out, slots) with flat Q/out and unflattened K/V; other arguments
-    prebuilt.
+    """launch(q, k, v, out, slots, scale_log2) with flat Q/out, unflattened K/V and the
+    FP32 softmax_scale * log2(e); other arguments prebuilt.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
@@ -819,7 +820,11 @@ def launcher(*, inputs, prepared: DirectPlan, out: torch.Tensor):
     compiled, args = _bound(
         inputs, prepared, out, torch.cuda.current_stream(inputs.q.device)
     )
-    tail, stand_in = args[5:], args[4]
+    tail, stand_in = args[6:], args[4]
     if prepared.slotted:
-        return lambda q, k, v, o, slots: compiled(q, k, v, o, slots, *tail)
-    return lambda q, k, v, o, slots: compiled(q, k, v, o, stand_in, *tail)
+        return lambda q, k, v, o, slots, scale_log2: compiled(
+            q, k, v, o, slots, scale_log2, *tail
+        )
+    return lambda q, k, v, o, slots, scale_log2: compiled(
+        q, k, v, o, stand_in, scale_log2, *tail
+    )

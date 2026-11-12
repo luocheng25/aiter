@@ -6,8 +6,6 @@ The LDS, QK/PV MFMA and staggered pipeline come from a dense BM128/BN64 D256
 attention kernel (see sparse_prefill_common). Q/O rows and sparse masks differ.
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -235,7 +233,7 @@ def _body(
     CAP: fx.Int32,
     BQ: fx.Constexpr[int],
     GP: fx.Constexpr[int],
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     STAGGER: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
 ):
@@ -247,9 +245,10 @@ def _body(
     stage then a compute stage; waves 4-7 (STAGGER) run one stage behind waves 0-3, so
     one group's memory stage overlaps the other group's compute stage.
 
-    Softmax in log2 units: S' = S * scale * log2(e) - m, P = exp2(S'), l = sum(P) and
+    Softmax in log2 units: S' = S * SCALE_LOG2 - m, P = exp2(S'), l = sum(P) and
     O = sum(P V); the output is O / l. m starts at the first row max + 1 and moves to a
-    later row max + 1 only when that exceeds m + 7, rescaling O and l.
+    later row max + 1 only when that exceeds m + 7, rescaling O and l. SCALE_LOG2 is the
+    runtime FP32 softmax_scale * log2(e).
     """
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
@@ -315,7 +314,6 @@ def _body(
                 extent,
             )
         )
-    scale = fx.Float32(SCALE * math.log2(math.e))
     compact_len = count * 4
     key_tiles = (compact_len + BN - 1) // BN
     last_tile = key_tiles - 1
@@ -413,7 +411,7 @@ def _body(
         _stage_end()
         # Compute: QK S(0) keys 32-63 and mask(0); softmax m and S'(0).
         s_hi = qk(k_hi)
-        s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * scale
+        s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * SCALE_LOG2
         row_max = _max(s_0)
         row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
         row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
@@ -434,7 +432,7 @@ def _body(
 
         rows_prev, rows_cur and rows_next are the DMA rows of tiles t - 1, t and t + 1.
         k_lds holds K(t) up to step 1 and K(t + 1) from step 2; v_lds holds V(t - 1).
-        S' = S * scale; m tracks the row max of S' lazily (S' - m <= 7).
+        S' = S * SCALE_LOG2; m tracks the row max of S' lazily (S' - m <= 7).
 
         step  memory stage                              compute stage
         0     g2r mask(t), ids(t+2); g2s V(t-1) with    QK: S(t) keys 0-31
@@ -515,7 +513,7 @@ def _body(
             o_hi,
             ready,
             v_ops,
-            center=(s_cur, max_cur, max_others, scale, row_max),
+            center=(s_cur, max_cur, max_others, SCALE_LOG2, row_max),
         )
         _schedule(32, 3, 4)
         o_lo, o_hi, row_sum = _rescale(o_lo, o_hi, row_sum, row_max, new_max, ballot)
@@ -602,7 +600,7 @@ def _kernel(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
+    SCALE_LOG2: fx.Float32,
     SLOTTED: fx.Constexpr[bool],
 ):
     body = _body
@@ -642,7 +640,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     True,
                     SLOTTED,
                 )
@@ -666,7 +664,7 @@ def _kernel(
                     CAP,
                     BQ,
                     GP,
-                    SCALE,
+                    SCALE_LOG2,
                     False,
                     SLOTTED,
                 )
@@ -679,6 +677,7 @@ def _launch(
     K: fx.Tensor,
     V: fx.Tensor,
     OUT: fx.Tensor,
+    SCALE_LOG2: fx.Float32,
     META: fx.Tensor,
     BLOCKS: fx.Tensor,
     MEMBERS: fx.Tensor,
@@ -694,7 +693,6 @@ def _launch(
     GP: fx.Constexpr[int],
     TASKS: fx.Int32,
     GRID: fx.Int32,
-    SCALE: fx.Constexpr[float],
     SLOTTED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
@@ -719,7 +717,7 @@ def _launch(
             GP,
             TASKS,
             GRID,
-            SCALE,
+            SCALE_LOG2,
             SLOTTED,
             value_attrs={
                 "rocdl.waves_per_eu": 2,
@@ -738,6 +736,7 @@ def _args(inputs, plan, out, stream):
         inputs.k,
         inputs.v,
         out.view(-1),
+        inputs.scale_log2,
         plan.metadata.view(-1),
         (plan.pool_blocks if plan.slotted else plan.blocks).view(-1),
         plan.score_masks.view(-1),
@@ -755,21 +754,21 @@ def _args(inputs, plan, out, stream):
         * inputs.k.shape[1]
         * ((plan.query_tile * plan.group_padded + 127) // 128),
         plan.grid,
-        inputs.scale,
         plan.slotted,
         stream,
     )
 
 
 def _compiled(inputs, args, stream):
-    key = (inputs.q.device, args[11], args[12], args[15], args[16], args[19], args[20])
+    # H, HK, BQ, GP, SLOTTED; the softmax scale is a kernel argument.
+    key = (inputs.q.device, args[12], args[13], args[16], args[17], args[20])
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
             compiled = _COMPILED[key] = flyc.compile(
-                _launch, *args[:18], 0, *args[19:21], stream
+                _launch, *args[:19], 0, args[20], stream
             )
     return compiled
 
@@ -784,8 +783,9 @@ def run(*, inputs, plan, out):
 
 
 def launcher(*, inputs, plan, out):
-    """launch(q, k, v, out, slots) with flat Q/out and unflattened K/V; other arguments
-    prebuilt. Union reads pool rows through K3's table, so the slot table is unused here.
+    """launch(q, k, v, out, slots, scale_log2) with flat Q/out, unflattened K/V and the
+    FP32 softmax_scale * log2(e); other arguments prebuilt. Union reads pool rows through
+    K3's table, so the slot table is unused here.
 
     Valid while the plan's scratch bindings and the current stream stay the same.
     """
@@ -794,5 +794,5 @@ def launcher(*, inputs, plan, out):
     stream = torch.cuda.current_stream(inputs.q.device)
     args = _args(inputs, plan, out, stream)
     compiled = _compiled(inputs, args, stream)
-    tail = args[4:]
-    return lambda q, k, v, o, slots: compiled(q, k, v, o, *tail)
+    tail = args[5:]
+    return lambda q, k, v, o, slots, scale_log2: compiled(q, k, v, o, scale_log2, *tail)

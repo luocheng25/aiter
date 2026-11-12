@@ -75,7 +75,7 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
+    def __init__(self, q, k, v, indices, query_lens, prefix_lens, kv_slots=None):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -87,7 +87,6 @@ class _Workspace:
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
-            "scale": scale,
             "topk": topk,
             "query_positions": prepare.upload(positions, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
@@ -162,7 +161,7 @@ class _Workspace:
             # Graph pointers must outlive arena growth.
             self.pinned = tuple(self.arena.buffers)
 
-    def bind(self, q, k, v, indices, kv_slots=None):
+    def bind(self, q, k, v, indices, kv_slots, scale_log2):
         self.attach()
         return SimpleNamespace(
             q=q,
@@ -171,17 +170,19 @@ class _Workspace:
             indices=indices,
             block_indices=self.block_indices,
             kv_slots=kv_slots,
+            scale_log2=scale_log2,
             **self.metadata,
         )
 
 
 class _Hot:
-    """Replays one workspace binding: the FlyDSL launchers with prebuilt arguments.
-    Building it performs the current call through the normal paths.
+    """Replays one workspace binding: the FlyDSL launchers with prebuilt arguments (the
+    softmax scale is passed per call). Building it performs the current call through the
+    normal paths.
     """
 
-    def __init__(self, workspace, q, k, v, indices, out, kv_slots=None):
-        inputs = workspace.bind(q, k, v, indices, kv_slots)
+    def __init__(self, workspace, q, k, v, indices, out, kv_slots, scale_log2):
+        inputs = workspace.bind(q, k, v, indices, kv_slots, scale_log2)
         prepare.run(inputs=inputs, plan=workspace.union)
         self.prepare = prepare.launchers(inputs=inputs, plan=workspace.union)
         self.compute = []
@@ -202,9 +203,9 @@ class _Hot:
         for launch in rest:
             launch(kv_slots)
 
-    def compute_call(self, q, k, v, out, kv_slots):
+    def compute_call(self, q, k, v, out, kv_slots, scale_log2):
         # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
-        views = (q.view(-1), k, v, out.view(-1), kv_slots)
+        views = (q.view(-1), k, v, out.view(-1), kv_slots, scale_log2)
         for launch in self.compute:
             launch(*views)
 
@@ -249,7 +250,9 @@ def flydsl_qsa_sparse_prefill(
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
     validated. Hot calls rebuild the selection: per-layout plans share one private
     per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
-    kv_slots. Warm the same stream and layout before graph capture. Captured
+    kv_slots. softmax_scale is a kernel argument (FP32 softmax_scale * log2(e)): a new
+    scale compiles nothing and reuses the layout's workspace, also under graph capture.
+    Warm the same stream and layout before graph capture. Captured
     workspaces stay pinned for graph pointer lifetime and share their stream's
     scratch: do not replay them concurrently with each other or with that stream's
     calls. Each kernel variant compiles on its first use: a few seconds with empty
@@ -265,6 +268,8 @@ def flydsl_qsa_sparse_prefill(
     scaled = scale * math.log2(math.e)
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
+    # Rounded once, as the compile-time constant it replaces was.
+    scale_log2 = float(np.float32(scaled))
     if kv_slots is not None and (
         not isinstance(kv_slots, torch.Tensor)
         or kv_slots.dtype != torch.int32
@@ -375,7 +380,6 @@ def flydsl_qsa_sparse_prefill(
             prefix_lens,
             q.shape[1],
             k.shape[1],
-            scale,
             topk,
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
@@ -386,9 +390,7 @@ def flydsl_qsa_sparse_prefill(
                 raise RuntimeError(
                     "Warm attention on this stream and layout before graph capture"
                 )
-            workspace = _Workspace(
-                q, k, v, indices, query_lens, prefix_lens, scale, kv_slots
-            )
+            workspace = _Workspace(q, k, v, indices, query_lens, prefix_lens, kv_slots)
             _workspaces[key] = workspace
             for stale in list(_workspaces):
                 if len(_workspaces) <= WORKSPACE_CACHE:
@@ -401,7 +403,7 @@ def flydsl_qsa_sparse_prefill(
         hot = workspace.hot
         if hot is not None:
             hot.prepare_call(indices, kv_slots)
-            hot.compute_call(q, k, v, out, kv_slots)
+            hot.compute_call(q, k, v, out, kv_slots, scale_log2)
         else:
-            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots)
+            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots, scale_log2)
     return out
