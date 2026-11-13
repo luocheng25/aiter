@@ -25,6 +25,7 @@ from .kernels.qsa import sparse_prefill_direct as direct
 from .kernels.qsa import sparse_prefill_direct_fp8 as direct_fp8
 from .kernels.qsa import sparse_prefill_prepare as prepare
 from .kernels.qsa import sparse_prefill_union as union
+from .kernels.qsa import sparse_prefill_union_fp8 as union_fp8
 from .kernels.qsa.sparse_prefill_common import (
     ARENA_GROWTH_PERCENT,
     SCRATCH_ALIGN,
@@ -123,11 +124,7 @@ class _Workspace:
         self.union = None
         minimum = _union_min_rows(q.shape[1] // k.shape[1], fp8)
         # Batch-invariant layouts plan union tiles only for requests of at least minimum rows.
-        # FP8 K/V run direct only until the FP8 union kernel lands.
-        if (
-            fp8 is None
-            and (max(query_lens) if batch_invariant else q.shape[0]) >= minimum
-        ):
+        if (max(query_lens) if batch_invariant else q.shape[0]) >= minimum:
             plan = prepare.allocate_plan(
                 inputs=inputs,
                 query_tile=32,
@@ -252,6 +249,19 @@ class _Hot:
                 inputs=inputs, prepared=workspace.direct, out=out, stage="pack"
             )
             self.union_fp8 = None
+            if workspace.union is not None:
+                union_fp8.run(
+                    inputs=inputs,
+                    plan=workspace.union,
+                    packed=workspace.direct,
+                    out=out,
+                )
+                self.union_fp8 = union_fp8.launcher(
+                    inputs=inputs,
+                    plan=workspace.union,
+                    packed=workspace.direct,
+                    out=out,
+                )
             direct_fp8.run(
                 inputs=inputs, prepared=workspace.direct, out=out, stage="direct"
             )
@@ -407,12 +417,15 @@ def flydsl_qsa_sparse_prefill(
     ([N,HK], with kv_slots [P,HK]) or both per tensor ([1]); K/V values are K8 * k_scale
     and V8 * v_scale. compute="fp8" (default) runs FP8 MFMA kernels: Q is quantized per
     (query, head) row with scale amax / 240 and the probabilities in FP8 (relative output
-    error of a few percent on random data); the context is repacked once per call.
-    compute="bf16" dequantizes the request tokens to BF16 (each value the FP32 product
-    rounded once) and runs the BF16 kernels (BF16 accuracy, temporary BF16 K/V of the
-    packed context). FP8 K/V (or the pool) require a byte span <= 2**32 - 2**20.
-    Workspaces are kept per K/V dtype and scale layout too; the scale tensors are read
-    on every call, also under graph replay.
+    error of a few percent on random data); the context is repacked once per call. Its
+    union plans may split a short prefill's longest tasks into two key ranges merged
+    at the end, and keep only a core of an H12/H6 union tile, the rows' other blocks
+    running direct and merging by log-sum-exp; whether a task splits depends on the
+    whole call, so batch_invariant=True does not split. compute="bf16" dequantizes the
+    request tokens to BF16 (each value the FP32 product rounded once) and runs the BF16
+    kernels (BF16 accuracy, temporary BF16 K/V of the packed context). FP8 K/V (or the
+    pool) require a byte span <= 2**32 - 2**20. Workspaces are kept per K/V dtype and
+    scale layout too; the scale tensors are read on every call, also under graph replay.
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
