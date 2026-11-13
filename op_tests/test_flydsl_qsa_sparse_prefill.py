@@ -217,6 +217,10 @@ FP8_LAYOUTS = {
     ),
     # Q and out of 2.25 GiB at group 12 (H192): rows from 21845 on reach past 2 GiB.
     "hk16_prefill_24576": ((24576,), (0,), 16, "shared", 512),
+    # 262 tiles x 16 KV heads = 4192 union tasks, more than one K3 order CTA sorts (4096):
+    # the random request's 6 tiles route direct, so the first chunk of the task order ends
+    # with idle entries, and the second chunk (KV head 15 of the last 96 tiles) must run.
+    "hk16_k3_chunks": ((60, 2560), (126976, 0), 16, ("random", "shared"), 512),
 }
 CASES = {
     **FUNCTIONAL_CASES,
@@ -312,8 +316,8 @@ FP8_LIMIT_ROWS = (2**32 - 2**20) // HEAD_DIM
 # (direct through a pool at HK2 and T = 256, union with BQ8 tiles), large logits, the BQ42
 # tile of H3 full prefill (FP8 union with 64-bit membership), the 12000-token serving
 # prompt (see FP8_PERF_CASES), K/V at the FP8 byte span limit: packed (requests at both
-# ends of it) and a pool whose pages start at 2 GiB and end at the limit, and Q and out
-# past 2 GiB (see FP8_LARGE_Q_CASES).
+# ends of it) and a pool whose pages start at 2 GiB and end at the limit, Q and out past
+# 2 GiB (see FP8_LARGE_Q_CASES), and union tasks past K3's first order chunk.
 FP8_CASES = {
     "fp8_ragged_4_token": ("ragged_4", 12, "token", "fp8", None),
     "fp8_kv_slots_ragged_4_tensor": ("ragged_4", 12, "tensor", "fp8", (None, 1, False)),
@@ -367,6 +371,7 @@ FP8_CASES = {
         (FP8_LIMIT_ROWS, 2**31 // HEAD_DIM // PAGE, True),
     ),
     "fp8_hk16_prefill_24576_token": ("hk16_prefill_24576", 12, "token", "fp8", None),
+    "fp8_hk16_k3_chunks_token": ("hk16_k3_chunks", 12, "token", "fp8", None),
 }
 # Also timed against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA, and
 # checked against the reference on the kernels' FP8 Q (see test_qsa_fp8_query).
@@ -375,7 +380,11 @@ FP8_PERF_CASES = ("fp8_prefill_12000_tensor",)
 # rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads)
 # near FP8_TOL's worst bound, while what its K/V or out addressing can break shows on
 # either check.
-FP8_QUERY_CHECKED = ("fp8_limit_packed_token", "fp8_hk16_prefill_24576_token")
+FP8_QUERY_CHECKED = (
+    "fp8_limit_packed_token",
+    "fp8_hk16_prefill_24576_token",
+    "fp8_hk16_k3_chunks_token",
+)
 # Q and out past 2 GiB: core/residual union tiles leave rows past 2 GiB of out to the
 # direct kernel's residual merge, which finds their union log-sum-exp from the row's out
 # offset. Checked (fp8_query_error) on every row past 2 GiB, some of which must have
@@ -480,6 +489,7 @@ FP8_ROUTES = {
     "fp8_limit_packed_token": (True, "packed", 10, 1, False, True),
     "fp8_limit_pool_ragged_4_tensor": (True, None, 10, 1, True, True),
     "fp8_hk16_prefill_24576_token": (True, None, 10, 1, True, True),
+    "fp8_hk16_k3_chunks_token": (True, "packed", 10, 1, False, True),
     "fp8_sink_chunk_1024_ctx_4024_random_token": (True, None, 10, 1, True, True),
     "fp8_sink_extend_64_ctx_70065_tensor": (False, "packed", None, None, False, True),
     "fp8_uniform_ragged_3_random_token": (True, "packed", 32, 2, False, True),
