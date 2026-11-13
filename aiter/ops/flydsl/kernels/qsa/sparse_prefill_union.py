@@ -18,6 +18,7 @@ from .sparse_prefill_common import (
     _buffer_words,
     _copy_coordinates,
     _cross,
+    _exp,
     _exps,
     _join,
     _k_lds_address,
@@ -33,7 +34,7 @@ from .sparse_prefill_common import (
     _pack_bf16,
     _pin,
     _pin_i32,
-    _pv,
+    _pv_half,
     _qk,
     _read_q_g2r,
     _read_s2r,
@@ -381,7 +382,7 @@ def _body(
         return read_tile_g2s(gv, v_lds, rows, True, s2r, lgkm, tail_tile)
 
     def qk(k):
-        return _qk(q, _k_operands(k))
+        return _qk(q, *_k_operands(k))
 
     def prologue():
         """Ids of tiles 0-2 and mask(0) g2r; K(0) g2s, QK(0), m and S'(0); K(1) g2s."""
@@ -492,7 +493,7 @@ def _body(
         v_ops = _v_operands(v_lo, 0, ready)
         _stage_end()
         # Step 2 compute.
-        o_lo, row_sum, max_cur = _pv(
+        o_lo, row_sum, max_cur = _pv_half(
             p_bf16,
             v_lo,
             o_lo,
@@ -510,7 +511,7 @@ def _body(
         v_ops = _v_operands(v_hi, 0, ready)
         _stage_end()
         # Step 3 compute.
-        o_hi, s_cur, new_max, ballot = _pv(
+        o_hi, s_cur, new_max, ballot = _pv_half(
             p_bf16,
             v_hi,
             o_hi,
@@ -519,7 +520,11 @@ def _body(
             center=(s_cur, max_cur, max_others, SCALE_LOG2, row_max),
         )
         _schedule(32, 3, 4)
-        o_lo, o_hi, row_sum = _rescale(o_lo, o_hi, row_sum, row_max, new_max, ballot)
+        o_lo, o_hi, row_sum = _rescale(
+            (o_lo, o_hi, row_sum),
+            ballot,
+            lambda: _exp(fx.Float32(row_max) - fx.Float32(new_max)),
+        )
         _stage_end()
         return s_cur, new_max, row_sum, o_lo, o_hi, rows_cur, rows_next, rows_next2
 
@@ -542,13 +547,13 @@ def _body(
         v_lo, _ = _read_s2r(v_s2r(0), lgkm)
         lgkm.wait()
         _stage_end()
-        o_lo = _pv(p_bf16, v_lo, o_lo)
+        o_lo = _pv_half(p_bf16, v_lo, o_lo)
         _stage_end()
         # Memory: V(last) dims 128-255 s2r.  Compute: PV O dims 128-255.
         v_hi, _ = _read_s2r(v_s2r(1), lgkm)
         lgkm.wait()
         _stage_end()
-        o_hi = _pv(p_bf16, v_hi, o_hi)
+        o_hi = _pv_half(p_bf16, v_hi, o_hi)
         _stage_end()
         if fx.const_expr(not STAGGER):
             # Waves 0-3 wait one stage for waves 4-7.

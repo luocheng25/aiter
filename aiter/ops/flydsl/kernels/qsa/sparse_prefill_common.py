@@ -9,8 +9,10 @@ AITER_QSA_PLATFORM overrides fields of the picked entry, e.g.
 ``AITER_QSA_PLATFORM="union_step=3.0,max_packed_kv_bytes=0"``.
 
 The second part holds raw-buffer operations, register pinning and pipeline
-barriers. The third part holds the BM128/BN64 MFMA, softmax and LDS pieces
-of the eight-wave staggered D256 pipeline that the union kernel runs.
+barriers. The third part holds the QK and PV MFMA loops and the lazy softmax
+rescale, each defined once for the union and both direct kernels. The fourth
+part holds the BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave
+staggered D256 pipeline that the union kernel runs.
 """
 
 import dataclasses
@@ -333,47 +335,104 @@ def _lds_store(address, value, dtype=fx.Int32):
     fx.generic_store(_lds_pointer(address, dtype), dtype(value))
 
 
+# ---- QK, PV and the lazy rescale shared by the union and direct kernels ----
+
+
 @flyc.jit
-def _rescale(o0, o1, row_sum, old_max, new_max, ballot):
-    o0, o1, row_sum = fx.Vector(o0), fx.Vector(o1), fx.Float32(row_sum)
+def _rescale(values, ballot, factor):
+    """Lazy online-softmax rescale: multiply values (O accumulators, a row sum) by
+    factor() when any lane's ballot bit is set; factor is only evaluated there."""
+    values = tuple(values)
     if ballot != fx.Int64(0):
-        correction = _exp(fx.Float32(old_max) - fx.Float32(new_max))
-        o0, o1, row_sum = o0 * correction, o1 * correction, row_sum * correction
-    return o0, o1, row_sum
-
-
-# ---- D256 BM128/BN64 eight-wave pipeline: MFMA fragments, softmax, LDS ----
-
-BM, BN, D, THREADS = 128, 64, 256, 512
-
-
-def _mma():
-    return fx.make_tiled_mma(
-        fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-        fx.make_layout((1, 8, 1), (1, 1, 0)),
-    )
+        correction = factor()
+        values = tuple(value * correction for value in values)
+    return values
 
 
 def _read_q_g2r(resource, offset, lane):
+    """The lane's 32 Q words: the B operands of a 16x16x16 MFMA over D = 256, four BF16
+    per 16-dim step, step s in words 2s and 2s + 1."""
     parts = [
         _buffer_words(resource, offset + (lane >> 4) * 16 + k * 64) for k in range(8)
     ]
-    words = fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
-    frag = _mma().make_fragment_B(
-        fx.make_rmem_tensor(fx.make_layout((BM, D), (1, BM)), fx.BFloat16)
+    return fx.Vector.from_elements([p[i] for p in parts for i in range(4)], fx.Int32)
+
+
+def _qk(q, k0, k1):
+    """Scores S = K Q^T of 32 keys over D = 256: one 16x16x16 BF16 MFMA per 16-key tile
+    and 16-dim step, steps in order (the same dim order in every kernel).
+
+    q holds the B operands (see _read_q_g2r); k0/k1 the A operands of keys 0-15 and
+    16-31, four BF16 per step, step s in words 2s and 2s + 1. Returns the 8 FP32 scores:
+    keys 0-15's accumulator, then keys 16-31's. The tiled MMA's eight-wave layout only
+    shapes the per-lane fragments, which come from registers; it is the form the union
+    pipeline's MFMA/VALU interleave was tuned with (per-MFMA calls schedule differently).
+    """
+    mma = fx.make_tiled_mma(
+        fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+        fx.make_layout((1, 8, 1), (1, 1, 0)),
     )
-    frag.store(words.bitcast(fx.BFloat16))
-    return frag
-
-
-def _qk(q, k):
-    mma = _mma()
+    b = mma.make_fragment_B(
+        fx.make_rmem_tensor(fx.make_layout((128, 256), (1, 128)), fx.BFloat16)
+    )
+    b.store(fx.Vector(q).bitcast(fx.BFloat16))
+    k0, k1 = fx.Vector(k0), fx.Vector(k1)
+    a = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
+    a.store(
+        fx.Vector.from_elements(
+            [k0[i] for i in range(32)] + [k1[i] for i in range(32)], fx.Int32
+        ).bitcast(fx.BFloat16)
+    )
+    a = fx.make_view(fx.get_iter(a), fx.make_layout((4, 2, 16), (1, 64, 4)))
     acc = mma.make_fragment_C(
-        fx.make_rmem_tensor(fx.make_layout((32, BM), (1, 32)), fx.Float32)
+        fx.make_rmem_tensor(fx.make_layout((32, 128), (1, 32)), fx.Float32)
     )
     acc.fill(0.0)
-    fx.gemm(mma, acc, k, q, acc, traversal_order="kmn")
+    fx.gemm(mma, acc, a, b, acc, traversal_order="kmn")
     return acc.load()
+
+
+def _pv(p, operand, acc):
+    """O += P V over one 16-key step: one 16x16x16 BF16 MFMA per 16-dim tile of O.
+
+    p holds the step's 4 BF16 probabilities (as Int16), operand(n) the A operand of
+    tile n (4 BF16 of V as Int16), acc the tiles' 4 FP32 accumulators, updated in order.
+    """
+    return [_mfma(operand(n), p, acc[n]) for n in range(len(acc))]
+
+
+def _v_pair(values, row, n):
+    """The A operand words of O tile n: V dim n of rows row .. row + 3 as loaded (four
+    words, 8 BF16 dims, per row and lane), two rows per word by v_perm_b32."""
+    selector = 0x03020706 if n % 2 else 0x01000504
+    return [
+        fx.Int32(
+            rocdl.perm_b32(
+                values[(row + r) * 4 + n // 2],
+                values[(row + r + 1) * 4 + n // 2],
+                selector,
+            )
+        )
+        for r in (0, 2)
+    ]
+
+
+def _tiles(values):
+    """FP32 values as MFMA accumulator tiles of 4."""
+    values = fx.Vector(values)
+    return [
+        fx.Vector.from_elements([values[n * 4 + i] for i in range(4)], fx.Float32)
+        for n in range(values.numel // 4)
+    ]
+
+
+def _untile(tiles):
+    return fx.Vector.from_elements(
+        [tile[i] for tile in tiles for i in range(4)], fx.Float32
+    )
+
+
+# ---- D256 BM128/BN64 eight-wave pipeline: MFMA fragments, softmax, LDS ----
 
 
 def _sum(values):
@@ -466,12 +525,15 @@ def _read_s2r(plan, queue):
 
 
 def _k_operands(words):
+    """The _qk A operands of keys 0-15 and 16-31 from one K half's 64 LDS words."""
     # MFMA-only uses leave the loads AV-class; the scheduler then reverts the QK interleave.
     _keep_vgpr(words)
     rocdl.sched_barrier(0)
-    frag = fx.make_rmem_tensor(fx.make_layout((4, 16, 2), (1, 4, 64)), fx.BFloat16)
-    frag.store(words.bitcast(fx.BFloat16))
-    return fx.make_view(fx.get_iter(frag), fx.make_layout((4, 2, 16), (1, 64, 4)))
+    words = fx.Vector(words)
+    return tuple(
+        fx.Vector.from_elements([words[n * 32 + i] for i in range(32)], fx.Int32)
+        for n in range(2)
+    )
 
 
 def _v_operands(values, step, ready=None):
@@ -487,21 +549,11 @@ def _v_operands(values, step, ready=None):
         rocdl.sched_barrier(0)
     words = []
     for n in range(8):
-        selector = 0x03020706 if n % 2 else 0x01000504
-        words.extend(
-            fx.Int32(
-                rocdl.perm_b32(
-                    raw[(row + r) * 4 + n // 2],
-                    raw[(row + r + 1) * 4 + n // 2],
-                    selector,
-                )
-            )
-            for r in (0, 2)
-        )
+        words.extend(_v_pair(raw, row, n))
     return fx.Vector.from_elements(words, fx.Int32)
 
 
-def _pv(
+def _pv_half(
     probabilities,
     values,
     output,
@@ -511,16 +563,14 @@ def _pv(
     sum_max=None,
     steps=4,
 ):
-    """O += P V over one V half; center and sum_max fold softmax VALU work into its MFMAs.
+    """O += P V over one V half of a key tile (its 4 key steps, 8 O tiles), by _pv per
+    step; center and sum_max fold softmax VALU work into its MFMAs.
 
     sum_max = (S, lane sum, other sums, l) also returns l + row sum and the lane max of S;
     center = (S, lane max, other maxima, scale, m) returns S * scale, m' and the ballot.
     """
     p = fx.Vector(probabilities)
-    acc = [
-        fx.Vector.from_elements([output[n * 4 + i] for i in range(4)], fx.Float32)
-        for n in range(8)
-    ]
+    acc = _tiles(output)
     prepared_steps = 0 if prepared is None else prepared.numel // 16
     operands = (
         _v_operands(values, 0, ready)
@@ -539,11 +589,13 @@ def _pv(
                 _v_operands(values, step + 1, ready) if step + 1 < steps else operands
             )
         b = fx.Vector.from_elements([p[step * 4 + i] for i in range(4)], fx.BFloat16)
-        for n in range(8):
-            a = fx.Vector.from_elements(
-                [operands[n * 2 + i] for i in range(2)], fx.Int32
-            ).bitcast(fx.Int16)
-            acc[n] = _mfma(a, b.bitcast(fx.Int16), acc[n])
+        acc = _pv(
+            b.bitcast(fx.Int16),
+            lambda n, words=operands: fx.Vector.from_elements(
+                [words[n * 2 + i] for i in range(2)], fx.Int32
+            ).bitcast(fx.Int16),
+            acc,
+        )
         if center is not None:
             current, candidate, maxima, scale, maximum = center
             if step == 0:
@@ -568,9 +620,7 @@ def _pv(
             _schedule(8, 3, 23)
         rocdl.sched_barrier(0)
         operands = following
-    result = fx.Vector.from_elements(
-        [acc[n][i] for n in range(8) for i in range(4)], fx.Float32
-    )
+    result = _untile(acc)
     if center is not None:
         # Pinned: unpinned, LLVM sinks the scaling into the next memory stage.
         scaled = _pin(fx.Vector.from_elements(scaled, fx.Float32))
