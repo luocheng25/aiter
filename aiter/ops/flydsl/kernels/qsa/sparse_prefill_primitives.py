@@ -8,14 +8,16 @@ except for what this module gathers, each with the reason it stays. No other mod
 of these kernels imports ``flydsl._mlir`` or calls a ROCDL operation that ``fx.rocdl``
 does not export.
 
-- Empty inline asm (pin_i32, pin, keep_vgpr): FlyDSL 0.5.0 has no public asm entry or
-  register-placement hint. A constraint LLVM cannot satisfy is only printed ("error:
-  could not allocate output register for constraint 'v'") and the kernel computes
-  garbage, so the guard tests check compiler output for errors.
+- Empty inline asm (pin_i32, pin, keep_vgpr, hold, compiler_fence): FlyDSL 0.5.0 has no
+  public asm entry, register-placement hint or compiler-only memory barrier. A constraint
+  LLVM cannot satisfy is only printed ("error: could not allocate output register for
+  constraint 'v'") and the kernel computes garbage, so the guard tests check compiler
+  output for errors.
 - kernel_attrs: the target-features function attribute (LLVM semantics).
 - ROCDL operations FlyDSL wraps without exporting (lane broadcasts, ballot, ds_bpermute,
-  v_perm_b32, scheduling barriers, raw buffer loads, DPP, mbcnt, s_setprio, s_barrier):
-  no stable equivalent, or the stable one adds instructions.
+  v_perm_b32, scheduling barriers, raw buffer loads, DPP, mbcnt, s_setprio, s_barrier,
+  FP8 conversion, bare log2 and reciprocal): no stable equivalent, or the stable one adds
+  instructions or rounds differently.
 - load_lds and LdsQueue: volatile LDS reads and the lgkmcnt ledger of the union
   pipeline's cross-wave LDS reuse.
 """
@@ -79,6 +81,23 @@ def keep_vgpr(words, chunk=4):
             [words[i] for i in range(start, start + chunk)], words.dtype
         )
         llvm.inline_asm(None, [part.ir_value()], "", "v", has_side_effects=True)
+
+
+def hold(*values):
+    """Empty asm uses: the FP32 values are computed at this point."""
+    # MachineSink ignores sched_barrier: results used only after a later branch would sink
+    # past it and run after the last MFMA.
+    for value in values:
+        llvm.inline_asm(
+            None, [fx.Float32(value).ir_value()], "", "v", has_side_effects=True
+        )
+
+
+def compiler_fence():
+    """Empty asm with a memory clobber: a compiler memory barrier, no instruction."""
+    # fx.memory_fence emits a real fence; this only keeps MachineSink from moving loads
+    # issued before it into a later block.
+    llvm.inline_asm(None, [], "", "~{memory}", has_side_effects=True)
 
 
 # ---- Kernel attributes ----
@@ -175,6 +194,43 @@ def lanes_below(mask):
     return fx.Int32(
         rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
     )
+
+
+def row_broadcast(value, lane):
+    """Lane ``lane`` of each 16-lane row (DPP row_newbcast); LLVM folds it into the VALU
+    instruction that uses it."""
+    # fx.gpu shuffles go through ds_bpermute or ds_swizzle and cannot fold into a VALU.
+    return fx.Float32(
+        rocdl.update_dpp(
+            fx.Float32.ir_type,
+            llvm.mlir_poison(fx.Float32.ir_type),
+            fx.Float32(value).ir_value(),
+            0x150 + lane,
+            0xF,
+            0xF,
+            True,
+        )
+    )
+
+
+def cvt_pk_fp8(a, b, word=None, high=False):
+    """FP32 a, b as two E4M3FNUZ bytes (round to nearest even) in the low (high) half of
+    word, its other half kept (v_cvt_pk_fp8_f32); no word starts a new one."""
+    # Float32.to(Float8E4M3FNUZ) converts one value per instruction.
+    old = llvm.mlir_poison(fx.Int32.ir_type) if word is None else fx.Int32(word)
+    return fx.Int32(rocdl.cvt_pk_fp8_f32(fx.Int32.ir_type, a, b, old, high))
+
+
+def log2(value):
+    """log2 by one bare v_log_f32."""
+    # fx.math.log2 adds denormal range reduction.
+    return fx.Float32(rocdl.log(fx.Float32.ir_type, fx.Float32(value).ir_value()))
+
+
+def rcp(value):
+    """1 / value by one bare v_rcp_f32."""
+    # Division lowers to a correctly rounded sequence of several instructions.
+    return fx.Float32(rocdl.rcp(fx.Float32.ir_type, fx.Float32(value).ir_value()))
 
 
 # ---- Volatile LDS reads and the lgkmcnt ledger ----
