@@ -12,8 +12,8 @@ layout, sparse_prefill_direct._Raw the raw K/V one.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import rocdl
 
+from . import sparse_prefill_primitives as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -21,19 +21,15 @@ from .sparse_prefill_common import (
     _buffer_store_words,
     _buffer_words,
     _exp,
-    _load_lds,
     _maximum,
     _min,
     _pack_bf16,
-    _pin,
     _pv,
     _qk,
     _read_q_g2r,
     _rescale,
     _stage_end,
-    _target_features,
     _tiles,
-    _uniform,
     _untile,
     _write_address,
 )
@@ -78,14 +74,16 @@ def _output(
             col = (((tid >> 4) & 3) * 4 + i) * 8 + half * 128
             address = fx.Int32(shared + ((row * 256 + col) ^ ((row & 7) * 8)) * 2)
             _write_address(address, words)
-    rocdl.s_waitcnt(lgkmcnt=0)
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     parts = []
     for part in range(8):
         element = tid * 8 + part * threads * 8
-        parts.append(_load_lds(storage, (element ^ (((element // 256) & 7) * 8)) * 2))
-    rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.sched_barrier(0)
+        parts.append(
+            prim.load_lds(storage, (element ^ (((element // 256) & 7) * 8)) * 2)
+        )
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+    prim.sched_barrier(0)
     for part in range(8):
         element = tid * 8 + part * threads * 8
         r, col = element // 256, element % 256
@@ -99,7 +97,7 @@ def _output(
         fragment = fx.make_rmem_tensor(8, fx.BFloat16)
         fragment.store(parts[part].bitcast(fx.BFloat16))
         fx.copy(
-            fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16),
+            fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16),
             fragment,
             fx.make_view(fx.get_iter(buffer) + offset, fx.make_layout(8, 1)),
         )
@@ -130,8 +128,8 @@ def _pack_block(
         # A wave packs one block, four consecutive pool rows from the slot table's first:
         # give it its own 64-bit base, so the pool may exceed 4 GiB. kr/vr are the pool
         # addresses here.
-        row = _uniform(fx.Int32(slots[_uniform(start)]))
-        base = (fx.Int64(row) * hk + _uniform(head)) * 512
+        row = prim.uniform(fx.Int32(slots[prim.uniform(start)]))
+        base = (fx.Int64(row) * hk + prim.uniform(head)) * 512
         kr = _buffer_at(kr + base, 4 * hk * 512)
         vr = _buffer_at(vr + base, 4 * hk * 512)
         source = valid.select(
@@ -168,7 +166,7 @@ def _pack_block(
             second = first | (1 << bit)
             kept = parity.select(words[second], words[first])
             sent = parity.select(words[first], words[second])
-            received = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source_lane, sent))
+            received = prim.bpermute(source_lane, sent)
             next_words[first] = parity.select(received, kept)
             next_words[second] = parity.select(kept, received)
         words = next_words
@@ -202,7 +200,7 @@ def _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED):
     else:
         kr, vr = _buffer(K, source_extent), _buffer(V, source_extent)
     pk, pv = _buffer(PK, extent), _buffer(PV, extent)
-    slots = rocdl.make_buffer_tensor(SLOTS)
+    slots = fx.rocdl.make_buffer_tensor(SLOTS)
     for u in fx.range_constexpr(4):
         _pack_block(
             kr,
@@ -252,7 +250,7 @@ def _pack_gated(
     HK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
 ):
-    if _uniform(DIRECT_FLAG[0]) != 0:
+    if prim.uniform(DIRECT_FLAG[0]) != 0:
         _pack_body(K, V, PK, PV, SOURCES, SLOTS, N, PACKED, HK, SLOTTED)
 
 
@@ -260,7 +258,7 @@ def _key_offset(cached, n, visible, extent, hk, topk):
     complete = _min(visible >> 2, fx.Int32(topk))
     width = complete * 4 + (visible & 3)
     selector = fx.Int32((_min(n >> 2, fx.Int32(topk - 1)) & 63) * 4)
-    block = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, selector, fx.Int32(cached)))
+    block = prim.bpermute(selector, fx.Int32(cached))
     base = (n < complete * 4).select(
         fx.Uint32(block) * (hk * 2048), fx.Uint32(visible & -4) * (hk * 512)
     )
@@ -312,10 +310,10 @@ def _value_load(resource, source_base, tile, segment, half, lane, visible, hk, t
 
 
 def _reduce(value, maximum):
-    a = value.shuffle_xor(16, 64)
-    b = value.shuffle_xor(32, 64)
-    c = value.shuffle_xor(48, 64)
-    rocdl.sched_barrier(0)
+    a = fx.gpu.shuffle_xor(value, 16, 64)
+    b = fx.gpu.shuffle_xor(value, 32, 64)
+    c = fx.gpu.shuffle_xor(value, 48, 64)
+    prim.sched_barrier(0)
     if maximum:
         return _maximum(_maximum(value, a), _maximum(b, c))
     return (value + a) + (b + c)
@@ -364,28 +362,20 @@ class _DirectLoop:
         for t in range(fx.Int32(0), tiles, fx.Int32(1)):
             # The lane holding a four-key block's first K offset gives its V row:
             # no second dependent block-table load.
-            row0 = fx.Int32(
-                rocdl.ds_bpermute(
-                    fx.Int32.ir_type, (lane >> 4) * self.row_lane, fx.Int32(offset0)
-                )
-            )
-            row1 = fx.Int32(
-                rocdl.ds_bpermute(
-                    fx.Int32.ir_type, (lane >> 4) * self.row_lane, fx.Int32(offset1)
-                )
-            )
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.sched_barrier(0)
+            row0 = prim.bpermute((lane >> 4) * self.row_lane, fx.Int32(offset0))
+            row1 = prim.bpermute((lane >> 4) * self.row_lane, fx.Int32(offset1))
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            prim.sched_barrier(0)
             values0 = self.values(row0, t, 0, 0)
             values1 = self.values(row0, t, 0, 1)
             if ((t + 1) & 7) == 0:
                 next_ids = self.next_ids(t)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             # The prior tile's sixteen K requests precede these eight V requests: wait
             # for K at its consumer, leaving V in flight for QK. A block-id prefetch
             # is younger still; vmcnt(8) then also waits for the oldest V request.
-            rocdl.s_waitcnt(vmcnt=8)
-            rocdl.sched_barrier(0)
+            fx.rocdl.s_waitcnt(vmcnt=8)
+            prim.sched_barrier(0)
             scores = self.scores(_qk(q, *self.key_operands(k0, k1)), t)
             candidate = fx.Float32(_MAX_FLOOR)
             for score in scores:
@@ -402,10 +392,10 @@ class _DirectLoop:
             current = self.reduce(current, False)
             total = total * alpha + current
             o0, o1 = self.rescale(o0, o1, alpha)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(vmcnt=0)
-            rocdl.sched_barrier(0)
+            fx.rocdl.s_waitcnt(lgkmcnt=0)
+            prim.sched_barrier(0)
+            fx.rocdl.s_waitcnt(vmcnt=0)
+            prim.sched_barrier(0)
             if ((t + 1) & 7) == 0:
                 ids = next_ids
             following0 = _min((t + 1) * 32, (((count + 15) >> 4) - 1) * 16)
@@ -424,18 +414,18 @@ class _DirectLoop:
             ).bitcast(fx.Int16)
             next_values0 = self.values(row1, t, 1, 0)
             next_values1 = self.values(row1, t, 1, 1)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             o0 = self.pv(p0, values0, o0)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             k0 = self.load_key(offset0)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             o1 = self.pv(p0, values1, o1)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             k1 = self.load_key(offset1)
-            rocdl.sched_barrier(0)
+            prim.sched_barrier(0)
             # Eight V loads precede sixteen K loads: consume V while K stays in flight.
-            rocdl.s_waitcnt(vmcnt=16)
-            rocdl.sched_barrier(0)
+            fx.rocdl.s_waitcnt(vmcnt=16)
+            prim.sched_barrier(0)
             o0 = self.pv(p1, next_values0, o0)
             o1 = self.pv(p1, next_values1, o1)
             maximum = updated
@@ -483,8 +473,8 @@ class _Packed(_DirectLoop):
         return _reduce(value, maximum)
 
     def rescale(self, o0, o1, alpha):
-        changed = rocdl.ballot(fx.Int64.ir_type, alpha != fx.Float32(1.0))
-        return _rescale((o0, o1), fx.Int64(changed), lambda: alpha)
+        changed = prim.ballot(alpha != fx.Float32(1.0))
+        return _rescale((o0, o1), changed, lambda: alpha)
 
     def key_offset(self, ids, position):
         return _key_offset(
@@ -500,7 +490,7 @@ class _Packed(_DirectLoop):
         return _key_load(self.kr, offset, self.lane, self.hk)
 
     def pv(self, p, values, output):
-        rocdl.s_setprio(2)
+        prim.s_setprio(2)
         values = fx.Vector(values)
         acc = _pv(
             p,
@@ -509,7 +499,7 @@ class _Packed(_DirectLoop):
             ).bitcast(fx.Int16),
             _tiles(output),
         )
-        rocdl.s_setprio(0)
+        prim.s_setprio(0)
         return _untile(acc)
 
 
@@ -536,10 +526,10 @@ def _body(
         .view(fx.make_layout(8192, 1))
     )
     tid = fx.thread_idx.x
-    wave, lane = _uniform(tid >> 6), tid & 63
-    first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
-    k0, kv_len = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 3])
-    position0 = _uniform(META[tile * 5 + 4])
+    wave, lane = prim.uniform(tid >> 6), tid & 63
+    first, rows = prim.uniform(META[tile * 5]), prim.uniform(META[tile * 5 + 1])
+    k0, kv_len = prim.uniform(META[tile * 5 + 2]), prim.uniform(META[tile * 5 + 3])
+    position0 = prim.uniform(META[tile * 5 + 4])
     valid_wave = _enabled(wave, rows, first, None, None, False, NQ)
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
@@ -567,13 +557,13 @@ def _body(
         extent,
     )
     row = _min(first + wave, fx.Int32(NQ - 1))
-    blocks = rocdl.make_buffer_tensor(BLOCKS)
+    blocks = fx.rocdl.make_buffer_tensor(BLOCKS)
     maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
-    o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
+    o0, o1 = prim.pin(fx.Vector.filled(32, 0.0, fx.Float32)), prim.pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
     cached = fx.Int32(blocks[row * TOPK + lane])
-    rocdl.s_waitcnt(vmcnt=0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
     offset0 = _key_offset(cached, lane & 15, visible, extent, HK, TOPK)
     offset0 = valid_wave.select(offset0, extent)
     kval0 = _key_load(kr, offset0, lane, HK)
@@ -587,19 +577,19 @@ def _body(
     )
     offset1 = valid_wave.select(offset1, extent)
     kval1 = _key_load(kr, offset1, lane, HK)
-    rocdl.s_waitcnt(vmcnt=0)
-    rocdl.sched_barrier(0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
+    prim.sched_barrier(0)
     path = _Packed(
         kr, vr, blocks, row, visible, extent, count, lane, HK, TOPK, SCALE_LOG2
     )
     maximum, total, o0, o1 = path.attend(
         q, kval0, kval1, offset0, offset1, cached, maximum, total, o0, o1, tiles
     )
-    rocdl.s_waitcnt(vmcnt=0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     outptr = fx.get_iter(OUT) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
-    output = rocdl.make_buffer_tensor(
+    output = fx.rocdl.make_buffer_tensor(
         fx.make_view(outptr, fx.make_layout(NQ * H * 256, 1)), num_records_bytes=qe
     )
     _output(
@@ -643,8 +633,9 @@ def _kernel(
     if fx.const_expr(GATED):
         # Grid (row * HK + head, union tile): one round of independent loads gates a slot.
         tile, local = fx.block_idx.y, task // HK
-        first, rows = _uniform(UNION_META[tile * 5]), _uniform(UNION_META[tile * 5 + 1])
-        if (_uniform(ACTIVE[tile]) == 0) & (local < rows):
+        first = prim.uniform(UNION_META[tile * 5])
+        rows = prim.uniform(UNION_META[tile * 5 + 1])
+        if (prim.uniform(ACTIVE[tile]) == 0) & (local < rows):
             _body(
                 Q,
                 K,
@@ -733,7 +724,7 @@ def _launch(
             GATED,
             SCALE_LOG2,
             TOPK,
-            value_attrs={"llvm.target_features": _target_features()},
+            value_attrs=prim.kernel_attrs(),
         )
         if fx.const_expr(GATED):
             kernel.launch(grid=(BQ * HK, TILES, 1), block=(64, 1, 1), stream=stream)

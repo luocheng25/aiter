@@ -30,9 +30,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl.expr import rocdl
 
 from . import sparse_prefill_direct_packed as packed
+from . import sparse_prefill_primitives as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     MAX_ROW_PACKED_KV_BYTES,
@@ -42,13 +42,10 @@ from .sparse_prefill_common import (
     _lds_store,
     _maximum,
     _min,
-    _pin,
     _pv,
     _read_q_g2r,
     _stage_end,
-    _target_features,
     _tiles,
-    _uniform,
     _untile,
     _v_pair,
     platform,
@@ -207,9 +204,7 @@ def _source_token(cached_blocks, n, visible, tail_start, topk):
     complete = _min(visible >> 2, fx.Int32(topk))
     width = complete * 4 + (visible & 3)
     lane_bytes = fx.Int32((_min(n >> 2, fx.Int32(topk - 1)) & 63) * 4)
-    block = fx.Int32(
-        rocdl.ds_bpermute(fx.Int32.ir_type, lane_bytes, fx.Int32(cached_blocks))
-    )
+    block = prim.bpermute(lane_bytes, fx.Int32(cached_blocks))
     token = (n < complete * 4).select(
         block * 4 + (n & 3), tail_start + n - complete * 4
     )
@@ -347,10 +342,7 @@ class _Raw(_DirectLoop):
         source_lane = fx.Int32(((self.lane & 15) * 4 + (self.lane >> 4)) * 4)
         return tuple(
             fx.Vector.from_elements(
-                [
-                    fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source_lane, key[i]))
-                    for i in range(32)
-                ],
+                [prim.bpermute(source_lane, key[i]) for i in range(32)],
                 fx.Int32,
             )
             for key in (fx.Vector(k0), fx.Vector(k1))
@@ -371,10 +363,10 @@ class _Raw(_DirectLoop):
 
     def reduce(self, value, maximum):
         if maximum:
-            value = _maximum(value, value.shuffle_xor(16, 64))
-            return _maximum(value, value.shuffle_xor(32, 64))
-        value = value + value.shuffle_xor(16, 64)
-        return value + value.shuffle_xor(32, 64)
+            value = _maximum(value, fx.gpu.shuffle_xor(value, 16, 64))
+            return _maximum(value, fx.gpu.shuffle_xor(value, 32, 64))
+        value = value + fx.gpu.shuffle_xor(value, 16, 64)
+        return value + fx.gpu.shuffle_xor(value, 32, 64)
 
     def rescale(self, o0, o1, alpha):
         return fx.Vector(o0) * alpha, fx.Vector(o1) * alpha
@@ -438,12 +430,12 @@ def _body(
         .view(fx.make_layout(32768, 1))
     )
     tid = fx.thread_idx.x
-    wave, lane = _uniform(tid >> 6), tid & 63
+    wave, lane = prim.uniform(tid >> 6), tid & 63
     task = TASK
     tile, hkv = task // HK, task % HK
-    first, rows = _uniform(META[tile * 5]), _uniform(META[tile * 5 + 1])
-    k0, kv_len = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 3])
-    position0 = _uniform(META[tile * 5 + 4])
+    first, rows = prim.uniform(META[tile * 5]), prim.uniform(META[tile * 5 + 1])
+    k0, kv_len = prim.uniform(META[tile * 5 + 2]), prim.uniform(META[tile * 5 + 3])
+    position0 = prim.uniform(META[tile * 5 + 4])
     valid_wave = _enabled(wave, rows, first, QUERY_TILES, ACTIVE, GATED, NQ)
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
@@ -462,9 +454,9 @@ def _body(
     else:
         kr, vr, invalid = _kv_resources(K, V, k0, kv_len, NK, hkv, HK, SLOTTED)
     row = _min(first + wave, fx.Int32(NQ - 1))
-    blocks = rocdl.make_buffer_tensor(BLOCKS)
+    blocks = fx.rocdl.make_buffer_tensor(BLOCKS)
     maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
-    o0, o1 = _pin(fx.Vector.filled(32, 0.0, fx.Float32)), _pin(
+    o0, o1 = prim.pin(fx.Vector.filled(32, 0.0, fx.Float32)), prim.pin(
         fx.Vector.filled(32, 0.0, fx.Float32)
     )
     # One block ID per lane; each BN32 step consumes eight of these IDs.
@@ -473,22 +465,22 @@ def _body(
     if fx.const_expr(SLOTTED):
         for chunk in fx.range_constexpr(TOPK // 64 - 1):
             ids.append(fx.Int32(blocks[row * TOPK + (chunk + 1) * 64 + lane]))
-    rocdl.s_waitcnt(vmcnt=0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
     tail_start = visible & -4
     if fx.const_expr(SLOTTED):
         # Map all TOPK IDs to pool blocks up front (a block is four aligned pool rows)
         # through this tile's request rows of the slot table, range-checked: padding IDs and
         # a tail start at the request end read zero. The loop reads chunks 1.. back from
         # this wave's LDS (free until the epilogue) where the plain path loads IDs.
-        slots = rocdl.make_buffer_tensor(
+        slots = fx.rocdl.make_buffer_tensor(
             fx.make_view(fx.get_iter(SLOTS) + k0, fx.make_layout(kv_len, 1)),
             num_records_bytes=kv_len * 4,
         )
         pools = [fx.Int32(slots[ids[chunk] * 4]) for chunk in range(TOPK // 64)]
-        pool_tail = _uniform(fx.Int32(slots[tail_start]))
+        pool_tail = prim.uniform(fx.Int32(slots[tail_start]))
         if fx.const_expr(WIDE):
-            invalid = _uniform(fx.Int32(slots[0]))
-        rocdl.s_waitcnt(vmcnt=0)
+            invalid = prim.uniform(fx.Int32(slots[0]))
+        fx.rocdl.s_waitcnt(vmcnt=0)
         shared = fx.Int32(fx.ptrtoint(fx.get_iter(storage)))
         table = shared + wave * (TOPK * 4) + lane * 4
         for chunk in fx.range_constexpr(TOPK // 64 - 1):
@@ -511,8 +503,8 @@ def _body(
     )
     key_offset1 = valid_wave.select(key_offset1, invalid)
     kval1 = load_key(kr, key_offset1, lane)
-    rocdl.s_waitcnt(vmcnt=0)
-    rocdl.sched_barrier(0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
+    prim.sched_barrier(0)
     path = _Raw(
         kr,
         vr,
@@ -545,11 +537,11 @@ def _body(
         tiles,
     )
     # Retire the final bounded speculative K prefetch before the epilogue.
-    rocdl.s_waitcnt(vmcnt=0)
+    fx.rocdl.s_waitcnt(vmcnt=0)
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     outptr = fx.get_iter(OUT) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
-    output = rocdl.make_buffer_tensor(
+    output = fx.rocdl.make_buffer_tensor(
         fx.make_view(outptr, fx.make_layout(NQ * H * 256, 1)), num_records_bytes=qe
     )
     _output(
@@ -603,8 +595,8 @@ def _kernel(
         # K3 listed the groups holding a direct row: they take the first CTAs, so the dispatch
         # slots share them evenly whatever the union/direct row pattern.
         index = fx.block_idx.x // HK
-        if index < _uniform(DIRECT_FLAG[1]):
-            task = _uniform(GROUP_LIST[index]) * HK + fx.block_idx.x % HK
+        if index < prim.uniform(DIRECT_FLAG[1]):
+            task = prim.uniform(GROUP_LIST[index]) * HK + fx.block_idx.x % HK
             body(
                 Q,
                 K,
@@ -708,7 +700,7 @@ def _launch(
             TOPK,
             SLOTTED,
             WIDE,
-            value_attrs={"llvm.target_features": _target_features()},
+            value_attrs=prim.kernel_attrs(),
         ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 

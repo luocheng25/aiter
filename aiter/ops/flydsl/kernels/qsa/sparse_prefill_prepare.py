@@ -20,10 +20,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
-from flydsl.expr import rocdl
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from . import sparse_prefill_primitives as prim
 from .sparse_prefill_common import (
     _buffer,
     _buffer_store_words,
@@ -32,9 +32,9 @@ from .sparse_prefill_common import (
     _lds_pointer,
     _lds_store,
     _min,
-    _uniform,
     platform,
 )
+from .sparse_prefill_primitives import uniform as _uniform
 
 THREADS = 256
 INT_MAX = 2**31 - 1
@@ -81,7 +81,7 @@ class SparsePlan:
 
 
 def _ballot(pred):
-    return fx.Int64(rocdl.ballot(fx.Int64.ir_type, pred))
+    return prim.ballot(pred)
 
 
 # gfx9 DPP controls: quad_perm xor 1 / 2 / 3, row_half_mirror (xor 7), row_mirror (xor 15).
@@ -96,13 +96,12 @@ def _lane_xor(value, mask):
             [_lane_xor(halves[0], mask), _lane_xor(halves[1], mask)], fx.Int32
         ).bitcast(fx.Int64)[0]
     if mask not in _DPP_XOR:
-        return value.shuffle_xor(mask, 64)
-    # Raw DPP (no fx wrapper): row-local moves instead of LDS-crossbar shuffles cut the
-    # latency-bound K1 by 10-14% on small calls.
-    raw = value.ir_value()
+        return fx.gpu.shuffle_xor(value, mask, 64)
+    # Row-local DPP moves instead of LDS-crossbar shuffles cut the latency-bound K1 by
+    # 10-14% on small calls.
     for control in _DPP_XOR[mask]:
-        raw = rocdl.update_dpp(fx.Int32.ir_type, raw, raw, control, 0xF, 0xF, True)
-    return fx.Int32(raw)
+        value = prim.dpp_move(value, control)
+    return value
 
 
 def _wave_reduce(value, op):
@@ -332,15 +331,13 @@ def _put(buffer, index, value):
 
 
 def _cta_sync():
-    fx.memory_fence(syncscope="workgroup")
-    rocdl.s_barrier()
-    fx.memory_fence(syncscope="workgroup")
+    fx.gpu.barrier()
 
 
 def _inclusive_scan(value, lane):
     for offset in (1, 2, 4, 8, 16, 32):
         source = ((lane - offset) & 63) * 4
-        other = fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, source, value))
+        other = prim.bpermute(source, value)
         value = (lane >= offset).select(value + other, value)
     return value
 
@@ -497,12 +494,7 @@ def _owned(cta, count):
 
 
 def _below(mask):
-    low = rocdl.mbcnt_lo(
-        fx.Int32.ir_type, fx.Int32(mask).ir_value(), fx.Int32(0).ir_value()
-    )
-    return fx.Int32(
-        rocdl.mbcnt_hi(fx.Int32.ir_type, fx.Int32(mask >> 32).ir_value(), low)
-    )
+    return prim.lanes_below(mask)
 
 
 def _count(mask):

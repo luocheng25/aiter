@@ -8,11 +8,12 @@ calibrated CU count of the same model) and read once per process;
 AITER_QSA_PLATFORM overrides fields of the picked entry, e.g.
 ``AITER_QSA_PLATFORM="union_step=3.0,max_packed_kv_bytes=0"``.
 
-The second part holds raw-buffer operations, register pinning and pipeline
-barriers. The third part holds the QK and PV MFMA loops and the lazy softmax
-rescale, each defined once for the union and both direct kernels. The fourth
-part holds the BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave
-staggered D256 pipeline that the union kernel runs.
+The second part holds raw-buffer operations and pipeline barriers. The third
+part holds the QK and PV MFMA loops and the lazy softmax rescale, each defined
+once for the union and both direct kernels. The fourth part holds the
+BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave staggered D256
+pipeline that the union kernel runs. Everything below FlyDSL's stable API is in
+sparse_prefill_primitives (prim).
 """
 
 import dataclasses
@@ -24,12 +25,9 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# for inline asm and target features
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import rocdl
-
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+from . import sparse_prefill_primitives as prim
 
 # ---- Platform calibration and private resource policy ----
 
@@ -117,66 +115,11 @@ def platform() -> Platform:
     return entry
 
 
-# ---- Raw buffers, register pinning, pipeline barriers ----
-
-
-def _uniform(value):
-    return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value)))
+# ---- Raw buffers, pipeline barriers ----
 
 
 def _min(a, b):
     return (a < b).select(a, b)
-
-
-def _pin_i32(value):
-    # Tied empty asm materializes the value in a VGPR here; no fx equivalent.
-    return fx.Int32(
-        llvm.inline_asm(
-            fx.Int32.ir_type,
-            [fx.Int32(value).ir_value()],
-            "",
-            "=v,0",
-            has_side_effects=True,
-        )
-    )
-
-
-def _pin(values, chunk=8):
-    values = fx.Vector(values)
-    dtype = values.dtype
-    words = values.bitcast(fx.Int32) if dtype.width < 32 else values
-    result = []
-    for start in range(0, words.numel, chunk):
-        part = fx.Vector.from_elements(
-            [words[i] for i in range(start, min(start + chunk, words.numel))],
-            words.dtype,
-        )
-        tied = fx.Vector(
-            llvm.inline_asm(
-                part.ir_value().type,
-                [part.ir_value()],
-                "",
-                "=v,0",
-                has_side_effects=True,
-            )
-        )
-        result.extend(tied[i] for i in range(tied.numel))
-    return fx.Vector.from_elements(result, words.dtype).bitcast(dtype)
-
-
-def _keep_vgpr(words, chunk=4):
-    # Empty asm use keeps LDS loads in VGPRs; a tied pin's def would cost an s_nop.
-    words = fx.Vector(words)
-    for start in range(0, words.numel, chunk):
-        part = fx.Vector.from_elements(
-            [words[i] for i in range(start, start + chunk)], words.dtype
-        )
-        llvm.inline_asm(None, [part.ir_value()], "", "v", has_side_effects=True)
-
-
-def _target_features():
-    # Packed FP32 VALU makes the union phase loop about 8% slower.
-    return ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
 
 
 def _join(a, b):
@@ -187,8 +130,9 @@ def _join(a, b):
 
 
 def _exp(value):
-    # Bare v_exp_f32: math.exp2 adds denormal range reduction under IEEE f32.
-    return fx.Float32(rocdl.exp2(fx.Float32.ir_type, fx.Float32(value).ir_value()))
+    """2**value by one bare v_exp_f32."""
+    # afn lowers to llvm.amdgcn.exp2; plain math.exp2 adds denormal range reduction.
+    return fx.math.exp2(fx.Float32(value), fastmath=fx.FastMathFlags.afn)
 
 
 def _mfma(a, b, c):
@@ -199,7 +143,7 @@ def _mfma(a, b, c):
     frag_a.store(fx.Vector(a).bitcast(fx.BFloat16))
     frag_b.store(fx.Vector(b).bitcast(fx.BFloat16))
     frag_c.store(fx.Vector(c))
-    mma = fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
     fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
     return fx.Vector(frag_c.load())
 
@@ -219,7 +163,7 @@ def _pack_bf16(values):
     rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
     # One v_perm_b32 joins both high halves; element i lands in the low half.
     words = [
-        fx.Uint32(rocdl.perm_b32(rounded[i + 1], rounded[i], 0x07060302))
+        fx.Uint32(prim.perm_b32(rounded[i + 1], rounded[i], 0x07060302))
         for i in range(0, values.numel, 2)
     ]
     return fx.Vector.from_elements(words, fx.Uint32)
@@ -227,46 +171,27 @@ def _pack_bf16(values):
 
 def _stage_end():
     # Compiler fences and CTA rendezvous, not a memory-counter wait.
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
+    prim.sched_barrier(0)
+    prim.s_barrier()
+    prim.sched_barrier(0)
 
 
 def _schedule(pairs, count, group, exp=False):
-    # 0x002 = VALU, 0x400 = TRANS; the pinned FlyDSL names only the MFMA/VMEM/DS masks.
     for _ in range(pairs):
-        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, group)
-        rocdl.sched_group_barrier(0x400 if exp else 0x002, count, group)
+        prim.sched_group_barrier(prim.MFMA, 1, group)
+        prim.sched_group_barrier(prim.TRANS if exp else prim.VALU, count, group)
 
 
 def _schedule_exps(count, group):
     # Per value: subtraction, MFMA, exp, MFMA (the fastest order measured).
     for _ in range(count):
-        for mask in (0x002, rocdl.mask_mfma, 0x400, rocdl.mask_mfma):
-            rocdl.sched_group_barrier(mask, 1, group)
-
-
-class _LdsQueue:
-    """Issue-order ledger of LDS reads and ds_bpermute, which retire in order."""
-
-    def __init__(self):
-        self.issued = 0
-
-    def issue(self, count):
-        """Count issued ops; the returned ready(n) waits until the first n of them retired."""
-        self.issued += count
-        first = self.issued - count
-        return lambda done: self.wait(first + done)
-
-    def wait(self, upto=None, vmcnt=None):
-        """Wait until the ops issued before index upto (default: all) have retired."""
-        lgkmcnt = 0 if upto is None else self.issued - upto
-        rocdl.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt)
+        for mask in (prim.VALU, prim.MFMA, prim.TRANS, prim.MFMA):
+            prim.sched_group_barrier(mask, 1, group)
 
 
 def _buffer(tensor, size_bytes):
     """Byte-addressed buffer pointer over tensor; loads at or past size_bytes return zero."""
-    return rocdl.make_buffer_ptr(
+    return fx.rocdl.make_buffer_ptr(
         fx.recast_iter(fx.Int8, fx.get_iter(tensor)), num_records_bytes=size_bytes
     )
 
@@ -278,13 +203,13 @@ def _buffer_at(address, size_bytes):
         fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 16),
         fx.Int64(address),
     )
-    return rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
+    return fx.rocdl.make_buffer_ptr(pointer, num_records_bytes=size_bytes)
 
 
 def _buffer_words(buffer, offset, words=4):
     data = fx.make_rmem_tensor(4 * words, fx.Int8)
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words), fx.Int8),
+        fx.make_copy_atom(fx.rocdl.BufferCopy(32 * words), fx.Int8),
         fx.make_view(buffer + offset, fx.make_layout(4 * words, 1)),
         data,
     )
@@ -296,19 +221,10 @@ def _buffer_store_words(words, buffer, offset):
     data = fx.make_rmem_tensor(4 * words.numel, fx.Int8)
     data.store(words.bitcast(fx.Int8))
     fx.copy(
-        fx.make_copy_atom(rocdl.BufferCopy(32 * words.numel), fx.Int8),
+        fx.make_copy_atom(fx.rocdl.BufferCopy(32 * words.numel), fx.Int8),
         data,
         fx.make_view(buffer + offset, fx.make_layout(4 * words.numel, 1)),
     )
-
-
-def _load_lds(storage, offset, immediate=0):
-    # Volatile keeps the hand-written order; the LDS variable's GEP gives it an alias scope.
-    ptr = fx.get_iter(storage) + (fx.Int32(offset) + immediate)
-    ptr = fx.recast_iter(
-        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 16), ptr
-    )
-    return fx.Vector(fx.generic_load(ptr, count=4, volatile=True))
 
 
 def _write_address(address, words):
@@ -369,7 +285,7 @@ def _qk(q, k0, k1):
     pipeline's MFMA/VALU interleave was tuned with (per-MFMA calls schedule differently).
     """
     mma = fx.make_tiled_mma(
-        fx.make_mma_atom(rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+        fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
         fx.make_layout((1, 8, 1), (1, 1, 0)),
     )
     b = mma.make_fragment_B(
@@ -407,7 +323,7 @@ def _v_pair(values, row, n):
     selector = 0x03020706 if n % 2 else 0x01000504
     return [
         fx.Int32(
-            rocdl.perm_b32(
+            prim.perm_b32(
                 values[(row + r) * 4 + n // 2],
                 values[(row + r + 1) * 4 + n // 2],
                 selector,
@@ -454,12 +370,10 @@ def _max(values):
 def _cross(value, addresses, queue):
     bits = fx.Float32(value).bitcast(fx.Int32)
     result = tuple(
-        fx.Int32(rocdl.ds_bpermute(fx.Int32.ir_type, address, bits)).bitcast(fx.Float32)
-        for address in addresses
+        queue.bpermute(address, bits).bitcast(fx.Float32) for address in addresses
     )
-    queue.issue(len(addresses))
     # LLVM would sink the ds_bpermutes below the LDS reads that the queue counts after them.
-    rocdl.sched_barrier(0)
+    prim.sched_barrier(0)
     return result
 
 
@@ -518,17 +432,18 @@ def _lds_words(parts):
 def _read_s2r(plan, queue):
     """Issue a (storage, reads) plan; ready(n) waits until its first n reads have landed."""
     storage, reads = plan
+    first = queue.issued
     parts = [None] * len(reads)
     for slot, address, immediate in reads:
-        parts[slot] = _load_lds(storage, address, immediate)
-    return _lds_words(parts), queue.issue(len(reads))
+        parts[slot] = queue.load(storage, address, immediate)
+    return _lds_words(parts), queue.ready(first, queue.issued - first)
 
 
 def _k_operands(words):
     """The _qk A operands of keys 0-15 and 16-31 from one K half's 64 LDS words."""
     # MFMA-only uses leave the loads AV-class; the scheduler then reverts the QK interleave.
-    _keep_vgpr(words)
-    rocdl.sched_barrier(0)
+    prim.keep_vgpr(words)
+    prim.sched_barrier(0)
     words = fx.Vector(words)
     return tuple(
         fx.Vector.from_elements([words[n * 32 + i] for i in range(32)], fx.Int32)
@@ -541,12 +456,12 @@ def _v_operands(values, step, ready=None):
     row = step * 4
     if ready is not None:
         ready(row + 4)
-        _keep_vgpr(
+        prim.keep_vgpr(
             fx.Vector.from_elements(
                 [raw[i] for i in range(row * 4, row * 4 + 16)], fx.Int32
             )
         )
-        rocdl.sched_barrier(0)
+        prim.sched_barrier(0)
     words = []
     for n in range(8):
         words.extend(_v_pair(raw, row, n))
@@ -578,7 +493,7 @@ def _pv_half(
         else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
     )
     scaled = []
-    rocdl.sched_barrier(0)
+    prim.sched_barrier(0)
     for step in range(steps):
         if step + 1 < prepared_steps:
             following = fx.Vector.from_elements(
@@ -606,7 +521,7 @@ def _pv_half(
                     * scale
                 )
                 predicate = candidate > maximum + 7.0
-                ballot = fx.Int64(rocdl.ballot(fx.Int64.ir_type, predicate))
+                ballot = prim.ballot(predicate)
                 new_max = predicate.select(candidate + 1.0, maximum)
             for i in range(step * 4, step * 4 + 4):
                 scaled.append(fx.Float32(current[i]) * scale)
@@ -618,12 +533,12 @@ def _pv_half(
             _schedule(8, 3 if center is not None else 2, 20 + step)
         elif sum_max is not None:
             _schedule(8, 3, 23)
-        rocdl.sched_barrier(0)
+        prim.sched_barrier(0)
         operands = following
     result = _untile(acc)
     if center is not None:
         # Pinned: unpinned, LLVM sinks the scaling into the next memory stage.
-        scaled = _pin(fx.Vector.from_elements(scaled, fx.Float32))
+        scaled = prim.pin(fx.Vector.from_elements(scaled, fx.Float32))
         return result, scaled, new_max, ballot
     if sum_max is not None:
         return result, row_sum, candidate

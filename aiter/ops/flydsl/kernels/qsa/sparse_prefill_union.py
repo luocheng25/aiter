@@ -9,8 +9,8 @@ attention kernel (see sparse_prefill_common). Q/O rows and sparse masks differ.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import rocdl
 
+from . import sparse_prefill_primitives as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     _buffer,
@@ -26,14 +26,10 @@ from .sparse_prefill_common import (
     _k_phase,
     _k_reads,
     _lds_words,
-    _LdsQueue,
-    _load_lds,
     _max,
     _maximum,
     _min,
     _pack_bf16,
-    _pin,
-    _pin_i32,
     _pv_half,
     _qk,
     _read_q_g2r,
@@ -43,8 +39,6 @@ from .sparse_prefill_common import (
     _schedule_exps,
     _stage_end,
     _sum,
-    _target_features,
-    _uniform,
     _v_lds_address,
     _v_operands,
     _v_reads,
@@ -69,7 +63,7 @@ def _kv_rows(ids, wave, hk, slotted):
     With a slot table the ids are pool blocks, kept as is for per-block descriptors."""
     rows = []
     for slot in range(4):
-        block = fx.Uint32(rocdl.readlane(fx.Int32.ir_type, ids, slot))
+        block = fx.Uint32(prim.readlane(ids, slot))
         if not slotted:
             block = block * (4 * hk * D * 2) + (wave >> 2) * 256
         rows.append(fx.Int32(block))
@@ -90,10 +84,12 @@ def _read_packet_g2s(
     extent,
     tail_tile=None,
     read=None,
+    queue=None,
 ):
     """LDS DMA of key (wave & 3) * 16 + packet, dims (wave >> 2) * 128 + 0..127.
 
-    The optional LDS read (storage, address, immediate) is issued just before it.
+    The optional LDS read (storage, address, immediate) is issued just before it, counted
+    by queue.
     """
     # Token k of a block reads SOFFSET min(row, limits[k]) + k rows: a partial final block re-reads
     # the request's last token, whose K is masked and V weighted 0; with fewer than k + 1 tokens
@@ -122,16 +118,15 @@ def _read_packet_g2s(
         base, final, partial, full = resource
         block = rows[packet // 4]
         records = (block == final).select(partial, full)
-        resource = rocdl.get_buffer_rsrc(
+        resource = fx.rocdl.get_buffer_rsrc(
             _buffer_at(base + fx.Int64(fx.Uint32(block)) * (4 * hk * D * 2), records)
         )
         soffset = fx.Uint32(0)
     else:
         row, limit = fx.Uint32(rows[packet // 4]), limits[packet & 3]
         soffset = _min(row, limit)
-    data = None if read is None else _load_lds(*read)
-    # Raw LDS DMA: BufferCopyLDS adds its own vmcnt wait; the pipeline waits itself.
-    rocdl.raw_ptr_buffer_load_lds(
+    data = None if read is None else queue.load(*read)
+    prim.buffer_load_lds(
         resource,
         fx.to_llvm_ptr(fx.get_iter(storage) + (base_destination + immediate)),
         4,
@@ -145,9 +140,7 @@ def _read_packet_g2s(
 def _read_mask_g2r(resource, tile, offset, bq):
     """Membership bits of this lane's query over the 16 keys it scores in a key tile."""
     # The next vmcnt(0) retires it before the compute stage that applies it.
-    bits = rocdl.raw_ptr_buffer_load(
-        fx.Int16.ir_type, resource, fx.Int32(offset), fx.Int32(tile * bq * 8), 0
-    )
+    bits = prim.buffer_load_i16(resource, fx.Int32(offset), fx.Int32(tile * bq * 8))
     # Only bits 0..15 are read, so the sign extension is harmless.
     return fx.Int16(bits).to(fx.Int32)
 
@@ -181,17 +174,17 @@ def _shuffle_o_r2s2r(o_lo, o_hi, inv, storages, tid):
                 base + (((row & 63) * 256 + column) ^ ((row & 7) * 8)) * 2
             )
             _write_address(address, words)
-    rocdl.s_waitcnt(lgkmcnt=0)
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
     _stage_end()
     parts = []
     for part in range(8):
         element = tid * 8 + (part % 4) * THREADS * 8
         read_row = element // 256
         parts.append(
-            _load_lds(storages[part // 4], (element ^ ((read_row & 7) * 8)) * 2)
+            prim.load_lds(storages[part // 4], (element ^ ((read_row & 7) * 8)) * 2)
         )
-    rocdl.s_waitcnt(lgkmcnt=0)
-    rocdl.sched_barrier(0)
+    fx.rocdl.s_waitcnt(lgkmcnt=0)
+    prim.sched_barrier(0)
     return parts
 
 
@@ -206,7 +199,7 @@ def _store_o_r2g(parts, buffer, tid, heads, g, gp, bq, qvalid, extent, row_offse
         offset = valid.select(offset, extent)
         fragment = fx.make_rmem_tensor(8, fx.BFloat16)
         fragment.store(parts[part].bitcast(fx.BFloat16))
-        atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.BFloat16)
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         fx.copy(
             atom,
             fragment,
@@ -253,21 +246,23 @@ def _body(
     """
     # Kept in a VGPR: the phase loop needs every SGPR, and a scale read from an SGPR there
     # spills SGPRs and reorders the tuned MFMA/VALU interleave (about 4% slower).
-    SCALE_LOG2 = _pin_i32(fx.Float32(SCALE_LOG2).bitcast(fx.Int32)).bitcast(fx.Float32)
+    scale_bits = prim.pin_i32(fx.Float32(SCALE_LOG2).bitcast(fx.Int32))
+    SCALE_LOG2 = scale_bits.bitcast(fx.Float32)
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
     row_offset = ((work // HK) % slices) * 128
-    q0, qvalid = _uniform(META[tile_id * 5]), _uniform(META[tile_id * 5 + 1])
-    k0, kv_len = _uniform(META[tile_id * 5 + 2]), _uniform(META[tile_id * 5 + 3])
-    count = _uniform(COUNTS[tile_id])
+    q0, qvalid = prim.uniform(META[tile_id * 5]), prim.uniform(META[tile_id * 5 + 1])
+    k0 = prim.uniform(META[tile_id * 5 + 2])
+    kv_len = prim.uniform(META[tile_id * 5 + 3])
+    count = prim.uniform(COUNTS[tile_id])
     blocks = fx.get_iter(BLOCKS) + tile_id * CAP
     masks = fx.make_view(
         fx.get_iter(MEMBERS) + tile_id * (CAP // 16) * BQ * 4,
         fx.make_layout((CAP // 16) * BQ * 4, 1),
     )
-    mask_resource = rocdl.get_buffer_rsrc(_buffer(masks, (CAP // 16) * BQ * 8))
+    mask_resource = fx.rocdl.get_buffer_rsrc(_buffer(masks, (CAP // 16) * BQ * 8))
     tid = fx.thread_idx.x
-    wave, lane = _uniform(tid >> 6), tid & 63
+    wave, lane = prim.uniform(tid >> 6), tid & 63
     ids_offset = ((wave & 3) * 4 + (lane & 3)) * 4
     row = row_offset + wave * 16 + (lane & 15)
     query, head = row // GP, row % GP
@@ -284,7 +279,7 @@ def _body(
         # BLOCKS holds K3's pool blocks: each gets a descriptor from the pool's base (no 4 GiB
         # limit); TAILS holds the final partial block's first pool row (-1: none).
         row_bytes, half = HK * D * 2, (wave >> 2) * 256
-        tail = _uniform(TAILS[tile_id])
+        tail = prim.uniform(TAILS[tile_id])
         final = (tail >= 0).select(tail >> 2, fx.Int32(-1))
         partial = (kv_len & 3) * row_bytes - half
         full = fx.Int32(4 * row_bytes) - half
@@ -300,7 +295,7 @@ def _body(
             (limit > k * HK * D * 2).select(limit - k * HK * D * 2, fx.Uint32(0))
             for k in range(4)
         )
-        gk = rocdl.get_buffer_rsrc(
+        gk = fx.rocdl.get_buffer_rsrc(
             _buffer(
                 fx.make_view(
                     fx.get_iter(K) + (fx.Int64(k0) * HK + hkv) * D,
@@ -309,7 +304,7 @@ def _body(
                 extent,
             )
         )
-        gv = rocdl.get_buffer_rsrc(
+        gv = fx.rocdl.get_buffer_rsrc(
             _buffer(
                 fx.make_view(
                     fx.get_iter(V) + (fx.Int64(k0) * HK + hkv) * D,
@@ -351,6 +346,7 @@ def _body(
     def read_tile_g2s(resource, storage, rows, is_v, s2r, lgkm, tail_tile):
         # 16 LDS-DMA packets; read i of the s2r plan is issued just before packet i.
         parts = [None] * 16
+        first = None if lgkm is None else lgkm.issued
         for packet in fx.range_constexpr(16):
             read, slot = None, packet
             if fx.const_expr(s2r is not None):
@@ -370,10 +366,11 @@ def _body(
                 extent,
                 tail_tile,
                 read,
+                lgkm,
             )
         if fx.const_expr(s2r is None):
             return None
-        return _lds_words(parts), lgkm.issue(16)
+        return _lds_words(parts), lgkm.ready(first, lgkm.issued - first)
 
     def read_k_g2s(rows, s2r=None, lgkm=None):
         return read_tile_g2s(gk, k_lds, rows, False, s2r, lgkm, None)
@@ -386,7 +383,7 @@ def _body(
 
     def prologue():
         """Ids of tiles 0-2 and mask(0) g2r; K(0) g2s, QK(0), m and S'(0); K(1) g2s."""
-        lgkm = _LdsQueue()
+        lgkm = prim.LdsQueue()
         ids_0 = read_ids_g2r(fx.Int32(0))
         ids_1 = read_ids_g2r(_min(fx.Int32(1), last_tile))
         ids_2 = read_ids_g2r(_min(fx.Int32(2), last_tile))
@@ -405,8 +402,8 @@ def _body(
         _stage_end()
         # Compute: QK S(0) keys 0-31; O = 0.
         s_lo = qk(k_lo)
-        o_lo = _pin(fx.Vector.filled(32, 0.0, fx.Float32))
-        o_hi = _pin(fx.Vector.filled(32, 0.0, fx.Float32))
+        o_lo = prim.pin(fx.Vector.filled(32, 0.0, fx.Float32))
+        o_hi = prim.pin(fx.Vector.filled(32, 0.0, fx.Float32))
         _schedule(32, 3, 5)
         _stage_end()
         # Memory: K(0) keys 32-63 s2r.
@@ -417,8 +414,8 @@ def _body(
         s_hi = qk(k_hi)
         s_0 = _apply_mask(_join(s_lo, s_hi), mask_0) * SCALE_LOG2
         row_max = _max(s_0)
-        row_max = _maximum(row_max, row_max.shuffle_xor(16, 64))
-        row_max = _maximum(row_max, row_max.shuffle_xor(32, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 16, 64))
+        row_max = _maximum(row_max, fx.gpu.shuffle_xor(row_max, 32, 64))
         row_max = _maximum(row_max, fx.Float32(_MAX_FLOOR)) + 1.0
         row_sum = fx.Float32(0.0)
         _stage_end()
@@ -457,7 +454,7 @@ def _body(
         rows_prev = fx.Vector(rows_prev)
         rows_cur, rows_next = fx.Vector(rows_cur), fx.Vector(rows_next)
         # Each phase ends with every LDS op retired, so the ledger starts empty.
-        lgkm = _LdsQueue()
+        lgkm = prim.LdsQueue()
 
         # Step 0 memory.
         mask_t = read_mask_g2r(t)
@@ -473,7 +470,7 @@ def _body(
 
         # Step 1 memory.
         k_hi, ready = _read_s2r(k_s2r(1, lower_first=STAGGER), lgkm)
-        rocdl.s_waitcnt(vmcnt=0)
+        fx.rocdl.s_waitcnt(vmcnt=0)
         if fx.const_expr(STAGGER):
             ready(8)
         _stage_end()
@@ -506,7 +503,7 @@ def _body(
 
         # Step 3 memory.
         max_others = _cross(max_cur, cross_addresses, lgkm)
-        rocdl.s_waitcnt(vmcnt=0)
+        fx.rocdl.s_waitcnt(vmcnt=0)
         v_hi, ready = _read_s2r(v_s2r(1), lgkm)
         v_ops = _v_operands(v_hi, 0, ready)
         _stage_end()
@@ -531,13 +528,13 @@ def _body(
     def epilogue(state):
         """V(last) g2s, keys past the list read 0; exp, row sum and PV of the last tile."""
         s_last, row_max, row_sum, o_lo, o_hi, rows_last, _, _ = state
-        lgkm = _LdsQueue()
+        lgkm = prim.LdsQueue()
         # Memory: V(last) g2s, with P(last) and l computed while it lands.
         read_v_g2s(fx.Vector(rows_last), tail_tile=last_tile)
         p_last = _exps(fx.Vector(s_last), fx.Float32(row_max))
         sum_last = _sum(p_last)
-        sum_last = sum_last + sum_last.shuffle_xor(16, 64)
-        sum_last = sum_last + sum_last.shuffle_xor(32, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 16, 64)
+        sum_last = sum_last + fx.gpu.shuffle_xor(sum_last, 32, 64)
         row_sum = fx.Float32(row_sum) + sum_last
         p_bf16 = _pack_bf16(p_last).bitcast(fx.BFloat16)
         lgkm.wait(vmcnt=0)
@@ -570,7 +567,7 @@ def _body(
         state = phase(*state, key_tiles - 1)
     o_lo, o_hi, row_sum = epilogue(state)
     inv = (row_sum > 0.0).select(fx.Float32(1.0) / row_sum, fx.Float32(0.0))
-    out = rocdl.make_buffer_tensor(
+    out = fx.rocdl.make_buffer_tensor(
         fx.make_view(
             fx.get_iter(OUT) + fx.Int64(q0) * (H * D) + hkv * (H // HK) * D,
             fx.make_layout(NQ * H * D, 1),
@@ -578,7 +575,7 @@ def _body(
         num_records_bytes=qextent,
     )
     # Pin keeps output addressing inside the task loop; the mask restores tid's range.
-    pinned_tid = _pin_i32(tid) & (THREADS - 1)
+    pinned_tid = prim.pin_i32(tid) & (THREADS - 1)
     o_parts = _shuffle_o_r2s2r(o_lo, o_hi, inv, (k_lds, v_lds), pinned_tid)
     _store_o_r2g(
         o_parts, out, pinned_tid, H, H // HK, GP, BQ, qvalid, qextent, row_offset
@@ -621,13 +618,13 @@ def _kernel(
     )
     work = fx.block_idx.x
     while work < ((TASKS + GRID - 1) // GRID) * GRID:
-        mapped = _uniform(ORDER[work])
+        mapped = prim.uniform(ORDER[work])
         tile = mapped // (HK * ((BQ * GP + 127) // 128))
         enabled = fx.Int32(0)
         if mapped >= 0:
-            enabled = _uniform(ACTIVE[tile])
+            enabled = prim.uniform(ACTIVE[tile])
         if enabled != 0:
-            group = _uniform(fx.thread_idx.x >> 8)
+            group = prim.uniform(fx.thread_idx.x >> 8)
             if group != 0:
                 body(
                     Q,
@@ -727,10 +724,7 @@ def _launch(
             GRID,
             SCALE_LOG2,
             SLOTTED,
-            value_attrs={
-                "rocdl.waves_per_eu": 2,
-                "llvm.target_features": _target_features(),
-            },
+            value_attrs=prim.kernel_attrs(),
         ).launch(grid=(GRID, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
 
@@ -775,7 +769,8 @@ def _compiled(inputs, args, stream):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
         with torch.cuda.device(inputs.q.device), torch.cuda.stream(stream):
-            compiled = _COMPILED[key] = flyc.compile(
+            # Eight waves and 64 KiB LDS per CTA: two waves per SIMD, 256 VGPRs each.
+            compiled = _COMPILED[key] = flyc.compile[{"waves_per_eu": 2}](
                 _launch, *args[:19], 0, args[20], stream
             )
     return compiled
