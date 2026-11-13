@@ -75,7 +75,17 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, kv_slots=None):
+    def __init__(
+        self,
+        q,
+        k,
+        v,
+        indices,
+        query_lens,
+        prefix_lens,
+        kv_slots=None,
+        batch_invariant=False,
+    ):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -104,9 +114,15 @@ class _Workspace:
             **self.metadata,
         )
         self.union = None
-        if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1]):
+        minimum = _union_min_rows(q.shape[1] // k.shape[1])
+        # Batch-invariant layouts plan union tiles only for requests of at least minimum rows.
+        if (max(query_lens) if batch_invariant else q.shape[0]) >= minimum:
             plan = prepare.allocate_plan(
-                inputs=inputs, query_tile=32, scratch=False, slotted=slotted
+                inputs=inputs,
+                query_tile=32,
+                scratch=False,
+                slotted=slotted,
+                min_request_rows=minimum if batch_invariant else None,
             )
             # Union scratch grows with tiles x their block capacity.
             needed = sum(
@@ -226,6 +242,7 @@ def flydsl_qsa_sparse_prefill(
     softmax_scale=None,
     out=None,
     kv_slots=None,
+    batch_invariant=False,
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].
 
@@ -257,6 +274,21 @@ def flydsl_qsa_sparse_prefill(
     scratch: do not replay them concurrently with each other or with that stream's
     calls. Each kernel variant compiles on its first use: a few seconds with empty
     FlyDSL caches. One GPU per process (TP uses separate workers).
+
+    Union tiles and the direct kernel round differently. By default the choice between
+    them spans the call: union tiles are planned by the call's row count, BQ21/BQ42
+    union tiles serve only a single full H6/H3 prefill, and a cost model over all
+    tiles routes them, so the low bits of a request's rows may change with the other
+    requests of the call. batch_invariant=True decides per request: only requests of
+    at least the union planning rows take union tiles, each request picks its own tile
+    rows and no tile is routed by the others, so a request gives the bits it gives
+    alone (with batch_invariant=True too; the modes may differ). Batches of short
+    requests then run more rows direct, which can be slower. In both modes, a layout
+    whose union scratch would exceed 4 GiB (millions of rows) runs direct only, so its
+    requests may differ from their runs alone. Whether direct reads packed or raw K/V
+    (a call-wide budget) does not change the bits. Tuning targets MI308X (gfx942,
+    80 CUs) only: other gfx942 parts log a warning and reuse the 80-CU MI308X
+    settings; results are unaffected, performance may not be optimal.
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -270,6 +302,8 @@ def flydsl_qsa_sparse_prefill(
         raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
     # Rounded once, as the compile-time constant it replaces was.
     scale_log2 = float(np.float32(scaled))
+    if not isinstance(batch_invariant, bool):
+        raise TypeError("batch_invariant must be a bool")
     if kv_slots is not None and (
         not isinstance(kv_slots, torch.Tensor)
         or kv_slots.dtype != torch.int32
@@ -383,6 +417,7 @@ def flydsl_qsa_sparse_prefill(
             topk,
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
+            batch_invariant,
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -390,7 +425,9 @@ def flydsl_qsa_sparse_prefill(
                 raise RuntimeError(
                     "Warm attention on this stream and layout before graph capture"
                 )
-            workspace = _Workspace(q, k, v, indices, query_lens, prefix_lens, kv_slots)
+            workspace = _Workspace(
+                q, k, v, indices, query_lens, prefix_lens, kv_slots, batch_invariant
+            )
             _workspaces[key] = workspace
             for stale in list(_workspaces):
                 if len(_workspaces) <= WORKSPACE_CACHE:

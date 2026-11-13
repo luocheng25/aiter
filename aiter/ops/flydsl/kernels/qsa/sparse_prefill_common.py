@@ -90,7 +90,9 @@ def platform() -> Platform:
     key = min(keys, key=lambda key: abs(key[1] - cus))
     if key[1] != cus:
         logging.getLogger("aiter").warning(
-            "QSA sparse attention: %s with %d CUs is not calibrated; using the %d-CU entry",
+            "QSA sparse attention is tuned only for MI308X (gfx942, 80 CUs); this %s has "
+            "%d CUs and reuses the %d-CU MI308X settings: results are unaffected, "
+            "performance may not be optimal",
             gfx,
             cus,
             key[1],
