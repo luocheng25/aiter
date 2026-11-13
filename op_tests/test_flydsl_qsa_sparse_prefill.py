@@ -77,7 +77,8 @@ compute, scale layout, union / packed direct / raw direct, packed or pooled K/V 
 whose FP8 probabilities must not underflow; K = 0 with power-of-two V scales, whose output
 is exact, and zero Q rows; the reference on the FP8 Q the kernels compute with, also for
 sharp scores; large logits; K/V at the 4 GiB - 1 MiB FP8 byte span, packed and as a pool,
-and one token past it; graph replay with every input rewritten in place, scratch growth
+and one token past it; Q and out past 2 GiB (H192), whose rows past 2 GiB merge residual
+blocks by their out offset; graph replay with every input rewritten in place, scratch growth
 and new softmax scales; a workspace key that must hold the K/V dtype, scale layout, pool
 and batch mode; input errors and the entry's signature; batch invariance with
 batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
@@ -214,6 +215,8 @@ FP8_LAYOUTS = {
         ("random", "shared", "random"),
         512,
     ),
+    # Q and out of 2.25 GiB at group 12 (H192): rows from 21845 on reach past 2 GiB.
+    "hk16_prefill_24576": ((24576,), (0,), 16, "shared", 512),
 }
 CASES = {
     **FUNCTIONAL_CASES,
@@ -308,8 +311,9 @@ FP8_LIMIT_ROWS = (2**32 - 2**20) // HEAD_DIM
 # The first eight pair compute, scales, paths, pools and groups 12/6/3; then group 16
 # (direct through a pool at HK2 and T = 256, union with BQ8 tiles), large logits, the BQ42
 # tile of H3 full prefill (FP8 union with 64-bit membership), the 12000-token serving
-# prompt (see FP8_PERF_CASES) and K/V at the FP8 byte span limit: packed (requests at both
-# ends of it) and a pool whose pages start at 2 GiB and end at the limit.
+# prompt (see FP8_PERF_CASES), K/V at the FP8 byte span limit: packed (requests at both
+# ends of it) and a pool whose pages start at 2 GiB and end at the limit, and Q and out
+# past 2 GiB (see FP8_LARGE_Q_CASES).
 FP8_CASES = {
     "fp8_ragged_4_token": ("ragged_4", 12, "token", "fp8", None),
     "fp8_kv_slots_ragged_4_tensor": ("ragged_4", 12, "tensor", "fp8", (None, 1, False)),
@@ -362,14 +366,21 @@ FP8_CASES = {
         "fp8",
         (FP8_LIMIT_ROWS, 2**31 // HEAD_DIM // PAGE, True),
     ),
+    "fp8_hk16_prefill_24576_token": ("hk16_prefill_24576", 12, "token", "fp8", None),
 }
 # Also timed against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA, and
 # checked against the reference on the kernels' FP8 Q (see test_qsa_fp8_query).
 FP8_PERF_CASES = ("fp8_prefill_12000_tensor",)
 # Checked against the reference on the kernels' FP8 Q instead of within FP8_TOL: FP8 Q
-# rounding alone takes a few (row, head) vectors of its 4M-token rows near FP8_TOL's worst
-# bound, while what its K/V addressing can break shows on either check.
-FP8_QUERY_CHECKED = ("fp8_limit_packed_token",)
+# rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads)
+# near FP8_TOL's worst bound, while what its K/V or out addressing can break shows on
+# either check.
+FP8_QUERY_CHECKED = ("fp8_limit_packed_token", "fp8_hk16_prefill_24576_token")
+# Q and out past 2 GiB: core/residual union tiles leave rows past 2 GiB of out to the
+# direct kernel's residual merge, which finds their union log-sum-exp from the row's out
+# offset. Checked (fp8_query_error) on every row past 2 GiB, some of which must have
+# merged residual blocks (residual_rows).
+FP8_LARGE_Q_CASES = ("fp8_hk16_prefill_24576_token",)
 # name -> (layout, Q heads per KV head, scales): an attention sink over a flat tail.
 FP8_SINK_CASES = {
     "fp8_sink_chunk_1024_ctx_4024_random_token": (
@@ -468,6 +479,7 @@ FP8_ROUTES = {
     "fp8_prefill_12000_tensor": (True, None, 10, 1, True, True),
     "fp8_limit_packed_token": (True, "packed", 10, 1, False, True),
     "fp8_limit_pool_ragged_4_tensor": (True, None, 10, 1, True, True),
+    "fp8_hk16_prefill_24576_token": (True, None, 10, 1, True, True),
     "fp8_sink_chunk_1024_ctx_4024_random_token": (True, None, 10, 1, True, True),
     "fp8_sink_extend_64_ctx_70065_tensor": (False, "packed", None, None, False, True),
     "fp8_uniform_ragged_3_random_token": (True, "packed", 32, 2, False, True),
@@ -1069,7 +1081,8 @@ def routes():
         without one): .active (the tiles the latest call ran union), .query_tile, and
         .union_ratio / .route_model (the calibration it routes with); FP8 plans add
         .split, .core_ratio, .residual (each tile's residual direct steps, written when
-        core_ratio > 0) and .direct_flag (entry 0 set when the pack must pack K);
+        core_ratio > 0), .residual_rows (each row's residual blocks, written per call
+        when core_ratio > 0) and .direct_flag (entry 0 set when the pack must pack K);
       - flydsl_prefill.platform(None / "tensor" / "token"), the route calibrations;
       - quantize_q of the kernel module sparse_prefill_union_fp8 (fp8_query);
       - flydsl_prefill._arenas[(device, stream)].generation and .buffers.
@@ -1110,6 +1123,14 @@ def plan_terms():
     """(union_ratio, route_model) the latest call's union plan routes with."""
     plan = latest_workspace().union
     return plan.union_ratio, plan.route_model
+
+
+def residual_rows():
+    """Rows the latest call's direct kernel merged residual blocks into (rows of
+    core/residual union tiles with blocks outside their tile's core); complete when every
+    tile ran union (routes()["direct"] is None: the residual launch writes every row).
+    """
+    return (latest_workspace().union.residual_rows > 0).nonzero().flatten().tolist()
 
 
 def calibrated_terms(scales):
@@ -1746,14 +1767,19 @@ def fp8_error(out, expected):
     return float(error.mean()), float(error.max())
 
 
-def fp8_query_error(out, q, k8, ks, v8, vs, indices, query_lens, prefix_lens):
+def fp8_query_error(
+    out, q, k8, ks, v8, vs, indices, query_lens, prefix_lens, rows=None
+):
     """(mean, worst) error of compute="fp8" output against the reference on the FP8 Q it
     computes with (fp8_query), which leaves it only its FP8 probability error: per
-    (row, head), norms floored at their median (PyHIP's check, also for sharp scores).
+    (row, head), norms floored at their median (PyHIP's check, also for sharp scores);
+    over rows (all rows by default).
     """
     expected = run_torch(
-        fp8_query(q), k8, v8, indices, query_lens, prefix_lens, SCALE, (ks, vs)
+        fp8_query(q), k8, v8, indices, query_lens, prefix_lens, SCALE, (ks, vs), rows
     )
+    if rows is not None:
+        out = out[rows]
     norms = expected.norm(dim=-1)
     floor = torch.maximum(norms, norms.median())
     error = (out.float() - expected).norm(dim=-1) / floor
@@ -1847,7 +1873,7 @@ def test_qsa_fp8(case, heads):
         "compute": compute,
         "pool GiB": None if pool is None else args[1].nbytes / 2**30,
     }
-    rotate = 10 if args[1].nbytes < 2**30 else 1
+    rotate = 10 if max(q.nbytes, args[1].nbytes) < 2**30 else 1
     out, us = run_perftest(qsa_sparse_prefill, *args, **kw, num_rotate_args=rotate)
     ret["routes"] = check_routes(case, heads)
     if compute == "fp8" and ret["routes"]["query_tile"] is not None:
@@ -1885,8 +1911,15 @@ def test_qsa_fp8(case, heads):
             msg=f"{msg}: out",
         )
     elif case in FP8_QUERY_CHECKED:
+        rows = None
+        if case in FP8_LARGE_Q_CASES:
+            # Every row whose out bytes reach past 2 GiB (the full reference would take
+            # tens of GiB), and how many of them merged residual blocks.
+            first = 2**31 // (heads * HEAD_DIM * 2)
+            rows = list(range(first, q.shape[0]))
+            ret["merged rows past 2 GiB"] = sum(r >= first for r in residual_rows())
         ret["fp8_query mean err"], ret["fp8_query worst err"] = fp8_query_error(
-            out, q, k8, ks, v8, vs, indices, query_lens, prefix_lens
+            out, q, k8, ks, v8, vs, indices, query_lens, prefix_lens, rows
         )
     else:
         rows = sample_rows(query_lens)
@@ -1935,6 +1968,8 @@ def test_qsa_fp8(case, heads):
             f"{msg}: error against the FP8-Q reference mean {mean:.4f}, "
             f"worst {worst:.4f}"
         )
+    if "merged rows past 2 GiB" in ret:
+        assert ret["merged rows past 2 GiB"], f"{msg}: no row past 2 GiB merged"
     return ret
 
 
@@ -2523,15 +2558,18 @@ def test_qsa_fp8_batch_invariance(case, heads):
 
 def kv_bytes(case):
     """K/V bytes a case allocates, pools included (graph and batch invariance cases
-    stay small). FP8 K/V count twice their bytes: the FP8 pack holds another copy."""
+    stay small). FP8 K/V count twice their bytes: the FP8 pack holds another copy; FP8
+    cases add three times their Q bytes (Q, out, the FP8 Q and run_perftest's outputs:
+    FP8_LARGE_Q_CASES pass 2 GiB)."""
     if case in SPAN_LIMIT_CASES:
         tokens, slotted = SPAN_LIMIT_CASES[case]
         return tokens * (4 if slotted else HEAD_DIM * 2)
     if case in FP8_SPAN_CASES:
         # One tensor serves as K, V and the pool.
         return (FP8_LIMIT_ROWS + 1) * HEAD_DIM
+    group = 0
     if case in FP8_CASES:
-        layout, *_, pool = FP8_CASES[case]
+        layout, group, *_, pool = FP8_CASES[case]
         pool_rows = None if pool is None else pool[0]
     else:
         layout, pool_rows, _ = SLOT_CASES.get(case, (case, None, None))
@@ -2539,7 +2577,8 @@ def kv_bytes(case):
         return 0
     query_lens, prefix_lens, hk = CASES[layout][:3]
     rows = max(pool_rows or 0, sum(query_lens) + sum(prefix_lens))
-    return 2 * rows * hk * HEAD_DIM * 2
+    q_bytes = sum(query_lens) * group * hk * HEAD_DIM * 2
+    return 2 * rows * hk * HEAD_DIM * 2 + 3 * q_bytes
 
 
 def main():
