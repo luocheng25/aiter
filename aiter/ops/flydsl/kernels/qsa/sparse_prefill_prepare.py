@@ -214,16 +214,21 @@ def _recover_row(
     visible = _uniform(POSITIONS[row]) + 1
     complete = _min(visible >> 2, fx.Int32(TOPK))
     indices = _buffer(INDICES, ROWS * row_bytes)
-    unsorted = fx.Boolean(False)
     # Lane holds columns 64 * k + lane: each load, store and scatter spans 64 adjacent ones.
     keys = []
     for k in fx.range_constexpr(columns):
         column = k * 64 + lane
-        full = column < complete
         block = _buffer_words(indices, row * row_bytes + column * 16, 1)[0] >> 2
-        unsorted = unsorted | (full & (block != column))
-        keys.append(full.select(block, fx.Int32(INT_MAX)))
-    # Rows that select their first blocks in order (complete causal prefixes) skip the sort.
+        keys.append((column < complete).select(block, fx.Int32(INT_MAX)))
+    # Rows whose complete blocks already ascend skip the sort: complete causal prefixes and the
+    # indexer's ascending top-k. Lane 63 takes the next column from lane 0's next key.
+    next_lane = ((lane + 1) & 63) * 4
+    unsorted = fx.Boolean(False)
+    for k in fx.range_constexpr(columns):
+        column = k * 64 + lane
+        source = keys[k] if k + 1 == columns else (lane == 0).select(keys[k + 1], keys[k])
+        following = prim.bpermute(next_lane, source)
+        unsorted = unsorted | ((column + 1 < complete) & (keys[k] > following))
     if _ballot(unsorted) != 0:
         # The sort holds keys width * lane .. width * lane + width - 1: transpose through the
         # wave's LDS, INT_MAX past the last column.
