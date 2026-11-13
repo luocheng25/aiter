@@ -250,6 +250,9 @@ def _body(
     later row max + 1 only when that exceeds m + 7, rescaling O and l. SCALE_LOG2 is the
     runtime FP32 softmax_scale * log2(e).
     """
+    # Kept in a VGPR: the phase loop needs every SGPR, and a scale read from an SGPR there
+    # spills SGPRs and reorders the tuned MFMA/VALU interleave (about 4% slower).
+    SCALE_LOG2 = _pin_i32(fx.Float32(SCALE_LOG2).bitcast(fx.Int32)).bitcast(fx.Float32)
     slices = (BQ * GP + 127) // 128
     tile_id, hkv = work // (HK * slices), work % HK
     row_offset = ((work // HK) % slices) * 128
