@@ -1149,6 +1149,7 @@ def _order(
     WIDTH: fx.Constexpr[int],
     SPLIT: fx.Constexpr[int],
     CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
 ):
     key = fx.Int64 if WIDE else fx.Int32
     tid = fx.thread_idx.x
@@ -1244,12 +1245,26 @@ def _order(
         keys.append(valid.select(rank_key, key(-1)))
     cta = (scratch, tid, wave, WIDE)
     keys = _bitonic(keys, tid & 63, True, cta)
+    # The FP8 union kernel ends a CTA's task loop at its first idle entry. With several order
+    # CTAs (CHUNKED: chunks of SIZE entries) each places its runnable entries after those of the
+    # earlier chunks and its idle ones after every runnable entry, so each CTA still meets all
+    # of its runnable tasks first. One order CTA (a split plan always) places them as sorted.
+    before, own, total = fx.Int32(0), fx.Int32(0), fx.Int32(0)
+    if fx.const_expr(CHUNKED):
+        before, own, total = _runnable_counts(
+            COUNTS, COSTS, scratch, program, threshold, entries, SIZE, per_head, SLICES
+        )
     # Sort hkv-major (tie order), publish the tile-major task the union kernel runs.
     mask = (key(1) << key(SHIFT)) - 1
     rounded = (entries + GRID - 1) // GRID * GRID
     for e in fx.range_constexpr(WIDTH):
         position = tid * WIDTH + e
         rank = program * SIZE + position
+        if fx.const_expr(CHUNKED):
+            runnable = (keys[e] >> key(SHIFT)) > key(0)
+            rank = runnable.select(
+                before + position, total + program * SIZE - before + position - own
+            )
         entry = entries - 1 - fx.Int32(keys[e] & mask)
         task = entry
         if fx.const_expr(SPLIT > 1):
@@ -1269,6 +1284,36 @@ def _order(
         destination = row * GRID + ((row & 1) == 0).select(column, GRID - 1 - column)
         if (position < SIZE) & (destination < rounded):
             ORDER[destination] = value
+
+
+@flyc.jit
+def _runnable_counts(
+    COUNTS, COSTS, scratch, program, threshold, entries, SIZE, per_head, SLICES
+):
+    """Runnable entries (union tile within the threshold, steps > 0: cost > 0 in _order's
+    keys) of the chunks before chunk `program`, of chunk `program` and of all chunks. Several
+    order CTAs come only with an unsplit plan: entry = task."""
+    tid = fx.thread_idx.x
+    zero = fx.Int32(0)
+    first = program * SIZE
+    before, own, total = zero, zero, zero
+    for index in range(tid, entries, THREADS):
+        task = fx.Int32(index)
+        tile = (task % per_head) // SLICES
+        steps = (COUNTS[tile] + 15) >> 4
+        union = COSTS[tile * 3 + 2] == 1
+        one = (union & (steps <= threshold) & (steps > 0)).select(fx.Int32(1), zero)
+        before = before + (task < first).select(one, zero)
+        own = own + ((task >= first) & (task < first + SIZE)).select(one, zero)
+        total = total + one
+    # The sort's exchange words are free again.
+    return _block_reduce(
+        [before, own, total],
+        [operator.add] * 3,
+        scratch,
+        0,
+        _uniform(tid >> 6),
+    )
 
 
 def _claim(flag, count):
@@ -1437,6 +1482,7 @@ def _order_masks_kernel(
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
     CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
 ):
     words = ORDER_WORDS + (SPLIT_WORDS if SPLIT > 1 else 0)
     scratch = (
@@ -1488,6 +1534,7 @@ def _order_masks_kernel(
                         width,
                         SPLIT,
                         CORE,
+                        CHUNKED,
                     )
         else:
             _direct_groups(
@@ -1562,6 +1609,7 @@ def _order_masks_launch(
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
     CORE: fx.Constexpr[bool],
+    CHUNKED: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if TILES > 0:
@@ -1603,6 +1651,7 @@ def _order_masks_launch(
             SLOTTED,
             SPLIT,
             CORE,
+            CHUNKED,
         ).launch(
             grid=(ORDER_CTAS + TILES + (GROUPS + THREADS - 1) // THREADS, 1, 1),
             block=(THREADS, 1, 1),
@@ -1983,7 +2032,7 @@ def _launches(inputs, plan, stream):
     entries = tasks * plan.split
     numel = plan.task_order.numel()
     # One order CTA sorts the whole task order up to the widest variant, else chunks of it
-    # (a split plan always fits one).
+    # (a split plan always fits one), runnable entries of every chunk first.
     size = min(THREADS * SORT_WIDTHS[-1], numel)
     shift = max(1, (entries - 1).bit_length())
     wide = ((plan.block_capacity // 16) << shift) + entries - 1 >= 2**31
@@ -2024,6 +2073,7 @@ def _launches(inputs, plan, stream):
         plan.slotted,
         plan.split,
         core,
+        numel > size,
         stream,
     )
     constants = (
@@ -2036,6 +2086,7 @@ def _launches(inputs, plan, stream):
         plan.slotted,
         plan.split,
         core,
+        numel > size,
     )
     yield _compiled(_order_masks_launch, args, 24, constants), args
 
