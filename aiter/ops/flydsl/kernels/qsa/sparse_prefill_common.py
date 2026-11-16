@@ -9,13 +9,13 @@ replace its route terms (FP8_ROUTES); AITER_QSA_PLATFORM overrides fields of the
 picked entry, e.g. ``AITER_QSA_PLATFORM="union_step=3.0,max_packed_kv_bytes=0"``.
 
 The second part holds raw-buffer operations and pipeline barriers. The third
-part holds the QK and PV MFMA loops and the lazy softmax rescale, each defined
-once for the union and both direct kernels. The fourth part holds the
-BM128/BN64 MFMA, softmax and LDS pieces of the eight-wave staggered D256
-pipeline that the union kernel runs. The fifth part holds what both FP8 K/V
-kernels share: the FP8 MFMA, the lazy max of their softmax, the BF16 output
-rounding and the FP8 quantization of Q. Everything below FlyDSL's stable API is
-in sparse_prefill_primitives (prim).
+part holds the lazy softmax rescale (every BF16 kernel) and the 16x16x16 BF16 QK
+and PV MFMA steps of the BF16 direct kernels (the BF16 union pipeline runs its own
+32x32x8 steps). The fourth part holds what both FP8 K/V kernels share: the FP8
+MFMA, the lazy max of their softmax, the BF16 output rounding and the FP8
+quantization of Q. The fifth part holds the persistent direct launches' pacing and
+work queue. Everything below FlyDSL's stable API is in sparse_prefill_primitives
+(prim).
 """
 
 import dataclasses
@@ -36,7 +36,11 @@ from . import sparse_prefill_primitives as prim
 # Resource policy; private, not configurable from outside.
 WORKSPACE_CACHE = 8  # layouts kept per process; captured workspaces are never evicted
 ARENA_GROWTH_PERCENT = 125  # a growing arena takes at least this share of its size
-SCRATCH_ALIGN = 256  # bytes between the scratch views of an arena
+# Arena views start on 4 KiB boundaries: a packed K/V block (1 KiB FP8, 2 KiB BF16) of a view
+# that starts mid-page straddles two, and the direct kernels' gathers of such blocks run slower
+# (random selections over a 128k-token context, H6: direct +0.3% behind BQ21 union scratch that
+# is no multiple of 4 KiB).
+SCRATCH_ALIGN = 4096
 UNION_SCRATCH_LIMIT = 4 << 30  # union scratch bytes; past it a layout runs direct only
 MAX_ROW_PACKED_KV_BYTES = 1 << 30  # PK+PV bytes of the pack_tokens_per_row rule
 
@@ -48,14 +52,14 @@ class Platform:
     union_fixed: float  # fixed cost of the union phase
     union_step: float  # per N64 step of the slowest union CTA
     row_step: float  # per BN32 step of the longest direct row
-    route_margin: float  # keeping every union tile must be this share slower to lose
+    route_margin: float  # each route step to fewer union tiles must save this share
     direct_fixed: float  # fixed cost of the direct phase
     pack_block: float  # per packed KV block and KV head
     direct_cu_step: float  # per BN32 direct step and KV head, times the CU count
     union_ratio: float  # union while padded union steps <= ratio x direct steps
     union_min_rows: int  # below max(rows, rows_per_head x H/HK) direct-only wins
     union_min_rows_per_head: int
-    wide_tiles_per_cu: float  # full H6/H3 prefill: BQ21/BQ42 from this many tiles/CU
+    wide_tiles_per_cu: float  # H6/H3 union rows: BQ21/BQ42 from this many tiles/CU
     max_packed_kv_bytes: int  # direct packs KV while PK+PV fits, else reads the raw KV
     # Past that budget, direct still packs a context of at most this many tokens per query row
     # (packing copies the whole context each call).
@@ -81,28 +85,31 @@ PLATFORMS = {
     ),
 }
 # FP8 K/V (sparse_prefill_*_fp8, by K/V scale layout): route terms fitted on the FP8 kernels'
-# phase timings, synthetic and SGLang-captured selections (median error 3%); the per-tile
-# ratio is the sweep's best with the global route on. Union and minimum-row thresholds
-# otherwise follow the BF16 entry.
+# phase timings over synthetic and SGLang-captured selections: union_step on the union
+# kernel's times of 23 plans per scale layout (union_fixed kept; median error of the
+# throughput-bound ones -0.4% / +0.4%, split plans up to 57% high and plans of two or three
+# tasks per CTA 19% low), the direct terms (direct_cu_step, row_step) on the direct kernel's
+# times of 176 plans (median error 0.4%); the per-tile ratio is the sweep's best with
+# them. Union and minimum-row thresholds otherwise follow the BF16 entry.
 FP8_ROUTES = {
     ("gfx942", 80): {
         "tensor": {
             "union_fixed": 5.7,
-            "union_step": 2.072,
-            "row_step": 1.275,
+            "union_step": 1.571,
+            "row_step": 1.05,
             "direct_fixed": 11.9,
             "pack_block": 0.00184,
-            "direct_cu_step": 0.24,
-            "union_ratio": 2.0,
+            "direct_cu_step": 0.145,
+            "union_ratio": 1.7,
         },
         "token": {
             "union_fixed": 5.14,
-            "union_step": 2.483,
-            "row_step": 1.4,
+            "union_step": 1.771,
+            "row_step": 1.12,
             "direct_fixed": 11.87,
             "pack_block": 0.00213,
-            "direct_cu_step": 0.3,
-            "union_ratio": 2.0,
+            "direct_cu_step": 0.152,
+            "union_ratio": 1.7,
         },
     },
 }
@@ -163,13 +170,6 @@ def _min(a, b):
     return (a < b).select(a, b)
 
 
-def _join(a, b):
-    a, b = fx.Vector(a), fx.Vector(b)
-    return fx.Vector.from_elements(
-        [a[i] for i in range(a.numel)] + [b[i] for i in range(b.numel)], fx.Float32
-    )
-
-
 def _exp(value):
     """2**value by one bare v_exp_f32."""
     # afn lowers to llvm.amdgcn.exp2; plain math.exp2 adds denormal range reduction.
@@ -217,19 +217,6 @@ def _stage_end():
     prim.sched_barrier(0)
 
 
-def _schedule(pairs, count, group, exp=False):
-    for _ in range(pairs):
-        prim.sched_group_barrier(prim.MFMA, 1, group)
-        prim.sched_group_barrier(prim.TRANS if exp else prim.VALU, count, group)
-
-
-def _schedule_exps(count, group):
-    # Per value: subtraction, MFMA, exp, MFMA (the fastest order measured).
-    for _ in range(count):
-        for mask in (prim.VALU, prim.MFMA, prim.TRANS, prim.MFMA):
-            prim.sched_group_barrier(mask, 1, group)
-
-
 def _buffer(tensor, size_bytes):
     """Byte-addressed buffer pointer over tensor; loads at or past size_bytes return zero."""
     return fx.rocdl.make_buffer_ptr(
@@ -268,9 +255,10 @@ def _buffer_store_words(words, buffer, offset, cache=0):
     )
 
 
-# gfx942 buffer cache policy (aux bits: sc0 = 1, nt = 2, sc1 = 16): sc0 | sc1 is system scope,
-# so stores write through and loads read past the CU's L1 and this XCD's L2 (coherent between
-# CTAs of one launch on any XCD).
+# gfx942 buffer cache policy (aux bits: sc0 = 1, nt = 2, sc1 = 16). sc1 alone is device scope:
+# loads read past the CU's L1. sc0 | sc1 is system scope, so stores write through and loads read
+# past the CU's L1 and this XCD's L2 (coherent between CTAs of one launch on any XCD).
+SC_DEVICE = 16
 SC_SYSTEM = 17
 
 
@@ -298,7 +286,7 @@ def _lds_store(address, value, dtype=fx.Int32):
     fx.generic_store(_lds_pointer(address, dtype), dtype(value))
 
 
-# ---- QK, PV and the lazy rescale shared by the union and direct kernels ----
+# ---- The lazy rescale; the BF16 direct kernels' QK and PV ----
 
 
 @flyc.jit
@@ -338,8 +326,8 @@ def _qk(q, k0, k1):
     q holds the B operands (see _read_q_g2r); k0/k1 the A operands of keys 0-15 and
     16-31, four BF16 per step, step s in words 2s and 2s + 1. Returns the 8 FP32 scores:
     keys 0-15's accumulator, then keys 16-31's. The tiled MMA's eight-wave layout only
-    shapes the per-lane fragments, which come from registers; it is the form the union
-    pipeline's MFMA/VALU interleave was tuned with (per-MFMA calls schedule differently).
+    shapes the per-lane fragments, which come from registers (per-MFMA calls schedule
+    differently).
     """
     mma = fx.make_tiled_mma(
         fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
@@ -403,203 +391,6 @@ def _untile(tiles):
     return fx.Vector.from_elements(
         [tile[i] for tile in tiles for i in range(4)], fx.Float32
     )
-
-
-# ---- D256 BM128/BN64 eight-wave pipeline: MFMA fragments, softmax, LDS ----
-
-
-def _sum(values):
-    partials = [values[i] + values[i + 1] for i in range(0, 16, 2)]
-    for width in (4, 2, 1):
-        partials = [partials[2 * i] + partials[2 * i + 1] for i in range(width)]
-    return partials[0]
-
-
-def _max(values):
-    # Keep MFMA -> max dependencies visible to LLVM: an opaque max tree failed
-    # repeated bit-exact checks, and maxnum avoids maximumf's NaN expansion.
-    parts = [fx.maxnumf(values[i], values[i + 1]) for i in range(0, 16, 2)]
-    for width in (4, 2, 1):
-        parts = [fx.maxnumf(parts[2 * i], parts[2 * i + 1]) for i in range(width)]
-    return parts[0]
-
-
-def _cross(value, addresses, queue):
-    bits = fx.Float32(value).bitcast(fx.Int32)
-    result = tuple(
-        queue.bpermute(address, bits).bitcast(fx.Float32) for address in addresses
-    )
-    # LLVM would sink the ds_bpermutes below the LDS reads that the queue counts after them.
-    prim.sched_barrier(0)
-    return result
-
-
-def _exps(values, maximum):
-    # values are the rounded S * scale the max came from: an FMA overshoots by ulp / 2.
-    return fx.Vector.from_elements(
-        [_exp(values[i] - maximum) for i in range(16)], fx.Float32
-    )
-
-
-def _k_phase(token):
-    return (token & 3) | ((token >> 3) & 1) * 4
-
-
-def _k_lds_address(token, dimension):
-    return token * 512 + ((dimension // 2) ^ (_k_phase(token) * 4)) * 4
-
-
-def _v_lds_address(token, dimension):
-    return token * 512 + dimension * 2
-
-
-def _copy_coordinates(wave, packet, page=0):
-    token = (wave & 3) * 16 + packet if page == 4 else (wave & 3) + packet * 4
-    return token, (wave >> 2) * 128
-
-
-def _k_reads(addresses, half, lower_first=False):
-    """(slot, address, immediate) of one K half's 16 LDS reads, in issue order."""
-    order = (
-        [(n, k + high * 4) for high in range(2) for n in range(2) for k in range(4)]
-        if lower_first
-        else [(n, k) for n in range(2) for k in range(8)]
-    )
-    return [
-        (n * 8 + k, addresses[n * 2 + k % 2], half * 16384 + (k // 2) * 128)
-        for n, k in order
-    ]
-
-
-def _v_reads(address, half):
-    """(slot, address, immediate) of one V half's 16 LDS reads, in issue order."""
-    return [
-        (block * 8 + row, address, half * 256 + block * 16384 + row * 512)
-        for block in range(2)
-        for row in range(8)
-    ]
-
-
-def _lds_words(parts):
-    return fx.Vector.from_elements(
-        [part[i] for part in parts for i in range(4)], fx.Int32
-    )
-
-
-def _read_s2r(plan, queue):
-    """Issue a (storage, reads) plan; ready(n) waits until its first n reads have landed."""
-    storage, reads = plan
-    first = queue.issued
-    parts = [None] * len(reads)
-    for slot, address, immediate in reads:
-        parts[slot] = queue.load(storage, address, immediate)
-    return _lds_words(parts), queue.ready(first, queue.issued - first)
-
-
-def _k_operands(words):
-    """The _qk A operands of keys 0-15 and 16-31 from one K half's 64 LDS words."""
-    # MFMA-only uses leave the loads AV-class; the scheduler then reverts the QK interleave.
-    prim.keep_vgpr(words)
-    prim.sched_barrier(0)
-    words = fx.Vector(words)
-    return tuple(
-        fx.Vector.from_elements([words[n * 32 + i] for i in range(32)], fx.Int32)
-        for n in range(2)
-    )
-
-
-def _v_operands(values, step, ready=None):
-    raw = fx.Vector(values)
-    row = step * 4
-    if ready is not None:
-        ready(row + 4)
-        prim.keep_vgpr(
-            fx.Vector.from_elements(
-                [raw[i] for i in range(row * 4, row * 4 + 16)], fx.Int32
-            )
-        )
-        prim.sched_barrier(0)
-    words = []
-    for n in range(8):
-        words.extend(_v_pair(raw, row, n))
-    return fx.Vector.from_elements(words, fx.Int32)
-
-
-def _pv_half(
-    probabilities,
-    values,
-    output,
-    ready=None,
-    prepared=None,
-    center=None,
-    sum_max=None,
-    steps=4,
-):
-    """O += P V over one V half of a key tile (its 4 key steps, 8 O tiles), by _pv per
-    step; center and sum_max fold softmax VALU work into its MFMAs.
-
-    sum_max = (S, lane sum, other sums, l) also returns l + row sum and the lane max of S;
-    center = (S, lane max, other maxima, scale, m) returns S * scale, m' and the ballot.
-    """
-    p = fx.Vector(probabilities)
-    acc = _tiles(output)
-    prepared_steps = 0 if prepared is None else prepared.numel // 16
-    operands = (
-        _v_operands(values, 0, ready)
-        if prepared is None
-        else fx.Vector.from_elements([prepared[i] for i in range(16)], fx.Int32)
-    )
-    scaled = []
-    prim.sched_barrier(0)
-    for step in range(steps):
-        if step + 1 < prepared_steps:
-            following = fx.Vector.from_elements(
-                [prepared[(step + 1) * 16 + i] for i in range(16)], fx.Int32
-            )
-        else:
-            following = (
-                _v_operands(values, step + 1, ready) if step + 1 < steps else operands
-            )
-        b = fx.Vector.from_elements([p[step * 4 + i] for i in range(4)], fx.BFloat16)
-        acc = _pv(
-            b.bitcast(fx.Int16),
-            lambda n, words=operands: fx.Vector.from_elements(
-                [words[n * 2 + i] for i in range(2)], fx.Int32
-            ).bitcast(fx.Int16),
-            acc,
-        )
-        if center is not None:
-            current, candidate, maxima, scale, maximum = center
-            if step == 0:
-                candidate = (
-                    _maximum(
-                        _maximum(candidate, maxima[0]), _maximum(maxima[1], maxima[2])
-                    )
-                    * scale
-                )
-                predicate = candidate > maximum + 7.0
-                ballot = prim.ballot(predicate)
-                new_max = predicate.select(candidate + 1.0, maximum)
-            for i in range(step * 4, step * 4 + 4):
-                scaled.append(fx.Float32(current[i]) * scale)
-        if sum_max is not None and step == 3:
-            current, total, sums, row_sum = sum_max
-            row_sum = row_sum + ((total + sums[0]) + (sums[1] + sums[2]))
-            candidate = _max(current)
-        if step + 1 < steps and step + 1 >= prepared_steps:
-            _schedule(8, 3 if center is not None else 2, 20 + step)
-        elif sum_max is not None:
-            _schedule(8, 3, 23)
-        prim.sched_barrier(0)
-        operands = following
-    result = _untile(acc)
-    if center is not None:
-        # Pinned: unpinned, LLVM sinks the scaling into the next memory stage.
-        scaled = prim.pin(fx.Vector.from_elements(scaled, fx.Float32))
-        return result, scaled, new_max, ballot
-    if sum_max is not None:
-        return result, row_sum, candidate
-    return result
 
 
 # ---- FP8 (E4M3FNUZ) K/V: MFMA, lazy max, output rounding and Q quantization ----
@@ -755,4 +546,68 @@ def quantize_rows(Q, Q8, QS, ROWS, cta):
         fx.Vector.from_elements([_as_i32(scale)], fx.Int32),
         gs,
         ((part < QR) & (row < ROWS)).select(row * 4, fx.Int32(ROWS * 4)),
+    )
+
+
+# ---- Persistent launches: pacing and the work queue ----
+#
+# A persistent direct launch runs one WG of one-row waves per CU. Waves w and w ^ 4 share a
+# SIMD and the older one issues first; each key step publishes the wave's step count in LDS
+# (_lds_relaxed_store) and a wave behind its sibling raises its priority (_behind_prio).
+# Work items come from the launch's queue: word 0 counts the items taken, word 64 the waves
+# out (the last one zeroes both, so graph replays start from zero); words 1-63 are free for
+# the kernel. Lane 0 updates them with buffer atomics whose other lanes are out of range:
+# one request, no divergent branch.
+QUEUE_WORDS = 128
+_QUEUE_OUT = 256  # byte offset of the waves-out word
+
+
+def _lds_relaxed_load(address):
+    """An LDS word another wave stores (a relaxed atomic load: not hoisted out of loops)."""
+    return fx.generic_load(
+        _lds_pointer(address, fx.Int32),
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope="workgroup",
+    )
+
+
+def _lds_relaxed_store(address, value):
+    fx.generic_store(
+        _lds_pointer(address, fx.Int32),
+        fx.Int32(value),
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope="workgroup",
+    )
+
+
+@flyc.jit
+def _behind_prio(count, sibling, margin, prio):
+    """s_setprio(prio) while the wave is more than `margin` steps behind its sibling, else
+    0 (a wave-uniform condition)."""
+    if count + margin < sibling:
+        prim.s_setprio(prio)
+    else:
+        prim.s_setprio(0)
+
+
+def _queue_take(queue, lane):
+    """The queue's next item index (word 0), per lane: read it with prim.readlane(..., 0).
+    queue: the buffer of the launch's QUEUE_WORDS words."""
+    beyond = fx.Int32(QUEUE_WORDS * 4)
+    return prim.buffer_atomic(
+        "add", queue, (lane == 0).select(fx.Int32(0), beyond), fx.Int32(1)
+    )
+
+
+def _queue_exit(queue, lane, waves):
+    """Count the wave out; the last of `waves` zeroes the taken and out words (every take
+    of the launch is done once all its waves are out)."""
+    beyond = fx.Int32(QUEUE_WORDS * 4)
+    out = prim.buffer_atomic(
+        "add", queue, (lane == 0).select(fx.Int32(_QUEUE_OUT), beyond), fx.Int32(1)
+    )
+    last = (prim.readlane(out, 0) == waves - 1) & (lane == 0)
+    prim.buffer_atomic("swap", queue, last.select(fx.Int32(0), beyond), fx.Int32(0))
+    prim.buffer_atomic(
+        "swap", queue, last.select(fx.Int32(_QUEUE_OUT), beyond), fx.Int32(0)
     )

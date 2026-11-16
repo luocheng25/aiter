@@ -5,9 +5,10 @@
 Layouts whose packed PK/PV scratch fits the platform's packed-KV budget, or whose
 context has at most pack_tokens_per_row tokens per query row, use the private
 packed implementation: every call packs each request's KV into four-token blocks
-and runs one query wave per CTA. Other KV keeps the raw KV fallback below, where
-packing the whole context would cost more than it saves. Both paths preserve the
-public inputs and selection.
+and runs one query wave per CTA, or, for plans of equal rows that fill a wave per
+SIMD, one persistent WG of PERSIST_WAVES one-row waves per CU taking rows from a
+queue. Other KV keeps the raw KV fallback below, where packing the whole context
+would cost more than it saves. Both paths preserve the public inputs and selection.
 
 In the raw fallback, four query waves each own one query and its GQA heads.
 V loads directly from global memory into registers for the transpose; Q/K
@@ -31,11 +32,14 @@ import flydsl.expr as fx
 import numpy as np
 import torch
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from . import sparse_prefill_direct_packed as packed
 from . import sparse_prefill_primitives as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     MAX_ROW_PACKED_KV_BYTES,
+    QUEUE_WORDS,
     _buffer,
     _buffer_words,
     _lds_load,
@@ -50,7 +54,14 @@ from .sparse_prefill_common import (
     _v_pair,
     platform,
 )
-from .sparse_prefill_direct_packed import _DirectLoop, _enabled, _output
+from .sparse_prefill_direct_packed import (
+    DIRECT_WAVES_PER_CU,
+    PERSIST_WAVES,
+    _DirectLoop,
+    _enabled,
+    _output,
+    record_bytes,
+)
 from .sparse_prefill_prepare import allocate_scratch, upload
 
 
@@ -102,15 +113,41 @@ class DirectPlan:
     wide: bool = False
     # Gated raw: K3's list of the row groups holding a direct row (count in direct_flag[1]).
     group_list: torch.Tensor | None = None
+    # Packed launch: resident one-wave CTAs (the split's unit), whether its last slots may
+    # split into key-tile parts (not batch-invariant), a part's record bytes; scratch: the
+    # inactive union tiles' (first row, rows) and their count (gated), the split slots'
+    # part counts and records.
+    ctas: int = 0
+    split: bool = False
+    record: int = 0
+    tile_list: torch.Tensor | None = None
+    listed: torch.Tensor | None = None
+    split_counts: torch.Tensor | None = None
+    records: torch.Tensor | None = None
+    # Packed plans of equal rows run persistent (packed.PERSIST_WAVES), with the launch
+    # queue (zero between launches; not scratch).
+    persistent: bool = False
+    queue: torch.Tensor | None = None
 
 
 def scratch_specs(prepared: DirectPlan) -> list:
     if not prepared.pack_shape:
         return []
-    return [
+    specs = [
         (name, prepared.pack_shape, prepared.pack_dtype)
         for name in ("packed_key", "packed_value")
     ]
+    if prepared.gated:
+        specs += [
+            ("tile_list", (prepared.union_tiles * 2,), torch.int32),
+            ("listed", (1,), torch.int32),
+        ]
+    if prepared.split:
+        specs += [
+            ("split_counts", (prepared.ctas // 2,), torch.int32),
+            ("records", (prepared.ctas * prepared.record // 4,), torch.float32),
+        ]
+    return specs
 
 
 def prepare(
@@ -118,6 +155,7 @@ def prepare(
     inputs,
     union=None,
     scratch: bool = True,
+    batch_invariant: bool = False,
 ):
     """Bind private scratch; attention's recovery refreshes sorted block_indices each call."""
     # Each request with queries packs its KV into whole four-token blocks at a
@@ -192,7 +230,23 @@ def prepare(
         slotted=slotted,
         wide=inputs.wide,
         group_list=group_list,
+        ctas=get_cu_num() * DIRECT_WAVES_PER_CU,
+        # Split parts merge in another order than one wave's key loop: never with
+        # batch_invariant (whether a slot splits depends on the call's other slots).
+        split=not batch_invariant,
+        record=record_bytes(inputs.q.shape[1] // hk),
     )
+    # Every row selects topk complete blocks (its first query sees prefix + 1 keys) and the
+    # rows fill a wave per SIMD: the packed launch runs persistent.
+    prefixes = np.asarray(inputs.prefix_lens, dtype=np.int64)[q_lens > 0]
+    prepared.persistent = bool(
+        packed
+        and len(prefixes)
+        and int(q_lens.sum()) * hk >= get_cu_num() * PERSIST_WAVES
+        and int(prefixes.min()) + 1 >= 4 * inputs.topk
+    )
+    if prepared.persistent:
+        prepared.queue = torch.zeros(QUEUE_WORDS, dtype=torch.int32, device=device)
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
     return prepared
@@ -753,6 +807,8 @@ def _bound(inputs, prepared, out, stream):
         prepared.gated,
         inputs.topk,
         prepared.slotted,
+        prepared.split,
+        prepared.persistent,
     )
     compiled = _COMPILED.get((*key, prepared.wide))
     if compiled is None:
