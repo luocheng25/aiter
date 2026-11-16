@@ -34,13 +34,21 @@ for bit. The span limit cases must be rejected: one request whose K/V spans one
 token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
-12000-token serving prompt (T = 512); they are checked as well and, with one
-batch invariance request, are the only cases using the full-prefill BQ21/BQ42
-union tiles. ``shared`` selections let 32-row windows share block priorities;
+12000-token serving prompt (T = 512); they are checked as well. H6/H3 union tiles
+take 21/42 queries (BQ21/BQ42) in calls of at least wide_tile_rows rows, with or
+without a prefix: the larger performance cases, one batch invariance request, a
+4096-row chunk and a 4096-row FP8 prefill run them. They and FP8_PERF_CASES alone
+take run_perftest's full timing; the other cases make the few calls their checks
+need (CHECK_PERFTEST), so their times are rough. ``shared`` selections let 32-row
+windows share block priorities;
 ``random`` rows choose independently; ``correlated`` (performance cases)
 simulates the real indexer's selection distribution, captured Qwen3.8 layers
 whose neighbouring rows share about half of their blocks (see
-correlated_prefill). A tuple gives each request its own selection.
+correlated_selection). A tuple gives each request its own selection. The output
+run_perftest returns is its last call's, in a block an earlier call's output freed,
+so rows a later call leaves unwritten would keep that call's values: one more FlyDSL
+call writes into a NaN-filled out and must pass the same check (state a cached
+workspace carries across calls, such as the persistent direct's launch queue).
 
 Group 16 is the most Q heads per KV head the interface accepts (BQ8 union
 tiles, a direct wave of 16 heads): ``mixed_union_raw`` batches a union request
@@ -81,14 +89,17 @@ and one token past it; Q and out past 2 GiB (H192), whose rows past 2 GiB merge 
 blocks by their out offset; graph replay with every input rewritten in place, scratch growth
 and new softmax scales; a workspace key that must hold the K/V dtype, scale layout, pool
 and batch mode; input errors and the entry's signature; batch invariance with
-batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
-dequantized K/V and aiter's Triton FP8 GQA (qsa_sparse_paged_gqa). The FP8 cases assert
-their paths too, including the FP8 split, core/residual union tiles and the skipped K pack.
+batch_invariant=True; 300 rows at HK8, below the union row threshold, whose plain direct
+runs persistent and takes items from its launch queue. The 12000-token prefill is timed
+against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA
+(qsa_sparse_paged_gqa). The FP8 cases assert their paths too, including the FP8 split,
+core/residual union tiles and the skipped K pack.
 
 ``triton`` is SGLang's native QSA extend path, copied below under SGLang's
 Apache-2.0 license (see the notice there) and called as its backend does:
 sparse_gqa_fwd_interface_triton when no request has a prefix, else
-sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V.
+sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V. It runs on the
+performance cases and at group 12 on the other functional cases.
 
 Usage:
     python op_tests/test_flydsl_qsa_sparse_prefill.py
@@ -98,6 +109,7 @@ Usage:
 """
 
 import argparse
+import functools
 import importlib
 import inspect
 import math
@@ -129,6 +141,9 @@ FP8_MAX = 240.0  # E4M3FNUZ
 # Per-(row, head) norm-relative error bounds (mean, worst) of compute="fp8" on random data
 # (PyHIP's): FP8 Q dominates (scores err by ~2**-5 of |q||k|), FP8 probabilities add ~2%.
 FP8_TOL = (0.06, 0.16)
+# run_perftest arguments of the cases not timed in full (see perftest): one warmup, then
+# three profiled calls, the first of which it drops.
+CHECK_PERFTEST = {"num_warmup": 1, "num_iters": 3}
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
 FUNCTIONAL_CASES = {
@@ -221,6 +236,9 @@ FP8_LAYOUTS = {
     # the random request's 6 tiles route direct, so the first chunk of the task order ends
     # with idle entries, and the second chunk (KV head 15 of the last 96 tiles) must run.
     "hk16_k3_chunks": ((60, 2560), (126976, 0), 16, ("random", "shared"), 512),
+    # Below the union row threshold: the plain direct's 2400 items (300 rows x 8 KV
+    # heads) run persistent, and its launch queue hands out items 640 to 1919.
+    "hk8_chunk_300_ctx_30300": ((300,), (30000,), 8, "random", 512),
 }
 CASES = {
     **FUNCTIONAL_CASES,
@@ -372,6 +390,13 @@ FP8_CASES = {
     ),
     "fp8_hk16_prefill_24576_token": ("hk16_prefill_24576", 12, "token", "fp8", None),
     "fp8_hk16_k3_chunks_token": ("hk16_k3_chunks", 12, "token", "fp8", None),
+    "fp8_hk8_chunk_300_ctx_30300_token": (
+        "hk8_chunk_300_ctx_30300",
+        12,
+        "token",
+        "fp8",
+        None,
+    ),
 }
 # Also timed against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA, and
 # checked against the reference on the kernels' FP8 Q (see test_qsa_fp8_query).
@@ -399,8 +424,12 @@ FP8_SINK_CASES = {
     ),
     "fp8_sink_extend_64_ctx_70065_tensor": ("extend_64_ctx_70065", 3, "tensor"),
 }
-# name -> (layout, Q heads per KV head); per token scales.
-FP8_UNIFORM_CASES = {"fp8_uniform_ragged_3_random_token": ("ragged_3_random", 3)}
+# name -> (layout, Q heads per KV head); per token scales. The random rows run direct, the
+# shared ones union tiles.
+FP8_UNIFORM_CASES = {
+    "fp8_uniform_ragged_3_random_token": ("ragged_3_random", 3),
+    "fp8_uniform_ragged_4_token": ("ragged_4", 3),
+}
 FP8_QUERY_CASES = {"fp8_query_reference_prefill_4096_token": ("prefill_4096", 12)}
 # name -> (layout, Q heads per KV head, scales, read through kv_slots, layout whose first
 # call then grows the stream's scratch arena or None, softmax scales no other case uses:
@@ -485,14 +514,16 @@ FP8_ROUTES = {
     # These two run every tile union whole: the pack skips K.
     "fp8_large_logits_prefill_768_token": (True, None, 32, 2, False, False),
     "fp8_prefill_4096_h3_tensor": (True, None, 42, 1, False, False),
-    "fp8_prefill_12000_tensor": (True, None, 10, 1, True, True),
+    "fp8_prefill_12000_tensor": (True, "packed", 10, 1, True, True),
     "fp8_limit_packed_token": (True, "packed", 10, 1, False, True),
     "fp8_limit_pool_ragged_4_tensor": (True, None, 10, 1, True, True),
-    "fp8_hk16_prefill_24576_token": (True, None, 10, 1, True, True),
+    "fp8_hk16_prefill_24576_token": (True, "packed", 10, 1, True, True),
     "fp8_hk16_k3_chunks_token": (True, "packed", 10, 1, False, True),
+    "fp8_hk8_chunk_300_ctx_30300_token": (False, "packed", None, None, False, True),
     "fp8_sink_chunk_1024_ctx_4024_random_token": (True, None, 10, 1, True, True),
     "fp8_sink_extend_64_ctx_70065_tensor": (False, "packed", None, None, False, True),
     "fp8_uniform_ragged_3_random_token": (True, "packed", 32, 2, False, True),
+    "fp8_uniform_ragged_4_token": (True, None, 32, 2, False, False),
     "fp8_query_reference_prefill_4096_token": (True, None, 10, 1, True, True),
     "fp8_graph_kv_slots_ragged_4_tensor": (True, None, 10, 1, True, True),
     "fp8_graph_mixed_union_raw_token": (True, "packed", 32, 2, False, True),
@@ -563,8 +594,11 @@ CORRELATED_PROFILES = (
 )
 
 
-def correlated_prefill(rows, seed=20260929):
-    """Selections simulating the real indexer distribution, one prefill, T = 512.
+@functools.lru_cache(maxsize=1)
+def correlated_selection(rows, seed=20260929):
+    """Selections simulating the real indexer distribution, one prefill, T = 512, as
+    an int32 host array (kept: the performance cases run a prefill at three groups in
+    a row).
 
     Mimics captured Qwen3.8 prefill selections: the first 2051 rows select their
     whole causal prefix. Later rows form 128-row windows, alternating the two
@@ -604,7 +638,12 @@ def correlated_prefill(rows, seed=20260929):
             rng.shuffle(chosen)
             indices[row, :2048] = (chosen[:, None] * 4 + np.arange(4)).reshape(-1)
             indices[row, 2048 : 2048 + visible % 4] = np.arange(blocks * 4, visible)
-    return torch.from_numpy(indices).cuda()
+    return indices
+
+
+def correlated_prefill(rows):
+    """correlated_selection's rows, on the GPU."""
+    return torch.from_numpy(correlated_selection(rows)).cuda()
 
 
 def make_indices(query_lens, prefix_lens, selection, generator, topk):
@@ -1200,6 +1239,15 @@ def mismatched_bits(a, b, msg):
     return int((a.view(torch.int16) != b.view(torch.int16)).sum().item())
 
 
+def perftest(case, fn, *args, **kwargs):
+    """run_perftest of fn: its defaults (2 warmup and 101 profiled calls) for the
+    performance cases, CHECK_PERFTEST for the others, whose checks only need an output
+    written after earlier calls."""
+    if case not in PERF_CASES and case not in FP8_PERF_CASES:
+        kwargs = {**CHECK_PERFTEST, **kwargs}
+    return run_perftest(fn, *args, **kwargs)
+
+
 @benchmark()
 def test_qsa_sparse_attention(case, heads):
     query_lens, prefix_lens, kv_heads, _, topk = CASES[case]
@@ -1209,7 +1257,9 @@ def test_qsa_sparse_attention(case, heads):
     q, k, v, indices = make_inputs(case, heads, generator)
     rows, kv_tokens = q.shape[0], k.shape[0]
 
-    # Both run as the SGLang QSA backend calls them; each allocates its output.
+    # Both run as the SGLang QSA backend calls them; each allocates its output. SGLang's
+    # kernels, a baseline compiled per group, run on the performance cases and at group
+    # 12 (TP2) on the others.
     candidates = {
         "flydsl": (
             qsa_sparse_prefill,
@@ -1220,8 +1270,12 @@ def test_qsa_sparse_attention(case, heads):
                 "softmax_scale": SCALE,
             },
         ),
-        "triton": (*sglang_triton(q, k, v, indices, query_lens, prefix_lens), {}),
     }
+    if case in PERF_CASES or heads == 12 * kv_heads:
+        candidates["triton"] = (
+            *sglang_triton(q, k, v, indices, query_lens, prefix_lens),
+            {},
+        )
     ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     # QK^T and PV over the selected tokens; compulsory traffic reads Q/K/V/indices
     # and writes O once.
@@ -1237,7 +1291,7 @@ def test_qsa_sparse_attention(case, heads):
     # Rotated copies of the 1M-token contexts' K/V would take tens of GiB.
     rotate = 10 if k.nbytes < 2**30 else 1
     for name, (fn, args, kwargs) in candidates.items():
-        out, us = run_perftest(fn, *args, **kwargs, num_rotate_args=rotate)
+        out, us = perftest(case, fn, *args, **kwargs, num_rotate_args=rotate)
         err = checkAllclose(
             ref,
             out.to(dtypes.fp32),
@@ -1249,10 +1303,20 @@ def test_qsa_sparse_attention(case, heads):
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    fn, args, kwargs = candidates["flydsl"]
+    into_nan = checkAllclose(
+        ref,
+        fn(*args, **kwargs, out=torch.full_like(q, float("nan"))).to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"{case} H{heads} flydsl into NaN: out",
+    )
     if case in EXPECTED_ROUTES:
         check_routes(case, heads)
     # The SGLang kernels are only the baseline: FlyDSL alone must pass the check.
-    assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    assert (
+        ret["flydsl err"] == into_nan == 0
+    ), f"{case} H{heads}: mismatch {ret['flydsl err']}, into NaN {into_nan}"
     return ret
 
 
@@ -1414,8 +1478,8 @@ def test_qsa_kv_slots(case, heads):
     }
     outputs = {}
     for name, (fn, args, kw) in candidates.items():
-        out, us = run_perftest(
-            fn, *args, **kw, num_rotate_args=10 if pool_k.nbytes < 2**30 else 1
+        out, us = perftest(
+            case, fn, *args, **kw, num_rotate_args=10 if pool_k.nbytes < 2**30 else 1
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -1835,10 +1899,10 @@ def test_qsa_fp8(case, heads):
     FP8_QUERY_CHECKED: fp8_query_error instead), its union plans routing with the FP8
     kernels' calibration rather than BF16's. compute="bf16": the bits of the BF16 path
     on the K/V the caller dequantizes, within 2e-2 of the reference. A repeated call
-    gives the same bits, and through a pool (unused rows and their per token scales NaN)
-    the bits of the packed call on the gathered K/V and scales. FP8_PERF_CASES also time
-    the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA, and meet the
-    fp8_query check (see test_qsa_fp8_query)."""
+    into a NaN-filled out gives the same bits, and through a pool (unused rows and their
+    per token scales NaN) the bits of the packed call on the gathered K/V and scales.
+    FP8_PERF_CASES also time the BF16 path on the dequantized K/V and aiter's Triton FP8
+    GQA, and meet the fp8_query check (see test_qsa_fp8_query)."""
     layout, _, scales, compute, pool = FP8_CASES[case]
     query_lens, prefix_lens, kv_heads, _, topk = CASES[layout]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
@@ -1884,7 +1948,7 @@ def test_qsa_fp8(case, heads):
         "pool GiB": None if pool is None else args[1].nbytes / 2**30,
     }
     rotate = 10 if max(q.nbytes, args[1].nbytes) < 2**30 else 1
-    out, us = run_perftest(qsa_sparse_prefill, *args, **kw, num_rotate_args=rotate)
+    out, us = perftest(case, qsa_sparse_prefill, *args, **kw, num_rotate_args=rotate)
     ret["routes"] = check_routes(case, heads)
     if compute == "fp8" and ret["routes"]["query_tile"] is not None:
         terms = plan_terms()
@@ -1897,7 +1961,9 @@ def test_qsa_fp8(case, heads):
     ret["flydsl TB/s"] = nbytes / us / 1e6
     differing = {
         "repeated": mismatched_bits(
-            qsa_sparse_prefill(*args, **kw), out, f"{msg} repeated vs first: out"
+            qsa_sparse_prefill(*args, **kw, out=torch.full_like(out, float("nan"))),
+            out,
+            f"{msg} repeated into NaN vs first: out",
         )
     }
     if pool is not None:
