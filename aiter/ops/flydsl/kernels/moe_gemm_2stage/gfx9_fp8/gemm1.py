@@ -5,6 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -1080,6 +1081,8 @@ def compile_moe_gemm1(
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
         if const_expr(E is not None) and M * TOPK <= E:
             task_num = M * TOPK
+        # Packed FP32 VALU cannot co-issue with MFMA.
+        features = ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
         moe_2stage_gateup_prefill_1x4(
             p_input,
             p_weight,
@@ -1091,6 +1094,7 @@ def compile_moe_gemm1(
             p_w_scale,
             p_a_scale,
             M,
+            value_attrs={"llvm.target_features": features},
         ).launch(
             grid=(num_n_blocks, task_num, 1),
             block=(256, 1, 1),

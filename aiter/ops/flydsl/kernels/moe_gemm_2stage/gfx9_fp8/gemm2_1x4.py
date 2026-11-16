@@ -319,10 +319,6 @@ def _build_moe_gemm2_1x4_n256(
             ldsA0 = activation_storage.peek().view(
                 fx.make_composed_layout(fx.static(a_swz), fxh.torch_layout(BLOCK_M, K))
             )
-            # 2. Gather activations into LDS; the barrier starts the four-wave pipeline.
-            arg_p_input = _gather_sorted_rows(
-                down_ops, ldsA0, arg_p_input, arg_p_sorted_ids, M, TOPK, K
-            )
 
             # (BLOCK_N, BLOCK_K, num_blocks_N, num_blocks_K)
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
@@ -525,15 +521,24 @@ def _build_moe_gemm2_1x4_n256(
 
             use_delayed_4wave_store = BLOCK_K == 128 and nBK == 2
 
-            # Prologue: stage0 prepares N block 0 / K core 0.
+            # Prologue: stage0 prepares N block 0 / K core 0. Its weight and scale loads (and
+            # the token scales above) are issued before the activation gather, so their
+            # latency overlaps it.
             _set_priority(0)
             frag_weight = down_ops.load_tiled_mma_fragA(
                 mm, weight, [None, None, fx.Int32(0), 0]
             )
+            first_scale_vec = None
+            if const_expr(weight_quant_type == "ptpc"):
+                first_scale_vec = issue_scale_block_global(0)
+            # 2. Gather activations into LDS; the barrier starts the four-wave pipeline.
+            _gather_sorted_rows(
+                down_ops, ldsA0, arg_p_input, arg_p_sorted_ids, M, TOPK, K
+            )
             frag_pc_scale = None
             next_frag_pc_scale = None
             if const_expr(weight_quant_type == "ptpc"):
-                frag_pc_scale = commit_scale_block_lds(issue_scale_block_global(0))
+                frag_pc_scale = commit_scale_block_lds(first_scale_vec)
                 next_frag_pc_scale = fx.make_fragment_like(frag_pc_scale)
             frag_weight_slots = [frag_weight, fx.make_fragment_like(frag_weight)]
 
@@ -646,6 +651,7 @@ def _build_moe_gemm2_1x4_n256(
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
+        features = ir.Attribute.parse('#llvm.target_features<["-packed-fp32-ops"]>')
         kernel = moe_2stage_down_prefill_1x4_64x256(
             p_input,
             p_weight,
@@ -657,7 +663,7 @@ def _build_moe_gemm2_1x4_n256(
             p_w_scale,
             p_a_scale,
             M,
-            value_attrs={"passthrough": [["target-features", "-packed-fp32-ops"]]},
+            value_attrs={"llvm.target_features": features},
         )
         kernel.launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
 
