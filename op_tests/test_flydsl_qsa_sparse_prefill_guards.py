@@ -4,28 +4,37 @@
 """Guards of the QSA sparse prefill kernels' low-level code (compile only, untimed).
 
 The kernels keep a few low-level primitives, all in sparse_prefill_primitives.py: empty
-inline asm pinning values in VGPRs, the "-packed-fp32-ops" target feature, ROCDL
-operations FlyDSL does not export, volatile LDS reads counted by an lgkmcnt ledger
-(LdsQueue), and the direct key loop's hand-counted vmcnt waits. When FlyDSL, MLIR or
-LLVM stop honouring them, nothing fails: LLVM only prints an asm constraint it cannot
-meet and the kernel computes garbage, a dropped attribute or a split load only costs
-speed or makes a counted wait wrong. These checks make such changes fail.
+inline asm pinning values in VGPRs or holding them at a point, the "-packed-fp32-ops"
+target feature, ROCDL operations FlyDSL does not export (DPP, FP8 conversion, bare log2
+and reciprocal, ...), volatile LDS reads counted by an lgkmcnt ledger (LdsQueue), and the
+direct key loop's hand-counted vmcnt waits. When FlyDSL, MLIR or LLVM stop honouring
+them, nothing fails: LLVM only prints an asm constraint it cannot meet and the kernel
+computes garbage, a dropped attribute or a split load only costs speed or makes a
+counted wait wrong. These checks make such changes fail.
 
-One process compiles three layouts of test_flydsl_qsa_sparse_prefill.py with FlyDSL's
-IR dumps (FLYDSL_DUMP_IR; dumping bypasses FlyDSL's disk cache): prefill_12000 at
-group 12 (union, raw direct and packed direct), kv_slots_ragged_4 at group 12 (slotted
-union) and kv_slots_pool_4g_extend_64_ctx_70065 at group 12 (raw direct over a pool past
-4 GiB, the WIDE variant). Its final ISA and LLVM IR of the union, raw direct and packed
-direct kernels must show:
+One process compiles six layouts of test_flydsl_qsa_sparse_prefill.py with FlyDSL's IR
+dumps (FLYDSL_DUMP_IR; dumping bypasses FlyDSL's disk cache). BF16, at group 12:
+prefill_12000 (union, raw direct and packed direct), kv_slots_ragged_4 (slotted union)
+and kv_slots_pool_4g_extend_64_ctx_70065 (raw direct over a pool past 4 GiB, the WIDE
+variant). FP8 (FP8_CASES entries, at their own group): fp8_ragged_4_token (union with
+core/residual tiles, direct with the residual merge, pack, per token scales),
+fp8_kv_slots_ragged_4_tensor (the same through a slot table, per tensor) and
+fp8_kv_slots_topk1024_mixed_ctx_132096_token (union split into two key ranges, T =
+1024, direct without a merge). Their final ISA and LLVM IR of the union, raw direct and
+packed direct kernels, and of the FP8 union, direct and pack kernels, must show:
 
   compile output   no "error:" line while compiling, and finite outputs
   resources        union: no scratch or VGPR spill, SGPR spills at most
                    UNION_SGPR_SPILLS', two waves per SIMD; direct kernels: no scratch
                    and no spill
-  target features  "target-features"="-packed-fp32-ops" on the three kernels and
-                   "amdgpu-waves-per-eu"="2" on union in LLVM IR; no v_pk_*_f32
-  empty asm        BASELINE's number of ;;#ASMSTART blocks, all empty, and of each
-                   LLVM IR asm constraint
+  FP8 resources    no scratch; FP8 union: one wave per SIMD (by design), at most
+                   UNION_FP8_SPILLS VGPR and SGPR spills; FP8 direct and pack: no
+                   spill, two and eight waves per SIMD
+  target features  "target-features"="-packed-fp32-ops" on every kernel and the
+                   "amdgpu-waves-per-eu" of WAVES_PER_EU in LLVM IR; no v_pk_*_f32
+  empty asm        the baseline number of ;;#ASMSTART blocks (BASELINE, FP8_BASELINE),
+                   all empty, and of each LLVM IR asm constraint (FP8: prim.hold's "v",
+                   prim.compiler_fence's "~{memory}")
   lgkmcnt ledger   the (LDS operations since the last lgkmcnt(0), N) pairs of union's
                    partial lgkmcnt(N) waits, recorded by LdsQueue while tracing
                    (record_lds_waits), equal those a scan of its ISA finds, with no
@@ -38,16 +47,25 @@ direct kernels must show:
                    there into vmcnt(8)), so a stale count costs speed, not results: it
                    waits for loads the loop means to keep in flight
   exp2             every exp2 lowered to llvm.amdgcn.exp2.f32 (no llvm.exp2.f32 or
-                   __ocml_exp2), BASELINE's number of them
+                   __ocml_exp2), the baseline number of them
+  FP8 MFMA         FP8 union: v_mfma_f32_32x32x16_fp8_fp8 only, direct:
+                   v_mfma_f32_16x16x32_fp8_fp8 only, the baseline number; none writes
+                   AGPRs (no asm keeps O there any more)
+  FP8 log2 / rcp   prim.log2 / prim.rcp as llvm.amdgcn.log.f32 / llvm.amdgcn.rcp.f32 (no
+                   llvm.log2, __ocml_log or __ocml_rcp), the baseline number of each
+  FP8 conversion   prim.cvt_pk_fp8: the baseline number of v_cvt_pk_fp8_f32
 
 and, compiling no kernel: LdsQueue's own assertions, prim.pin rejecting a one-word chunk
-while tracing, and a source audit that the kernel modules (every sparse_prefill_*.py but
+while tracing, a source audit that the kernel modules (every sparse_prefill_*.py but
 sparse_prefill_primitives.py) use FlyDSL's stable API only (FlyDSL
 docs/api_stability.md): no flydsl._mlir or bare rocdl import, no inline_asm,
 Attribute.parse or llvm.passthrough, every fx./flyc. path in its module's __all__ and
-none of the deprecated ones. The deprecated Numeric/Vector methods (shuffle_xor, exp2,
-...) are reported on any receiver except the fx modules that export them as functions
-(fx.gpu.shuffle_xor, fx.math.exp2).
+none of the deprecated ones (the deprecated Numeric/Vector methods, shuffle_xor, exp2,
+..., are reported on any receiver except the fx modules that export them as functions,
+fx.gpu.shuffle_xor and fx.math.exp2), and that the FP8 modules wait only for zero
+outstanding operations (s_waitcnt arguments all 0: they keep no counted wait and need no
+ledger). The FP8 direct kernel's unsigned record and LSE offsets past 2 GiB are checked
+by the op test (fp8_limit_packed_token, fp8_hk16_prefill_24576_token), not here.
 
 Usage:
     python op_tests/test_flydsl_qsa_sparse_prefill_guards.py [--keep DIR]
@@ -85,8 +103,20 @@ OP_TEST = Path(__file__).with_name("test_flydsl_qsa_sparse_prefill.py")
 UNION = "sparse_prefill_union_bf16_d256"
 DIRECT = "sparse_prefill_direct_bf16_d256"
 PACKED = "sparse_prefill_direct_packed_bf16_d256"
-SHORT = {UNION: "union", DIRECT: "direct", PACKED: "packed"}
-# label -> (a layout or SLOT_CASES entry of the op test, Q heads per KV head)
+UNION_FP8 = "sparse_prefill_union_fp8_d256"
+DIRECT_FP8 = "sparse_prefill_direct_fp8_d256"
+PACK_FP8 = "sparse_prefill_pack_kv_fp8_d256"
+SHORT = {
+    UNION: "union",
+    DIRECT: "direct",
+    PACKED: "packed",
+    UNION_FP8: "union_fp8",
+    DIRECT_FP8: "direct_fp8",
+    PACK_FP8: "pack_fp8",
+}
+TOPK1024 = "fp8_kv_slots_topk1024_mixed_ctx_132096_token"
+# label -> (a layout or SLOT_CASES entry of the op test, Q heads per KV head); FP8
+# labels are FP8_CASES entries, at their own group (None).
 LAYOUTS = {
     "prefill_12000": ("prefill_12000", 12),
     "kv_slots_ragged_4": ("kv_slots_ragged_4", 12),
@@ -94,12 +124,16 @@ LAYOUTS = {
         "kv_slots_pool_4g_extend_64_ctx_70065",
         12,
     ),
+    "fp8_ragged_4_token": ("fp8_ragged_4_token", None),
+    "fp8_kv_slots_ragged_4_tensor": ("fp8_kv_slots_ragged_4_tensor", None),
+    TOPK1024: (TOPK1024, None),
 }
-# label -> the union and direct kernels its call must compile
+# label -> the union, direct and pack kernels its call must compile
 EXPECTED = {
     "prefill_12000": (UNION, DIRECT, PACKED),
     "kv_slots_ragged_4": (UNION, DIRECT, PACKED),
     "kv_slots_pool_4g_extend_64_ctx_70065": (DIRECT, PACKED),
+    **{label: (UNION_FP8, DIRECT_FP8, PACK_FP8) for label in list(LAYOUTS)[3:]},
 }
 # kernel -> (;;#ASMSTART blocks, LLVM IR asm constraints, llvm.amdgcn.exp2.f32 calls)
 BASELINE = {
@@ -109,6 +143,34 @@ BASELINE = {
 }
 # label -> most SGPR spills of its union kernel: 6 with a slot table (pool block ids).
 UNION_SGPR_SPILLS = {"prefill_12000": 0, "kv_slots_ragged_4": 6}
+# (FP8 label, kernel) -> (;;#ASMSTART blocks, MFMA instructions, llvm.amdgcn.exp2.f32,
+# llvm.amdgcn.log.f32 and llvm.amdgcn.rcp.f32 calls, v_cvt_pk_fp8_f32). Union holds 10
+# values per tensor, 18 per token (prim.hold); a split adds 2 exp2 to union, the residual
+# merge 2 exp2, a log2 and an rcp to direct; union and pack add log2 / rcp per token
+# scale, union a log2 storing the log-sum-exp for a merge; direct fences 3 load groups.
+FP8_BASELINE = {
+    ("fp8_ragged_4_token", UNION_FP8): (18, 320, 164, 11, 10, 80),
+    ("fp8_ragged_4_token", DIRECT_FP8): (3, 96, 29, 1, 1, 12),
+    ("fp8_ragged_4_token", PACK_FP8): (0, 0, 0, 1, 3, 16),
+    ("fp8_kv_slots_ragged_4_tensor", UNION_FP8): (10, 320, 164, 1, 0, 80),
+    ("fp8_kv_slots_ragged_4_tensor", DIRECT_FP8): (3, 96, 29, 1, 1, 12),
+    ("fp8_kv_slots_ragged_4_tensor", PACK_FP8): (0, 0, 0, 0, 2, 16),
+    (TOPK1024, UNION_FP8): (18, 320, 166, 10, 10, 80),
+    (TOPK1024, DIRECT_FP8): (3, 96, 27, 0, 0, 12),
+    (TOPK1024, PACK_FP8): (0, 0, 0, 1, 3, 16),
+}
+# FP8 kernel -> the constraint of its empty asm, its MFMA instruction
+FP8_ASM = {UNION_FP8: "v", DIRECT_FP8: "~{memory}"}
+FP8_MFMA = {
+    UNION_FP8: "v_mfma_f32_32x32x16_fp8_fp8",
+    DIRECT_FP8: "v_mfma_f32_16x16x32_fp8_fp8",
+}
+# kernel -> waves per SIMD (union kernels and FP8 direct set it by waves_per_eu)
+WAVES = {UNION: 2, UNION_FP8: 1, DIRECT_FP8: 2, PACK_FP8: 8}
+WAVES_PER_EU = {UNION: "2", UNION_FP8: "1", DIRECT_FP8: "2"}
+# Most VGPR and SGPR spills of the FP8 union (one wave per SIMD: 256 arch VGPRs plus
+# AGPRs); PyHIP's version used up to 60 B of scratch and 14 VGPR spills.
+UNION_FP8_SPILLS = (1, 48)
 LGKMCNT = re.compile(r"lgkmcnt\((\d+)\)")
 VMEM_LOAD = re.compile(r"^(buffer|global)_load")
 SMEM_LOAD = re.compile(r"^s_(buffer_)?load")
@@ -148,23 +210,49 @@ def captured(path):
 
 def compile_layout(op, label, root):
     """One qsa_sparse_prefill call of a layout (inputs and seed as the op test makes
-    them) with its kernels dumped to root/label. Returns (outputs finite, the
-    (LDS operations, lgkmcnt) pairs LdsQueue recorded while tracing)."""
+    them; FP8 as test_qsa_fp8) with its kernels dumped to root/label. Returns (outputs
+    finite, the (LDS operations, lgkmcnt) pairs LdsQueue recorded while tracing)."""
     case, group = LAYOUTS[label]
-    layout, pool = case, None
-    if case in op.SLOT_CASES:
-        layout, *pool = op.SLOT_CASES[case]
-    query_lens, prefix_lens, kv_heads = op.CASES[layout][:3]
-    heads = group * kv_heads
-    generator = torch.Generator(device="cuda").manual_seed(
-        list(op.CASES).index(layout) * 16 + heads
-    )
-    q, k, v, indices = op.make_inputs(layout, heads, generator)
-    kwargs = {"query_lens": query_lens, "prefix_lens": prefix_lens}
-    if pool is not None:
-        k, v, kwargs["kv_slots"] = op.make_pool(
-            k, v, query_lens, prefix_lens, *pool, generator
+    if case in op.FP8_CASES:
+        layout, group, scales, compute, pool = op.FP8_CASES[case]
+        query_lens, prefix_lens, kv_heads = op.CASES[layout][:3]
+        heads = group * kv_heads
+        generator = torch.Generator(device="cuda").manual_seed(op.fp8_seed(case, heads))
+        q, k, k_scale, v, v_scale, indices = op.make_fp8_inputs(
+            layout, heads, scales == "token", generator
         )
+        kwargs = {"k_scale": k_scale, "v_scale": v_scale, "compute": compute}
+        if pool is not None:
+            pool_rows, first_page, last_page = pool
+            k, v, slots = op.make_pool(
+                k,
+                v,
+                query_lens,
+                prefix_lens,
+                pool_rows,
+                first_page,
+                generator,
+                last_page,
+            )
+            kwargs["kv_slots"] = slots
+            kwargs["k_scale"] = op.pool_scale(k_scale, slots, k.shape[0])
+            kwargs["v_scale"] = op.pool_scale(v_scale, slots, k.shape[0])
+    else:
+        layout, pool = case, None
+        if case in op.SLOT_CASES:
+            layout, *pool = op.SLOT_CASES[case]
+        query_lens, prefix_lens, kv_heads = op.CASES[layout][:3]
+        heads = group * kv_heads
+        generator = torch.Generator(device="cuda").manual_seed(
+            list(op.CASES).index(layout) * 16 + heads
+        )
+        q, k, v, indices = op.make_inputs(layout, heads, generator)
+        kwargs = {}
+        if pool is not None:
+            k, v, kwargs["kv_slots"] = op.make_pool(
+                k, v, query_lens, prefix_lens, *pool, generator
+            )
+    kwargs.update(query_lens=query_lens, prefix_lens=prefix_lens)
     os.environ["FLYDSL_DUMP_DIR"] = str(root / label)
     with captured(root / f"{label}.log"), prim.record_lds_waits() as waits:
         out = op.qsa_sparse_prefill(q, k, v, indices, softmax_scale=op.SCALE, **kwargs)
@@ -242,7 +330,7 @@ def read_dumps(root):
             for name, (body, meta) in isa_kernels(
                 latest(directory, "final_isa.s")
             ).items():
-                if name not in BASELINE:
+                if name not in SHORT:
                     continue
                 ir, attributes = functions[name]
                 kernels[(label, name)] = {
@@ -277,6 +365,8 @@ def waves_per_simd(meta):
 def check_resources(kernels):
     found = []
     for (label, name), kernel in kernels.items():
+        if name not in BASELINE:
+            continue
         meta = kernel["meta"]
         spills = (meta["vgpr_spill_count"], meta["sgpr_spill_count"])
         scratch = meta["private_segment_fixed_size"]
@@ -299,10 +389,11 @@ def check_target_features(kernels):
             f"{label} {name}: LLVM IR function attributes lack -packed-fp32-ops: "
             f"{kernel['attributes']}"
         )
-        if name == UNION:
+        if name in WAVES_PER_EU:
+            waves = f'"amdgpu-waves-per-eu"="{WAVES_PER_EU[name]}"'
             assert (
-                '"amdgpu-waves-per-eu"="2"' in kernel["attributes"]
-            ), f"{label} {name}: waves_per_eu 2 missing: {kernel['attributes']}"
+                waves in kernel["attributes"]
+            ), f"{label} {name}: {waves} missing: {kernel['attributes']}"
         packed = [
             op for _, op in instructions(kernel["isa"]) if re.match(r"v_pk_\w*_f32", op)
         ]
@@ -310,10 +401,18 @@ def check_target_features(kernels):
     return "present; no v_pk_*_f32"
 
 
+def asm_baseline(label, name):
+    """(;;#ASMSTART blocks, LLVM IR asm constraints) a kernel must have."""
+    if name in BASELINE:
+        return BASELINE[name][:2]
+    blocks = FP8_BASELINE[(label, name)][0]
+    return blocks, {FP8_ASM[name]: blocks} if blocks else {}
+
+
 def check_empty_asm(kernels):
     found = []
     for (label, name), kernel in kernels.items():
-        expected_blocks, expected_constraints, _ = BASELINE[name]
+        expected_blocks, expected_constraints = asm_baseline(label, name)
         blocks, inside, nonempty = 0, False, 0
         for line in kernel["isa"]:
             if line.startswith(";;#ASMSTART"):
@@ -446,7 +545,7 @@ def check_vmcnt(kernels):
     on every path not drained in between."""
     found = []
     for (label, name), kernel in kernels.items():
-        if name == UNION:
+        if name not in (DIRECT, PACKED):
             continue
         blocks, predecessors = blocks_of(kernel["isa"])
         waits = {
@@ -489,12 +588,93 @@ def check_exp2(kernels):
     for (label, name), kernel in kernels.items():
         amdgcn = len(re.findall(r"call float @llvm\.amdgcn\.exp2\.f32\(", kernel["ir"]))
         other = re.findall(r"@llvm\.exp2\.\w+|__ocml_exp2\w*", kernel["ir"])
-        expected = BASELINE[name][2]
+        expected = (
+            BASELINE[name][2] if name in BASELINE else FP8_BASELINE[(label, name)][2]
+        )
         assert amdgcn == expected and not other, (
             f"{label} {name}: {amdgcn} llvm.amdgcn.exp2.f32 (expected {expected}), "
             f"other exp2 {sorted(set(other))}"
         )
         found.append(f"{label} {SHORT[name]} {amdgcn}")
+    return "; ".join(found)
+
+
+def fp8_only(kernels):
+    return [
+        (label, name, kernel)
+        for (label, name), kernel in kernels.items()
+        if name in (UNION_FP8, DIRECT_FP8, PACK_FP8)
+    ]
+
+
+def check_fp8_resources(kernels):
+    found = []
+    for label, name, kernel in fp8_only(kernels):
+        meta = kernel["meta"]
+        spills = (meta["vgpr_spill_count"], meta["sgpr_spill_count"])
+        scratch = meta["private_segment_fixed_size"]
+        limit = UNION_FP8_SPILLS if name == UNION_FP8 else (0, 0)
+        waves = waves_per_simd(meta)
+        assert (
+            scratch == 0
+            and spills[0] <= limit[0]
+            and spills[1] <= limit[1]
+            and waves == WAVES[name]
+        ), (
+            f"{label} {name}: scratch {scratch} B, VGPR/SGPR spills {spills} (at most "
+            f"0 B and {limit}), {waves} waves per SIMD (expected {WAVES[name]})"
+        )
+        found.append(
+            f"{label} {SHORT[name]} {meta['vgpr_count']}v/{spills[1]}s/{waves}w"
+        )
+    return "; ".join(found)
+
+
+def check_fp8_mfma(kernels):
+    found = []
+    for label, name, kernel in fp8_only(kernels):
+        ops = collections.Counter(
+            op for _, op in instructions(kernel["isa"]) if op.startswith("v_mfma")
+        )
+        count = FP8_BASELINE[(label, name)][1]
+        expected = {FP8_MFMA[name]: count} if count else {}
+        agpr = [line for line in kernel["isa"] if re.match(r"v_mfma\S*\s+a\[", line)]
+        assert dict(ops) == expected and not agpr, (
+            f"{label} {name}: MFMA {dict(ops)} (expected {expected}), AGPR "
+            f"destinations {agpr[:3]}"
+        )
+        if count:
+            found.append(f"{label} {SHORT[name]} {count}")
+    return "; ".join(found)
+
+
+def check_fp8_log_rcp(kernels):
+    found = []
+    for label, name, kernel in fp8_only(kernels):
+        ir = kernel["ir"]
+        counts = (
+            len(re.findall(r"call float @llvm\.amdgcn\.log\.f32\(", ir)),
+            len(re.findall(r"call float @llvm\.amdgcn\.rcp\.f32\(", ir)),
+        )
+        other = sorted(set(re.findall(r"@llvm\.log2?\.\w+|__ocml_(?:log|rcp)\w*", ir)))
+        expected = FP8_BASELINE[(label, name)][3:5]
+        assert counts == expected and not other, (
+            f"{label} {name}: llvm.amdgcn.log/rcp {counts} (expected {expected}), "
+            f"other log2/rcp {other}"
+        )
+        found.append(f"{label} {SHORT[name]} {counts[0]}/{counts[1]}")
+    return "; ".join(found)
+
+
+def check_fp8_conversion(kernels):
+    found = []
+    for label, name, kernel in fp8_only(kernels):
+        count = sum(op == "v_cvt_pk_fp8_f32" for _, op in instructions(kernel["isa"]))
+        expected = FP8_BASELINE[(label, name)][5]
+        assert (
+            count == expected
+        ), f"{label} {name}: {count} v_cvt_pk_fp8_f32 (expected {expected})"
+        found.append(f"{label} {SHORT[name]} {count}")
     return "; ".join(found)
 
 
@@ -704,6 +884,30 @@ def check_sources(paths=None):
     return f"{len(paths or kernel_sources())} modules"
 
 
+def check_fp8_waits(paths=None):
+    """The FP8 modules wait only for zero outstanding operations: every s_waitcnt argument
+    is 0 and none uses LdsQueue, so they keep no counted wait a ledger would check."""
+    paths = paths or [path for path in kernel_sources() if "fp8" in path.name]
+    counted = {}
+    for path in paths:
+        for node in ast.walk(ast.parse(Path(path).read_text(), filename=str(path))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "s_waitcnt"
+            ):
+                values = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if not values or not all(
+                    isinstance(value, ast.Constant) and value.value == 0
+                    for value in values
+                ):
+                    counted.setdefault(path.name, []).append(node.lineno)
+            elif "LdsQueue" in (getattr(node, "id", None), getattr(node, "attr", None)):
+                counted.setdefault(path.name, []).append(node.lineno)
+    assert paths and not counted, f"counted waits in FP8 modules {paths}: {counted}"
+    return f"{len(paths)} modules"
+
+
 # ---- Driver ----
 
 
@@ -750,6 +954,7 @@ def main():
             results.append((name, "FAIL", str(error)))
 
     guard("source uses the stable FlyDSL API", check_sources)
+    guard("FP8 sources wait for zero only", check_fp8_waits)
     guard("LdsQueue assertions", check_ledger_assertions)
     guard("pin rejects one-word chunks", check_pin_rejects_one_word)
 
@@ -772,11 +977,15 @@ def main():
     guard("compile output", check_compile_output, root, finite, seconds)
     guard("kernels dumped", check_dumped, kernels)
     guard("resources", check_resources, kernels)
+    guard("FP8 resources", check_fp8_resources, kernels)
     guard("target features", check_target_features, kernels)
     guard("empty asm", check_empty_asm, kernels)
     guard("lgkmcnt ledger", check_lgkmcnt_ledger, kernels, recorded)
     guard("vmcnt counts", check_vmcnt, kernels)
     guard("exp2 lowering", check_exp2, kernels)
+    guard("FP8 MFMA", check_fp8_mfma, kernels)
+    guard("FP8 log2 / rcp", check_fp8_log_rcp, kernels)
+    guard("FP8 conversion", check_fp8_conversion, kernels)
     if not args.keep:
         shutil.rmtree(root)
     aiter.logger.info(
