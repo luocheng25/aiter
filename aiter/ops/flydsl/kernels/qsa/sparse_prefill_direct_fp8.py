@@ -45,10 +45,10 @@ request without a slot table read zero past its end; through a slot table masked
 zero, or for a pool past 4 GiB (WIDE, 64-bit loads) the request's first row.
 
 Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one K3b CTA per
-union tile (prepare.residual_tile), which moves the residual blocks of each row of an active
-core tile to the front of its block_indices row. Those rows then run here over their residual
-blocks only (no causal tail) and merge into the union output by log-sum-exp (the union kernel
-writes each row's lse).
+union tile (prepare.residual_tile), dispatched first, which moves the residual blocks of each
+row of an active core tile to the front of its block_indices row. Those rows then run here
+over their residual blocks only (no causal tail) and merge into the union output by
+log-sum-exp (the union kernel writes each row's lse).
 """
 
 import math
@@ -266,9 +266,13 @@ def _pack_kernel(
     RESIDUAL: fx.Constexpr[bool],
     TOPK: fx.Constexpr[int],
 ):
-    cta = fx.Int32(fx.block_idx.x)
+    index = fx.Int32(fx.block_idx.x)
     pack_ctas = (PACKED * HK + 3) // 4
     quant_end = pack_ctas + (ROWS + QROWS - 1) // QROWS
+    # The K3b CTAs (latency-bound) are dispatched first: the bandwidth-bound K/V and Q CTAs
+    # overlap them instead of the launch ending on them.
+    tiles = TILES if fx.const_expr(RESIDUAL) else fx.Int32(0)
+    cta = (index < tiles).select(index + quant_end, index - tiles)
     if fx.const_expr(RESIDUAL):
         storage = (
             fx.SharedAllocator().allocate(fx.Array[fx.Int32, RESIDUAL_WORDS, 16]).peek()
@@ -277,7 +281,7 @@ def _pack_kernel(
             fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(RESIDUAL_WORDS, 1))))
         )
     if cta >= quant_end:
-        # Then one CTA per union tile lists its rows' residual blocks (K3b).
+        # One CTA per union tile lists its rows' residual blocks (K3b).
         if fx.const_expr(RESIDUAL):
             residual_tile(
                 BLOCK_ROWS,
