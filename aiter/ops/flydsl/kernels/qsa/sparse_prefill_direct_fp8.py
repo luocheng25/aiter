@@ -13,11 +13,11 @@ kernel reads the raw K/V) the pack runs only when K3 routes some tile to direct
   PK[block][i * 256 + (g * 4 + token) * 16 + 0..15]
       = K[token][64i + 8g + 0..7] ++ K[token][64i + 32 + 8g + 0..7]
   PV[block][p * 256 + d * 16 + (m - 4p) * 4 + token] = V[token][16d + m]   (p = m >> 2)
-Per-token scales are stored per block as one 64-byte record of k_scale, log2(v_scale) and
-1 / v_scale (clamped as in the union kernel); tokens past a request's end read 0 (a slot
-table's later pool rows too). A pack wave reads its block from the block's own 64-bit base,
-so K/V (or a pool) may exceed 4 GiB; the pack is [blocks * HK, 1024] bytes (FlyDSL passes
-tensor dims as int32) and below 4 GiB.
+Per-token scales are stored per block as one 64-byte record of four 16-byte token entries
+(k_scale, log2(v_scale), 1 / v_scale, 0), the V terms clamped as in the union kernel; tokens
+past a request's end read 0 (a slot table's later pool rows too). A pack wave reads its
+block from the block's own 64-bit base, so K/V (or a pool) may exceed 4 GiB; the pack is
+[blocks * HK, 1024] bytes (FlyDSL passes tensor dims as int32) and below 4 GiB.
 
 A wave runs one query row and KV head: its G <= 16 Q heads are the columns of 16x16x32 FP8
 MFMAs. Its key list (complete blocks in block_indices order, then the causal tail block)
@@ -211,8 +211,8 @@ def _pack_v(vr, pv, target, start, valid, head, lane, hk, oob):
 
 
 def _pack_scales(KS, VS, PSC, start, valid, block, head, lane, inside, n, packed, hk):
-    """Scale record of the block: k_scale, log2(v_scale), 1 / v_scale of its four tokens
-    (lanes 0..3), 64 bytes."""
+    """Scale record of the block: per token (lanes 0..3) 16 bytes of k_scale, log2(v_scale),
+    1 / v_scale and 0."""
     scale_extent = fx.Uint32(n) * hk * 4
     ks, vs = _buffer(KS, scale_extent), _buffer(VS, scale_extent)
     t = lane & 3
@@ -221,15 +221,15 @@ def _pack_scales(KS, VS, PSC, start, valid, block, head, lane, inside, n, packed
     lsv, rsv = _v_scale_terms(_as_f32(_buffer_words(vs, source, 1)[0]))
     record_extent = fx.Uint32(packed) * hk * 64
     record = (inside & (lane < 4)).select(
-        (block * hk + head) * 64 + t * 4, fx.Int32(record_extent)
+        (block * hk + head) * 64 + t * 16, fx.Int32(record_extent)
     )
-    records = _buffer(PSC, record_extent)
-    for part, value in enumerate((sk, lsv, rsv)):
-        _buffer_store_words(
-            fx.Vector.from_elements([_as_i32(value)], fx.Int32),
-            records,
-            record + 16 * part,
-        )
+    _buffer_store_words(
+        fx.Vector.from_elements(
+            [_as_i32(sk), _as_i32(lsv), _as_i32(rsv), fx.Int32(0)], fx.Int32
+        ),
+        _buffer(PSC, record_extent),
+        record,
+    )
 
 
 @flyc.jit
@@ -683,9 +683,12 @@ def _raw_env(env, K, V, KS, VS, SLOTS, length, nk, topk, slotted, wide):
         env.gks = _buffer(fx.make_view(fx.get_iter(KS) + first, layout), count * 4)
         env.gvs = _buffer(fx.make_view(fx.get_iter(VS) + first, layout), count * 4)
         env.sc_oob = fx.Int32(count * 4)
-        env.sc_r = n & 3
-        env.sc_k, env.sc_log = (n % 12) < 4, ((n % 12) >> 2) == 1
-        env.sc_up_log = (n & 7) < 4
+        # A lane's record dword (_scale_words): token n // 4, field n % 4 (k_scale, then
+        # log2(v_scale) and 1 / v_scale from v_scale, then none).
+        env.sc_r = n >> 2
+        env.sc_k = (n & 3) == 0
+        env.sc_v = ((n & 3) == 1) | ((n & 3) == 2)
+        env.sc_log = (n & 3) == 1
     if slotted:
         env.gslots = _buffer(
             fx.make_view(fx.get_iter(SLOTS) + env.p_start, fx.make_layout(length, 1)),
@@ -698,11 +701,7 @@ def _raw_env(env, K, V, KS, VS, SLOTS, length, nk, topk, slotted, wide):
         env.k_limit = env.complete + one((lane & 3) < env.tail)
         env.v_limits = [env.complete + one(fx.Int32(r) < env.tail) for r in range(4)]
         if env.per_token:
-            limit = env.complete + one(env.sc_r < env.tail)
-            env.sc_limits = [
-                limit - env.sc_hi.select(fx.Int32(4), fx.Int32(0)),
-                limit - 4,
-            ]
+            env.sc_limit = env.complete + one(env.sc_r < env.tail)
     if wide:
         env.fallback = _uniform(fx.Int32(_buffer_words(env.gslots, fx.Int32(0), 1)[0]))
 
@@ -793,15 +792,12 @@ def _raw_offsets(env, rows, t, masked):
                 v_slot + 4 * b < env.v_limits[tt] for b in range(2) for tt in range(4)
             ]
             if env.per_token:
-                sc_valid = [v_slot < env.sc_limits[w] for w in range(2)]
+                sc_valid = [v_slot + 4 * b < env.sc_limit for b in range(2)]
         else:
             # Padding slots: past the key list.
             k_valid = [k_slot + 4 * kg < env.blocks for kg in range(2)]
             v_valid = [v_slot + 4 * b < env.blocks for b in range(2) for _ in range(4)]
-            sc_valid = [
-                v_slot + env.sc_hi.select(fx.Int32(4), fx.Int32(0)) < env.blocks,
-                v_slot + 4 < env.blocks,
-            ]
+            sc_valid = [v_slot + 4 * b < env.blocks for b in range(2)]
     if env.wide:
         k_rows = [rows[kg] + env.token for kg in range(2)]
         v_rows = [rows[2 + b] + tt for b in range(2) for tt in range(4)]
@@ -819,13 +815,10 @@ def _raw_offsets(env, rows, t, masked):
         v = [v[i] + (i % 4) * stride for i in range(8)]
     scales = [fx.Int32(0), fx.Int32(0)]
     if env.per_token:
-        # Rows of values n (block n >= 12) and 16 + n (block 1), token n % 4.
-        scales = [
-            (env.sc_hi.select(rows[3], rows[2]) + env.sc_r) * (env.hk * 4),
-            (rows[3] + env.sc_r) * (env.hk * 4),
-        ]
+        # Token n // 4 of the lane's blocks 8t + g, 8t + 4 + g.
+        scales = [(rows[2 + b] + env.sc_r) * (env.hk * 4) for b in range(2)]
         if masked:
-            scales = [sc_valid[w].select(scales[w], env.sc_oob) for w in range(2)]
+            scales = [sc_valid[b].select(scales[b], env.sc_oob) for b in range(2)]
     return k + v + scales
 
 
@@ -878,23 +871,22 @@ def _scale_loads(env, sources, zero4):
     if not env.per_token:
         return fx.Vector.from_elements([zero4[0], zero4[0]], fx.Int32)
     if env.raw:
-        # k_scale and v_scale of value n, v_scale of value 16 + n.
-        offsets = sources[2]
-        scales = [
-            _buffer_words(env.gks, offsets[0], 1)[0],
-            _buffer_words(env.gvs, offsets[0], 1)[0],
-            _buffer_words(env.gvs, offsets[1], 1)[0],
-        ]
+        # Per block the k_scale (field 0 lanes) or v_scale (fields 1 and 2) of token n // 4;
+        # the other lanes' loads are out of range.
+        scales = []
+        for b in range(2):
+            offset = sources[2][b]
+            scales += [
+                _buffer_words(env.gks, env.sc_k.select(offset, env.sc_oob), 1)[0],
+                _buffer_words(env.gvs, env.sc_v.select(offset, env.sc_oob), 1)[0],
+            ]
         return fx.Vector.from_elements(scales, fx.Int32)
-    # The 24 scale terms of the row's blocks 8t + g, 8t + 4 + g (records: k_scale,
-    # log2(v_scale), 1 / v_scale of four tokens) spread over its 16 lanes: two dword
-    # loads instead of six 16-byte loads per lane. Bases are unsigned: past 2 GiB of
-    # packed K/V an arithmetic shift would read zeros past the records.
+    # The scale records of the row's blocks 8t + g, 8t + 4 + g (per token k_scale,
+    # log2(v_scale), 1 / v_scale, 0) over its 16 lanes: a dword load per block and lane
+    # instead of six 16-byte loads per lane. Bases are unsigned: past 2 GiB of packed K/V
+    # an arithmetic shift would read zeros past the records.
     rec = [fx.Int32(fx.Uint32(sources[2 + b]) >> 10) * 64 for b in range(2)]
-    scales = [
-        _buffer_words(env.gsc, env.sc_hi.select(rec[1], rec[0]) + env.sc_lo, 1)[0],
-        _buffer_words(env.gsc, rec[1] + env.sc_up, 1)[0],
-    ]
+    scales = [_buffer_words(env.gsc, rec[b] + env.sc_lane, 1)[0] for b in range(2)]
     return fx.Vector.from_elements(scales, fx.Int32)
 
 
@@ -907,10 +899,9 @@ def _chunk_words(env, sources, zero4):
 
 def _scale_term(sc, b, field, r):
     """Per-token scale term (field 0 k_scale, 1 log2(v_scale), 2 1 / v_scale) of token r of
-    the lane's block b: value 12b + 4 field + r of its 16-lane row (g), word 0 holding values
-    0..15 and word 1 values 16..23 in lanes 0..7, read by a DPP row broadcast."""
-    v = 12 * b + 4 * field + r
-    return prim.row_broadcast(_as_f32(sc[v >> 4]), v & 15)
+    the lane's block b: word b of lane 4r + field of its 16-lane row (g), read by a DPP row
+    broadcast."""
+    return prim.row_broadcast(_as_f32(sc[b]), 4 * r + field)
 
 
 def _probabilities(vals, sc, per_token):
@@ -1133,18 +1124,18 @@ def _v_operands(env, vw):
 
 
 def _scale_words(env, scw):
-    """The two words _scale_term reads: RAW per token, the record's k_scale, log2(v_scale) or
-    1 / v_scale from the loaded scales, as _pack_scales computes them."""
+    """The two words _scale_term reads (the lane's dword of each block's record): RAW per
+    token, its k_scale, log2(v_scale) or 1 / v_scale from the loaded scales, as
+    _pack_scales computes them (field 3 lanes: unused)."""
     scw = fx.Vector(scw)
     if not (env.raw and env.per_token):
         return [scw[0], scw[1]]
-    lsv, rsv = _v_scale_terms(_as_f32(scw[1]))
-    lsv_up, rsv_up = _v_scale_terms(_as_f32(scw[2]))
-    log = env.sc_log.select(_as_i32(lsv), _as_i32(rsv))
-    return [
-        env.sc_k.select(fx.Int32(scw[0]), log),
-        env.sc_up_log.select(_as_i32(lsv_up), _as_i32(rsv_up)),
-    ]
+    words = []
+    for b in range(2):
+        lsv, rsv = _v_scale_terms(_as_f32(scw[2 * b + 1]))
+        terms = env.sc_log.select(_as_i32(lsv), _as_i32(rsv))
+        words.append(env.sc_k.select(fx.Int32(scw[2 * b]), terms))
+    return words
 
 
 def _qk_half_fp8(env, k):
@@ -1286,11 +1277,8 @@ def _direct_row(
         gsc=_buffer(ins.PSC, scale_extent),
         k_lane=(g * 4 + (lane & 3)) * 16,
         v_lane=n * 16,
-        # Scale value n (word 0: block n >= 12, field (n % 12) // 4) and 16 + n (word 1,
-        # lanes 0..7: block 1, field 1 + n // 4), token n % 4.
-        sc_hi=n >= 12,
-        sc_lo=((n % 12) >> 2) * 16 + (n & 3) * 4,
-        sc_up=(1 + ((n & 7) >> 2)) * 16 + (n & 3) * 4,
+        # Scale record dword n of each block: token n // 4, field n % 4.
+        sc_lane=n * 4,
         gout=_buffer(ins.OUT, q_rows * D * 2),
         out_lane=head_ok.select(qrow * (D * 2) + g * 128, fx.Int32(q_rows * D * 2)),
         lse=ins.LSE,
