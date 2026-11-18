@@ -42,8 +42,14 @@ read zeros without a memory request. Per token the 24 scale terms of a 16-lane r
 Plain plans (no core/residual tiles) run PLAIN_WAVES rows per WG, one wave each, heaviest
 rows first (fewer rows than two such WGs per CU: one row per WG, spread over the CUs):
 waves of rows the union serves exit at once, and every wave of a launch whose tiles all run
-in the union exits on K3's direct flag before any row load. Listed rows (below)
-stage their output in LDS and store it a kilobyte per store (whole lines).
+in the union exits on K3's direct flag before any row load. A plan whose rows all select
+topk blocks (equal rows, at least a wave per SIMD) runs persistent instead (PLAIN_PERSIST):
+the launch's waves start their rows together and, kept at one pace, sweep their sorted key
+lists in step, so the K/V they read at a time stay in the L2. A gated plain plan's WGs first
+list the tiles K3 routes direct: the waves take only those tiles' rows, however few. So does
+a core/residual plan of such rows (at least two rounds of them) whose union keeps no tile
+(the pack launch's list says so on the GPU; its listed launch then exits). Persistent and
+listed rows stage their output in LDS and store it a kilobyte per store (whole lines).
 
 RAW: a wave first maps its key list's slots to rows in LDS (the slot table's pool row of a
 block's first token, else the request row), which each chunk then reads per lane. A lane
@@ -82,9 +88,11 @@ from .sparse_prefill_common import (
     LAZY,
     MAX_ROW_PACKED_KV_BYTES,
     QROWS,
+    QUEUE_WORDS,
     SC_DEVICE,
     _as_f32,
     _as_i32,
+    _behind_prio,
     _buffer,
     _buffer_at,
     _buffer_store_words,
@@ -93,10 +101,14 @@ from .sparse_prefill_common import (
     _fp8_word,
     _lazy_max,
     _lds_load,
+    _lds_relaxed_load,
+    _lds_relaxed_store,
     _lds_store,
     _maximum,
     _mfma_fp8,
     _min,
+    _queue_exit,
+    _queue_take,
     _scaled_bf16,
     _uniform,
     _v_scale_terms,
@@ -151,6 +163,17 @@ COMPACT_GROUP = 8
 # Listed (and persistent) rows stage their output in LDS, a head per SLOT_HEAD bytes (512 + 16:
 # on both the write and the read side lanes 8k .. 8k + 7 hit different banks) (_store_o).
 SLOT_HEAD = 528
+# Persistent plain launch: one WG of PLAIN_PERSIST waves per CU (waves w and w ^ 4 share a
+# SIMD). Rows started together sweep their sorted blocks together (the first rows of a plain
+# launch ran at about 520 chunks/us, later ones near 470), but the older wave of a SIMD issues
+# first: a wave more than PRIO_MARGIN chunks behind its sibling runs at s_setprio(PRIO_BEHIND)
+# so the two keep pace. Rows past the whole rounds (one row per wave) run one per SIMD, on
+# different CUs.
+PLAIN_PERSIST = 8
+PRIO_BEHIND = 1
+PRIO_MARGIN = 0
+# LDS a persistent WG keeps besides its pace words, row tables (RAW), output slots and tile list.
+PERSIST_SPARE = 1024
 
 
 def _transpose4(w):
@@ -1196,10 +1219,25 @@ def _row_max(local):
 
 
 @flyc.jit
-def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, table=None):
+def _direct_row(
+    ins,
+    row,
+    hkv,
+    p_start,
+    visible,
+    residual,
+    on,
+    length=None,
+    table=None,
+    pace=None,
+    take=None,
+):
     """The wave's query row and KV head: residual (a core/residual row) merges into the
     union output; visible keys of the row (residual: 4 x its residual blocks). RAW: length
-    the request's, table the wave's LDS row table (TOPK + 64 words)."""
+    the request's, table the wave's LDS row table (TOPK + 64 words). Persistent waves: pace
+    (the LDS words of the wave's and its SIMD sibling's chunk counts, the wave's count before
+    this row, its output slot) and take (the queue's next index, taken in the last chunk).
+    Returns (chunks, the take) for unlisted rows."""
     H, HK, TOPK, PER_TOKEN = ins.H, ins.HK, ins.TOPK, ins.PER_TOKEN
     group = H // HK
     lane = fx.Int32(fx.thread_idx.x) & 63
@@ -1265,7 +1303,7 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
         # The output through the wave's LDS slot (_store_o): lane (n, g) writes head n's
         # dims 64g .. at n * SLOT_HEAD + 128g (lanes past the group into the spare slot
         # `group`), lane i of store s reads the group's piece 64 s + i.
-        slot = ins.slot
+        slot = pace.stage if pace is not None else ins.slot
         env.stage = ins.stage
         env.stage_write = slot + _min(n, fx.Int32(group)) * SLOT_HEAD + g * 128
         env.stage_read = (
@@ -1305,7 +1343,7 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
         )
         if fx.const_expr(ins.stage is not None):
             env.stage_compact = (
-                ins.slot
+                (pace.stage if pace is not None else ins.slot)
                 + _min(head, fx.Int32(group)) * SLOT_HEAD
                 + g * 128
                 + (n >> 3) * 64
@@ -1335,6 +1373,7 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
             first_v,
             first_sc,
             *_chunk_ids(env, fx.Int32(1)),
+            _lds_relaxed_load(pace.sibling) if pace is not None else fx.Int32(0),
         )
 
         def softmax_pv(o, m_run, l_run, v, sc, scored):
@@ -1352,9 +1391,17 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
             previous step) issue spread over QK(t): its first K half and scale words (with
             chunk t + 2's id loads) first, its other K half between QK(t)'s halves, its V
             after QK(t). Issued at once, they queued in the CU's vector memory path and
-            stalled the wave's issue longer."""
-            *ids, t = rest
+            stalled the wave's issue longer. sib: the sibling's chunk count (persistent
+            waves), read one step earlier."""
+            *ids, sib, t = rest
             t = fx.Int32(t)
+            if fx.const_expr(pace is not None):
+                # The sibling's count landed with chunk t + 1's ids, which the step waits for
+                # first; publish this wave's count and read the sibling's for the next step.
+                count = pace.base + t
+                _behind_prio(count, _uniform(sib), PRIO_MARGIN, PRIO_BEHIND)
+                _lds_relaxed_store(pace.mine, count + 1)
+                sib = _lds_relaxed_load(pace.sibling)
             sources = _chunk_sources(env, ids, t + 1)
             k_next = _k_loads(env, sources, 0)
             sc_next = _scale_loads(env, sources, zero4)
@@ -1382,6 +1429,7 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
                 _flatten(v_next),
                 sc_next,
                 *ids_next,
+                sib,
             )
 
         # Two chunks per iteration: chunk t + 1's words land in the registers chunk t - 1
@@ -1393,6 +1441,8 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
             state = step(*state, fx.Int32(t) + 1)
         if (chunks & 1) == 0:
             state = step(*state, chunks - 2)
+        # The next row's index: the atomic's latency hides behind this row's last chunk.
+        nxt = take() if take is not None else fx.Int32(0)
         o, m_run, l_run, kw, vw, scw = state[:6]
         swaps = _k_swaps(env, kw)
         sc = _scale_words(env, scw)
@@ -1413,14 +1463,19 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
                 _store_o(env, [o[i] for i in range(64)], inv)
         else:
             _store_o(env, [o[i] for i in range(64)], inv)
+        return nxt
 
     if fx.const_expr(ins.listed):
         # A listed row runs at least one chunk.
         run()
     else:
         # Disabled waves (rows another kernel serves) exit without loads.
+        nxt = fx.Int32(0)
         if chunks > 0:
-            run()
+            nxt = run()
+        else:
+            nxt = take() if take is not None else fx.Int32(0)
+        return chunks, nxt
 
 
 def _rows_before(sched, word):
@@ -1487,11 +1542,13 @@ def _listed(
     RAW: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    WHOLE_EXIT: fx.Constexpr[bool],
 ):
     """Core/residual plans: the pack launch's list of direct rows, heaviest first (a
     cost-sorted dispatch keeps the launch from ending on a long row). Work item i is list
     position i // HK, KV head i % HK; items past the listed rows exit, as every item does
-    when K3 routes no row direct (FLAG[0] clear: the pack launch listed nothing)."""
+    when K3 routes no row direct (FLAG[0] clear: the pack launch listed nothing) or after a
+    persistent launch ran a list of whole rows (WHOLE_EXIT)."""
     ins = SimpleNamespace(
         Q8=Q8,
         QS=QS,
@@ -1537,6 +1594,9 @@ def _listed(
     listed = (_uniform(fx.Int32(FLAG[0])) != 0).select(
         ends[LIST_BUCKETS - 1] * HK, fx.Int32(0)
     )
+    if fx.const_expr(WHOLE_EXIT):
+        whole = fx.Vector(rocdl.s_buffer_load(sched, SCHED_WHOLE, count=4))[0]
+        listed = (_uniform(whole) != 0).select(fx.Int32(0), listed)
     if item < listed:
         word, visible, p_start, length = _list_entry(sched, ends, item // HK, CAP)
         row, residual = word & 0x7FFFFFFF, word < 0
@@ -1555,6 +1615,11 @@ def _listed(
 
 _direct_kernel = flyc.kernel(
     name="sparse_prefill_direct_fp8_d256", known_block_size=[64, 1, 1]
+)(_listed)
+# The listed launch after a persistent one (WHOLE_EXIT), apart in a profile: it runs the
+# rows of a list with an active tile, the persistent launch those of a whole-row list.
+_direct_whole_exit_kernel = flyc.kernel(
+    name="sparse_prefill_direct_fp8_listed_d256", known_block_size=[64, 1, 1]
 )(_listed)
 
 
@@ -1643,17 +1708,19 @@ _plain_spread_kernel = flyc.kernel(
 )(_plain)
 
 
-def _plain_row(ins, work, META, QUERY_TILES, ACTIVE, GATED, table):
+def _plain_row(
+    ins, work, META, QUERY_TILES, ACTIVE, GATED, table, pace=None, take=None
+):
     """Work item `work` of a plain launch: query row work // HK, KV head work % HK (the last
     WG's spare waves, work < 0, exit). A plain plan's metadata row i is query row i, so the
-    union test does not wait for META."""
+    union test does not wait for META. Returns (chunks, the take) (_direct_row)."""
     inside = work >= 0
     work = inside.select(work, fx.Int32(0))
     row, hkv = work // ins.HK, work % ins.HK
     p_start, position = _uniform(META[row * 5 + 2]), _uniform(META[row * 5 + 4])
     length = _uniform(META[row * 5 + 3]) if fx.const_expr(ins.RAW) else None
     on = _enabled(fx.Int32(0), fx.Int32(1), row, QUERY_TILES, ACTIVE, GATED, ins.NQ)
-    _direct_row(
+    return _direct_row(
         ins,
         row,
         hkv,
@@ -1663,6 +1730,255 @@ def _plain_row(ins, work, META, QUERY_TILES, ACTIVE, GATED, table):
         on & inside,
         length,
         table,
+        pace,
+        take,
+    )
+
+
+def _persist_tables(topk, raw):
+    """LDS bytes of a persistent WG's row tables (RAW)."""
+    return PLAIN_PERSIST * (topk + 64) * 4 if raw else 0
+
+
+def _staged(group, tables):
+    """The persistent WG stages its waves' output rows (_store_o) in LDS."""
+    return PLAIN_PERSIST * (group + 1) * SLOT_HEAD + PERSIST_SPARE + tables <= 65536
+
+
+def _tile_capacity(group, tables):
+    """Direct tiles a gated plain persistent WG lists: the LDS its output slots and row
+    tables leave."""
+    staged = PLAIN_PERSIST * (group + 1) * SLOT_HEAD if _staged(group, tables) else 0
+    free = 65536 - PERSIST_SPARE - staged - tables - 2 * PLAIN_PERSIST * 4
+    return (free // 4 - 4) // 64 * 64
+
+
+@flyc.kernel(
+    name="sparse_prefill_direct_fp8_d256", known_block_size=[64 * PLAIN_PERSIST, 1, 1]
+)
+def _plain_persistent_kernel(
+    Q8: fx.Tensor,
+    QS: fx.Tensor,
+    PK: fx.Tensor,
+    PV: fx.Tensor,
+    PSC: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    OUT: fx.Tensor,
+    SLOTS: fx.Tensor,
+    BLOCKS: fx.Tensor,
+    META: fx.Tensor,
+    ACTIVE: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    FLAG: fx.Tensor,
+    SCHED: fx.Tensor,
+    QUEUE: fx.Tensor,
+    TILE_META: fx.Tensor,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    ROWS: fx.Int32,
+    PACKED: fx.Int32,
+    NK: fx.Int32,
+    SCALE_LOG2: fx.Float32,
+    TOPK: fx.Constexpr[int],
+    GATED: fx.Constexpr[bool],
+    PER_TOKEN: fx.Constexpr[bool],
+    RAW: fx.Constexpr[bool],
+    SLOTTED: fx.Constexpr[bool],
+    WIDE: fx.Constexpr[bool],
+    CUS: fx.Int32,
+    FLAG_WORD: fx.Constexpr[int],
+    TILES: fx.Int32,
+    TILE_ROWS: fx.Int32,
+):
+    """Plans of equal whole rows: one WG of PLAIN_PERSIST waves per CU. Wave b *
+    PLAIN_PERSIST + w starts on that work item (the plain order, heaviest first) and takes
+    later ones from the launch's queue (QUEUE[0]) while they are in the whole rounds (CUS *
+    PLAIN_PERSIST items each), then item whole + w * CUS + b of the last round if any (one per
+    SIMD, on different CUs). The last wave out zeroes the queue (QUEUE[64] counts the waves
+    out) for the next launch. A gated plain plan's items are the rows of the tiles K3 routes
+    direct (_tile_list): TILE_ROWS * HK items per listed tile, those past its rows exit.
+    """
+    ins = SimpleNamespace(
+        Q8=Q8,
+        QS=QS,
+        PK=PK,
+        PV=PV,
+        PSC=PSC,
+        KS=KS,
+        VS=VS,
+        OUT=OUT,
+        SLOTS=SLOTS,
+        BLOCKS=BLOCKS,
+        LSE=OUT,
+        H=H,
+        HK=HK,
+        NQ=NQ,
+        ROWS=ROWS,
+        PACKED=PACKED,
+        NK=NK,
+        SCALE_LOG2=SCALE_LOG2,
+        TOPK=TOPK,
+        PER_TOKEN=PER_TOKEN,
+        RESIDUAL=False,
+        RAW=RAW,
+        SLOTTED=SLOTTED,
+        WIDE=WIDE,
+        listed=False,
+        stage=None,
+        slot=0,
+    )
+    group = H // HK
+    allocator = fx.SharedAllocator()
+    paces = _lds_words(allocator, PLAIN_PERSIST)
+    tables = _persist_tables(TOPK, RAW)
+    # A gated plain plan's direct tiles (first row | rows << 24), a word past them for the
+    # unlisted lanes' stores, and the waves' tile counts of two listing steps.
+    compact = GATED and FLAG_WORD == 0
+    capacity = _tile_capacity(group, tables) if compact else 0
+    if fx.const_expr(compact):
+        tile_words = _lds_words(allocator, capacity + 4)
+        tally = _lds_words(allocator, 2 * PLAIN_PERSIST)
+    # Each wave's output staging slot (_store_o): group + 1 heads, while the CU's 64 KiB
+    # of LDS hold them.
+    slot = (group + 1) * SLOT_HEAD
+    if fx.const_expr(_staged(group, tables)):
+        ins.stage = (
+            allocator.allocate(fx.Array[fx.Int8, PLAIN_PERSIST * slot, 16])
+            .peek()
+            .view(fx.make_layout(PLAIN_PERSIST * slot, 1))
+        )
+    lane = fx.Int32(fx.thread_idx.x) & 63
+    wave = _uniform(fx.Int32(fx.thread_idx.x) >> 6)
+    table = None
+    if fx.const_expr(RAW):
+        table = _lds_words(allocator, tables // 4) + wave * ((TOPK + 64) * 4)
+    go = fx.Boolean(True)
+    if fx.const_expr(GATED):
+        # K3 raises flag[0] when some tile goes direct (a core/residual plan: the pack launch
+        # then raises the schedule's SCHED_WHOLE when no listed tile is active): otherwise
+        # every wave exits here.
+        go = _uniform(fx.Int32(FLAG[0])) != 0
+        if fx.const_expr(FLAG_WORD != 0):
+            go = go & (_uniform(fx.Int32(SCHED[FLAG_WORD])) != 0)
+    if go:
+        items = ROWS * HK
+        if fx.const_expr(compact):
+            listed = _tile_list(
+                ACTIVE, TILE_META, TILES, tile_words, tally, capacity, wave, lane
+            )
+            items = _uniform(listed) * TILE_ROWS * HK
+        # (This barrier also ends the listing: every wave reads all of it.)
+        _lds_relaxed_store(paces + wave * 4, fx.Int32(0))
+        fx.gpu.barrier()
+        queue = _buffer(QUEUE, QUEUE_WORDS * 4)
+        waves = CUS * PLAIN_PERSIST
+        whole = (items // waves) * waves
+        spread = whole + wave * CUS + fx.Int32(fx.block_idx.x)
+        late = (spread < items).select(spread, items)
+        first = fx.Int32(fx.block_idx.x) * PLAIN_PERSIST + wave
+        item = (first < whole).select(first, late)
+        done = fx.Int32(0)
+
+        def take():
+            return _queue_take(queue, lane)
+
+        while item < items:
+            pace = SimpleNamespace(
+                mine=paces + wave * 4,
+                sibling=paces + (wave ^ 4) * 4,
+                base=done,
+                stage=wave * slot,
+            )
+            if fx.const_expr(compact):
+                chunks, got = _tile_row(
+                    ins,
+                    items - 1 - item,
+                    META,
+                    tile_words,
+                    TILE_ROWS,
+                    table,
+                    pace,
+                    take,
+                )
+            else:
+                # A whole-row list (FLAG_WORD) has no row the union serves.
+                chunks, got = _plain_row(
+                    ins,
+                    items - 1 - item,
+                    META,
+                    QUERY_TILES,
+                    ACTIVE,
+                    False,
+                    table,
+                    pace,
+                    take,
+                )
+            done = done + chunks
+            nxt = prim.readlane(got, 0) + waves
+            item = (item >= whole).select(items, (nxt < whole).select(nxt, late))
+        _queue_exit(queue, lane, waves)
+
+
+@flyc.jit
+def _tile_list(ACTIVE, TILE_META, TILES, listing, tally, capacity, wave, lane):
+    """The WG lists the plan's tiles K3 routes direct (ACTIVE clear), in tile order, as
+    first row | rows << 24 words from listing on: a step's waves take 64 tiles each, count
+    theirs (tally, alternate halves by step) and store them past the earlier waves' and steps'
+    (the other lanes store past the list). Returns the list's length (lane values)."""
+    active = _buffer(ACTIVE, fx.Uint32(TILES) * 4)
+    meta = _buffer(TILE_META, fx.Uint32(TILES) * 20)
+    listed = fx.Int32(0)
+    for base in range(fx.Int32(0), TILES, fx.Int32(64 * PLAIN_PERSIST)):
+        tile = base + wave * 64 + lane
+        kept = fx.Int32(_buffer_words(active, tile * 4, 1)[0])
+        first = fx.Int32(_buffer_words(meta, tile * 20, 1)[0])
+        rows = fx.Int32(_buffer_words(meta, tile * 20 + 4, 1)[0])
+        direct = (tile < TILES) & (kept == fx.Int32(0))
+        mask = prim.ballot(direct)
+        half = tally + ((base // (64 * PLAIN_PERSIST)) & 1) * (PLAIN_PERSIST * 4)
+        _lds_relaxed_store(half + wave * 4, fx.Int32(fx.math.ctpop(mask)))
+        fx.gpu.barrier()
+        before, total = fx.Int32(0), fx.Int32(0)
+        for w in fx.range_constexpr(PLAIN_PERSIST):
+            count = _lds_relaxed_load(half + w * 4)
+            before = before + (fx.Int32(w) < wave).select(count, fx.Int32(0))
+            total = total + count
+        at = listed + before + prim.lanes_below(mask)
+        _lds_relaxed_store(
+            direct.select(listing + at * 4, listing + capacity * 4),
+            first | (rows << 24),
+        )
+        listed = listed + total
+    return listed
+
+
+def _tile_row(ins, work, META, listing, TILE_ROWS, table, pace, take):
+    """Work item `work` of a gated plain persistent launch: row work // HK % TILE_ROWS of
+    listed tile work // (TILE_ROWS * HK), KV head work % HK (past the tile's rows: exits).
+    Returns (chunks, the take) (_direct_row)."""
+    span = TILE_ROWS * ins.HK
+    j = work // span
+    local = work - j * span
+    r, hkv = local // ins.HK, local % ins.HK
+    entry = _uniform(_lds_relaxed_load(listing + j * 4))
+    on = r < (entry >> 24)
+    row = (entry & 0xFFFFFF) + on.select(r, fx.Int32(0))
+    p_start, position = _uniform(META[row * 5 + 2]), _uniform(META[row * 5 + 4])
+    length = _uniform(META[row * 5 + 3]) if fx.const_expr(ins.RAW) else None
+    return _direct_row(
+        ins,
+        row,
+        hkv,
+        p_start,
+        position + 1,
+        fx.Boolean(False),
+        on,
+        length,
+        table,
+        pace,
+        take,
     )
 
 
@@ -1685,6 +2001,8 @@ def _direct_launch(
     LSE: fx.Tensor,
     FLAG: fx.Tensor,
     SCHED: fx.Tensor,
+    QUEUE: fx.Tensor,
+    TILE_META: fx.Tensor,
     CAP: fx.Int32,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
@@ -1699,14 +2017,20 @@ def _direct_launch(
     RAW: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    PERSIST: fx.Constexpr[bool],
     WAVES: fx.Constexpr[int],
+    CUS: fx.Int32,
+    TILES: fx.Int32,
+    TILE_ROWS: fx.Int32,
     GRID: fx.Int32,
     stream: fx.Stream,
 ):
     # FLAG: K3's direct flag; SCHED: the pack launch's schedule (core/residual plans).
+    # A core/residual plan of equal rows launches the persistent kernel for a list of whole
+    # rows (no active tile, known on the GPU), then the listed kernel for any other list.
     if GRID > 0:
-        if fx.const_expr(RESIDUAL):
-            _direct_kernel(
+        if fx.const_expr(PERSIST):
+            _plain_persistent_kernel(
                 Q8,
                 QS,
                 PK,
@@ -1717,10 +2041,13 @@ def _direct_launch(
                 OUT,
                 SLOTS,
                 BLOCKS,
-                LSE,
+                META,
+                ACTIVE,
+                QUERY_TILES,
                 FLAG,
                 SCHED,
-                CAP,
+                QUEUE,
+                TILE_META,
                 H,
                 HK,
                 NQ,
@@ -1729,13 +2056,18 @@ def _direct_launch(
                 NK,
                 SCALE_LOG2,
                 TOPK,
+                GATED,
                 PER_TOKEN,
                 RAW,
                 SLOTTED,
                 WIDE,
+                CUS,
+                SCHED_WHOLE if RESIDUAL else 0,
+                TILES,
+                TILE_ROWS,
                 value_attrs=prim.kernel_attrs(),
-            ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
-        else:
+            ).launch(grid=(CUS, 1, 1), block=(64 * PLAIN_PERSIST, 1, 1), stream=stream)
+        if fx.const_expr(not RESIDUAL and not PERSIST):
             (_plain_kernel if WAVES == PLAIN_WAVES else _plain_spread_kernel)(
                 Q8,
                 QS,
@@ -1771,6 +2103,37 @@ def _direct_launch(
                 block=(64 * WAVES, 1, 1),
                 stream=stream,
             )
+        if fx.const_expr(RESIDUAL):
+            (_direct_whole_exit_kernel if PERSIST else _direct_kernel)(
+                Q8,
+                QS,
+                PK,
+                PV,
+                PSC,
+                KS,
+                VS,
+                OUT,
+                SLOTS,
+                BLOCKS,
+                LSE,
+                FLAG,
+                SCHED,
+                CAP,
+                H,
+                HK,
+                NQ,
+                ROWS,
+                PACKED,
+                NK,
+                SCALE_LOG2,
+                TOPK,
+                PER_TOKEN,
+                RAW,
+                SLOTTED,
+                WIDE,
+                PERSIST,
+                value_attrs=prim.kernel_attrs(),
+            ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
 
 
 # ---- Host ----
@@ -1829,6 +2192,7 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
     request = np.repeat(np.arange(len(q_lens)), q_lens)
     local = np.arange(len(request)) - np.repeat(np.cumsum(q_lens) - q_lens, q_lens)
     rows = len(request)
+    positions = (lengths - q_lens)[request] + local
     metadata = np.stack(
         (
             np.arange(rows),
@@ -1836,7 +2200,7 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
             # The request's first packed block, or (raw) K row / slot-table entry.
             (k_starts if raw else p_starts)[request],
             lengths[request],
-            (lengths - q_lens)[request] + local,
+            positions,
         ),
         axis=1,
     )
@@ -1870,8 +2234,35 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
         union=union,
         residual=union is not None and union.core_ratio > 0,
     )
+    # A plan of equal rows (every row selects topk blocks), at least a wave per SIMD, runs
+    # persistent (PLAIN_PERSIST); its queue words stay zero between launches. A core/residual
+    # plan's rows run whole there when the union keeps no tile (no active tile: the pack
+    # launch's SCHED_WHOLE), else they run listed: it launches both, so it needs two rounds
+    # of rows to pay for the other (empty) launch. A gated plain plan's WGs list its direct
+    # tiles in LDS (_tile_list), so it runs persistent while they hold its tiles. The
+    # schedule is the batch's: a batch-invariant union plan (no routing) does not take it.
+    prepared.cus = get_cu_num()
+    group = inputs.q.shape[1] // hk
+    tables = _persist_tables(inputs.topk, raw)
+    rounds = 2 if prepared.residual else 1
+    prepared.persistent = (
+        rows * hk >= rounds * prepared.cus * PLAIN_PERSIST
+        and int(((positions + 1) >> 2).min()) >= inputs.topk
+        and (
+            union is None
+            or (
+                union.routing
+                and (
+                    prepared.residual
+                    or union.num_tiles <= _tile_capacity(group, tables)
+                )
+            )
+        )
+    )
     # A plain launch of fewer rows than two of its WGs per CU spreads one row per WG.
-    prepared.waves = PLAIN_WAVES if rows * hk >= 2 * PLAIN_WAVES * get_cu_num() else 1
+    prepared.waves = PLAIN_WAVES if rows * hk >= 2 * PLAIN_WAVES * prepared.cus else 1
+    if prepared.persistent:
+        prepared.queue = torch.zeros(QUEUE_WORDS, dtype=torch.int32, device=device)
     if prepared.residual:
         if union.query_tile > 64:
             raise ValueError("FP8 direct lists at most 64 rows per union tile")
@@ -1977,6 +2368,8 @@ def _direct_args(inputs, prepared, out, stream):
         "LSE": prepared.union.lse.view(-1) if residual else empty,
         "FLAG": prepared.direct_flag,
         "SCHED": prepared.schedule if residual else empty,
+        "QUEUE": prepared.queue if prepared.persistent else empty,
+        "TILE_META": prepared.union.metadata.view(-1) if prepared.gated else empty,
         "CAP": prepared.list_cap if residual else 0,
         "H": inputs.q.shape[1],
         "HK": prepared.hk,
@@ -1991,7 +2384,11 @@ def _direct_args(inputs, prepared, out, stream):
         "RAW": raw,
         "SLOTTED": raw and prepared.slotted,
         "WIDE": prepared.wide,
+        "PERSIST": prepared.persistent,
         "WAVES": prepared.waves,
+        "CUS": prepared.cus,
+        "TILES": prepared.union.num_tiles if prepared.gated else 0,
+        "TILE_ROWS": prepared.union.query_tile if prepared.gated else 0,
         "GRID": prepared.rows * prepared.hk,
         "stream": stream,
     }
@@ -2045,6 +2442,7 @@ def _compiled(inputs, prepared, out, stream):
             "RAW",
             "SLOTTED",
             "WIDE",
+            "PERSIST",
             "WAVES",
         ),
         "GRID",
