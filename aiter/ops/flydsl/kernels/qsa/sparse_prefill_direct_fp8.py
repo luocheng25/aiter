@@ -39,7 +39,10 @@ key list (every earlier chunk holds eight complete blocks); the last chunk's pad
 read zeros without a memory request. Per token the 24 scale terms of a 16-lane row's blocks
 (its g) take two dword loads per lane and reach their users by DPP row broadcasts.
 
-Waves of rows another kernel serves exit at once.
+Plain plans (no core/residual tiles) run PLAIN_WAVES rows per WG, one wave each, heaviest
+rows first (fewer rows than two such WGs per CU: one row per WG, spread over the CUs):
+waves of rows the union serves exit at once, and every wave of a launch whose tiles all run
+in the union exits on K3's direct flag before any row load.
 
 RAW: a wave first maps its key list's slots to rows in LDS (the slot table's pool row of a
 block's first token, else the request row), which each chunk then reads per lane. A lane
@@ -50,12 +53,15 @@ request without a slot table read zero past its end (and for its last chunk's pa
 slots); through a slot table its last chunk's masked keys read zero, or for a pool past 4 GiB
 (WIDE, 64-bit loads) the request's first row.
 
-Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one K3b CTA per
-union tile (prepare.residual_tile), dispatched first, which moves the residual blocks of each
-row of an active core tile to the front of its block_indices row. Those rows then run here
-over their residual blocks only (no causal tail) and merge into the union output by
+Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one CTA per tile,
+dispatched first: on a union tile K3b (prepare.residual_tile) moves the residual blocks of
+each row of an active core tile to the front of its block_indices row. Those rows then run
+here over their residual blocks only (no causal tail) and merge into the union output by
 log-sum-exp (the union kernel writes each row's lse); a residual row copies its union output
-to LDS when it starts.
+to LDS when it starts. A residual count is known only then, so the same CTA lists the tile's
+direct rows in chunk-count buckets, and the direct waves take the rows from that list,
+heaviest first: the launch does not end on a long row, and a wave reads its row's parameters
+in one entry.
 """
 
 import math
@@ -67,12 +73,15 @@ import numpy as np
 import torch
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     LAZY,
     MAX_ROW_PACKED_KV_BYTES,
     QROWS,
+    SC_DEVICE,
     _as_f32,
     _as_i32,
     _buffer,
@@ -111,6 +120,31 @@ CHUNK = 8  # blocks per 32-key chunk
 # Byte base of a padding key slot: its loads (base + < 1 KiB, scale records at (base >> 10) * 64)
 # lie past every pack (PK/PV below 4 GiB) and read zeros without a memory request.
 PAD_BASE = -1024
+# Core/residual plans run the direct rows heaviest first: the pack launch lists every row in
+# one of LIST_BUCKETS chunk-count buckets (bucket 0 the longest rows), each split in
+# LIST_PARTS parts by tile (the atomics of one counter serialize). Slot s = bucket *
+# LIST_PARTS + part. Schedule scratch (Int32 words): word b the rows of buckets 0 .. b, word
+# LIST_BUCKETS + s the rows of slots 0 .. s, word SCHED_WHOLE 1 when no listed tile is active
+# (every row runs whole), then from word SCHED_HEADER list q * LIST_PARTS + part (q < 4) of
+# `cap` entries, bucket 2q of the part filling it from the front and bucket 2q + 1 from the
+# back, one 16-byte entry per row: row | residual << 31, its visible keys (residual: 4 x its
+# residual blocks), its request's first packed block (RAW: K row or slot-table entry) and
+# length.
+LIST_BUCKETS = 8
+LIST_PARTS = 8
+LIST_SLOTS = LIST_BUCKETS * LIST_PARTS
+SCHED_WHOLE = LIST_BUCKETS + LIST_SLOTS
+SCHED_HEADER = SCHED_WHOLE + 4
+# Persistent counters (zero between pack launches), each on its own 256-byte line: tiles
+# listed per part, parts listed, then one per slot. A part's count adds CORE_COUNT per active
+# tile, the parts' count CORE_COUNT per part with one (a tile count in the low half).
+COUNTER_STRIDE = 64
+COUNTER_SLOTS = LIST_PARTS + 1
+CORE_COUNT = 1 << 16
+# Plain plans' rows per WG (one wave each): four waves fill a CU's SIMDs at once, so a launch
+# of equal rows refills a CU in a quarter of the WG dispatches, and a launch the union serves
+# dispatches a quarter of the (empty) WGs.
+PLAIN_WAVES = 4
 # Residual merges of groups of at most COMPACT_GROUP heads run on 8 lanes per head (_merge_o).
 COMPACT_GROUP = 8
 
@@ -243,6 +277,144 @@ def _pack_body(
         )
 
 
+def _bucket_edges(topk):
+    """Chunk counts bounding the list buckets, longest first: 3/4, 1/2, 3/8, 1/4, 3/16, 1/8
+    and 1/16 of a whole row's chunks."""
+    whole = (topk + CHUNK) // CHUNK
+    return [max(1, whole * k // 16) for k in (12, 8, 6, 4, 3, 2, 1)]
+
+
+@flyc.jit
+def _list_tile(
+    SCHED,
+    COUNTERS,
+    TILE_META,
+    TILE_ACTIVE,
+    RESIDUAL_ROWS,
+    DIRECT_META,
+    rows,
+    tiles,
+    cap,
+    tile,
+    TOPK,
+):
+    """List the tile's direct rows (all of an inactive tile; an active one's with residual
+    blocks, after K3b counted them) in their chunk-count buckets; the last tile listed
+    publishes the slot counts (and SCHED_WHOLE) and zeroes the counters for the next
+    launch."""
+    tid = fx.Int32(fx.thread_idx.x)
+    lane = tid & 63
+    part = tile & (LIST_PARTS - 1)
+    first_row = _uniform(fx.Int32(TILE_META[tile * 5]))
+    count_rows = _uniform(fx.Int32(TILE_META[tile * 5 + 1]))
+    position = _uniform(fx.Int32(TILE_META[tile * 5 + 4]))
+    active = _uniform(fx.Int32(TILE_ACTIVE[tile])) != 0
+    # K3b's residual counts (stored by lane 0 of each wave) are in L2 before wave 0 reads them
+    # back past its L1.
+    rocdl.s_waitcnt(vmcnt=0)
+    fx.gpu.barrier()
+    if _uniform(tid >> 6) == 0:
+        row = first_row + _min(lane, count_rows - 1)
+        counts = _buffer(RESIDUAL_ROWS, fx.Uint32(rows) * 4)
+        # An inactive tile's rows run whole (their counts are stale): no load.
+        count_at = active.select(row * 4, fx.Int32(rows * 4))
+        count = _buffer_words(counts, count_at, 1, SC_DEVICE)[0]
+        listed = (lane < count_rows) & (~active | (count > 0))
+        visible = active.select(count * 4, position + lane + 1)
+        complete = _min(visible >> 2, fx.Int32(TOPK))
+        blocks = complete + ((visible & 3) != 0).select(fx.Int32(1), fx.Int32(0))
+        chunks = (blocks + CHUNK - 1) // CHUNK
+        bucket = fx.Int32(0)
+        for edge in _bucket_edges(TOPK):
+            bucket = bucket + (chunks < edge).select(fx.Int32(1), fx.Int32(0))
+        rank, size = fx.Int32(0), fx.Int32(0)
+        for b in fx.range_constexpr(LIST_BUCKETS):
+            mine = listed & (bucket == b)
+            mask = prim.ballot(mine)
+            rank = mine.select(prim.lanes_below(mask), rank)
+            size = (lane == b).select(fx.Int32(fx.ctpop(mask)), size)
+        # Lane b reserves the tile's rows of bucket b in its slot; each row takes its bucket's
+        # base from that lane's register (v_readlane, whatever the lanes' order of execution).
+        counters = fx.get_iter(COUNTERS)
+        base = fx.Int32(0)
+        if (lane < LIST_BUCKETS) & (size > 0):
+            slot = COUNTER_SLOTS + lane * LIST_PARTS + part
+            base = fx.atomic_add(
+                counters + COUNTER_STRIDE * slot, size, syncscope="agent"
+            )
+        index = rank
+        for b in fx.range_constexpr(LIST_BUCKETS):
+            index = (bucket == b).select(prim.readlane(base, b) + rank, index)
+        where = ((bucket & 1) == 1).select(cap - 1 - index, index)
+        entry = ((bucket >> 1) * LIST_PARTS + part) * cap + where
+        flag = active.select(fx.Int32(-(2**31)), fx.Int32(0))
+        extent = (fx.Uint32(cap) * (LIST_SLOTS // 2) * 4 + SCHED_HEADER) * 4
+        sched = _buffer(SCHED, extent)
+        # The request's first packed block (RAW: K row or slot-table entry) and length.
+        p_start = fx.Int32(DIRECT_META[row * 5 + 2])
+        length = fx.Int32(DIRECT_META[row * 5 + 3])
+        _buffer_store_words(
+            fx.Vector.from_elements([row | flag, visible, p_start, length], fx.Int32),
+            sched,
+            listed.select((SCHED_HEADER + entry * 4) * 4, fx.Int32(extent)),
+        )
+        # The reservations are performed (their results arrived) before the tile counts. Lane 0
+        # counts the tile (then the part), an active tile CORE_COUNT more; the wave reads its
+        # result by v_readlane.
+        rocdl.s_waitcnt(vmcnt=0)
+        cores = active.select(fx.Int32(CORE_COUNT), fx.Int32(0))
+        counted = fx.Int32(0)
+        if lane == 0:
+            counted = fx.atomic_add(
+                counters + COUNTER_STRIDE * part, fx.Int32(1) + cores, syncscope="agent"
+            )
+        counted = prim.readlane(counted, 0)
+        part_tiles = (tiles - part + LIST_PARTS - 1) // LIST_PARTS
+        if (counted & (CORE_COUNT - 1)) == part_tiles - 1:
+            # The part's last tile counts the part, CORE_COUNT more when one of its tiles is
+            # active.
+            any_core = ((counted & -CORE_COUNT) + cores) != 0
+            cores = any_core.select(fx.Int32(CORE_COUNT), fx.Int32(0))
+            counted = fx.Int32(0)
+            if lane == 0:
+                counted = fx.atomic_add(
+                    counters + COUNTER_STRIDE * LIST_PARTS,
+                    fx.Int32(1) + cores,
+                    syncscope="agent",
+                )
+            counted = prim.readlane(counted, 0)
+            parts = _min(tiles, fx.Int32(LIST_PARTS))
+            if (counted & (CORE_COUNT - 1)) == parts - 1:
+                # Every tile is listed: lane s takes slot s's row count (zeroing it) and
+                # publishes the rows of slots 0 .. s; lane 0 whether no tile is active.
+                cores = (counted & -CORE_COUNT) + cores
+                total = fx.atomic_xchg(
+                    counters + COUNTER_STRIDE * (COUNTER_SLOTS + lane),
+                    fx.Int32(0),
+                    syncscope="agent",
+                )
+                for offset in (1, 2, 4, 8, 16, 32):
+                    other = prim.bpermute(((lane - offset) & 63) * 4, total)
+                    total = (lane >= offset).select(total + other, total)
+                words = fx.Vector.from_elements([total], fx.Int32)
+                _buffer_store_words(words, sched, (LIST_BUCKETS + lane) * 4)
+                last_part = (lane & (LIST_PARTS - 1)) == LIST_PARTS - 1
+                bucket_end = last_part.select(
+                    (lane // LIST_PARTS) * 4, fx.Int32(extent)
+                )
+                _buffer_store_words(words, sched, bucket_end)
+                whole = (cores == 0).select(fx.Int32(1), fx.Int32(0))
+                _buffer_store_words(
+                    fx.Vector.from_elements([whole], fx.Int32),
+                    sched,
+                    (lane == 0).select(fx.Int32(SCHED_WHOLE * 4), fx.Int32(extent)),
+                )
+                if lane < COUNTER_SLOTS:
+                    fx.atomic_xchg(
+                        counters + COUNTER_STRIDE * lane, fx.Int32(0), syncscope="agent"
+                    )
+
+
 @flyc.kernel(name="sparse_prefill_pack_kv_fp8_d256", known_block_size=[256, 1, 1])
 def _pack_kernel(
     K: fx.Tensor,
@@ -266,12 +438,18 @@ def _pack_kernel(
     TILE_ACTIVE: fx.Tensor,
     TILE_RESIDUAL: fx.Tensor,
     RESIDUAL_ROWS: fx.Tensor,
+    SCHED: fx.Tensor,
+    COUNTERS: fx.Tensor,
+    DIRECT_META: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     ROWS: fx.Int32,
     CAPACITY: fx.Int32,
     MAX_BLOCKS: fx.Int32,
     TILES: fx.Int32,
+    LISTED: fx.Int32,
+    DIRECT_ROWS: fx.Int32,
+    CAP: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
@@ -282,10 +460,10 @@ def _pack_kernel(
     index = fx.Int32(fx.block_idx.x)
     pack_ctas = (PACKED * HK + 3) // 4
     quant_end = pack_ctas + (ROWS + QROWS - 1) // QROWS
-    # The K3b CTAs (latency-bound) are dispatched first: the bandwidth-bound K/V and Q CTAs
-    # overlap them instead of the launch ending on them.
-    tiles = TILES if fx.const_expr(RESIDUAL) else fx.Int32(0)
-    cta = (index < tiles).select(index + quant_end, index - tiles)
+    # The list CTAs (latency-bound; K3b first on union tiles) are dispatched first: the
+    # bandwidth-bound K/V and Q CTAs overlap them instead of the launch ending on them.
+    listing = LISTED if fx.const_expr(RESIDUAL) else fx.Int32(0)
+    cta = (index < listing).select(index + quant_end, index - listing)
     if fx.const_expr(RESIDUAL):
         storage = (
             fx.SharedAllocator().allocate(fx.Array[fx.Int32, RESIDUAL_WORDS, 16]).peek()
@@ -294,22 +472,43 @@ def _pack_kernel(
             fx.ptrtoint(fx.get_iter(storage.view(fx.make_layout(RESIDUAL_WORDS, 1))))
         )
     if cta >= quant_end:
-        # One CTA per union tile lists its rows' residual blocks (K3b).
+        # One CTA per tile: on a union tile K3b moves its rows' residual blocks to the front
+        # of their block_indices rows; then the tile's direct rows are listed by cost.
         if fx.const_expr(RESIDUAL):
-            residual_tile(
-                BLOCK_ROWS,
-                TILE_COUNTS,
-                TILE_BLOCKS,
-                TILE_META,
-                TILE_ACTIVE,
-                TILE_RESIDUAL,
-                RESIDUAL_ROWS,
-                CAPACITY,
-                MAX_BLOCKS,
-                cta - quant_end,
-                bits,
-                TOPK,
-            )
+            tile = cta - quant_end
+            # K3 sets direct_flag[0] when some tile goes direct or keeps residual blocks:
+            # otherwise no row is listed, and the direct launch exits on the flag (the
+            # schedule and the counters stay as they are). Read before K3b's latency.
+            listed = _uniform(fx.Int32(DIRECT_FLAG[0])) != 0
+            if tile < TILES:
+                residual_tile(
+                    BLOCK_ROWS,
+                    TILE_COUNTS,
+                    TILE_BLOCKS,
+                    TILE_META,
+                    TILE_ACTIVE,
+                    TILE_RESIDUAL,
+                    RESIDUAL_ROWS,
+                    CAPACITY,
+                    MAX_BLOCKS,
+                    tile,
+                    bits,
+                    TOPK,
+                )
+            if listed:
+                _list_tile(
+                    SCHED,
+                    COUNTERS,
+                    TILE_META,
+                    TILE_ACTIVE,
+                    RESIDUAL_ROWS,
+                    DIRECT_META,
+                    DIRECT_ROWS,
+                    LISTED,
+                    CAP,
+                    tile,
+                    TOPK,
+                )
     elif cta >= pack_ctas:
         # CTAs past the blocks quantize Q for both FP8 kernels (one launch fewer).
         quantize_rows(Q, Q8, QS, ROWS, cta - pack_ctas)
@@ -348,12 +547,18 @@ def _pack_launch(
     TILE_ACTIVE: fx.Tensor,
     TILE_RESIDUAL: fx.Tensor,
     RESIDUAL_ROWS: fx.Tensor,
+    SCHED: fx.Tensor,
+    COUNTERS: fx.Tensor,
+    DIRECT_META: fx.Tensor,
     N: fx.Int32,
     PACKED: fx.Int32,
     ROWS: fx.Int32,
     CAPACITY: fx.Int32,
     MAX_BLOCKS: fx.Int32,
     TILES: fx.Int32,
+    LISTED: fx.Int32,
+    DIRECT_ROWS: fx.Int32,
+    CAP: fx.Int32,
     HK: fx.Constexpr[int],
     PER_TOKEN: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
@@ -385,12 +590,18 @@ def _pack_launch(
             TILE_ACTIVE,
             TILE_RESIDUAL,
             RESIDUAL_ROWS,
+            SCHED,
+            COUNTERS,
+            DIRECT_META,
             N,
             PACKED,
             ROWS,
             CAPACITY,
             MAX_BLOCKS,
             TILES,
+            LISTED,
+            DIRECT_ROWS,
+            CAP,
             HK,
             PER_TOKEN,
             SLOTTED,
@@ -402,7 +613,7 @@ def _pack_launch(
             grid=(
                 (PACKED * HK + 3) // 4
                 + (ROWS + QROWS - 1) // QROWS
-                + (TILES if RESIDUAL else 0),
+                + (LISTED if RESIDUAL else 0),
                 1,
                 1,
             ),
@@ -940,81 +1151,38 @@ def _row_max(local):
     return reduce
 
 
-@flyc.kernel(name="sparse_prefill_direct_fp8_d256", known_block_size=[64, 1, 1])
-def _direct_kernel(
-    Q8: fx.Tensor,
-    QS: fx.Tensor,
-    PK: fx.Tensor,
-    PV: fx.Tensor,
-    PSC: fx.Tensor,
-    KS: fx.Tensor,
-    VS: fx.Tensor,
-    OUT: fx.Tensor,
-    BLOCKS: fx.Tensor,
-    META: fx.Tensor,
-    ACTIVE: fx.Tensor,
-    QUERY_TILES: fx.Tensor,
-    RES_ROWS: fx.Tensor,
-    LSE: fx.Tensor,
-    SLOTS: fx.Tensor,
-    H: fx.Constexpr[int],
-    HK: fx.Constexpr[int],
-    NQ: fx.Int32,
-    ROWS: fx.Int32,
-    PACKED: fx.Int32,
-    NK: fx.Int32,
-    SCALE_LOG2: fx.Float32,
-    TOPK: fx.Constexpr[int],
-    GATED: fx.Constexpr[bool],
-    PER_TOKEN: fx.Constexpr[bool],
-    RESIDUAL: fx.Constexpr[bool],
-    RAW: fx.Constexpr[bool],
-    SLOTTED: fx.Constexpr[bool],
-    WIDE: fx.Constexpr[bool],
-):
+@flyc.jit
+def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, table=None):
+    """The wave's query row and KV head: residual (a core/residual row) merges into the
+    union output; visible keys of the row (residual: 4 x its residual blocks). RAW: length
+    the request's, table the wave's LDS row table (TOPK + 64 words)."""
+    H, HK, TOPK, PER_TOKEN = ins.H, ins.HK, ins.TOPK, ins.PER_TOKEN
     group = H // HK
-    # Rows run in reverse: later rows list the most blocks (causal-prefix rows the fewest), so
-    # the heaviest waves start first and the light or empty ones fill the tail.
-    work = ROWS * HK - 1 - fx.Int32(fx.block_idx.x)
-    tile, hkv = work // HK, work % HK
-    row = _uniform(META[tile * 5])
-    p_start, position = _uniform(META[tile * 5 + 2]), _uniform(META[tile * 5 + 4])
-    on = _enabled(fx.Int32(0), fx.Int32(1), row, QUERY_TILES, ACTIVE, GATED, NQ)
     lane = fx.Int32(fx.thread_idx.x) & 63
     n, g = lane & 15, lane >> 4
-    visible = position + 1
-    residual = fx.Boolean(False)
-    if fx.const_expr(RESIDUAL):
-        # A row of an active union tile with residual blocks: its block_indices row lists them
-        # (complete, wholly visible blocks), as if `count` blocks were visible (no tail; the
-        # masked tail slot reads block count of the request); the union output gets merged in.
-        count = _uniform(RES_ROWS[row])
-        residual = ~on & (count > 0)
-        on = on | residual
-        visible = residual.select(count * 4, visible)
     complete = _min(visible >> 2, fx.Int32(TOPK))
     tail = visible & 3
     tail_block = visible >> 2
     blocks = complete + (tail != 0).select(fx.Int32(1), fx.Int32(0))
     chunks = on.select((blocks + CHUNK - 1) // CHUNK, fx.Int32(0))
-    q_rows = fx.Uint32(NQ) * H
+    q_rows = fx.Uint32(ins.NQ) * H
     head_ok = on & (n < group)
     qrow = row * H + hkv * group + n
-    extent = fx.Uint32(PACKED) * HK * BLOCK_BYTES
-    scale_extent = fx.Uint32(PACKED) * HK * 64
-    gq8 = _buffer(Q8, q_rows * D)
+    extent = fx.Uint32(ins.PACKED) * HK * BLOCK_BYTES
+    scale_extent = fx.Uint32(ins.PACKED) * HK * 64
+    gq8 = _buffer(ins.Q8, q_rows * D)
     q_base = head_ok.select(qrow * D + 8 * g, fx.Int32(q_rows * D))
     qs_offset = head_ok.select(qrow * 4, fx.Int32(q_rows * 4))
-    qs = _as_f32(_buffer_words(_buffer(QS, q_rows * 4), qs_offset, 1)[0])
-    c_scale = qs * SCALE_LOG2
+    qs = _as_f32(_buffer_words(_buffer(ins.QS, q_rows * 4), qs_offset, 1)[0])
+    c_scale = qs * ins.SCALE_LOG2
     v_scale = None
     if fx.const_expr(not PER_TOKEN):
-        c_scale = c_scale * fx.Float32(KS[0])
+        c_scale = c_scale * fx.Float32(ins.KS[0])
         # Read with k_scale (a scalar load): past the loop's memory fences it would be a
         # vector load the epilogue waits for.
-        v_scale = fx.Float32(VS[0])
+        v_scale = fx.Float32(ins.VS[0])
     env = SimpleNamespace(
-        raw=RAW,
+        raw=ins.RAW,
         lane=lane,
         hkv=hkv,
         hk=HK,
@@ -1028,12 +1196,12 @@ def _direct_kernel(
         g=g,
         per_token=PER_TOKEN,
         c_scale=c_scale,
-        gblocks=_buffer(BLOCKS, fx.Uint32(ROWS) * TOPK * 4),
-        # Int32 offset of the row's key list (row 0 for a disabled tile, which runs no chunk).
+        gblocks=_buffer(ins.BLOCKS, fx.Uint32(ins.ROWS) * TOPK * 4),
+        # Int32 offset of the row's key list (row 0 for a disabled row, which runs no chunk).
         ids_row=on.select(row * TOPK, fx.Int32(0)),
-        gk=_buffer(PK, extent),
-        gv=_buffer(PV, extent),
-        gsc=_buffer(PSC, scale_extent),
+        gk=_buffer(ins.PK, extent),
+        gv=_buffer(ins.PV, extent),
+        gsc=_buffer(ins.PSC, scale_extent),
         k_lane=(g * 4 + (lane & 3)) * 16,
         v_lane=n * 16,
         # Scale value n (word 0: block n >= 12, field (n % 12) // 4) and 16 + n (word 1,
@@ -1041,29 +1209,32 @@ def _direct_kernel(
         sc_hi=n >= 12,
         sc_lo=((n % 12) >> 2) * 16 + (n & 3) * 4,
         sc_up=(1 + ((n & 7) >> 2)) * 16 + (n & 3) * 4,
-        gout=_buffer(OUT, q_rows * D * 2),
+        gout=_buffer(ins.OUT, q_rows * D * 2),
         out_lane=head_ok.select(qrow * (D * 2) + g * 128, fx.Int32(q_rows * D * 2)),
-        lse=LSE,
-        nq=NQ,
+        lse=ins.LSE,
+        nq=ins.NQ,
         heads=H,
         group=group,
     )
-    allocator = fx.SharedAllocator()
-    if fx.const_expr(RAW):
-        table = allocator.allocate(fx.Array[fx.Int32, TOPK + 64, 16]).peek()
-        env.table = fx.Int32(
-            fx.ptrtoint(fx.get_iter(table.view(fx.make_layout(TOPK + 64, 1))))
+    if fx.const_expr(ins.RAW):
+        env.table = table
+        _raw_env(
+            env,
+            ins.PK,
+            ins.PV,
+            ins.KS,
+            ins.VS,
+            ins.SLOTS,
+            length,
+            ins.NK,
+            TOPK,
+            ins.SLOTTED,
+            ins.WIDE,
         )
-        length = _uniform(META[tile * 5 + 3])
-        _raw_env(env, PK, PV, KS, VS, SLOTS, length, NK, TOPK, SLOTTED, WIDE)
-    if fx.const_expr(RESIDUAL):
+    if fx.const_expr(ins.RESIDUAL):
         # The row's union output O_u for the merge: group heads of 512 bytes. With at most
         # COMPACT_GROUP heads lane n merges dims 64g + 32 (n >> 3) .. + 31 of head n & 7.
-        env.union = (
-            allocator.allocate(fx.Array[fx.Int8, group * 512, 16])
-            .peek()
-            .view(fx.make_layout(group * 512, 1))
-        )
+        env.union = ins.union
         env.union_lane = n * 512 + g * 128
         head = n & 7
         env.union_compact = (
@@ -1079,13 +1250,13 @@ def _direct_kernel(
         # Q (B operand): head n, dims 32c + 8g .. + 7 for MFMA c.
         env.q = [_buffer_words(gq8, q_base + 32 * c, 2) for c in range(8)]
         zero4 = fx.Vector.filled(4, 0, fx.Int32)
-        if fx.const_expr(RAW):
+        if fx.const_expr(ins.RAW):
             _row_table(env)
         ids0 = _chunk_ids(env, fx.Int32(0))
         first_k, first_v, first_sc = _chunk_words(
             env, _chunk_sources(env, ids0, fx.Int32(0)), zero4
         )
-        if fx.const_expr(RESIDUAL):
+        if fx.const_expr(ins.RESIDUAL):
             lse_word = fx.Int32(0)
             if env.residual:
                 lse_word = _union_words(env, row, hkv, lane)
@@ -1169,7 +1340,7 @@ def _direct_kernel(
         inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
         if fx.const_expr(not PER_TOKEN):
             inv = inv * v_scale
-        if fx.const_expr(RESIDUAL):
+        if fx.const_expr(ins.RESIDUAL):
             if env.residual:
                 _merge_o(env, [o[i] for i in range(64)], inv, state[1], total)
             else:
@@ -1177,9 +1348,252 @@ def _direct_kernel(
         else:
             _store_o(env, [o[i] for i in range(64)], inv)
 
-    # Disabled waves (rows another kernel serves) exit without loads.
-    if chunks > 0:
+    if fx.const_expr(ins.listed):
+        # A listed row runs at least one chunk.
         run()
+    else:
+        # Disabled waves (rows another kernel serves) exit without loads.
+        if chunks > 0:
+            run()
+
+
+def _rows_before(sched, word):
+    """Eight wave-uniform schedule words from word on (scalar loads)."""
+    return [
+        _uniform(fx.Vector(rocdl.s_buffer_load(sched, word + 4 * h, count=4))[i])
+        for h in range(2)
+        for i in range(4)
+    ]
+
+
+@flyc.jit
+def _list_entry(sched, ends, j, cap):
+    """The list entry (row | residual << 31, visible keys, p_start, length) at position j of
+    the pack launch's cost order (ends[b]: the rows of buckets 0 .. b)."""
+    bucket, first = fx.Int32(0), fx.Int32(0)
+    for b in fx.range_constexpr(1, LIST_BUCKETS):
+        later = j >= ends[b - 1]
+        bucket = later.select(fx.Int32(b), bucket)
+        first = later.select(ends[b - 1], first)
+    slots = _rows_before(sched, LIST_BUCKETS + bucket * LIST_PARTS)
+    part = fx.Int32(0)
+    for p in fx.range_constexpr(1, LIST_PARTS):
+        later = j >= slots[p - 1]
+        part = later.select(fx.Int32(p), part)
+        first = later.select(slots[p - 1], first)
+    index = j - first
+    where = ((bucket & 1) == 1).select(cap - 1 - index, index)
+    entry = ((bucket >> 1) * LIST_PARTS + part) * cap + where
+    words = fx.Vector(rocdl.s_buffer_load(sched, SCHED_HEADER + entry * 4, count=4))
+    return [_uniform(words[i]) for i in range(4)]
+
+
+def _lds_words(allocator, words):
+    """Byte address of words Int32 words of LDS."""
+    array = allocator.allocate(fx.Array[fx.Int32, words, 16]).peek()
+    return fx.Int32(fx.ptrtoint(fx.get_iter(array.view(fx.make_layout(words, 1)))))
+
+
+def _listed(
+    Q8: fx.Tensor,
+    QS: fx.Tensor,
+    PK: fx.Tensor,
+    PV: fx.Tensor,
+    PSC: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    OUT: fx.Tensor,
+    SLOTS: fx.Tensor,
+    BLOCKS: fx.Tensor,
+    LSE: fx.Tensor,
+    FLAG: fx.Tensor,
+    SCHED: fx.Tensor,
+    CAP: fx.Int32,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    ROWS: fx.Int32,
+    PACKED: fx.Int32,
+    NK: fx.Int32,
+    SCALE_LOG2: fx.Float32,
+    TOPK: fx.Constexpr[int],
+    PER_TOKEN: fx.Constexpr[bool],
+    RAW: fx.Constexpr[bool],
+    SLOTTED: fx.Constexpr[bool],
+    WIDE: fx.Constexpr[bool],
+):
+    """Core/residual plans: the pack launch's list of direct rows, heaviest first (a
+    cost-sorted dispatch keeps the launch from ending on a long row). Work item i is list
+    position i // HK, KV head i % HK; items past the listed rows exit, as every item does
+    when K3 routes no row direct (FLAG[0] clear: the pack launch listed nothing)."""
+    ins = SimpleNamespace(
+        Q8=Q8,
+        QS=QS,
+        PK=PK,
+        PV=PV,
+        PSC=PSC,
+        KS=KS,
+        VS=VS,
+        OUT=OUT,
+        SLOTS=SLOTS,
+        BLOCKS=BLOCKS,
+        LSE=LSE,
+        H=H,
+        HK=HK,
+        NQ=NQ,
+        ROWS=ROWS,
+        PACKED=PACKED,
+        NK=NK,
+        SCALE_LOG2=SCALE_LOG2,
+        TOPK=TOPK,
+        PER_TOKEN=PER_TOKEN,
+        RESIDUAL=True,
+        RAW=RAW,
+        SLOTTED=SLOTTED,
+        WIDE=WIDE,
+        listed=True,
+    )
+    group = H // HK
+    allocator = fx.SharedAllocator()
+    # The row's O_u (_union_words, group heads of 512 bytes).
+    ins.union = (
+        allocator.allocate(fx.Array[fx.Int8, group * 512, 16])
+        .peek()
+        .view(fx.make_layout(group * 512, 1))
+    )
+    table = _lds_words(allocator, TOPK + 64) if fx.const_expr(RAW) else None
+    item = fx.Int32(fx.block_idx.x)
+    sched = _buffer(SCHED, (fx.Uint32(CAP) * (LIST_SLOTS // 2) * 4 + SCHED_HEADER) * 4)
+    ends = _rows_before(sched, fx.Int32(0))
+    listed = (_uniform(fx.Int32(FLAG[0])) != 0).select(
+        ends[LIST_BUCKETS - 1] * HK, fx.Int32(0)
+    )
+    if item < listed:
+        word, visible, p_start, length = _list_entry(sched, ends, item // HK, CAP)
+        row, residual = word & 0x7FFFFFFF, word < 0
+        _direct_row(
+            ins,
+            row,
+            item % HK,
+            p_start,
+            visible,
+            residual,
+            fx.Boolean(True),
+            length,
+            table,
+        )
+
+
+_direct_kernel = flyc.kernel(
+    name="sparse_prefill_direct_fp8_d256", known_block_size=[64, 1, 1]
+)(_listed)
+
+
+def _plain(
+    Q8: fx.Tensor,
+    QS: fx.Tensor,
+    PK: fx.Tensor,
+    PV: fx.Tensor,
+    PSC: fx.Tensor,
+    KS: fx.Tensor,
+    VS: fx.Tensor,
+    OUT: fx.Tensor,
+    SLOTS: fx.Tensor,
+    BLOCKS: fx.Tensor,
+    META: fx.Tensor,
+    ACTIVE: fx.Tensor,
+    QUERY_TILES: fx.Tensor,
+    FLAG: fx.Tensor,
+    H: fx.Constexpr[int],
+    HK: fx.Constexpr[int],
+    NQ: fx.Int32,
+    ROWS: fx.Int32,
+    PACKED: fx.Int32,
+    NK: fx.Int32,
+    SCALE_LOG2: fx.Float32,
+    TOPK: fx.Constexpr[int],
+    GATED: fx.Constexpr[bool],
+    PER_TOKEN: fx.Constexpr[bool],
+    RAW: fx.Constexpr[bool],
+    SLOTTED: fx.Constexpr[bool],
+    WIDE: fx.Constexpr[bool],
+    WAVES: fx.Constexpr[int],
+):
+    """Plans without core/residual tiles: WAVES rows per WG, one wave each."""
+    ins = SimpleNamespace(
+        Q8=Q8,
+        QS=QS,
+        PK=PK,
+        PV=PV,
+        PSC=PSC,
+        KS=KS,
+        VS=VS,
+        OUT=OUT,
+        SLOTS=SLOTS,
+        BLOCKS=BLOCKS,
+        LSE=OUT,
+        H=H,
+        HK=HK,
+        NQ=NQ,
+        ROWS=ROWS,
+        PACKED=PACKED,
+        NK=NK,
+        SCALE_LOG2=SCALE_LOG2,
+        TOPK=TOPK,
+        PER_TOKEN=PER_TOKEN,
+        RESIDUAL=False,
+        RAW=RAW,
+        SLOTTED=SLOTTED,
+        WIDE=WIDE,
+        listed=False,
+    )
+    wave = _uniform(fx.Int32(fx.thread_idx.x) >> 6)
+    table = None
+    if fx.const_expr(RAW):
+        tables = _lds_words(fx.SharedAllocator(), WAVES * (TOPK + 64))
+        table = tables + wave * ((TOPK + 64) * 4)
+    # Rows run in reverse: later rows list the most blocks (causal-prefix rows the fewest),
+    # so the heaviest waves start first and the light or empty ones fill the tail.
+    work = ROWS * HK - 1 - (fx.Int32(fx.block_idx.x) * WAVES + wave)
+    if fx.const_expr(GATED):
+        # K3 raises flag[0] when some tile goes direct: otherwise every wave exits here.
+        if _uniform(fx.Int32(FLAG[0])) != 0:
+            _plain_row(ins, work, META, QUERY_TILES, ACTIVE, GATED, table)
+    else:
+        _plain_row(ins, work, META, QUERY_TILES, ACTIVE, GATED, table)
+
+
+_plain_kernel = flyc.kernel(
+    name="sparse_prefill_direct_fp8_d256", known_block_size=[64 * PLAIN_WAVES, 1, 1]
+)(_plain)
+# Fewer rows than two PLAIN_WAVES WGs per CU: one row per WG, so that they spread over the CUs
+# (PLAIN_WAVES rows per WG would leave most CUs idle).
+_plain_spread_kernel = flyc.kernel(
+    name="sparse_prefill_direct_fp8_d256", known_block_size=[64, 1, 1]
+)(_plain)
+
+
+def _plain_row(ins, work, META, QUERY_TILES, ACTIVE, GATED, table):
+    """Work item `work` of a plain launch: query row work // HK, KV head work % HK (the last
+    WG's spare waves, work < 0, exit). A plain plan's metadata row i is query row i, so the
+    union test does not wait for META."""
+    inside = work >= 0
+    work = inside.select(work, fx.Int32(0))
+    row, hkv = work // ins.HK, work % ins.HK
+    p_start, position = _uniform(META[row * 5 + 2]), _uniform(META[row * 5 + 4])
+    length = _uniform(META[row * 5 + 3]) if fx.const_expr(ins.RAW) else None
+    on = _enabled(fx.Int32(0), fx.Int32(1), row, QUERY_TILES, ACTIVE, GATED, ins.NQ)
+    _direct_row(
+        ins,
+        row,
+        hkv,
+        p_start,
+        position + 1,
+        fx.Boolean(False),
+        on & inside,
+        length,
+        table,
+    )
 
 
 @flyc.jit
@@ -1198,8 +1612,10 @@ def _direct_launch(
     META: fx.Tensor,
     ACTIVE: fx.Tensor,
     QUERY_TILES: fx.Tensor,
-    RES_ROWS: fx.Tensor,
     LSE: fx.Tensor,
+    FLAG: fx.Tensor,
+    SCHED: fx.Tensor,
+    CAP: fx.Int32,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -1213,42 +1629,78 @@ def _direct_launch(
     RAW: fx.Constexpr[bool],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    WAVES: fx.Constexpr[int],
     GRID: fx.Int32,
     stream: fx.Stream,
 ):
+    # FLAG: K3's direct flag; SCHED: the pack launch's schedule (core/residual plans).
     if GRID > 0:
-        _direct_kernel(
-            Q8,
-            QS,
-            PK,
-            PV,
-            PSC,
-            KS,
-            VS,
-            OUT,
-            BLOCKS,
-            META,
-            ACTIVE,
-            QUERY_TILES,
-            RES_ROWS,
-            LSE,
-            SLOTS,
-            H,
-            HK,
-            NQ,
-            ROWS,
-            PACKED,
-            NK,
-            SCALE_LOG2,
-            TOPK,
-            GATED,
-            PER_TOKEN,
-            RESIDUAL,
-            RAW,
-            SLOTTED,
-            WIDE,
-            value_attrs=prim.kernel_attrs(),
-        ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
+        if fx.const_expr(RESIDUAL):
+            _direct_kernel(
+                Q8,
+                QS,
+                PK,
+                PV,
+                PSC,
+                KS,
+                VS,
+                OUT,
+                SLOTS,
+                BLOCKS,
+                LSE,
+                FLAG,
+                SCHED,
+                CAP,
+                H,
+                HK,
+                NQ,
+                ROWS,
+                PACKED,
+                NK,
+                SCALE_LOG2,
+                TOPK,
+                PER_TOKEN,
+                RAW,
+                SLOTTED,
+                WIDE,
+                value_attrs=prim.kernel_attrs(),
+            ).launch(grid=(GRID, 1, 1), block=(64, 1, 1), stream=stream)
+        else:
+            (_plain_kernel if WAVES == PLAIN_WAVES else _plain_spread_kernel)(
+                Q8,
+                QS,
+                PK,
+                PV,
+                PSC,
+                KS,
+                VS,
+                OUT,
+                SLOTS,
+                BLOCKS,
+                META,
+                ACTIVE,
+                QUERY_TILES,
+                FLAG,
+                H,
+                HK,
+                NQ,
+                ROWS,
+                PACKED,
+                NK,
+                SCALE_LOG2,
+                TOPK,
+                GATED,
+                PER_TOKEN,
+                RAW,
+                SLOTTED,
+                WIDE,
+                WAVES,
+                value_attrs=prim.kernel_attrs(),
+            ).launch(
+                grid=((GRID + WAVES - 1) // WAVES, 1, 1),
+                block=(64 * WAVES, 1, 1),
+                stream=stream,
+            )
 
 
 # ---- Host ----
@@ -1271,6 +1723,10 @@ def scratch_specs(prepared):
         specs.append(("packed_value", (rows, BLOCK_BYTES), torch.uint8))
     if prepared.per_token and not prepared.raw:
         specs.append(("scale_records", (rows * 16,), torch.float32))
+    if prepared.residual:
+        # The direct rows' cost order (written by the pack launch's list CTAs).
+        words = SCHED_HEADER + prepared.list_cap * (LIST_SLOTS // 2) * 4
+        specs.append(("schedule", (words,), torch.int32))
     return specs
 
 
@@ -1344,6 +1800,24 @@ def prepare(*, inputs, union=None, per_token, scratch=True):
         union=union,
         residual=union is not None and union.core_ratio > 0,
     )
+    # A plain launch of fewer rows than two of its WGs per CU spreads one row per WG.
+    prepared.waves = PLAIN_WAVES if rows * hk >= 2 * PLAIN_WAVES * get_cu_num() else 1
+    if prepared.residual:
+        if union.query_tile > 64:
+            raise ValueError("FP8 direct lists at most 64 rows per union tile")
+        if union.num_tiles >= LIST_PARTS * CORE_COUNT:
+            raise ValueError(
+                f"FP8 direct lists fewer than {LIST_PARTS * CORE_COUNT} tiles"
+            )
+        # Rows of one part's tiles: a list's length.
+        prepared.list_cap = -(-union.num_tiles // LIST_PARTS) * union.query_tile
+        # The list CTAs' counters, zero between pack launches (the last tile listed zeroes
+        # them): not arena scratch, which other plans overwrite.
+        prepared.counters = torch.zeros(
+            COUNTER_STRIDE * (COUNTER_SLOTS + LIST_SLOTS),
+            dtype=torch.int32,
+            device=device,
+        )
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
     return prepared
@@ -1358,123 +1832,152 @@ def _standin(prepared):
 
 
 def _pack_args(inputs, prepared, stream):
+    """_pack_launch's arguments by parameter name, in its order."""
     empty = _standin(prepared)
     union, residual, raw = prepared.union, prepared.residual, prepared.raw
     standin = prepared.pack_valid
     # A raw call packs nothing: byte stand-ins of PK/PV's rank, so it shares the variant.
     blank = empty.view(torch.uint8).view(1, -1)
-    return (
-        inputs.k,
-        inputs.v,
-        inputs.k_scale.view(-1),
-        inputs.v_scale.view(-1),
-        blank if raw else prepared.packed_key,
-        blank if raw else prepared.packed_value,
-        prepared.scale_records if prepared.per_token and not raw else empty,
-        prepared.pack_sources,
-        prepared.pack_valid,
-        inputs.kv_slots if prepared.slotted else prepared.pack_sources,
-        prepared.direct_flag,
-        inputs.q.view(-1),
-        inputs.q8.view(-1),
-        inputs.qs.view(-1),
-        # K3b CTAs of a core/residual union plan (stand-ins otherwise).
-        inputs.block_indices.view(-1) if residual else standin,
-        union.counts if residual else standin,
-        union.blocks.view(-1) if residual else standin,
-        union.metadata.view(-1) if residual else standin,
-        union.active if residual else standin,
-        union.residual if residual else standin,
-        union.residual_rows if residual else standin,
-        inputs.k.shape[0],
-        prepared.packed_blocks,
-        inputs.q.shape[0] * inputs.q.shape[1],
-        union.block_capacity if residual else 0,
-        union.max_blocks if residual else 0,
-        union.union_tiles if residual else 0,
-        prepared.hk,
-        prepared.per_token,
-        prepared.slotted,
-        prepared.gated,
-        residual,
-        inputs.topk if residual else 0,
-        stream,
-    )
+    return {
+        "K": inputs.k,
+        "V": inputs.v,
+        "KS": inputs.k_scale.view(-1),
+        "VS": inputs.v_scale.view(-1),
+        "PK": blank if raw else prepared.packed_key,
+        "PV": blank if raw else prepared.packed_value,
+        "PSC": prepared.scale_records if prepared.per_token and not raw else empty,
+        "SOURCES": prepared.pack_sources,
+        "VALID": prepared.pack_valid,
+        "SLOTS": inputs.kv_slots if prepared.slotted else prepared.pack_sources,
+        "DIRECT_FLAG": prepared.direct_flag,
+        "Q": inputs.q.view(-1),
+        "Q8": inputs.q8.view(-1),
+        "QS": inputs.qs.view(-1),
+        # K3b and list CTAs of a core/residual union plan (stand-ins otherwise).
+        "BLOCK_ROWS": inputs.block_indices.view(-1) if residual else standin,
+        "TILE_COUNTS": union.counts if residual else standin,
+        "TILE_BLOCKS": union.blocks.view(-1) if residual else standin,
+        "TILE_META": union.metadata.view(-1) if residual else standin,
+        "TILE_ACTIVE": union.active if residual else standin,
+        "TILE_RESIDUAL": union.residual if residual else standin,
+        "RESIDUAL_ROWS": union.residual_rows if residual else standin,
+        "SCHED": prepared.schedule if residual else standin,
+        "COUNTERS": prepared.counters if residual else standin,
+        "DIRECT_META": prepared.metadata.view(-1),
+        "N": inputs.k.shape[0],
+        "PACKED": prepared.packed_blocks,
+        "ROWS": inputs.q.shape[0] * inputs.q.shape[1],
+        "CAPACITY": union.block_capacity if residual else 0,
+        "MAX_BLOCKS": union.max_blocks if residual else 0,
+        "TILES": union.union_tiles if residual else 0,
+        "LISTED": union.num_tiles if residual else 0,
+        "DIRECT_ROWS": prepared.rows,
+        "CAP": prepared.list_cap if residual else 0,
+        "HK": prepared.hk,
+        "PER_TOKEN": prepared.per_token,
+        "SLOTTED": prepared.slotted,
+        "GATED": prepared.gated,
+        "RESIDUAL": residual,
+        "TOPK": inputs.topk if residual else 0,
+        "stream": stream,
+    }
 
 
 def _direct_args(inputs, prepared, out, stream):
+    """_direct_launch's arguments by parameter name, in its order."""
     empty = _standin(prepared)
-    raw = prepared.raw
-    return (
-        inputs.q8.view(-1),
-        inputs.qs.view(-1),
-        inputs.k if raw else prepared.packed_key,
-        inputs.v if raw else prepared.packed_value,
-        prepared.scale_records if prepared.per_token and not raw else empty,
-        inputs.k_scale.view(-1),
-        inputs.v_scale.view(-1),
-        out.view(-1),
-        inputs.kv_slots if raw and prepared.slotted else prepared.metadata.view(-1),
-        inputs.scale_log2,
-        prepared.source_blocks.view(-1),
-        prepared.metadata.view(-1),
-        prepared.active,
-        prepared.query_tiles,
-        prepared.union.residual_rows if prepared.residual else prepared.query_tiles,
-        prepared.union.lse.view(-1) if prepared.residual else empty,
-        inputs.q.shape[1],
-        prepared.hk,
-        inputs.q.shape[0],
-        prepared.rows,
-        prepared.packed_blocks,
-        inputs.k.shape[0],
-        inputs.topk,
-        prepared.gated,
-        prepared.per_token,
-        prepared.residual,
-        raw,
-        raw and prepared.slotted,
-        prepared.wide,
-        prepared.rows * prepared.hk,
-        stream,
-    )
+    raw, residual = prepared.raw, prepared.residual
+    return {
+        "Q8": inputs.q8.view(-1),
+        "QS": inputs.qs.view(-1),
+        "PK": inputs.k if raw else prepared.packed_key,
+        "PV": inputs.v if raw else prepared.packed_value,
+        "PSC": prepared.scale_records if prepared.per_token and not raw else empty,
+        "KS": inputs.k_scale.view(-1),
+        "VS": inputs.v_scale.view(-1),
+        "OUT": out.view(-1),
+        "SLOTS": (
+            inputs.kv_slots if raw and prepared.slotted else prepared.metadata.view(-1)
+        ),
+        "SCALE_LOG2": inputs.scale_log2,
+        "BLOCKS": prepared.source_blocks.view(-1),
+        "META": prepared.metadata.view(-1),
+        "ACTIVE": prepared.active,
+        "QUERY_TILES": prepared.query_tiles,
+        "LSE": prepared.union.lse.view(-1) if residual else empty,
+        "FLAG": prepared.direct_flag,
+        "SCHED": prepared.schedule if residual else empty,
+        "CAP": prepared.list_cap if residual else 0,
+        "H": inputs.q.shape[1],
+        "HK": prepared.hk,
+        "NQ": inputs.q.shape[0],
+        "ROWS": prepared.rows,
+        "PACKED": prepared.packed_blocks,
+        "NK": inputs.k.shape[0],
+        "TOPK": inputs.topk,
+        "GATED": prepared.gated,
+        "PER_TOKEN": prepared.per_token,
+        "RESIDUAL": residual,
+        "RAW": raw,
+        "SLOTTED": raw and prepared.slotted,
+        "WIDE": prepared.wide,
+        "WAVES": prepared.waves,
+        "GRID": prepared.rows * prepared.hk,
+        "stream": stream,
+    }
 
 
-def _compile(cache, key, launch, args, empty, device, stream, hints=None):
-    """Compile once per specialization. Compiling runs the launcher, so args[empty] (the pack's
-    Q rows, the direct grid) is 0 and it launches nothing: neither kernel is idempotent
-    (the pack's K3b CTAs compact block_indices in place, residual rows merge into out).
-    """
-    compiled = cache.get(key)
+def _compile(cache, launch, args, key, empty, device, stream, hints=None):
+    """Compile once per specialization: the launcher's constexpr arguments named by key.
+    Compiling runs the launcher, so the argument named empty (the pack's Q rows, the direct
+    grid) is 0 and it launches nothing: neither kernel is idempotent (the pack's K3b CTAs
+    compact block_indices in place, residual rows merge into out). args: by name, in the
+    launcher's order."""
+    specialization = (device, *(args[name] for name in key))
+    compiled = cache.get(specialization)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm the QSA specialization before graph capture")
-        args = list(args)
-        args[empty] = 0
+        args = {**args, empty: 0}
         compile_ = flyc.compile if hints is None else flyc.compile[hints]
         with torch.cuda.device(device), torch.cuda.stream(stream):
-            compiled = cache[key] = compile_(launch, *args)
+            compiled = cache[specialization] = compile_(launch, *args.values())
     return compiled
 
 
 def _compiled(inputs, prepared, out, stream):
+    """The pack and direct launchers' arguments (by name, in their order) and compiled
+    launchers. The softmax scale is a kernel argument, not part of a specialization."""
     device = inputs.q.device
     pack = _pack_args(inputs, prepared, stream)
     direct = _direct_args(inputs, prepared, out, stream)
-    # Specializations: pack (HK, PER_TOKEN, SLOTTED, GATED, RESIDUAL, TOPK); direct (H,
-    # HK, TOPK, GATED, PER_TOKEN, RESIDUAL, RAW, SLOTTED, WIDE); the softmax scale is a kernel
-    # argument.
     pack_fn = _compile(
-        _PACK, (device, *pack[27:33]), _pack_launch, pack, 23, device, stream
+        _PACK,
+        _pack_launch,
+        pack,
+        ("HK", "PER_TOKEN", "SLOTTED", "GATED", "RESIDUAL", "TOPK"),
+        "ROWS",
+        device,
+        stream,
     )
-    key = (device, *direct[16:18], *direct[22:29])
     # Two direct waves per SIMD.
     direct_fn = _compile(
         _DIRECT,
-        key,
         _direct_launch,
         direct,
-        29,
+        (
+            "H",
+            "HK",
+            "TOPK",
+            "GATED",
+            "PER_TOKEN",
+            "RESIDUAL",
+            "RAW",
+            "SLOTTED",
+            "WIDE",
+            "WAVES",
+        ),
+        "GRID",
         device,
         stream,
         {"waves_per_eu": 2},
@@ -1484,17 +1987,17 @@ def _compiled(inputs, prepared, out, stream):
 
 def run(*, inputs, prepared, out, stage="both"):
     """Pack the context and quantize Q into inputs.q8/qs (stage "pack"; the FP8 union kernel
-    reads its V^T and Q8), then the direct waves ("direct"). inputs carries q8/qs,
-    k_scale/v_scale and scale_log2 like the union kernel."""
+    reads its Q8), then the direct waves ("direct"). inputs carries q8/qs, k_scale/v_scale
+    and scale_log2 like the union kernel."""
     if prepared.rows == 0:
         return
     stream = torch.cuda.current_stream(inputs.q.device)
     with torch.cuda.device(inputs.q.device):
         pack, direct, pack_fn, direct_fn = _compiled(inputs, prepared, out, stream)
         if stage in ("pack", "both"):
-            pack_fn(*pack)
+            pack_fn(*pack.values())
         if stage in ("direct", "both"):
-            direct_fn(*direct)
+            direct_fn(*direct.values())
 
 
 def launchers(*, inputs, prepared, out):
@@ -1509,33 +2012,25 @@ def launchers(*, inputs, prepared, out):
     slotted, raw = prepared.slotted, prepared.raw
     # Bind only fixed arguments: the cached workspace must not keep this call's Q, K/V,
     # scales, slot table or out alive.
-    pack_mid, pack_table, flag, pack_tail = pack[4:9], pack[9], pack[10], pack[12:]
-    packed_kv, records, table_fixed, direct_tail = (
-        direct[2:4],
-        direct[4],
-        direct[8],
-        direct[10:],
-    )
+    names, values = tuple(pack), tuple(pack.values())
+    at_slots, at_q = names.index("SLOTS"), names.index("Q")
+    pack_mid, pack_table = values[4:at_slots], values[at_slots]
+    pack_between, pack_tail = values[at_slots + 1 : at_q], values[at_q + 1 :]
     if slotted:
         pack_table = None
+    names, values = tuple(direct), tuple(direct.values())
+    at_slots = names.index("SLOTS")
+    packed_kv, records = values[2:4], values[4]
+    table_fixed, direct_tail = values[at_slots], values[at_slots + 2 :]
     if raw:
         packed_kv = None
         if slotted:
             table_fixed = None
-    del pack, direct
+    del pack, direct, values
 
     def pack_launch(q, k, v, ks, vs, slots):
-        pack_fn(
-            k,
-            v,
-            ks,
-            vs,
-            *pack_mid,
-            slots if slotted else pack_table,
-            flag,
-            q,
-            *pack_tail,
-        )
+        table = slots if slotted else pack_table
+        pack_fn(k, v, ks, vs, *pack_mid, table, *pack_between, q, *pack_tail)
 
     def direct_launch(q8, qs, k, v, o, ks, vs, slots, scale_log2):
         kv = (k, v) if raw else packed_kv
