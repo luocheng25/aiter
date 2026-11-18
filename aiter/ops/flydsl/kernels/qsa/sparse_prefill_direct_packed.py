@@ -403,8 +403,12 @@ class _DirectLoop:
         # dependent block-table load. A tile's rows shuffle under the previous tile's PV.
         row0 = prim.bpermute((lane >> 4) * self.row_lane, fx.Int32(offset0))
         row1 = prim.bpermute((lane >> 4) * self.row_lane, fx.Int32(offset1))
+        boundary = self.part_boundary()
         for t in range(fx.Int32(start), tiles, fx.Int32(1)):
             self.pace(t)
+            boundary, maximum, total, o0, o1 = self.part_start(
+                t, boundary, maximum, total, o0, o1
+            )
             rocdl.s_waitcnt(lgkmcnt=0)
             prim.sched_barrier(0)
             values0 = self.values(row0, t, 0, 0)
@@ -477,6 +481,16 @@ class _DirectLoop:
 
     def pace(self, t):
         """Hook at the start of tile t (the persistent launch keeps sibling waves in step)."""
+
+    def part_boundary(self):
+        """The first tile part_start acts at (-1: none)."""
+        return fx.Int32(-1)
+
+    def part_start(self, t, boundary, maximum, total, o0, o1):
+        """Hook at the start of tile t on the online softmax state (m, l, O), acting at tile
+        `boundary`; returns the next boundary and the state. Raw direct repeats the packed
+        launch's split there (sparse_prefill_direct._Raw)."""
+        return boundary, maximum, total, o0, o1
 
 
 class _Packed(_DirectLoop):

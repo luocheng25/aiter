@@ -22,8 +22,12 @@ kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
 reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
 1024-row chunk, starts at 4 GiB), one request whose K and V each span the
 4 GiB - 1 MiB limit (raw direct and union), ragged batches with an empty request,
-HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and
-constant Q/K whose logits sit near +1e11 on the union path (``large_logits``).
+HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections,
+constant Q/K whose logits sit near +1e11 on the union path (``large_logits``) and
+two-request batches whose direct rows read raw or packed K/V. Some of them
+(RAW_CHECKED) run again with every direct row on the raw K/V, which must give the
+packed call's bits, also for the rows the packed direct launch splits into key-tile
+parts (a direct-only call, over two KV heads, and a union call's direct tiles).
 The graph case captures a union layout on its own stream, replays it after
 rewriting its indices in place, then again after another layout grows the
 stream's scratch arena, which must keep the captured scratch allocated. The
@@ -32,7 +36,7 @@ token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
 for bit, also when the next call finds the pages moved to other pool rows (the
 fixed selection of ``kv_slots_prefill_2048`` then reuses its plan and only maps
-its union blocks again). The span limit cases must be rejected: one request whose
+its union blocks again), and for two of them by raw direct through the slot table. The span limit cases must be rejected: one request whose
 K/V spans one token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry
 past it.
 Cases needing more device memory than is free are skipped with a warning.
@@ -250,6 +254,15 @@ CASES = {
     **MIXED_CASES,
     **FP8_LAYOUTS,
 }
+# Functional layouts also run with every direct row on the raw K/V (raw_direct), which must
+# give the packed call's bits -> the groups at which the packed direct launch splits some
+# rows into key-tile parts on MI308X (direct_split; the raw rows then repeat the split):
+# rows of a direct-only call, over two KV heads, and of a union call's direct tiles.
+RAW_CHECKED = {
+    "extend_17_ctx_30017": (12, 6, 3),
+    "hk2_ragged": (12, 6, 3),
+    "mixed_union_packed": (12, 3),
+}
 # name -> (captured union layout, layout whose first call then grows the scratch arena:
 # its packed KV outgrows the captured layout's)
 GRAPH_CASES = {"graph_ragged_4": ("ragged_4", "chunk_1024_ctx_31024_random")}
@@ -282,6 +295,9 @@ SLOT_CASES = {
     # reuse the plan, and with the pages moved only K3 maps the union blocks again.
     "kv_slots_prefill_2048": ("prefill_2048", None, 1),
 }
+# Also read by raw direct through the slot table (raw_direct; its block ids from the
+# wave's LDS table), which must give the gathered packed call's split rows' bits.
+SLOT_RAW_CHECKED = ("kv_slots_hk2_ragged", "kv_slots_g16_hk2_ragged")
 # name -> (K/V tokens of one request, read through kv_slots): one past the
 # 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
 SPAN_LIMIT_CASES = {
@@ -1268,6 +1284,30 @@ def direct_persistent():
     return latest_workspace().direct.persistent
 
 
+def direct_split():
+    """Work items the latest call's BF16 packed direct launch split into key-tile parts:
+    unless batch_invariant, its last slots (_split_rule in
+    sparse_prefill_direct_packed: the slots of the inactive union tiles its pack lists,
+    gated, else of every row); 0 for a raw direct call."""
+    direct = latest_workspace().direct
+    if not direct.split or direct.packed_key is None:
+        return 0
+    ctas, hk = direct.ctas, direct.pack_shape[1]
+    if direct.gated:
+        tile = direct.union_tile * hk
+        slots = int(direct.listed.item()) * tile if int(direct.direct_flag[0]) else 0
+        launched = direct.union_tiles * tile
+    else:
+        slots = direct.num_tiles * hk
+        rows = min(slots, slots % ctas + ctas // 16)
+        extra = 3 * rows if rows * 4 <= ctas else slots if slots * 2 <= ctas else 0
+        launched = slots + extra
+    rows = min(slots, slots % ctas + ctas // 16)
+    shift = 2 if rows * 4 <= ctas else 1 if slots * 2 <= ctas else 0
+    rows = min(rows, (launched - slots) // 3 if shift == 2 else launched - slots)
+    return rows if shift and rows > 0 else 0
+
+
 def union_tile_rows():
     """Query rows of the union tiles the latest call ran (its plan's tile metadata: first
     row, rows, ...; active tiles ran union)."""
@@ -1369,13 +1409,32 @@ def test_qsa_sparse_attention(case, heads):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     fn, args, kwargs = candidates["flydsl"]
+    into = fn(*args, **kwargs, out=torch.full_like(q, float("nan")))
     into_nan = checkAllclose(
         ref,
-        fn(*args, **kwargs, out=torch.full_like(q, float("nan"))).to(dtypes.fp32),
+        into.to(dtypes.fp32),
         rtol=2e-2,
         atol=2e-2,
         msg=f"{case} H{heads} flydsl into NaN: out",
     )
+    if case in RAW_CHECKED:
+        packed, split = routes(), direct_split()
+        with raw_direct():
+            ret["raw direct differing"] = mismatched_bits(
+                fn(*args, **kwargs), into, f"{case} H{heads} raw direct vs packed: out"
+            )
+            raw = routes()
+        ret["direct split slots"] = split
+        group = heads // kv_heads
+        assert get_cu_num() != 80 or (
+            packed["direct"] == "packed"
+            and raw["direct"] == "raw"
+            and (split > 0) == (group in RAW_CHECKED[case])
+        ), f"{case} H{heads}: direct {packed} then {raw}, {split} split slots"
+        assert not ret["raw direct differing"], (
+            f"{case} H{heads}: raw direct differs from packed in "
+            f"{ret['raw direct differing']} elements"
+        )
     # The SGLang kernels are only the baseline: FlyDSL alone must pass the check.
     assert (
         ret["flydsl err"] == into_nan == 0
@@ -1520,7 +1579,7 @@ def test_qsa_kv_slots(case, heads):
     """K/V read in place from a token pool through kv_slots, against the packed call on
     the gathered rows (what a caller without kv_slots runs); both match bit for bit, also
     in a next call after the pages moved to other pool rows (a fixed selection's plan is
-    then reused: plan_reused)."""
+    then reused: plan_reused), and SLOT_RAW_CHECKED by raw direct."""
     layout, pool_rows, first_page = SLOT_CASES[case]
     query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
     generator = torch.Generator(device="cuda").manual_seed(
@@ -1603,6 +1662,21 @@ def test_qsa_kv_slots(case, heads):
     assert (
         moved_bits == 0
     ), f"{case} H{heads}: moved pages differ from the gathered call"
+    if case in SLOT_RAW_CHECKED:
+        with raw_direct():
+            raw_bits = mismatched_bits(
+                qsa_sparse_prefill(
+                    q, pool_k, pool_v, indices, **kwargs, kv_slots=moved
+                ),
+                outputs["flydsl_gather"],
+                f"{case} H{heads} raw direct through kv_slots vs flydsl_gather: out",
+            )
+            taken = routes()
+        assert get_cu_num() != 80 or taken["direct"] == "raw", f"{case}: took {taken}"
+        assert (
+            not raw_bits
+        ), f"{case} H{heads}: raw direct differs in {raw_bits} elements"
+        ret["raw direct differing"] = raw_bits
     ret["plan reused"] = reused
     return ret
 
@@ -2728,7 +2802,7 @@ def main():
     suites = (
         (
             "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, *MIXED_CASES],
             test_qsa_sparse_attention,
         ),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),

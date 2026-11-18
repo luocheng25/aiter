@@ -171,10 +171,13 @@ class SparsePlan:
     pool_blocks: torch.Tensor | None = None
     tails: torch.Tensor | None = None
     # Gated raw direct (set by its plan): K3 lists the row groups holding a direct row, so the
-    # direct grid runs them first. direct_flag[1] counts them.
+    # direct grid runs them first. direct_flag[1] counts them. K3 also ranks the direct tiles
+    # in tile order (tile_ranks; direct_flag[2] counts them): raw direct splits the slots the
+    # packed direct launch would.
     direct_meta: torch.Tensor | None = None
     direct_list: torch.Tensor | None = None
     direct_groups: int = 0
+    tile_ranks: torch.Tensor | None = None
     # Key-range parts per task (SPLIT_PARTS for a split-capable plan, else 1); with
     # split > 1 task_order entries encode (task, slot, part, split) and the union kernel
     # writes / merges partial records (partials, split_counters).
@@ -2129,6 +2132,67 @@ def _direct_groups(
         GROUP_LIST[base + _below(mask)] = group
 
 
+RANK_TILES = 8  # tiles per thread and pass of _rank_direct_tiles
+
+
+@flyc.jit
+def _rank_direct_tiles(
+    COUNTS: fx.Tensor,
+    COSTS: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
+    scratch,
+    threshold,
+    UNION_TILES: fx.Int32,
+    TILES: fx.Int32,
+):
+    """Each direct tile's rank among them in tile order into TILE_RANKS, their number into
+    DIRECT_FLAG[2]: the order of the packed direct launch's slots (its pack lists the tiles
+    _order publishes inactive), whose split raw direct repeats."""
+    tid = fx.thread_idx.x
+    wave = _uniform(tid >> 6)
+    zero = fx.Int32(0)
+    base = zero
+    # The scratch _route read is free.
+    fx.gpu.barrier()
+    for start in range(zero, TILES, fx.Int32(THREADS * RANK_TILES)):
+        tiles = [start + tid * RANK_TILES + i for i in fx.range_constexpr(RANK_TILES)]
+        words = [
+            (
+                COUNTS[_min(tile, UNION_TILES - 1)],
+                COSTS[_min(tile, UNION_TILES - 1) * 3 + 2],
+            )
+            for tile in tiles
+        ]
+        direct = []
+        for tile, (count, route) in zip(tiles, words):
+            # _order's route; tiles past the union candidates are direct.
+            active = (
+                (tile < UNION_TILES) & (route == 1) & (((count + 15) >> 4) <= threshold)
+            )
+            direct.append((tile < TILES) & ~active)
+        below, total = zero, zero
+        for flag in direct:
+            mask = _ballot(flag)
+            below = below + _below(mask)
+            total = total + _count(mask)
+        scratch[wave] = total
+        fx.gpu.barrier()
+        totals = [scratch[w] for w in range(THREADS // 64)]
+        fx.gpu.barrier()
+        position = base + below
+        for w in fx.range_constexpr(THREADS // 64 - 1):
+            position = position + (fx.Int32(w) < wave).select(totals[w], zero)
+        for tile, flag in zip(tiles, direct):
+            if flag:
+                TILE_RANKS[tile] = position
+            position = position + flag.select(fx.Int32(1), zero)
+        for w in fx.range_constexpr(THREADS // 64):
+            base = base + totals[w]
+    if tid == 0:
+        DIRECT_FLAG[2] = base
+
+
 # Mask entry layout: slot s of a group sits in quarter (s % 8) // 2, nibble (s // 8) * 2 + s % 2;
 # quarters 0, 1 form the entry's first word, 2, 3 its second.
 MASK_WORD = tuple(((s % 8) // 2) >> 1 for s in range(16))
@@ -2440,6 +2504,7 @@ def _order_masks_kernel(
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
     COUNTERS: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -2448,6 +2513,7 @@ def _order_masks_kernel(
     CAP: fx.Int32,
     TILES: fx.Int32,
     GROUPS: fx.Int32,
+    RANKS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -2479,7 +2545,8 @@ def _order_masks_kernel(
         .view(fx.make_layout(words, 1))
     )
     program = fx.block_idx.x
-    # The order CTA, then MASK_PARTS mask CTAs per tile, then the raw direct group-list CTAs.
+    # The order CTA, then MASK_PARTS mask CTAs per tile, then the raw direct group-list CTAs
+    # and one CTA ranking the direct tiles (RANKS).
     mask_ctas = TILES * MASK_PARTS
     if fx.const_expr(ORDER_PRIORITY):  # noqa: SIM102 - a compile-time branch
         if program == 0:
@@ -2538,7 +2605,7 @@ def _order_masks_kernel(
                         BALANCE,
                         descents,
                     )
-        else:
+        elif program - 1 - mask_ctas < (GROUPS + THREADS - 1) // THREADS:
             _direct_groups(
                 COUNTS,
                 COSTS,
@@ -2550,6 +2617,17 @@ def _order_masks_kernel(
                 program - 1 - mask_ctas,
                 threshold,
                 GROUPS,
+            )
+        else:
+            _rank_direct_tiles(
+                COUNTS,
+                COSTS,
+                TILE_RANKS,
+                DIRECT_FLAG,
+                scratch,
+                threshold,
+                TILES,
+                TASKS // (HK * SLICES),
             )
     else:
         # MASK_PARTS mask CTAs per union tile, last tile first.
@@ -2594,6 +2672,7 @@ def _order_masks_launch(
     GROUP_META: fx.Tensor,
     GROUP_LIST: fx.Tensor,
     COUNTERS: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
     TASKS: fx.Int32,
     GRID: fx.Int32,
     SIZE: fx.Int32,
@@ -2602,6 +2681,7 @@ def _order_masks_launch(
     CAP: fx.Int32,
     TILES: fx.Int32,
     GROUPS: fx.Int32,
+    RANKS: fx.Int32,
     TASK_SHARE: fx.Float32,
     DIRECT_STEP: fx.Float32,
     DIRECT_FIXED: fx.Float32,
@@ -2639,6 +2719,7 @@ def _order_masks_launch(
             GROUP_META,
             GROUP_LIST,
             COUNTERS,
+            TILE_RANKS,
             TASKS,
             GRID,
             SIZE,
@@ -2647,6 +2728,7 @@ def _order_masks_launch(
             CAP,
             TILES,
             GROUPS,
+            RANKS,
             TASK_SHARE,
             DIRECT_STEP,
             DIRECT_FIXED,
@@ -2665,7 +2747,11 @@ def _order_masks_launch(
             ORDER_PRIORITY,
             value_attrs=prim.kernel_attrs(),
         ).launch(
-            grid=(1 + TILES * MASK_PARTS + (GROUPS + THREADS - 1) // THREADS, 1, 1),
+            grid=(
+                1 + TILES * MASK_PARTS + (GROUPS + THREADS - 1) // THREADS + RANKS,
+                1,
+                1,
+            ),
             block=(THREADS, 1, 1),
             stream=stream,
         )
@@ -2996,7 +3082,7 @@ def allocate_plan(
         task_order=torch.empty(
             _cdiv(tasks * split, launch_grid) * launch_grid if grid else 0, **kwargs
         ),
-        direct_flag=torch.empty(2, **kwargs),
+        direct_flag=torch.empty(3, **kwargs),
         query_tiles=upload(query_tiles, inputs.q.device),
         query_tile=query_tile,
         group_padded=group,
@@ -3168,6 +3254,7 @@ def _launches(inputs, plan, stream):
         plan.direct_meta.view(-1) if plan.direct_groups else standin,
         plan.direct_list if plan.direct_groups else standin,
         plan.split_counters if plan.split > 1 else standin,
+        plan.tile_ranks if plan.direct_groups else standin,
         tasks,
         plan.grid,
         size,
@@ -3176,6 +3263,7 @@ def _launches(inputs, plan, stream):
         plan.block_capacity,
         plan.union_tiles,
         plan.direct_groups,
+        1 if plan.direct_groups else 0,
         *plan.route_costs,
         hk,
         slices,
@@ -3205,7 +3293,7 @@ def _launches(inputs, plan, stream):
         mask_parts,
         order_priority,
     )
-    yield _compiled(_order_masks_launch, args, 23, constants), args
+    yield _compiled(_order_masks_launch, args, 24, constants), args
 
 
 def run(*, inputs, plan):
