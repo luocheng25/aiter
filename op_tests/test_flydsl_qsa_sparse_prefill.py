@@ -2510,19 +2510,46 @@ def main():
         )
         return
 
+    suites = (
+        (
+            "functional",
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
+            test_qsa_sparse_attention,
+        ),
+        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
+        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
+        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
+        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
+        ("fp8", list(FP8_CASES), test_qsa_fp8),
+        ("fp8 attention sink", list(FP8_SINK_CASES), test_qsa_fp8_sink),
+        ("fp8 uniform", list(FP8_UNIFORM_CASES), test_qsa_fp8_uniform),
+        ("fp8 query reference", list(FP8_QUERY_CASES), test_qsa_fp8_query),
+        ("fp8 graph", list(FP8_GRAPH_CASES), test_qsa_fp8_graph),
+        ("fp8 workspace", list(FP8_WORKSPACE_CASES), test_qsa_fp8_workspace),
+        ("fp8 input errors", list(FP8_ERROR_CASES), test_qsa_fp8_input_errors),
+        ("fp8 batch invariance", list(FP8_BATCH_CASES), test_qsa_fp8_batch_invariance),
+    )
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
     )
+    # Only names some suite runs: a layout only other rows use would run nothing.
+    runnable = {case for _, cases, _ in suites for case in cases}
     all_cases = [
-        *CASES,
-        *GRAPH_CASES,
-        *SLOT_CASES,
-        *SPAN_LIMIT_CASES,
-        *SCALE_CASES,
-        *BATCH_CASES,
-        *FP8_LAYOUT_CASES,
-        *FP8_BATCH_CASES,
+        case
+        for case in (
+            *CASES,
+            *GRAPH_CASES,
+            *SLOT_CASES,
+            *SPAN_LIMIT_CASES,
+            *SCALE_CASES,
+            *BATCH_CASES,
+            *FP8_LAYOUT_CASES,
+            *FP8_BATCH_CASES,
+        )
+        if case in runnable
     ]
     parser.add_argument(
         "-c",
@@ -2546,27 +2573,7 @@ def main():
     args = parser.parse_args()
 
     layouts = {**GRAPH_CASES, **SLOT_CASES, **SCALE_CASES, **FP8_LAYOUT_CASES}
-    for suite, cases, test in (
-        (
-            "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
-            test_qsa_sparse_attention,
-        ),
-        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
-        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
-        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
-        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
-        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
-        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
-        ("fp8", list(FP8_CASES), test_qsa_fp8),
-        ("fp8 attention sink", list(FP8_SINK_CASES), test_qsa_fp8_sink),
-        ("fp8 uniform", list(FP8_UNIFORM_CASES), test_qsa_fp8_uniform),
-        ("fp8 query reference", list(FP8_QUERY_CASES), test_qsa_fp8_query),
-        ("fp8 graph", list(FP8_GRAPH_CASES), test_qsa_fp8_graph),
-        ("fp8 workspace", list(FP8_WORKSPACE_CASES), test_qsa_fp8_workspace),
-        ("fp8 input errors", list(FP8_ERROR_CASES), test_qsa_fp8_input_errors),
-        ("fp8 batch invariance", list(FP8_BATCH_CASES), test_qsa_fp8_batch_invariance),
-    ):
+    for suite, cases, test in suites:
         df = []
         selected = [case for case in args.case if case in cases]
         for case, group in [
