@@ -127,7 +127,7 @@ NEG_INF_BITS = -8388608  # FP32 -inf
 KPRE, BAR1, BAR2 = 10, 48, 48
 # Issue cycles per MFMA slot; stream (release MFMA, deadline MFMA, estimated slots) per part.
 SLOT32 = 30
-P1_EXP, P1_VWRITE, P1_KLOAD = (0, 63, 21), (0, BAR1 - 2, 24), (0, 56, 48)
+P1_EXP, P1_VWRITE, P1_KLOAD = (0, 63, 26), (0, BAR1 - 2, 24), (0, 56, 48)
 P1_META, P1_VLOAD0 = (0, 12, 2), (0, 60, 48)
 P2_SOFT, P2_KWRITE, P2_VLOAD = (2, BAR2 - 8, 21), (6, BAR2 - 2, 16), (0, 62, 48)
 SOFT_DUE = 63  # deadline of the softmax steps after the row-max shuffle
@@ -149,7 +149,7 @@ def _first_pv32(kb, c):
 
 # P chunks (kb, c) in EXP_CHUNKS order: the first P1_CHUNKS under QK, the rest under the
 # PV MFMAs before their first use.
-P1_CHUNKS, P2_EXP = 5, (0, _first_pv32(*EXP_CHUNKS[5]) - 2, 13)
+P1_CHUNKS, P2_EXP = 5, (0, _first_pv32(*EXP_CHUNKS[5]) - 2, 16)
 
 
 class _Env32:
@@ -237,8 +237,9 @@ def _part32(count, issue, streams, bar, after_bar, lgkm):
     """count MFMAs, issue(i) emitting MFMA i with its own operand reads and returning their
     estimated issue cycles. Between MFMAs the ready streams step, least laxity first,
     until the MFMA's SLOT32 cycles are filled (an overrun is carried, idle time is not).
-    After MFMA bar every LDS access lands (lgkmcnt 0), the CTA meets, and after_bar()'s
-    stream (deadline: AFTER_BAR MFMAs later) is released."""
+    After MFMA bar only the steps due by then run (a wave's later arrival there idles
+    every wave's MFMAs), every LDS access lands (lgkmcnt 0), the CTA meets, and
+    after_bar()'s stream (deadline: AFTER_BAR MFMAs later) is released."""
     streams = list(streams)
     budget = 0
     for i in range(count):
@@ -246,7 +247,7 @@ def _part32(count, issue, streams, bar, after_bar, lgkm):
         _pin32()
         for stream in streams:
             stream.drain(i)
-        while budget > 0:
+        while budget > 0 and i != bar:
             ready = [x for x in streams if not x.done and x.ready <= i]
             if not ready:
                 break
@@ -468,10 +469,14 @@ def _gen_rows32(env, t, meta, out):
     yield from _gen_rows_steps32(env, meta["ids2"], t + 2, out)
 
 
+def _rne32(x):
+    """FP32 x rounded to nearest even in its high half (its BF16, like _pack_bf16)."""
+    return _as_i32(x) + 0x7FFF + ((_as_i32(x) >> 16) & 1)
+
+
 def _bf16_pair(a, b):
     """BF16 a (low half) and b (high half), rounded to nearest even like _pack_bf16."""
-    ra, rb = (_as_i32(x) + 0x7FFF + ((_as_i32(x) >> 16) & 1) for x in (a, b))
-    return fx.Int32(prim.perm_b32(rb, ra, 0x07060302))
+    return fx.Int32(prim.perm_b32(_rne32(b), _rne32(a), 0x07060302))
 
 
 def _gen_exp32(x_prev, l_pair, out, chunks=EXP_CHUNKS, due=None):
@@ -491,10 +496,14 @@ def _gen_exp32(x_prev, l_pair, out, chunks=EXP_CHUNKS, due=None):
             yield C_EXP
         words = []
         for k in range(2):
+            # A pair in two steps: the rounding's VALUs fill MFMA slots more evenly.
             l_lo = l_lo + values[2 * k]
             l_hi = l_hi + values[2 * k + 1]
-            words.append(_bf16_pair(values[2 * k], values[2 * k + 1]))
-            yield 7 * C_VALU
+            low = _rne32(values[2 * k])
+            yield 4 * C_VALU
+            high = _rne32(values[2 * k + 1])
+            words.append(fx.Int32(prim.perm_b32(high, low, 0x07060302)))
+            yield 3 * C_VALU
         out[(kb, c)] = tuple(words)
     out["l"] = (l_lo, l_hi)
 
@@ -663,12 +672,17 @@ def _pv_last32(env, o, pw, streams):
 
 
 def _gen_out_pair32(o, inv, words, i):
-    """BF16 O / l of blocks 2i and 2i + 1 (words[r][i] per register r), once final."""
+    """BF16 O / l of blocks 2i and 2i + 1 (words[r][i] per register r): block 2i rounded
+    once final (the stream starts after MFMA 16i + 7), the pairs eight MFMAs later, once
+    block 2i + 1 is (block 7 is final after the last MFMA)."""
+    low = []
     for r in range(16):
-        words[r][i] = _bf16_pair(
-            fx.Float32(o[2 * i][r]) * inv, fx.Float32(o[2 * i + 1][r]) * inv
-        )
-        yield 7 * C_VALU
+        low.append(_rne32(fx.Float32(o[2 * i][r]) * inv))
+        yield (3 * C_VALU, 8) if r == 15 else 3 * C_VALU
+    for r in range(16):
+        high = _rne32(fx.Float32(o[2 * i + 1][r]) * inv)
+        words[r][i] = fx.Int32(prim.perm_b32(high, low[r], 0x07060302))
+        yield 4 * C_VALU
 
 
 def _gen_kpre32(env, out, gap=1):
@@ -925,7 +939,7 @@ def _epilogue_p32(env, x_last, l_pair, v_data, pw, loads):
     stores = _gen_vstores32(env, _unflat32(v_data, 16, 2))
     for i in range(16):
         _step32(stores)
-        _step32(exps, 3)
+        _step32(exps, 4)
         # The scalars' loads were issued just before P(last): give them time to land.
         if i >= 6:
             _step32(loads, 2)
@@ -1736,7 +1750,7 @@ def _body32(
             pw,
             [_Stream32(_gen_prefetch_ids32(env, nxt), *PV_PREFETCH)]
             + [
-                _Stream32(_gen_out_pair32(o, inv, words, i), 16 * i + 16, 63, 13)
+                _Stream32(_gen_out_pair32(o, inv, words, i), 16 * i + 8, 63, 13)
                 for i in range(4)
             ],
         )
