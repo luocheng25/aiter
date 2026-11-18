@@ -42,7 +42,8 @@ read zeros without a memory request. Per token the 24 scale terms of a 16-lane r
 Plain plans (no core/residual tiles) run PLAIN_WAVES rows per WG, one wave each, heaviest
 rows first (fewer rows than two such WGs per CU: one row per WG, spread over the CUs):
 waves of rows the union serves exit at once, and every wave of a launch whose tiles all run
-in the union exits on K3's direct flag before any row load.
+in the union exits on K3's direct flag before any row load. Listed rows (below)
+stage their output in LDS and store it a kilobyte per store (whole lines).
 
 RAW: a wave first maps its key list's slots to rows in LDS (the slot table's pool row of a
 block's first token, else the request row), which each chunk then reads per lane. A lane
@@ -147,6 +148,9 @@ CORE_COUNT = 1 << 16
 PLAIN_WAVES = 4
 # Residual merges of groups of at most COMPACT_GROUP heads run on 8 lanes per head (_merge_o).
 COMPACT_GROUP = 8
+# Listed (and persistent) rows stage their output in LDS, a head per SLOT_HEAD bytes (512 + 16:
+# on both the write and the read side lanes 8k .. 8k + 7 hit different banks) (_store_o).
+SLOT_HEAD = 528
 
 
 def _transpose4(w):
@@ -912,18 +916,44 @@ def _pv16(o, v, pw):
 
 def _store_o(env, o, inv):
     """O / l as BF16: lane (head, g) holds dims 64g .. 64g + 63 (dim 64g + 16r + m in
-    o[4m + r])."""
+    o[4m + r]), 16-byte piece p of them in words 4p .. 4p + 3. Stored from the lanes, each
+    store writes a piece of 4 x group lines. A staged row (env.stage) passes them through its
+    wave's LDS slot instead, so that store s writes the group's bytes 1024 s .. + 1023: whole
+    lines instead of 16-byte pieces of lines."""
     words = []
     for r in range(4):
         values = [o[4 * m + r] for m in range(16)]
         for k in range(4):
             words += _scaled_bf16(values[4 * k : 4 * k + 4], inv)
-    for s in range(8):
-        _buffer_store_words(
-            fx.Vector.from_elements(words[4 * s : 4 * s + 4], fx.Int32),
-            env.gout,
-            env.out_lane + 16 * s,
-        )
+    if env.stage is None:
+        for s in range(8):
+            _buffer_store_words(
+                fx.Vector.from_elements(words[4 * s : 4 * s + 4], fx.Int32),
+                env.gout,
+                env.out_lane + 16 * s,
+            )
+        return
+    for p in range(8):
+        prim.store_lds(env.stage, env.stage_write, words[4 * p : 4 * p + 4], 16 * p)
+    _store_staged(env)
+
+
+def _store_staged(env):
+    """The group's output from the wave's LDS slot (_store_o): lane i of store s stores the
+    group's 16-byte piece 64 s + i."""
+    stores = (env.group + 1) // 2
+    # The wave's LDS operations run in order: the reads see the other lanes' writes. All
+    # reads first, then the stores back to back.
+    pieces = [
+        prim._load_lds(env.stage, env.stage_read, 2 * SLOT_HEAD * s)
+        for s in range(stores)
+    ]
+    for s in range(stores):
+        at = env.stage_out + 1024 * s
+        if 2 * s + 1 == env.group:
+            # An odd group's last store: its upper half reads the spare slot.
+            at = (env.lane < 32).select(at, fx.Int32(env.stage_end))
+        _buffer_store_words(pieces[s], env.gout, at)
 
 
 def _from_lower(own, lower):
@@ -937,7 +967,9 @@ def _merge_o(env, o, inv, m_run, total):
     normalized) by their log-sum-exps (log2 units), then stored like _store_o, a half (32
     dims) at a time. O_u and the LSE were loaded at the row's start (_union_words). A group
     of at most COMPACT_GROUP heads leaves lanes n >= 8 idle: lane n + 8 merges the upper
-    half of lane n's head (one DPP move per value), so each lane merges one half."""
+    half of lane n's head (one DPP move per value), so each lane merges one half. Staged
+    (env.stage: the slot overlaps O_u's), the halves are written to it after every read of
+    O_u."""
     lse_u = _as_f32(env.lse_word)
     lse_d = fx.Float32(m_run) + prim.log2(total)
     top = _maximum(lse_u, lse_d)
@@ -946,12 +978,14 @@ def _merge_o(env, o, inv, m_run, total):
     w_u, w_d = w_u * norm, w_d * norm * fx.Float32(inv)
     # The LDS copy of O_u landed long ago; LLVM waits for it before the first read.
     rocdl.s_waitcnt(vmcnt=0)
+    staged = env.stage is not None
     if env.group <= COMPACT_GROUP:
         w_u, w_d = _from_lower(w_u, w_u), _from_lower(w_d, w_d)
         halves = [
             (
                 env.union_compact,
                 env.out_compact,
+                env.stage_compact if staged else None,
                 lambda m, r: _from_lower(o[4 * m + r], o[4 * m + r + 2]),
             )
         ]
@@ -960,11 +994,13 @@ def _merge_o(env, o, inv, m_run, total):
             (
                 env.union_lane + 64 * half,
                 env.out_lane + 64 * half,
+                env.stage_write + 64 * half if staged else None,
                 lambda m, r, half=half: o[4 * m + r + 2 * half],
             )
             for half in range(2)
         ]
-    for union_at, out_at, value in halves:
+    pending = []
+    for union_at, out_at, stage_at, value in halves:
         union = [prim._load_lds(env.union, union_at + 16 * s) for s in range(4)]
         words = []
         for r in range(2):
@@ -980,12 +1016,20 @@ def _merge_o(env, o, inv, m_run, total):
                         fx.Float32(fx.fma(value(m, r), w_d, _as_f32(bits) * w_u))
                     )
                 words += _scaled_bf16(values, fx.Float32(1.0))
+        if staged:
+            pending.append((stage_at, words))
+            continue
         for s in range(4):
             _buffer_store_words(
                 fx.Vector.from_elements(words[4 * s : 4 * s + 4], fx.Int32),
                 env.gout,
                 out_at + 16 * s,
             )
+    if staged:
+        for stage_at, words in pending:
+            for p in range(4):
+                prim.store_lds(env.stage, stage_at, words[4 * p : 4 * p + 4], 16 * p)
+        _store_staged(env)
 
 
 def _union_words(env, row, hkv, lane):
@@ -1216,6 +1260,21 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
         heads=H,
         group=group,
     )
+    env.stage = None
+    if fx.const_expr(ins.stage is not None):
+        # The output through the wave's LDS slot (_store_o): lane (n, g) writes head n's
+        # dims 64g .. at n * SLOT_HEAD + 128g (lanes past the group into the spare slot
+        # `group`), lane i of store s reads the group's piece 64 s + i.
+        slot = ins.slot
+        env.stage = ins.stage
+        env.stage_write = slot + _min(n, fx.Int32(group)) * SLOT_HEAD + g * 128
+        env.stage_read = (
+            slot + (lane >> 5) * SLOT_HEAD + ((lane >> 3) & 3) * 128 + (lane & 7) * 16
+        )
+        env.stage_out = on.select(
+            (row * H + hkv * group) * (D * 2) + 16 * lane, fx.Int32(q_rows * D * 2)
+        )
+        env.stage_end = q_rows * D * 2
     if fx.const_expr(ins.RAW):
         env.table = table
         _raw_env(
@@ -1244,6 +1303,13 @@ def _direct_row(ins, row, hkv, p_start, visible, residual, on, length=None, tabl
             (row * H + hkv * group + head) * (D * 2) + g * 128 + (n >> 3) * 64,
             fx.Int32(q_rows * D * 2),
         )
+        if fx.const_expr(ins.stage is not None):
+            env.stage_compact = (
+                ins.slot
+                + _min(head, fx.Int32(group)) * SLOT_HEAD
+                + g * 128
+                + (n >> 3) * 64
+            )
 
     @flyc.jit
     def run():
@@ -1455,12 +1521,15 @@ def _listed(
     )
     group = H // HK
     allocator = fx.SharedAllocator()
-    # The row's O_u (_union_words, group heads of 512 bytes).
+    # The row's O_u (_union_words, group heads of 512 bytes), then its output's staging slot
+    # (_store_o, group + 1 heads of SLOT_HEAD bytes).
+    lds_bytes = (group + 1) * SLOT_HEAD
     ins.union = (
-        allocator.allocate(fx.Array[fx.Int8, group * 512, 16])
+        allocator.allocate(fx.Array[fx.Int8, lds_bytes, 16])
         .peek()
-        .view(fx.make_layout(group * 512, 1))
+        .view(fx.make_layout(lds_bytes, 1))
     )
+    ins.stage, ins.slot = ins.union, 0
     table = _lds_words(allocator, TOPK + 64) if fx.const_expr(RAW) else None
     item = fx.Int32(fx.block_idx.x)
     sched = _buffer(SCHED, (fx.Uint32(CAP) * (LIST_SLOTS // 2) * 4 + SCHED_HEADER) * 4)
@@ -1546,6 +1615,7 @@ def _plain(
         SLOTTED=SLOTTED,
         WIDE=WIDE,
         listed=False,
+        stage=None,
     )
     wave = _uniform(fx.Int32(fx.thread_idx.x) >> 6)
     table = None
