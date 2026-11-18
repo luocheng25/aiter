@@ -30,19 +30,25 @@ uniform per row across its four lanes; c = q_scale * SCALE_LOG2 (times k_scale p
 per key otherwise), SCALE_LOG2 the runtime FP32 softmax_scale * log2(e). Q8 and its row
 scales come from the pack launch.
 
-Loads: chunk t + 1's K/V words issue at the start of chunk t; its block ids come one chunk
-earlier by scalar loads, so the K/V loads stay in flight (vector loads complete in order).
-The loop runs two chunks per iteration, alternating two register sets; waves of disabled
-rows exit at once. Per token the 24 scale terms of a 16-lane row's blocks (its g) take two
-dword loads per lane and reach their users by DPP row broadcasts.
+Loads: chunk t + 1's words issue during chunk t, spread over its QK (the first K half and
+per-token scale words first, the other K half between QK's halves, V after QK); its block ids
+come one chunk earlier by scalar loads, so the K/V loads stay in flight (vector loads
+complete in order). The loop runs two chunks per iteration, alternating two register sets,
+and stops before the last chunk, which runs apart without loads and alone masks keys past the
+key list (every earlier chunk holds eight complete blocks); the last chunk's padding slots
+read zeros without a memory request. Per token the 24 scale terms of a 16-lane row's blocks
+(its g) take two dword loads per lane and reach their users by DPP row broadcasts.
+
+Waves of rows another kernel serves exit at once.
 
 RAW: a wave first maps its key list's slots to rows in LDS (the slot table's pool row of a
 block's first token, else the request row), which each chunk then reads per lane. A lane
 loads 16-byte K quarters of its token's rows (lanes g and g ^ 1 swap the halves the other
 one needs, ds_swizzle) and its V rows (transposed as the pack does), so the operands and
 per-token scale terms (computed as the pack does) are the pack's, bit for bit. K/V of a
-request without a slot table read zero past its end; through a slot table masked keys read
-zero, or for a pool past 4 GiB (WIDE, 64-bit loads) the request's first row.
+request without a slot table read zero past its end (and for its last chunk's padding
+slots); through a slot table its last chunk's masked keys read zero, or for a pool past 4 GiB
+(WIDE, 64-bit loads) the request's first row.
 
 Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one K3b CTA per
 union tile (prepare.residual_tile), dispatched first, which moves the residual blocks of each
@@ -100,6 +106,9 @@ __all__ = ["launchers", "prepare", "run", "scratch_specs"]
 D = 256
 BLOCK_BYTES = 1024  # one packed four-token block of one KV head
 CHUNK = 8  # blocks per 32-key chunk
+# Byte base of a padding key slot: its loads (base + < 1 KiB, scale records at (base >> 10) * 64)
+# lie past every pack (PK/PV below 4 GiB) and read zeros without a memory request.
+PAD_BASE = -1024
 
 
 def _transpose4(w):
@@ -492,20 +501,35 @@ def _chunk_ids(env, t):
     return [_uniform(fx.Vector(w)[i]) for w in words for i in range(4)]
 
 
-def _chunk_bases(env, ids, t):
-    """(K bases of blocks 8t + jj, 8t + 4 + jj; V/scale bases of blocks 8t + g, 8t + 4 + g):
-    complete blocks in block_indices order, the causal tail block, then padding (block 0,
-    masked). RAW: _raw_sources."""
+def _chunk_sources(env, ids, t):
+    """Where chunk t's words come from: _chunk_bases, RAW _raw_sources."""
     if env.raw:
         return _raw_sources(env, ids, t)
+    return _chunk_bases(env, ids, t)
+
+
+@flyc.jit
+def _chunk_bases(env, ids, t):
+    """(K bases of blocks 8t + jj, 8t + 4 + jj; V/scale bases of blocks 8t + g, 8t + 4 + g):
+    complete blocks in block_indices order, the causal tail block, then padding slots at
+    PAD_BASE (masked; their loads read zeros without a memory request). Only a row's last
+    chunk can hold the tail block or padding: a chunk of eight complete blocks takes the
+    short path."""
     first = t * CHUNK
-    bases = []
-    for s in range(CHUNK):
-        slot = first + s
-        block = (slot < env.complete).select(
-            fx.Int32(ids[s]), (slot == env.complete).select(env.tail_block, fx.Int32(0))
-        )
-        bases.append(((env.p_start + block) * env.hk + env.hkv) * BLOCK_BYTES)
+    full = [
+        ((env.p_start + fx.Int32(ids[s])) * env.hk + env.hkv) * BLOCK_BYTES
+        for s in range(CHUNK)
+    ]
+    b0, b1, b2, b3, b4, b5, b6, b7 = full
+    if first + CHUNK > env.complete:
+        bases = []
+        for s in fx.range_constexpr(CHUNK):
+            slot = first + s
+            block = (slot < env.complete).select(fx.Int32(ids[s]), env.tail_block)
+            base = ((env.p_start + block) * env.hk + env.hkv) * BLOCK_BYTES
+            bases.append((slot < env.blocks).select(base, fx.Int32(PAD_BASE)))
+        b0, b1, b2, b3, b4, b5, b6, b7 = bases
+    bases = [b0, b1, b2, b3, b4, b5, b6, b7]
 
     def pick(sel, lo):
         low = (sel & 1) == 1
@@ -516,110 +540,127 @@ def _chunk_bases(env, ids, t):
     return [pick(env.jj, 0), pick(env.jj, 4), pick(env.g, 0), pick(env.g, 4)]
 
 
-def _raw_sources(env, rows, t):
-    """RAW: (K sources of the lane's token in blocks 8t + jj, 8t + 4 + jj; V sources of the
-    four tokens of blocks 8t + g, 8t + 4 + g; scale offsets of _raw_loads) from the rows of
-    _chunk_ids: byte offsets, WIDE 64-bit K/V addresses. Through a slot table masked keys read
-    zero (WIDE: the request's first row): pool rows past a request's end may hold anything.
-    The request's own descriptors read zero past its end."""
+def _raw_offsets(env, rows, t, masked):
+    """_raw_sources' twelve values, masked (the row's last chunk) or not."""
     k_slot, v_slot = t * CHUNK + env.jj, t * CHUNK + env.g
     stride = env.hk * D
-    if env.slotted:
-        k_valid = [k_slot + 4 * kg < env.k_limit for kg in range(2)]
-        v_valid = [
-            v_slot + 4 * b < env.v_limits[tt] for b in range(2) for tt in range(4)
-        ]
+    if masked:
+        if env.slotted:
+            k_valid = [k_slot + 4 * kg < env.k_limit for kg in range(2)]
+            v_valid = [
+                v_slot + 4 * b < env.v_limits[tt] for b in range(2) for tt in range(4)
+            ]
+            if env.per_token:
+                sc_valid = [v_slot < env.sc_limits[w] for w in range(2)]
+        else:
+            # Padding slots: past the key list.
+            k_valid = [k_slot + 4 * kg < env.blocks for kg in range(2)]
+            v_valid = [v_slot + 4 * b < env.blocks for b in range(2) for _ in range(4)]
+            sc_valid = [
+                v_slot + env.sc_hi.select(fx.Int32(4), fx.Int32(0)) < env.blocks,
+                v_slot + 4 < env.blocks,
+            ]
     if env.wide:
-        k = [
-            env.kbase
-            + fx.Int64(k_valid[kg].select(rows[kg] + env.token, env.fallback)) * stride
-            for kg in range(2)
-        ]
-        v = [
-            env.vbase
-            + fx.Int64(v_valid[4 * b + tt].select(rows[2 + b] + tt, env.fallback))
-            * stride
-            for b in range(2)
-            for tt in range(4)
-        ]
+        k_rows = [rows[kg] + env.token for kg in range(2)]
+        v_rows = [rows[2 + b] + tt for b in range(2) for tt in range(4)]
+        if masked:
+            k_rows = [k_valid[kg].select(k_rows[kg], env.fallback) for kg in range(2)]
+            v_rows = [v_valid[i].select(v_rows[i], env.fallback) for i in range(8)]
+        k = [env.kbase + fx.Int64(row) * stride for row in k_rows]
+        v = [env.vbase + fx.Int64(row) * stride for row in v_rows]
     else:
         k = [rows[kg] * stride + env.k_lane for kg in range(2)]
         v = [rows[2 + b] * stride + env.v_lane for b in range(2) for _ in range(4)]
-        if env.slotted:
+        if masked:
             k = [k_valid[kg].select(k[kg], env.oob) for kg in range(2)]
             v = [v_valid[i].select(v[i], env.oob) for i in range(8)]
         v = [v[i] + (i % 4) * stride for i in range(8)]
-    scales = []
+    scales = [fx.Int32(0), fx.Int32(0)]
     if env.per_token:
         # Rows of values n (block n >= 12) and 16 + n (block 1), token n % 4.
         scales = [
             (env.sc_hi.select(rows[3], rows[2]) + env.sc_r) * (env.hk * 4),
             (rows[3] + env.sc_r) * (env.hk * 4),
         ]
-        if env.slotted:
-            scales = [
-                (v_slot < env.sc_limits[w]).select(scales[w], env.sc_oob)
-                for w in range(2)
-            ]
-    return k, v, scales
+        if masked:
+            scales = [sc_valid[w].select(scales[w], env.sc_oob) for w in range(2)]
+    return k + v + scales
 
 
-def _raw_loads(env, sources):
-    """RAW: 8 + 8 b128 loads, K quarters of the token's row (_raw_env) and V rows (dims
-    16n .. 16n + 15 of each token), which _operands turns into the pack's operands, and per
-    token k_scale, v_scale of value n and v_scale of value 16 + n (_scale_words)."""
-    k_src, v_src, sc_src = sources
-
-    def load(source, buffer, offset=0):
-        if env.wide:
-            return _global_words(source + offset)
-        return _buffer_words(buffer, source + offset)
-
-    k = [load(k_src[kg], env.gk, 64 * i) for kg in range(2) for i in range(4)]
-    v = [load(source, env.gv) for source in v_src]
-    scales = []
-    if env.per_token:
-        scales = [
-            _buffer_words(env.gks, sc_src[0], 1)[0],
-            _buffer_words(env.gvs, sc_src[0], 1)[0],
-            _buffer_words(env.gvs, sc_src[1], 1)[0],
-        ]
-    return k, v, scales
+@flyc.jit
+def _raw_sources(env, rows, t):
+    """RAW: (K sources of the lane's token in blocks 8t + jj, 8t + 4 + jj; V sources of the
+    four tokens of blocks 8t + g, 8t + 4 + g; scale offsets of _scale_loads) from the rows of
+    _chunk_ids: byte offsets, WIDE 64-bit K/V addresses. Only a row's last chunk holds keys
+    past its key list: there through a slot table masked keys read zero (WIDE: the request's
+    first row), as pool rows past a request's end may hold anything, and otherwise padding
+    slots read zero without a memory request (the request's own descriptors read zero past
+    its end)."""
+    first = t * CHUNK
+    k0, k1, v0, v1, v2, v3, v4, v5, v6, v7, c0, c1 = _raw_offsets(env, rows, t, False)
+    if first + CHUNK > env.complete:
+        masked = _raw_offsets(env, rows, t, True)
+        k0, k1, v0, v1, v2, v3, v4, v5, v6, v7, c0, c1 = masked
+    return [k0, k1], [v0, v1, v2, v3, v4, v5, v6, v7], [c0, c1]
 
 
-def _chunk_loads(env, bases):
-    """K and V words of a chunk (and per-token scale terms): 8 + 8 b128 loads."""
+def _raw_load(env, source, buffer, offset=0):
+    if env.wide:
+        return _global_words(source + offset)
+    return _buffer_words(buffer, source + offset)
+
+
+def _k_loads(env, sources, kg):
+    """K words of QK half kg of a chunk (blocks 8t + 4kg + jj): 4 b128 loads (RAW: quarters
+    of the token's K row, _raw_env)."""
     if env.raw:
-        return _raw_loads(env, bases)
-    k = [
-        _buffer_words(env.gk, bases[kg] + 256 * i + env.k_lane, 4)
-        for kg in range(2)
-        for i in range(4)
+        return [_raw_load(env, sources[0][kg], env.gk, 64 * i) for i in range(4)]
+    return [
+        _buffer_words(env.gk, sources[kg] + 256 * i + env.k_lane, 4) for i in range(4)
     ]
-    v = [
-        _buffer_words(env.gv, bases[2 + b] + 256 * p + env.v_lane, 4)
+
+
+def _v_loads(env, sources):
+    """V words of a chunk: 8 b128 loads (RAW: dims 16n .. 16n + 15 of each token)."""
+    if env.raw:
+        return [_raw_load(env, source, env.gv) for source in sources[1]]
+    return [
+        _buffer_words(env.gv, sources[2 + b] + 256 * p + env.v_lane, 4)
         for b in range(2)
         for p in range(4)
     ]
-    scales = []
-    if env.per_token:
-        # The 24 scale terms of the row's blocks 8t + g, 8t + 4 + g (records: k_scale,
-        # log2(v_scale), 1 / v_scale of four tokens) spread over its 16 lanes: two dword
-        # loads instead of six 16-byte loads per lane. Bases are unsigned: past 2 GiB of
-        # packed K/V an arithmetic shift would read zeros past the records.
-        rec = [fx.Int32(fx.Uint32(bases[2 + b]) >> 10) * 64 for b in range(2)]
-        scales = [
-            _buffer_words(env.gsc, env.sc_hi.select(rec[1], rec[0]) + env.sc_lo, 1)[0],
-            _buffer_words(env.gsc, rec[1] + env.sc_up, 1)[0],
-        ]
-    return k, v, scales
 
 
-def _chunk_words(env, bases, zero4):
-    k, v, sc = _chunk_loads(env, bases)
+def _scale_loads(env, sources, zero4):
+    """Per token the chunk's scale words (_scale_words), else zeros."""
     if not env.per_token:
-        sc = [zero4[0], zero4[0]]
-    return _flatten(k), _flatten(v), fx.Vector.from_elements(sc, fx.Int32)
+        return fx.Vector.from_elements([zero4[0], zero4[0]], fx.Int32)
+    if env.raw:
+        # k_scale and v_scale of value n, v_scale of value 16 + n.
+        offsets = sources[2]
+        scales = [
+            _buffer_words(env.gks, offsets[0], 1)[0],
+            _buffer_words(env.gvs, offsets[0], 1)[0],
+            _buffer_words(env.gvs, offsets[1], 1)[0],
+        ]
+        return fx.Vector.from_elements(scales, fx.Int32)
+    # The 24 scale terms of the row's blocks 8t + g, 8t + 4 + g (records: k_scale,
+    # log2(v_scale), 1 / v_scale of four tokens) spread over its 16 lanes: two dword
+    # loads instead of six 16-byte loads per lane. Bases are unsigned: past 2 GiB of
+    # packed K/V an arithmetic shift would read zeros past the records.
+    rec = [fx.Int32(fx.Uint32(sources[2 + b]) >> 10) * 64 for b in range(2)]
+    scales = [
+        _buffer_words(env.gsc, env.sc_hi.select(rec[1], rec[0]) + env.sc_lo, 1)[0],
+        _buffer_words(env.gsc, rec[1] + env.sc_up, 1)[0],
+    ]
+    return fx.Vector.from_elements(scales, fx.Int32)
+
+
+def _chunk_words(env, sources, zero4):
+    """K, V words and scale words of a chunk at once (the row's first)."""
+    k = _k_loads(env, sources, 0) + _k_loads(env, sources, 1)
+    sc = _scale_loads(env, sources, zero4)
+    return _flatten(k), _flatten(_v_loads(env, sources)), sc
 
 
 def _scale_term(sc, b, field, r):
@@ -723,35 +764,48 @@ def _split(vector, count):
     ]
 
 
-def _operands(env, kw, vw):
-    """K and V^T operands of a chunk from its words. RAW: lanes g and g ^ 1 (16 apart) swap the
-    half of their K quarters the other one needs (ds_swizzle), giving the pack's
-    K[64i + 8g ..] ++ K[64i + 32 + 8g ..]; each block's V rows transpose as in _pack_v, under
-    the swizzles' latency (the scheduling barrier)."""
-    k, v = _split(kw, 8), _split(vw, 8)
+def _k_half(env, kw, kg, got=None):
+    """The A operands of QK half kg (blocks 8t + 4kg + jj) from the chunk's K words. RAW: lanes
+    g and g ^ 1 (16 apart) swap the half of their K quarters the other one needs (got:
+    _k_swaps), giving the pack's K[64i + 8g ..] ++ K[64i + 32 + 8g ..]."""
+    k = _split(kw, 8)[4 * kg : 4 * kg + 4]
     if not env.raw:
-        return k, v
+        return k
     even = env.k_even
     k = [fx.Vector(x) for x in k]
+    return [
+        fx.Vector.from_elements(
+            [even.select(x[j], r[j]) for j in range(2)]
+            + [even.select(r[j], x[2 + j]) for j in range(2)],
+            fx.Int32,
+        )
+        for x, r in zip(k, got[4 * kg : 4 * kg + 4])
+    ]
+
+
+def _k_swaps(env, kw):
+    """RAW: the K words lanes g ^ 1 send this lane (ds_swizzle), both QK halves' at once."""
+    if not env.raw:
+        return None
+    even = env.k_even
+    k = [fx.Vector(x) for x in _split(kw, 8)]
     sent = [[even.select(x[2 + j], x[j]) for j in range(2)] for x in k]
-    got = [[fx.Int32(fx.gpu.shuffle_xor(w, 16, 64)) for w in pair] for pair in sent]
-    v = [
+    return [[fx.Int32(fx.gpu.shuffle_xor(w, 16, 64)) for w in pair] for pair in sent]
+
+
+def _v_operands(env, vw):
+    """The V^T operands of a chunk from its V words. RAW: each block's V rows transpose as in
+    _pack_v."""
+    v = _split(vw, 8)
+    if not env.raw:
+        return v
+    return [
         fx.Vector.from_elements(
             _transpose4([fx.Vector(v[4 * b + tt])[p] for tt in range(4)]), fx.Int32
         )
         for b in range(2)
         for p in range(4)
     ]
-    prim.sched_barrier(0)
-    k = [
-        fx.Vector.from_elements(
-            [even.select(x[j], r[j]) for j in range(2)]
-            + [even.select(r[j], x[2 + j]) for j in range(2)],
-            fx.Int32,
-        )
-        for x, r in zip(k, got)
-    ]
-    return k, v
 
 
 def _scale_words(env, scw):
@@ -769,22 +823,26 @@ def _scale_words(env, scw):
     ]
 
 
-def _scores(env, k, sc, t, m_run):
-    """S''(t) of the lane's 8 keys (blocks 8t + g, 8t + 4 + g; tokens 0..3), masked past the
-    key list, with the lane-local max and the lazy-max ballot."""
-    s = []
-    for kg in range(2):
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for c in range(8):
-            w = k[4 * kg + (c >> 1)]
-            q = env.q[c]
-            acc = _mfma_fp8((w[2 * (c & 1)], w[2 * (c & 1) + 1]), (q[0], q[1]), acc)
-        s.append(acc)
+def _qk_half_fp8(env, k):
+    """One QK half of a chunk: S of blocks 8t + 4kg + jj from its A operands k (_k_half),
+    eight 16x16x32 FP8 MFMAs (sparse_prefill_common._qk is the BF16 direct kernels' step).
+    """
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for c in range(8):
+        w = k[c >> 1]
+        q = env.q[c]
+        acc = _mfma_fp8((w[2 * (c & 1)], w[2 * (c & 1) + 1]), (q[0], q[1]), acc)
+    return acc
+
+
+def _scores(env, s, sc, t, m_run, last):
+    """S''(t) of the lane's 8 keys (blocks 8t + g, 8t + 4 + g; tokens 0..3) from QK's halves
+    s, with the lane-local max and the lazy-max ballot; in the row's last chunk (last) keys
+    past the key list are masked."""
     fresh = m_run == fx.Float32(_MAX_FLOOR)
     neg = fresh.select(fx.Float32(0.0), fx.Float32(0.0) - m_run)
     vals = []
     for b in range(2):
-        slot = t * CHUNK + 4 * b + env.g
         for r in range(4):
             x = s[b][r]
             if env.per_token:
@@ -792,15 +850,37 @@ def _scores(env, k, sc, t, m_run):
             x = fx.Float32(fx.fma(x, env.c_scale, neg))
             if env.per_token:
                 x = x + _scale_term(sc, b, 1, r)
-            keep = (slot < env.complete) | (
-                (slot == env.complete) & (fx.Int32(r) < env.tail)
-            )
-            vals.append(keep.select(x, fx.Float32(-math.inf)))
+            vals.append(x)
+    if last:
+        vals = _key_mask(env, vals, t)
     local = vals[0]
     for x in vals[1:]:
         local = _maximum(local, x)
     trigger = (local > LAZY) | (fresh & (local > fx.Float32(-math.inf)))
     return fx.Vector.from_elements(vals, fx.Float32), local, prim.ballot(trigger)
+
+
+@flyc.jit
+def _key_mask(env, vals, t):
+    """S'' of the lane's keys past the key list set to -inf; a chunk of eight complete blocks
+    has none."""
+    v0, v1, v2, v3, v4, v5, v6, v7 = vals
+    partial = (t + 1) * CHUNK > env.complete
+    if fx.const_expr(env.per_token):
+        # Per token the last chunk masks unconditionally: the branch costs that variant
+        # more registers than it saves.
+        partial = fx.Boolean(True)
+    if partial:
+        masked = []
+        for b in fx.range_constexpr(2):
+            slot = t * CHUNK + 4 * b + env.g
+            for r in fx.range_constexpr(4):
+                keep = (slot < env.complete) | (
+                    (slot == env.complete) & (fx.Int32(r) < env.tail)
+                )
+                masked.append(keep.select(vals[4 * b + r], fx.Float32(-math.inf)))
+        v0, v1, v2, v3, v4, v5, v6, v7 = masked
+    return [v0, v1, v2, v3, v4, v5, v6, v7]
 
 
 def _row_max(local):
@@ -881,8 +961,12 @@ def _direct_kernel(
     qs_offset = head_ok.select(qrow * 4, fx.Int32(q_rows * 4))
     qs = _as_f32(_buffer_words(_buffer(QS, q_rows * 4), qs_offset, 1)[0])
     c_scale = qs * SCALE_LOG2
+    v_scale = None
     if fx.const_expr(not PER_TOKEN):
         c_scale = c_scale * fx.Float32(KS[0])
+        # Read with k_scale (a scalar load): past the loop's memory fences it would be a
+        # vector load the epilogue waits for.
+        v_scale = fx.Float32(VS[0])
     env = SimpleNamespace(
         raw=RAW,
         lane=lane,
@@ -892,6 +976,7 @@ def _direct_kernel(
         complete=complete,
         tail=tail,
         tail_block=tail_block,
+        blocks=blocks,
         residual=residual,
         jj=(lane >> 2) & 3,
         g=g,
@@ -931,12 +1016,10 @@ def _direct_kernel(
         zero4 = fx.Vector.filled(4, 0, fx.Int32)
         if fx.const_expr(RAW):
             _row_table(env)
-
-        def loads(bases):
-            return _chunk_words(env, bases, zero4)
-
         ids0 = _chunk_ids(env, fx.Int32(0))
-        first_k, first_v, first_sc = loads(_chunk_bases(env, ids0, fx.Int32(0)))
+        first_k, first_v, first_sc = _chunk_words(
+            env, _chunk_sources(env, ids0, fx.Int32(0)), zero4
+        )
         state = (
             fx.Vector.filled(64, 0.0, fx.Float32),
             fx.Float32(_MAX_FLOOR),
@@ -947,52 +1030,75 @@ def _direct_kernel(
             *_chunk_ids(env, fx.Int32(1)),
         )
 
-        @flyc.jit
-        def step(o, m_run, l_run, kw, vw, scw, *rest):
-            """Chunk t from its prefetched words; issues chunk t + 1's loads (block ids from
-            the previous step) and chunk t + 2's id loads first."""
-            *ids, t = rest
-            t = fx.Int32(t)
-            bases = _chunk_bases(env, ids, t + 1)
-            k_next, v_next, sc_next = loads(bases)
-            ids_next = _chunk_ids(env, t + 2)
-            # MachineSink cannot move the loads above the fence past the rescale branch into
-            # the block that first uses their words (the next step's); the scheduling barrier
-            # keeps QK(t), which waits for chunk t, after their issue.
-            prim.compiler_fence()
-            prim.sched_barrier(0)
-            k, v = _operands(env, kw, vw)
-            sc = _scale_words(env, scw)
-            vals, local, ballot = _scores(env, k, sc, t, fx.Float32(m_run))
+        def softmax_pv(o, m_run, l_run, v, sc, scored):
+            """(O, running max, running sum) after a chunk from its scores."""
+            vals, local, ballot = scored
             (o,), l_run, vals, m_run = _lazy_max(
                 (o,), l_run, vals, m_run, ballot, _row_max(local)
             )
             pw, total = _probabilities(fx.Vector(vals), sc, PER_TOKEN)
-            l_run = fx.Float32(l_run) + total
+            return _pv16(o, v, pw), m_run, fx.Float32(l_run) + total
+
+        @flyc.jit
+        def step(o, m_run, l_run, kw, vw, scw, *rest):
+            """Chunk t from its prefetched words. Chunk t + 1's loads (block ids from the
+            previous step) issue spread over QK(t): its first K half and scale words (with
+            chunk t + 2's id loads) first, its other K half between QK(t)'s halves, its V
+            after QK(t). Issued at once, they queued in the CU's vector memory path and
+            stalled the wave's issue longer."""
+            *ids, t = rest
+            t = fx.Int32(t)
+            sources = _chunk_sources(env, ids, t + 1)
+            k_next = _k_loads(env, sources, 0)
+            sc_next = _scale_loads(env, sources, zero4)
+            ids_next = _chunk_ids(env, t + 2)
+            swaps = _k_swaps(env, kw)
+            # The scheduling barriers keep each group of loads in its place among QK(t)'s
+            # MFMAs, which wait for chunk t's K words.
+            prim.sched_barrier(0)
+            s0 = _qk_half_fp8(env, _k_half(env, kw, 0, swaps))
+            prim.sched_barrier(0)
+            k_next = k_next + _k_loads(env, sources, 1)
+            prim.sched_barrier(0)
+            s1 = _qk_half_fp8(env, _k_half(env, kw, 1, swaps))
+            sc = _scale_words(env, scw)
+            scored = _scores(env, (s0, s1), sc, t, fx.Float32(m_run), False)
+            prim.sched_barrier(0)
+            v_next = _v_loads(env, sources)
+            # MachineSink cannot move the loads above the fence past the rescale branch into
+            # the block that first uses their words (the next step's).
+            prim.compiler_fence()
+            prim.sched_barrier(0)
             return (
-                _pv16(o, v, pw),
-                m_run,
-                l_run,
-                k_next,
-                v_next,
+                *softmax_pv(o, m_run, l_run, _v_operands(env, vw), sc, scored),
+                _flatten(k_next),
+                _flatten(v_next),
                 sc_next,
                 *ids_next,
             )
 
         # Two chunks per iteration: chunk t + 1's words land in the registers chunk t - 1
         # used, so the loop carries them without copies (a copy would wait for the loads at
-        # the loop end).
-        for t in range(fx.Int32(0), chunks - 1, fx.Int32(2)):
+        # the loop end). The last chunk runs apart: it issues no loads (past the key list)
+        # and alone masks keys (every earlier chunk holds eight complete blocks).
+        for t in range(fx.Int32(0), chunks - 2, fx.Int32(2)):
             state = step(*state, t)
             state = step(*state, fx.Int32(t) + 1)
-        if (chunks & 1) == 1:
-            state = step(*state, chunks - 1)
+        if (chunks & 1) == 0:
+            state = step(*state, chunks - 2)
+        o, m_run, l_run, kw, vw, scw = state[:6]
+        swaps = _k_swaps(env, kw)
+        sc = _scale_words(env, scw)
+        s0 = _qk_half_fp8(env, _k_half(env, kw, 0, swaps))
+        s1 = _qk_half_fp8(env, _k_half(env, kw, 1, swaps))
+        scored = _scores(env, (s0, s1), sc, chunks - 1, fx.Float32(m_run), True)
+        state = softmax_pv(o, m_run, l_run, _v_operands(env, vw), sc, scored)
         o, l_run = fx.Vector(state[0]), fx.Float32(state[2])
         total = l_run + fx.gpu.shuffle_xor(l_run, 16, 64)
         total = total + fx.gpu.shuffle_xor(total, 32, 64)
         inv = (total > 0.0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
         if fx.const_expr(not PER_TOKEN):
-            inv = inv * fx.Float32(VS[0])
+            inv = inv * v_scale
         if fx.const_expr(RESIDUAL):
             if env.residual:
                 _merge_o(env, [o[i] for i in range(64)], inv, state[1], total)
