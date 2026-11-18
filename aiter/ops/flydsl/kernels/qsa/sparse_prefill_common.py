@@ -358,6 +358,16 @@ def _load_lds(storage, offset, immediate=0):
     return fx.Vector(fx.generic_load(ptr, count=4, volatile=True))
 
 
+def _load_lds32(storage, offset):
+    """One LDS word (ds_read_b32) at storage + offset, volatile like _load_lds: it keeps its
+    place among the LDS reads that a ledger counts."""
+    ptr = fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 4),
+        fx.get_iter(storage) + offset,
+    )
+    return fx.Int32(fx.generic_load(ptr, count=1, volatile=True))
+
+
 def store_lds(storage, offset, words, immediate=0):
     """4 words to LDS at storage + offset + immediate (one ds_write_b128): _load_lds's
     counterpart, for a wave that reads back what its other lanes stored."""
