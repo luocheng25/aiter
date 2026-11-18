@@ -54,7 +54,8 @@ Core/residual union plans (prepare.CORE_RATIOS): the pack launch also runs one K
 union tile (prepare.residual_tile), dispatched first, which moves the residual blocks of each
 row of an active core tile to the front of its block_indices row. Those rows then run here
 over their residual blocks only (no causal tail) and merge into the union output by
-log-sum-exp (the union kernel writes each row's lse).
+log-sum-exp (the union kernel writes each row's lse); a residual row copies its union output
+to LDS when it starts.
 """
 
 import math
@@ -64,6 +65,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import numpy as np
 import torch
+from flydsl.expr import rocdl
 
 from . import sparse_prefill_common as prim
 from .sparse_prefill_common import (
@@ -109,6 +111,8 @@ CHUNK = 8  # blocks per 32-key chunk
 # Byte base of a padding key slot: its loads (base + < 1 KiB, scale records at (base >> 10) * 64)
 # lie past every pack (PK/PV below 4 GiB) and read zeros without a memory request.
 PAD_BASE = -1024
+# Residual merges of groups of at most COMPACT_GROUP heads run on 8 lanes per head (_merge_o).
+COMPACT_GROUP = 8
 
 
 def _transpose4(w):
@@ -711,45 +715,87 @@ def _store_o(env, o, inv):
         )
 
 
+def _from_lower(own, lower):
+    """own in lanes 0 .. 7 of each 16-lane row, lane i - 8's lower in lanes 8 .. 15 (one
+    v_mov_b32_dpp: row_shr:8 into banks 2 and 3)."""
+    return prim.dpp_banks(own, lower, 0x118, 0xC)
+
+
 def _merge_o(env, o, inv, m_run, total):
     """Residual row: O_d = o * inv merged with the row's union output O_u (BF16, already
-    normalized) by their log-sum-exps (log2 units), then stored like _store_o. The LSE offset
-    comes from out_lane (qrow * 512 + g * 128) and O_u is merged a half at a time, so the merge
-    keeps no value of its own live across the chunk loop."""
-    # out_lane is unsigned (Q may pass 2 GiB).
-    lse_lane = fx.Int32(fx.Uint32(env.out_lane) >> 9) << 2
-    q_rows = fx.Uint32(env.nq) * env.heads
-    lse_u = _as_f32(_buffer_words(_buffer(env.lse, q_rows * 4), lse_lane, 1)[0])
+    normalized) by their log-sum-exps (log2 units), then stored like _store_o, a half (32
+    dims) at a time. O_u and the LSE were loaded at the row's start (_union_words). A group
+    of at most COMPACT_GROUP heads leaves lanes n >= 8 idle: lane n + 8 merges the upper
+    half of lane n's head (one DPP move per value), so each lane merges one half."""
+    lse_u = _as_f32(env.lse_word)
     lse_d = fx.Float32(m_run) + prim.log2(total)
     top = _maximum(lse_u, lse_d)
     w_u, w_d = _exp(lse_u - top), _exp(lse_d - top)
     norm = prim.rcp(w_u + w_d)
     w_u, w_d = w_u * norm, w_d * norm * fx.Float32(inv)
-    for half in range(2):
-        union = [
-            _buffer_words(env.gout, env.out_lane + 16 * s, 4)
-            for s in range(4 * half, 4 * half + 4)
+    # The LDS copy of O_u landed long ago; LLVM waits for it before the first read.
+    rocdl.s_waitcnt(vmcnt=0)
+    if env.group <= COMPACT_GROUP:
+        w_u, w_d = _from_lower(w_u, w_u), _from_lower(w_d, w_d)
+        halves = [
+            (
+                env.union_compact,
+                env.out_compact,
+                lambda m, r: _from_lower(o[4 * m + r], o[4 * m + r + 2]),
+            )
         ]
+    else:
+        halves = [
+            (
+                env.union_lane + 64 * half,
+                env.out_lane + 64 * half,
+                lambda m, r, half=half: o[4 * m + r + 2 * half],
+            )
+            for half in range(2)
+        ]
+    for union_at, out_at, value in halves:
+        union = [prim._load_lds(env.union, union_at + 16 * s) for s in range(4)]
         words = []
-        for r in range(2 * half, 2 * half + 2):
+        for r in range(2):
             for k in range(4):
                 values = []
                 for j in range(4):
                     m = 4 * k + j
-                    # Dim 16r + m: BF16 half m & 1 of word 8r + m // 2.
-                    w = 8 * r + m // 2 - 16 * half
+                    # Dim 16r + m of the half: BF16 half m & 1 of word 8r + m // 2.
+                    w = 8 * r + m // 2
                     bits = fx.Int32(fx.Vector(union[w // 4])[w % 4])
                     bits = (bits & fx.Int32(-65536)) if m & 1 else (bits << 16)
                     values.append(
-                        fx.Float32(fx.fma(o[4 * m + r], w_d, _as_f32(bits) * w_u))
+                        fx.Float32(fx.fma(value(m, r), w_d, _as_f32(bits) * w_u))
                     )
                 words += _scaled_bf16(values, fx.Float32(1.0))
         for s in range(4):
             _buffer_store_words(
                 fx.Vector.from_elements(words[4 * s : 4 * s + 4], fx.Int32),
                 env.gout,
-                env.out_lane + 16 * (4 * half + s),
+                out_at + 16 * s,
             )
+
+
+def _union_words(env, row, hkv, lane):
+    """A residual row's union output O_u (its group heads, contiguous BF16 rows of 512 bytes)
+    copied to the wave's LDS (LDS DMA, no registers held across the chunk loop) and the
+    lane's LSE word, issued at the row's start; _merge_o reads them."""
+    q_rows = fx.Uint32(env.nq) * env.heads
+    first = (row * env.heads + hkv * env.group) * (D * 2)
+    resource = rocdl.get_buffer_rsrc(env.gout)
+    for j in range(2 * env.group):
+        prim.buffer_load_lds(
+            resource,
+            fx.to_llvm_ptr(fx.get_iter(env.union) + j * 256),
+            4,
+            fx.Int32(first + j * 256 + lane * 4),
+            fx.Uint32(0),
+            0,
+        )
+    # out_lane is unsigned (Q may pass 2 GiB).
+    lse_lane = fx.Int32(fx.Uint32(env.out_lane) >> 9) << 2
+    return _buffer_words(_buffer(env.lse, q_rows * 4), lse_lane, 1)[0]
 
 
 def _flatten(vectors, dtype=fx.Int32):
@@ -1000,14 +1046,33 @@ def _direct_kernel(
         lse=LSE,
         nq=NQ,
         heads=H,
+        group=group,
     )
+    allocator = fx.SharedAllocator()
     if fx.const_expr(RAW):
-        table = fx.SharedAllocator().allocate(fx.Array[fx.Int32, TOPK + 64, 16]).peek()
+        table = allocator.allocate(fx.Array[fx.Int32, TOPK + 64, 16]).peek()
         env.table = fx.Int32(
             fx.ptrtoint(fx.get_iter(table.view(fx.make_layout(TOPK + 64, 1))))
         )
         length = _uniform(META[tile * 5 + 3])
         _raw_env(env, PK, PV, KS, VS, SLOTS, length, NK, TOPK, SLOTTED, WIDE)
+    if fx.const_expr(RESIDUAL):
+        # The row's union output O_u for the merge: group heads of 512 bytes. With at most
+        # COMPACT_GROUP heads lane n merges dims 64g + 32 (n >> 3) .. + 31 of head n & 7.
+        env.union = (
+            allocator.allocate(fx.Array[fx.Int8, group * 512, 16])
+            .peek()
+            .view(fx.make_layout(group * 512, 1))
+        )
+        env.union_lane = n * 512 + g * 128
+        head = n & 7
+        env.union_compact = (
+            _min(head, fx.Int32(group - 1)) * 512 + g * 128 + (n >> 3) * 64
+        )
+        env.out_compact = (on & (head < group)).select(
+            (row * H + hkv * group + head) * (D * 2) + g * 128 + (n >> 3) * 64,
+            fx.Int32(q_rows * D * 2),
+        )
 
     @flyc.jit
     def run():
@@ -1020,6 +1085,11 @@ def _direct_kernel(
         first_k, first_v, first_sc = _chunk_words(
             env, _chunk_sources(env, ids0, fx.Int32(0)), zero4
         )
+        if fx.const_expr(RESIDUAL):
+            lse_word = fx.Int32(0)
+            if env.residual:
+                lse_word = _union_words(env, row, hkv, lane)
+            env.lse_word = lse_word
         state = (
             fx.Vector.filled(64, 0.0, fx.Float32),
             fx.Float32(_MAX_FLOOR),
