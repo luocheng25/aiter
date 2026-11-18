@@ -30,8 +30,11 @@ stream's scratch arena, which must keep the captured scratch allocated. The
 kv_slots cases scatter a layout's K/V into random 64-token pages of a NaN-filled
 token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
-for bit. The span limit cases must be rejected: one request whose K/V spans one
-token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+for bit, also when the next call finds the pages moved to other pool rows (the
+fixed selection of ``kv_slots_prefill_2048`` then reuses its plan and only maps
+its union blocks again). The span limit cases must be rejected: one request whose
+K/V spans one token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry
+past it.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
 12000-token serving prompt (T = 512); they are checked as well. H6/H3 union tiles
@@ -60,7 +63,9 @@ uses: the scale is a kernel argument, so capturing compiles nothing and builds
 no workspace. They replay after rewriting the indices in place (and the slot
 table, with the K/V moved to other pages), and an eager call at yet another
 scale must add no FlyDSL specialization. The batch invariance cases run each
-request alone (one of them a full H6 prefill, which also takes the BQ21 tiles)
+request alone (one of them a full H6 prefill, which also takes the BQ21 tiles; the
+mixed-tile cases batch a BQ21/BQ42 request with a BQ16/BQ32 one, and their plan
+must hold both tile rows; two direct requests run persistent direct only batched)
 and all of them in one call with batch_invariant=True, and both must give the
 same bits: union planning (the row threshold) and the union tile rows are
 decided per request and K3 routes no tile by the others (packed and raw direct
@@ -273,6 +278,9 @@ SLOT_CASES = {
     ),
     # At group 16 (see CASE_GROUPS): a 16-head direct wave per KV head, over two KV heads.
     "kv_slots_g16_hk2_ragged": ("hk2_ragged", None, 1),
+    # A fixed selection (every row selects all of its complete blocks): repeated calls
+    # reuse the plan, and with the pages moved only K3 maps the union blocks again.
+    "kv_slots_prefill_2048": ("prefill_2048", None, 1),
 }
 # name -> (K/V tokens of one request, read through kv_slots): one past the
 # 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
@@ -318,7 +326,32 @@ BATCH_CASES = {
         6,
         ((4096, 0, "correlated"), (17, 30000, "random")),
     ),
+    # Union tiles of two widths (BATCH_TILE_ROWS): alone, the prefill takes BQ21 (H6) or
+    # BQ42 (H3) tiles and the 1000-row chunk BQ16 / BQ32 ones; batched, both keep theirs.
+    "batch_invariance_mixed_tiles_h6": (
+        6,
+        ((2048, 0, "correlated"), (1000, 4096, "shared"), (17, 30000, "random")),
+    ),
+    "batch_invariance_mixed_tiles_h3": (
+        3,
+        ((4096, 0, "correlated"), (1000, 4096, "shared"), (17, 30000, "random")),
+    ),
+    # Direct only, every row selecting T complete blocks: the batch's 700 rows fill a wave
+    # per SIMD, so its packed direct runs persistent (BATCH_PERSISTENT); alone each runs
+    # one-wave CTAs.
+    "batch_invariance_persistent_h12": (
+        12,
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
 }
+# name -> (wide, narrow) union tile rows the batch-invariant plan of a batch must both hold
+# (on MI308X's 80 CUs, where the wide tiles start at wide_tile_rows rows).
+BATCH_TILE_ROWS = {
+    "batch_invariance_mixed_tiles_h6": (21, 16),
+    "batch_invariance_mixed_tiles_h3": (42, 32),
+}
+# Batches whose batch-invariant direct launch must run persistent (on MI308X's 80 CUs).
+BATCH_PERSISTENT = ("batch_invariance_persistent_h12",)
 # FP8 pool rows of 4.5 GiB at HK1.
 FP8_POOL_4G_ROWS = (2**32 + 2**29) // HEAD_DIM
 # FP8 K/V cases: name -> (layout, Q heads per KV head, scales ("tensor" [1] or "token"
@@ -1098,8 +1131,8 @@ def routes():
     the context for the direct kernel ("pack_k": never for raw direct, and no pack runs
     when every tile runs union whole).
 
-    The helpers from latest_workspace to scratch_arena (and test_qsa_graph_replay's arena)
-    are the only code reading prefill internals:
+    The helpers from latest_workspace to union_tile_rows (and test_qsa_graph_replay's
+    arena) are the only code reading prefill internals:
       - flydsl_prefill._workspaces, the most recently used workspace last;
       - a workspace's fp8 (None for BF16 K/V, else the scale layout), its BF16
         direct.pack_shape (empty when direct reads the raw K/V) or FP8 direct.raw, and
@@ -1111,6 +1144,9 @@ def routes():
         when core_ratio > 0) and .direct_flag (entry 0 set when the pack must run);
       - flydsl_prefill.platform(None / "tensor" / "token"), the route calibrations;
       - a workspace's q8 / qs scratch, the FP8 Q of its latest call (fp8_query);
+      - a workspace's .static (a fixed selection's plan) and .arena.holds(workspace)
+        (plan_reused), its BF16 direct.persistent (direct_persistent) and its union
+        plan's .metadata (union_tile_rows);
       - flydsl_prefill._arenas[(device, stream)].generation and .buffers.
     """
     workspace = latest_workspace()
@@ -1217,6 +1253,29 @@ def scratch_arena(stream):
     device = torch.device("cuda", torch.cuda.current_device())
     arena = flydsl_prefill._arenas[(device, stream.cuda_stream)]
     return arena.generation, [buffer.data_ptr() for buffer in arena.buffers]
+
+
+def plan_reused():
+    """Whether the latest call's workspace holds a fixed selection's plan (static) that its
+    stream's scratch arena still holds, so that its next call skips K1-K3 but K3's slot
+    table mapping (_Workspace.static, _Arena.holds)."""
+    workspace = latest_workspace()
+    return workspace.static and workspace.arena.holds(workspace)
+
+
+def direct_persistent():
+    """Whether the latest call's BF16 packed direct launch runs persistent."""
+    return latest_workspace().direct.persistent
+
+
+def union_tile_rows():
+    """Query rows of the union tiles the latest call ran (its plan's tile metadata: first
+    row, rows, ...; active tiles ran union)."""
+    plan = latest_workspace().union
+    if plan is None:
+        return set()
+    rows = plan.metadata.view(-1, 5)[:, 1].cpu()
+    return set(rows[plan.active.bool().cpu()].tolist())
 
 
 def flydsl_variants():
@@ -1437,10 +1496,31 @@ def make_pool(
     return *pools, slots
 
 
+def move_pages(pool_k, pool_v, slots, first_page, generator):
+    """Int32 slots of the pools' used PAGE-token pages moved to random unused pages from
+    first_page on; the old rows become NaN."""
+    rows = slots.long()
+    used = torch.unique(rows // PAGE)
+    unused = torch.ones(pool_k.shape[0] // PAGE, dtype=torch.bool, device=rows.device)
+    unused[:first_page] = False
+    unused[used] = False
+    free = unused.nonzero().flatten()
+    order = torch.randperm(free.numel(), generator=generator, device="cuda")
+    target = torch.full_like(unused, -1, dtype=torch.long)
+    target[used] = free[order[: used.numel()]]
+    moved = target[rows // PAGE] * PAGE + rows % PAGE
+    for pool in (pool_k, pool_v):
+        pool[moved] = pool[rows]
+        pool[rows] = float("nan")
+    return moved.to(dtypes.i32)
+
+
 @benchmark()
 def test_qsa_kv_slots(case, heads):
     """K/V read in place from a token pool through kv_slots, against the packed call on
-    the gathered rows (what a caller without kv_slots runs); both match bit for bit."""
+    the gathered rows (what a caller without kv_slots runs); both match bit for bit, also
+    in a next call after the pages moved to other pool rows (a fixed selection's plan is
+    then reused: plan_reused)."""
     layout, pool_rows, first_page = SLOT_CASES[case]
     query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
     generator = torch.Generator(device="cuda").manual_seed(
@@ -1505,6 +1585,25 @@ def test_qsa_kv_slots(case, heads):
         msg=f"{case} H{heads} flydsl_kv_slots vs flydsl_gather: out",
     )
     assert bitwise == 0, f"{case} H{heads}: kv_slots differs from the gathered call"
+    # Right after run_perftest's last kv_slots call, with the same K/V on other pages.
+    reused = plan_reused()
+    fixed = all(
+        n + p <= 4 * CASES[layout][4] + 3 for n, p in zip(*CASES[layout][:2]) if n
+    )
+    assert reused == fixed, f"{case} H{heads}: plan reused {reused}, fixed {fixed}"
+    moved = move_pages(pool_k, pool_v, slots, first_page, generator)
+    out = qsa_sparse_prefill(q, pool_k, pool_v, indices, **kwargs, kv_slots=moved)
+    moved_bits = checkAllclose(
+        outputs["flydsl_gather"],
+        out,
+        rtol=0,
+        atol=0,
+        msg=f"{case} H{heads} flydsl_kv_slots, pages moved, vs flydsl_gather: out",
+    )
+    assert (
+        moved_bits == 0
+    ), f"{case} H{heads}: moved pages differ from the gathered call"
+    ret["plan reused"] = reused
     return ret
 
 
@@ -1642,11 +1741,12 @@ def test_qsa_batch_invariance(case, heads):
     """With batch_invariant=True every request alone gives the bits it gives in one call
     with all of the batch's requests: union planning (the row threshold) and the union
     tile rows (BQ21/BQ42 by the request's own rows) are decided per request, K3 routes no
-    tile by the others, and packed and raw direct agree bit for bit. The one exception, a
-    batch whose union scratch exceeds its budget running direct only, takes millions of
-    rows and is not tested. The batch first runs in the default mode, whose decisions span
-    the call: it must stay within tolerance, and batch_invariant=True must not reuse its
-    workspace (its plan would change the requests' bits)."""
+    tile by the others, and packed and raw direct agree bit for bit, as do the persistent
+    and one-wave direct launches (BATCH_PERSISTENT). The one exception, a batch whose
+    union scratch exceeds its budget running direct only, takes millions of rows and is
+    not tested. The batch first runs in the default mode, whose decisions span the call:
+    it must stay within tolerance, and batch_invariant=True must not reuse its workspace
+    (its plan would change the requests' bits)."""
     _, requests = BATCH_CASES[case]
     generator = torch.Generator(device="cuda").manual_seed(
         len(CASES) * 16 + list(BATCH_CASES).index(case) * 16 + heads
@@ -1682,6 +1782,16 @@ def test_qsa_batch_invariance(case, heads):
         msg=f"{case} H{heads} batched, default mode: out",
     )
     batched = qsa_sparse_prefill(q, k, v, indices, batch_invariant=True, **kwargs)
+    tile_rows = union_tile_rows()
+    persistent = direct_persistent()
+    assert get_cu_num() != 80 or persistent == (
+        case in BATCH_PERSISTENT
+    ), f"{case} H{heads}: the batch's direct launch runs persistent: {persistent}"
+    if case in BATCH_TILE_ROWS and get_cu_num() == 80:
+        wide, narrow = BATCH_TILE_ROWS[case]
+        assert any(narrow < rows <= wide for rows in tile_rows) and any(
+            rows <= narrow for rows in tile_rows
+        ), f"{case} H{heads}: union tiles of {sorted(tile_rows)} rows"
     err = checkAllclose(
         reference,
         batched.to(dtypes.fp32),
@@ -1717,6 +1827,8 @@ def test_qsa_batch_invariance(case, heads):
         "gfx": get_gfx(),
         "rows": q.shape[0],
         "requests": len(requests),
+        "union tile rows": sorted(tile_rows),
+        "persistent direct": persistent,
         "flydsl err": err,
         "default mode err": default_err,
         "differing elements": max(differing),
