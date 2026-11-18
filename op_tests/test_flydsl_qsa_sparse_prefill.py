@@ -97,9 +97,11 @@ blocks by their out offset; graph replay with every input rewritten in place, sc
 and new softmax scales; a fixed selection through a slot table whose next calls find the
 pages moved and reuse the plan, with the packed call's bits; a workspace key that must hold
 the K/V dtype, scale layout, pool and batch mode; input errors and the entry's signature;
-batch invariance with batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
-dequantized K/V and aiter's Triton FP8 GQA (qsa_sparse_paged_gqa). The FP8 cases assert
-their paths too, including the FP8 split, core/residual union tiles and the skipped pack.
+batch invariance with batch_invariant=True (also two direct requests, per tensor and per
+token scales, that run persistent direct only batched). The 12000-token prefill is timed
+against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA
+(qsa_sparse_paged_gqa). The FP8 cases assert their paths too, including the FP8 split,
+core/residual union tiles and the skipped pack.
 
 ``triton`` is SGLang's native QSA extend path, copied below under SGLang's
 Apache-2.0 license (see the notice there) and called as its backend does:
@@ -508,15 +510,37 @@ FP8_SLOT_REUSE_CASES = {
     "fp8_kv_slots_reuse_prefill_2048_tensor": ("prefill_2048", 12, "tensor"),
     "fp8_kv_slots_reuse_prefill_2048_token": ("prefill_2048", 6, "token"),
 }
-# As BATCH_CASES, with FP8 K/V (per token scales) and batch_invariant=True. By default
-# the first two requests alone have few enough union tasks to split their key ranges and
-# batched they do not: batch_invariant=True must not split.
+# As BATCH_CASES, with FP8 K/V and batch_invariant=True: name -> (Q heads per KV head,
+# scales ("tensor": one [1] scale, the batch's, also for each request alone; or "token"),
+# requests). By default the first two requests of fp8_batch_invariance_token alone have
+# few enough union tasks to split their key ranges and batched they do not:
+# batch_invariant=True must not split.
 FP8_BATCH_CASES = {
     "fp8_batch_invariance_token": (
         3,
+        "token",
         ((768, 0, "shared"), (2048, 30000, "shared"), (64, 70001, "random")),
     ),
+    # Direct only, every row selecting T complete blocks: the batch's 700 rows fill a wave
+    # per SIMD, so its direct launch runs persistent (FP8_BATCH_PERSISTENT); alone each
+    # request runs one-row WGs.
+    "fp8_batch_invariance_persistent_tensor": (
+        12,
+        "tensor",
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
+    "fp8_batch_invariance_persistent_token": (
+        12,
+        "token",
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
 }
+# FP8 batches whose batch-invariant direct launch must run persistent while their requests
+# alone do not (on MI308X's 80 CUs).
+FP8_BATCH_PERSISTENT = (
+    "fp8_batch_invariance_persistent_tensor",
+    "fp8_batch_invariance_persistent_token",
+)
 FP8_LAYOUT_CASES = {
     **FP8_CASES,
     **FP8_SINK_CASES,
@@ -535,7 +559,7 @@ CASE_GROUPS = {
     **{name: group for name, (_, group, *_) in SCALE_CASES.items()},
     **{name: group for name, (group, *_) in BATCH_CASES.items()},
     **{name: group for name, (_, group, *_) in FP8_LAYOUT_CASES.items()},
-    **{name: group for name, (group, _) in FP8_BATCH_CASES.items()},
+    **{name: group for name, (group, *_) in FP8_BATCH_CASES.items()},
 }
 # FP8 workspaces' paths (see routes): union tiles ran, direct rows ("packed", "raw" or None),
 # union tile rows, key-range parts of the union tasks, core/residual tiles ran residual
@@ -580,6 +604,15 @@ FP8_ROUTES = {
     "fp8_graph_mixed_union_raw_token": (True, "packed", 32, 2, False, True),
     # The first request alone: no split with batch_invariant=True.
     "fp8_batch_invariance_token": (True, None, 32, 1, False, False),
+    "fp8_batch_invariance_persistent_tensor": (
+        False,
+        "packed",
+        None,
+        None,
+        False,
+        True,
+    ),
+    "fp8_batch_invariance_persistent_token": (False, "packed", None, None, False, True),
 }
 # name -> paths its call under test takes (see routes); for batch invariance, the first
 # request alone: whether union tiles ran, how direct rows read K/V ("packed", "raw", or
@@ -1170,8 +1203,8 @@ def routes():
       - flydsl_prefill.platform(None / "tensor" / "token"), the route calibrations;
       - a workspace's q8 / qs scratch, the FP8 Q of its latest call (fp8_query);
       - a workspace's .static (a fixed selection's plan) and .arena.holds(workspace)
-        (plan_reused), its BF16 direct.persistent (direct_persistent) and its union
-        plan's .metadata (union_tile_rows);
+        (plan_reused), its BF16 packed or FP8 direct.persistent (direct_persistent) and
+        its union plan's .metadata (union_tile_rows);
       - flydsl_prefill._arenas[(device, stream)].generation and .buffers.
     """
     workspace = latest_workspace()
@@ -1289,7 +1322,8 @@ def plan_reused():
 
 
 def direct_persistent():
-    """Whether the latest call's BF16 packed direct launch runs persistent."""
+    """Whether the latest call's direct plan runs persistent: BF16 packed direct, or FP8
+    direct (a core/residual plan's rows only when its union keeps no tile)."""
     return latest_workspace().direct.persistent
 
 
@@ -2756,22 +2790,33 @@ def test_qsa_fp8_input_errors(case, heads):
 @benchmark()
 def test_qsa_fp8_batch_invariance(case, heads):
     """With batch_invariant=True every request alone gives the bits it gives batched
-    with the others (as test_qsa_batch_invariance), FP8 K/V with per token scales: union
-    planning and tile rows per request, no K3 routing by the others and no FP8 split of
-    the union tasks (by default the first two requests alone split their key ranges). The
-    batch is within FP8_TOL of the reference."""
-    _, requests = FP8_BATCH_CASES[case]
+    with the others (as test_qsa_batch_invariance), FP8 K/V: union planning and tile rows
+    per request, no K3 routing by the others and no FP8 split of the union tasks (by
+    default the first two requests of fp8_batch_invariance_token alone split their key
+    ranges), and the persistent and one-row direct launches agree bit for bit
+    (FP8_BATCH_PERSISTENT: direct only, the batch runs persistent, each request alone
+    does not). The batch is within FP8_TOL of the reference."""
+    _, scales, requests = FP8_BATCH_CASES[case]
+    per_token = scales == "token"
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
     parts = []
     for rows, prefix, selection in requests:
         q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
-        k8, ks = make_fp8_kv(rows + prefix, 1, True, generator)
-        v8, vs = make_fp8_kv(rows + prefix, 1, True, generator)
+        k8, ks = make_fp8_kv(rows + prefix, 1, per_token, generator)
+        v8, vs = make_fp8_kv(rows + prefix, 1, per_token, generator)
+        if parts and not per_token:
+            # One per tensor scale: the batch's, which each request alone reads too.
+            ks, vs = parts[0][4:]
         indices = make_indices((rows,), (prefix,), selection, generator, 512)
         parts.append((q, k8, v8, indices, ks, vs))
     query_lens = tuple(rows for rows, _, _ in requests)
     prefix_lens = tuple(prefix for _, prefix, _ in requests)
-    q, k8, v8, indices, ks, vs = (torch.cat(tensors) for tensors in zip(*parts))
+    columns = list(zip(*parts))
+    q, k8, v8, indices = (torch.cat(tensors) for tensors in columns[:4])
+    if per_token:
+        ks, vs = (torch.cat(tensors) for tensors in columns[4:])
+    else:
+        ks, vs = parts[0][4:]
     kwargs = {"softmax_scale": SCALE, "batch_invariant": True}
     batched = qsa_sparse_prefill(
         q,
@@ -2785,6 +2830,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
         **kwargs,
     )
     taken = routes()
+    persistent = direct_persistent()
     sampled = sample_rows(query_lens)
     mean, worst = fp8_error(
         batched[sampled],
@@ -2792,7 +2838,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
             q, k8, v8, indices, query_lens, prefix_lens, SCALE, (ks, vs), sampled
         ),
     )
-    differing, first, alone = [], 0, None
+    differing, first, alone, alone_persistent = [], 0, None, []
     for (*tensors, k_scale, v_scale), (rows, prefix, _) in zip(parts, requests):
         out = qsa_sparse_prefill(
             *tensors,
@@ -2805,6 +2851,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
         if alone is None:
             # The first request alone takes the paths the batch must not change.
             alone = check_routes(case, heads)
+        alone_persistent.append(direct_persistent())
         differing.append(
             mismatched_bits(
                 out,
@@ -2813,10 +2860,22 @@ def test_qsa_fp8_batch_invariance(case, heads):
             )
         )
         first += rows
-    assert taken["union"] and taken["direct"], (
-        f"{case} H{heads}: the batch took {taken}; it must mix union tiles and "
-        "direct rows"
-    )
+    if case in FP8_BATCH_PERSISTENT:
+        assert (
+            not taken["union"] and taken["direct"]
+        ), f"{case} H{heads}: the batch took {taken}; it must run direct only"
+        assert get_cu_num() != 80 or (persistent and not any(alone_persistent)), (
+            f"{case} H{heads}: persistent direct launches: the batch's {persistent}, "
+            f"the requests' alone {alone_persistent}"
+        )
+    else:
+        assert taken["union"] and taken["direct"], (
+            f"{case} H{heads}: the batch took {taken}; it must mix union tiles and "
+            "direct rows"
+        )
+        assert (
+            get_cu_num() != 80 or not persistent
+        ), f"{case} H{heads}: the batch's direct launch runs persistent"
     assert bool(torch.isfinite(batched).all()), f"{case} H{heads}: non-finite output"
     assert (
         mean < FP8_TOL[0] and worst < FP8_TOL[1]
@@ -2829,7 +2888,9 @@ def test_qsa_fp8_batch_invariance(case, heads):
         "gfx": get_gfx(),
         "rows": q.shape[0],
         "requests": len(requests),
+        "scales": scales,
         "batch routes": taken,
+        "persistent direct": persistent,
         "first request alone": alone,
         "mean err": mean,
         "worst err": worst,
