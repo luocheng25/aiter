@@ -1786,7 +1786,8 @@ def _plain_persistent_kernel(
     PLAIN_PERSIST items each), then item whole + w * CUS + b of the last round if any (one per
     SIMD, on different CUs). The last wave out zeroes the queue (QUEUE[64] counts the waves
     out) for the next launch. A gated plain plan's items are the rows of the tiles K3 routes
-    direct (_tile_list): TILE_ROWS * HK items per listed tile, those past its rows exit.
+    direct (_tile_list): TILE_ROWS * HK items per listed tile, those past its rows exit, or
+    when every tile runs direct the plan's rows in the plain order.
     """
     ins = SimpleNamespace(
         Q8=Q8,
@@ -1853,10 +1854,14 @@ def _plain_persistent_kernel(
     if go:
         items = ROWS * HK
         if fx.const_expr(compact):
-            listed = _tile_list(
-                ACTIVE, TILE_META, TILES, tile_words, tally, capacity, wave, lane
+            listed = _uniform(
+                _tile_list(
+                    ACTIVE, TILE_META, TILES, tile_words, tally, capacity, wave, lane
+                )
             )
-            items = _uniform(listed) * TILE_ROWS * HK
+            # Every tile direct: the rows run in the plain order (no tile lookup per row).
+            every = listed == TILES
+            items = every.select(ROWS * HK, listed * TILE_ROWS * HK)
         # (This barrier also ends the listing: every wave reads all of it.)
         _lds_relaxed_store(paces + wave * 4, fx.Int32(0))
         fx.gpu.barrier()
@@ -1883,6 +1888,7 @@ def _plain_persistent_kernel(
                 chunks, got = _tile_row(
                     ins,
                     items - 1 - item,
+                    every,
                     META,
                     tile_words,
                     TILE_ROWS,
@@ -1942,17 +1948,12 @@ def _tile_list(ACTIVE, TILE_META, TILES, listing, tally, capacity, wave, lane):
     return listed
 
 
-def _tile_row(ins, work, META, listing, TILE_ROWS, table, pace, take):
+def _tile_row(ins, work, every, META, listing, TILE_ROWS, table, pace, take):
     """Work item `work` of a gated plain persistent launch: row work // HK % TILE_ROWS of
-    listed tile work // (TILE_ROWS * HK), KV head work % HK (past the tile's rows: exits).
-    Returns (chunks, the take) (_direct_row)."""
-    span = TILE_ROWS * ins.HK
-    j = work // span
-    local = work - j * span
-    r, hkv = local // ins.HK, local % ins.HK
-    entry = _uniform(_lds_relaxed_load(listing + j * 4))
-    on = r < (entry >> 24)
-    row = (entry & 0xFFFFFF) + on.select(r, fx.Int32(0))
+    listed tile work // (TILE_ROWS * HK), KV head work % HK (past the tile's rows: exits);
+    with every tile listed (every), query row work // HK as in the plain order. Returns
+    (chunks, the take) (_direct_row)."""
+    row, hkv, on = _listed_row(work, every, listing, TILE_ROWS, ins.HK)
     p_start, position = _uniform(META[row * 5 + 2]), _uniform(META[row * 5 + 4])
     length = _uniform(META[row * 5 + 3]) if fx.const_expr(ins.RAW) else None
     return _direct_row(
@@ -1968,6 +1969,22 @@ def _tile_row(ins, work, META, listing, TILE_ROWS, table, pace, take):
         pace,
         take,
     )
+
+
+@flyc.jit
+def _listed_row(work, every, listing, TILE_ROWS, HK):
+    """(query row, KV head, whether it runs) of _tile_row's work item."""
+    row, hkv, on = work // HK, work % HK, fx.Boolean(True)
+    if ~every:
+        span = TILE_ROWS * HK
+        j = work // span
+        local = work - j * span
+        r = local // HK
+        hkv = local % HK
+        entry = _uniform(_lds_relaxed_load(listing + j * 4))
+        on = r < (entry >> 24)
+        row = (entry & 0xFFFFFF) + on.select(r, fx.Int32(0))
+    return row, hkv, on
 
 
 @flyc.jit
