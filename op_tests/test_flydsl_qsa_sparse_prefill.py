@@ -94,9 +94,10 @@ is exact, and zero Q rows; the reference on the FP8 Q the kernels compute with, 
 sharp scores; large logits; K/V past 4 GiB, packed (a request crossing it) and as a pool
 whose pages lie past it; Q and out past 2 GiB (H192), whose rows past 2 GiB merge residual
 blocks by their out offset; graph replay with every input rewritten in place, scratch growth
-and new softmax scales; a workspace key that must hold the K/V dtype, scale layout, pool
-and batch mode; input errors and the entry's signature; batch invariance with
-batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
+and new softmax scales; a fixed selection through a slot table whose next calls find the
+pages moved and reuse the plan, with the packed call's bits; a workspace key that must hold
+the K/V dtype, scale layout, pool and batch mode; input errors and the entry's signature;
+batch invariance with batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
 dequantized K/V and aiter's Triton FP8 GQA (qsa_sparse_paged_gqa). The FP8 cases assert
 their paths too, including the FP8 split, core/residual union tiles and the skipped pack.
 
@@ -500,6 +501,13 @@ FP8_GRAPH_CASES = {
 # name -> (layout, Q heads per KV head)
 FP8_WORKSPACE_CASES = {"fp8_workspace_key_ragged_4": ("ragged_4", 12)}
 FP8_ERROR_CASES = {"fp8_input_errors": ("extend_9_ctx_139", 3)}
+# name -> (layout, Q heads per KV head, scales): a fixed selection's FP8 K/V read through a
+# slot table, whose next calls find the pages (and per token scales) moved to other pool
+# rows and reuse the plan.
+FP8_SLOT_REUSE_CASES = {
+    "fp8_kv_slots_reuse_prefill_2048_tensor": ("prefill_2048", 12, "tensor"),
+    "fp8_kv_slots_reuse_prefill_2048_token": ("prefill_2048", 6, "token"),
+}
 # As BATCH_CASES, with FP8 K/V (per token scales) and batch_invariant=True. By default
 # the first two requests alone have few enough union tasks to split their key ranges and
 # batched they do not: batch_invariant=True must not split.
@@ -517,6 +525,7 @@ FP8_LAYOUT_CASES = {
     **FP8_GRAPH_CASES,
     **FP8_WORKSPACE_CASES,
     **FP8_ERROR_CASES,
+    **FP8_SLOT_REUSE_CASES,
 }
 # name -> Q heads per KV head: these cases run once, at this group, whatever -g selects.
 # Group 16 is the most the interface accepts (BQ8 union tiles, a 16-head direct wave).
@@ -1555,9 +1564,10 @@ def make_pool(
     return *pools, slots
 
 
-def move_pages(pool_k, pool_v, slots, first_page, generator):
+def move_pages(pool_k, pool_v, slots, first_page, generator, *tables):
     """Int32 slots of the pools' used PAGE-token pages moved to random unused pages from
-    first_page on; the old rows become NaN."""
+    first_page on, with the rows of per pool row tables (FP8 per token scales); the old
+    rows become NaN (FP8: the NaN byte)."""
     rows = slots.long()
     used = torch.unique(rows // PAGE)
     unused = torch.ones(pool_k.shape[0] // PAGE, dtype=torch.bool, device=rows.device)
@@ -1568,7 +1578,7 @@ def move_pages(pool_k, pool_v, slots, first_page, generator):
     target = torch.full_like(unused, -1, dtype=torch.long)
     target[used] = free[order[: used.numel()]]
     moved = target[rows // PAGE] * PAGE + rows % PAGE
-    for pool in (pool_k, pool_v):
+    for pool in (pool_k, pool_v, *tables):
         pool[moved] = pool[rows]
         pool[rows] = float("nan")
     return moved.to(dtypes.i32)
@@ -2491,6 +2501,63 @@ def test_qsa_fp8_graph(case, heads):
 
 
 @benchmark()
+def test_qsa_fp8_kv_slots_reuse(case, heads):
+    """FP8 K/V of a fixed selection read through a slot table (unused pool rows and their
+    per token scales NaN) give the packed call's bits, also in the next calls after the
+    pages and their scales moved to other pool rows: those reuse the plan (plan_reused),
+    only K3 mapping the union blocks again."""
+    layout, _, scales = FP8_SLOT_REUSE_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
+    q, k8, ks, v8, vs, indices = make_fp8_inputs(
+        layout, heads, scales == "token", generator
+    )
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    packed = qsa_sparse_prefill(q, k8, v8, indices, k_scale=ks, v_scale=vs, **kwargs)
+    pool_k, pool_v, slots = make_pool(
+        k8, v8, query_lens, prefix_lens, None, 1, generator
+    )
+    size = pool_k.shape[0]
+    pool_ks, pool_vs = pool_scale(ks, slots, size), pool_scale(vs, slots, size)
+    tables = [table for table in (pool_ks, pool_vs) if table.ndim == 2]
+    differing, reused = [], []
+    for call in range(3):
+        if call:
+            slots = move_pages(pool_k, pool_v, slots, 1, generator, *tables)
+        out = qsa_sparse_prefill(
+            q,
+            pool_k,
+            pool_v,
+            indices,
+            k_scale=pool_ks,
+            v_scale=pool_vs,
+            kv_slots=slots,
+            **kwargs,
+        )
+        # Whether the next call reuses this one's plan.
+        reused.append(plan_reused())
+        differing.append(
+            mismatched_bits(
+                out, packed, f"{case} H{heads} call {call}, kv_slots vs packed: out"
+            )
+        )
+    assert all(reused), f"{case} H{heads}: plan reused {reused}"
+    assert not any(differing), f"{case} H{heads}: differing elements {differing}"
+    return {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "scales": scales,
+        "routes": routes(),
+        "plan reused": reused,
+        "differing": differing,
+    }
+
+
+@benchmark()
 def test_qsa_fp8_workspace(case, heads):
     """Workspaces are cached per stream and layout, so their key must hold the K/V dtype,
     the FP8 scale layout, the pool and the batch mode, and every call must bind its
@@ -2816,6 +2883,7 @@ def main():
         ("fp8 uniform", list(FP8_UNIFORM_CASES), test_qsa_fp8_uniform),
         ("fp8 query reference", list(FP8_QUERY_CASES), test_qsa_fp8_query),
         ("fp8 graph", list(FP8_GRAPH_CASES), test_qsa_fp8_graph),
+        ("fp8 kv_slots reuse", list(FP8_SLOT_REUSE_CASES), test_qsa_fp8_kv_slots_reuse),
         ("fp8 workspace", list(FP8_WORKSPACE_CASES), test_qsa_fp8_workspace),
         ("fp8 input errors", list(FP8_ERROR_CASES), test_qsa_fp8_input_errors),
         ("fp8 batch invariance", list(FP8_BATCH_CASES), test_qsa_fp8_batch_invariance),
