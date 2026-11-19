@@ -22,24 +22,41 @@ kernel's 64 MiB budget, one packed by the per-row rule, one only raw direct
 reads), nine 1M-token requests whose packed K/V exceed 4 GiB (the last, a
 1024-row chunk, starts at 4 GiB), one request whose K and V each span the
 4 GiB - 1 MiB limit (raw direct and union), ragged batches with an empty request,
-HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections and
-constant Q/K whose logits sit near +1e11 on the union path (``large_logits``).
+HK > 1 (HK = 16 with over 4096 tasks to route), T = 256/768/1024 selections,
+constant Q/K whose logits sit near +1e11 on the union path (``large_logits``) and
+two-request batches whose direct rows read raw or packed K/V. Some of them
+(RAW_CHECKED) run again with every direct row on the raw K/V, which must give the
+packed call's bits, also for the rows the packed direct launch splits into key-tile
+parts (a direct-only call, over two KV heads, and a union call's direct tiles).
 The graph case captures a union layout on its own stream, replays it after
 rewriting its indices in place, then again after another layout grows the
 stream's scratch arena, which must keep the captured scratch allocated. The
 kv_slots cases scatter a layout's K/V into random 64-token pages of a NaN-filled
 token pool (past 4 GiB for the ``pool_4g`` cases) and read it in place through
 the slot table; the result must equal the packed call on the gathered rows bit
-for bit. The span limit cases must be rejected: one request whose K/V spans one
-token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry past it.
+for bit, also when the next call finds the pages moved to other pool rows (the
+fixed selection of ``kv_slots_prefill_2048`` then reuses its plan and only maps
+its union blocks again), and for two of them by raw direct through the slot table. The span limit cases must be rejected: one request whose
+K/V spans one token past 4 GiB - 1 MiB, or whose int32 slot table spans one entry
+past it.
 Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
-12000-token serving prompt (T = 512); they are checked as well and are the only
-cases using the full-prefill BQ21/BQ42 union tiles. ``shared`` selections let
-32-row windows share block priorities; ``random`` rows choose independently;
-``correlated`` (performance cases) simulates the real indexer's selection
-distribution, captured Qwen3.8 layers whose neighbouring rows share about half
-of their blocks (see correlated_prefill).
+12000-token serving prompt (T = 512); they are checked as well. H6/H3 union tiles
+take 21/42 queries (BQ21/BQ42) in calls of at least wide_tile_rows rows, with or
+without a prefix: the larger performance cases, one batch invariance request, a
+4096-row chunk (BF16 and FP8 K/V), an FP8 batch of two 2048-row chunks and a 4096-row
+FP8 prefill run them. They and FP8_PERF_CASES alone take run_perftest's full timing;
+the other cases make the few calls their checks need (CHECK_PERFTEST), so their times
+are rough. ``shared``
+selections let 32-row windows share block priorities; ``random`` rows choose
+independently; ``correlated`` (performance cases) simulates the real indexer's
+selection distribution, captured Qwen3.8 layers whose neighbouring rows share about
+half of their blocks (see correlated_selection). A tuple gives each request its own
+selection. The output run_perftest returns is its last call's, in a block an earlier
+call's output freed, so rows a later call leaves unwritten would keep that call's
+values: one more FlyDSL call writes into a NaN-filled out and must pass the same
+check (state a cached workspace carries across calls, such as the persistent
+direct's launch queue).
 
 Group 16 is the most Q heads per KV head the interface accepts (BQ8 union
 tiles, a direct wave of 16 heads): ``mixed_union_raw`` batches a union request
@@ -51,7 +68,9 @@ uses: the scale is a kernel argument, so capturing compiles nothing and builds
 no workspace. They replay after rewriting the indices in place (and the slot
 table, with the K/V moved to other pages), and an eager call at yet another
 scale must add no FlyDSL specialization. The batch invariance cases run each
-request alone (one of them a full H6 prefill, which also takes the BQ21 tiles)
+request alone (one of them a full H6 prefill, which also takes the BQ21 tiles; the
+mixed-tile cases batch a BQ21/BQ42 request with a BQ16/BQ32 one, and their plan
+must hold both tile rows; two direct requests run persistent direct only batched)
 and all of them in one call with batch_invariant=True, and both must give the
 same bits: union planning (the row threshold) and the union tile rows are
 decided per request and K3 routes no tile by the others (packed and raw direct
@@ -76,16 +95,20 @@ is exact, and zero Q rows; the reference on the FP8 Q the kernels compute with, 
 sharp scores; large logits; K/V past 4 GiB, packed (a request crossing it) and as a pool
 whose pages lie past it; Q and out past 2 GiB (H192), whose rows past 2 GiB merge residual
 blocks by their out offset; graph replay with every input rewritten in place, scratch growth
-and new softmax scales; a workspace key that must hold the K/V dtype, scale layout, pool
-and batch mode; input errors and the entry's signature; batch invariance with
-batch_invariant=True. The 12000-token prefill is timed against the BF16 path on the
-dequantized K/V and aiter's Triton FP8 GQA (qsa_sparse_paged_gqa). The FP8 cases assert
-their paths too, including the FP8 split, core/residual union tiles and the skipped pack.
+and new softmax scales; a fixed selection through a slot table whose next calls find the
+pages moved and reuse the plan, with the packed call's bits; a workspace key that must hold
+the K/V dtype, scale layout, pool and batch mode; input errors and the entry's signature;
+batch invariance with batch_invariant=True (also two direct requests, per tensor and per
+token scales, that run persistent direct only batched). The 12000-token prefill is timed
+against the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA
+(qsa_sparse_paged_gqa). The FP8 cases assert their paths too, including the FP8 split,
+core/residual union tiles and the skipped pack.
 
 ``triton`` is SGLang's native QSA extend path, copied below under SGLang's
 Apache-2.0 license (see the notice there) and called as its backend does:
 sparse_gqa_fwd_interface_triton when no request has a prefix, else
-sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V.
+sparse_gqa_fwd_interface_triton_ck over the packed full-context K/V. It runs on the
+performance cases and at group 12 on the other functional cases.
 
 Usage:
     python op_tests/test_flydsl_qsa_sparse_prefill.py
@@ -96,6 +119,7 @@ Usage:
 
 import argparse
 import contextlib
+import functools
 import gc
 import importlib
 import inspect
@@ -130,6 +154,9 @@ FP8_MAX = 240.0  # E4M3FNUZ
 # Per-(row, head) norm-relative error bounds (mean, worst) of compute="fp8" on random data:
 # FP8 Q dominates (scores err by ~2**-5 of |q||k|), FP8 probabilities add ~2%.
 FP8_TOL = (0.06, 0.16)
+# run_perftest arguments of the cases not timed in full (see perftest): one warmup, then
+# three profiled calls, the first of which it drops.
+CHECK_PERFTEST = {"num_warmup": 1, "num_iters": 3}
 
 # name -> (query_lens, prefix_lens, kv_heads, selection, blocks per row T)
 FUNCTIONAL_CASES = {
@@ -206,6 +233,8 @@ FP8_LAYOUTS = {
     "topk256_hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 256),
     "chunk_1024_ctx_4024_random": ((1024,), (3000,), 1, "random", 512),
     "ragged_3_random": ((480, 1000, 301), (11392, 3, 4001), 1, "random", 512),
+    # Two chunks after prefixes: at H3 their rows take BQ42 tiles together.
+    "two_chunks_2048": ((2048, 2048), (30000, 4000), 1, "shared", 512),
     "extend_9_ctx_139": ((9,), (130,), 1, "random", 512),
     # FP8 K/V past 4 GiB (16843185 tokens at HK1): the first two requests' K/V are the
     # longest a request may have (their BF16 span would be 4 GiB - 1 MiB), the last
@@ -230,6 +259,15 @@ CASES = {
     **{name: shape for name, (shape, _) in CONSTANT_CASES.items()},
     **MIXED_CASES,
     **FP8_LAYOUTS,
+}
+# Functional layouts also run with every direct row on the raw K/V (raw_direct), which must
+# give the packed call's bits -> the groups at which the packed direct launch splits some
+# rows into key-tile parts on MI308X (direct_split; the raw rows then repeat the split):
+# rows of a direct-only call, over two KV heads, and of a union call's direct tiles.
+RAW_CHECKED = {
+    "extend_17_ctx_30017": (12, 6, 3),
+    "hk2_ragged": (12, 6, 3),
+    "mixed_union_packed": (12, 3),
 }
 # name -> (captured union layout, layout whose first call then grows the scratch arena:
 # its packed KV outgrows the captured layout's)
@@ -259,7 +297,13 @@ SLOT_CASES = {
     ),
     # At group 16 (see CASE_GROUPS): a 16-head direct wave per KV head, over two KV heads.
     "kv_slots_g16_hk2_ragged": ("hk2_ragged", None, 1),
+    # A fixed selection (every row selects all of its complete blocks): repeated calls
+    # reuse the plan, and with the pages moved only K3 maps the union blocks again.
+    "kv_slots_prefill_2048": ("prefill_2048", None, 1),
 }
+# Also read by raw direct through the slot table (raw_direct; its block ids from the
+# wave's LDS table), which must give the gathered packed call's split rows' bits.
+SLOT_RAW_CHECKED = ("kv_slots_hk2_ragged", "kv_slots_g16_hk2_ragged")
 # name -> (K/V tokens of one request, read through kv_slots): one past the
 # 4 GiB - 1 MiB byte span of the request's K/V, or of the int32 slot table
 SPAN_LIMIT_CASES = {
@@ -299,12 +343,37 @@ BATCH_CASES = {
             (1001, 4093, "shared"),
         ),
     ),
-    # Alone, the full prefill takes the BQ21 union tiles of single-request H6 prefill.
+    # Alone, the full prefill takes BQ21 union tiles.
     "batch_invariance_full_prefill_h6": (
         6,
         ((4096, 0, "correlated"), (17, 30000, "random")),
     ),
+    # Union tiles of two widths (BATCH_TILE_ROWS): alone, the prefill takes BQ21 (H6) or
+    # BQ42 (H3) tiles and the 1000-row chunk BQ16 / BQ32 ones; batched, both keep theirs.
+    "batch_invariance_mixed_tiles_h6": (
+        6,
+        ((2048, 0, "correlated"), (1000, 4096, "shared"), (17, 30000, "random")),
+    ),
+    "batch_invariance_mixed_tiles_h3": (
+        3,
+        ((4096, 0, "correlated"), (1000, 4096, "shared"), (17, 30000, "random")),
+    ),
+    # Direct only, every row selecting T complete blocks: the batch's 700 rows fill a wave
+    # per SIMD, so its packed direct runs persistent (BATCH_PERSISTENT); alone each runs
+    # one-wave CTAs.
+    "batch_invariance_persistent_h12": (
+        12,
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
 }
+# name -> (wide, narrow) union tile rows the batch-invariant plan of a batch must both hold
+# (on MI308X's 80 CUs, where the wide tiles start at wide_tile_rows rows).
+BATCH_TILE_ROWS = {
+    "batch_invariance_mixed_tiles_h6": (21, 16),
+    "batch_invariance_mixed_tiles_h3": (42, 32),
+}
+# Batches whose batch-invariant direct launch must run persistent (on MI308X's 80 CUs).
+BATCH_PERSISTENT = ("batch_invariance_persistent_h12",)
 # FP8 pool rows of 4.5 GiB at HK1.
 FP8_POOL_4G_ROWS = (2**32 + 2**29) // HEAD_DIM
 # FP8 K/V cases: name -> (layout, Q heads per KV head, scales ("tensor" [1] or "token"
@@ -312,7 +381,8 @@ FP8_POOL_4G_ROWS = (2**32 + 2**29) // HEAD_DIM
 # needed; first pool page; whether the last request's last page is the pool's last page)).
 # The first eight pair compute, scales, paths, pools and groups 12/6/3; then group 16
 # (direct through a pool at HK2 and T = 256, union with BQ8 tiles), large logits, the BQ42
-# tile of H3 full prefill (FP8 union with 64-bit membership), the 12000-token serving
+# tile of H3 full prefill (FP8 union with 64-bit membership), BQ21 tiles of an H6 chunk after
+# a prefix and BQ42 ones of an H3 batch of two chunks (through a pool), the 12000-token serving
 # prompt (see FP8_PERF_CASES), K/V past 4 GiB: packed (the last request crosses it) and a
 # 4.5 GiB pool whose pages start at 4 GiB and end at its last page, Q and out past 2 GiB
 # (see FP8_LARGE_Q_CASES), and union tasks past K3's first order chunk.
@@ -359,6 +429,20 @@ FP8_CASES = {
         None,
     ),
     "fp8_prefill_4096_h3_tensor": ("prefill_4096", 3, "tensor", "fp8", None),
+    "fp8_chunk_4096_ctx_131072_h6_token": (
+        "chunk_4096_ctx_131072",
+        6,
+        "token",
+        "fp8",
+        None,
+    ),
+    "fp8_kv_slots_two_chunks_h3_tensor": (
+        "two_chunks_2048",
+        3,
+        "tensor",
+        "fp8",
+        (None, 1, False),
+    ),
     "fp8_prefill_12000_tensor": ("prefill_12000", 12, "tensor", "fp8", None),
     "fp8_4g_packed_token": ("fp8_4g_packed", 12, "token", "fp8", None),
     "fp8_pool_4g_ragged_4_tensor": (
@@ -375,10 +459,11 @@ FP8_CASES = {
 # checked against the reference on the kernels' FP8 Q (see test_qsa_fp8_query).
 FP8_PERF_CASES = ("fp8_prefill_12000_tensor",)
 # Checked against the reference on the kernels' FP8 Q instead of within FP8_TOL: FP8 Q
-# rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads)
-# near FP8_TOL's worst bound, while what its K/V or out addressing can break shows on
-# either check.
+# rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads,
+# or of the H6 chunk's rows: 0.165 with BQ16 tiles as with BQ21) near FP8_TOL's worst bound,
+# while what its K/V or out addressing can break shows on either check.
 FP8_QUERY_CHECKED = (
+    "fp8_chunk_4096_ctx_131072_h6_token",
     "fp8_4g_packed_token",
     "fp8_hk16_prefill_24576_token",
     "fp8_hk16_k3_chunks_token",
@@ -406,8 +491,12 @@ FP8_SINK_CASES = {
     ),
     "fp8_sink_extend_64_ctx_70065_tensor": ("extend_64_ctx_70065", 3, "tensor"),
 }
-# name -> (layout, Q heads per KV head); per token scales.
-FP8_UNIFORM_CASES = {"fp8_uniform_ragged_3_random_token": ("ragged_3_random", 3)}
+# name -> (layout, Q heads per KV head); per token scales. The random rows run direct, the
+# shared ones union tiles.
+FP8_UNIFORM_CASES = {
+    "fp8_uniform_ragged_3_random_token": ("ragged_3_random", 3),
+    "fp8_uniform_ragged_4_token": ("ragged_4", 3),
+}
 FP8_QUERY_CASES = {"fp8_query_reference_prefill_4096_token": ("prefill_4096", 12)}
 # name -> (layout, Q heads per KV head, scales, read through kv_slots, layout whose first
 # call then grows the stream's scratch arena or None, softmax scales no other case uses:
@@ -433,15 +522,44 @@ FP8_GRAPH_CASES = {
 # name -> (layout, Q heads per KV head)
 FP8_WORKSPACE_CASES = {"fp8_workspace_key_ragged_4": ("ragged_4", 12)}
 FP8_ERROR_CASES = {"fp8_input_errors": ("extend_9_ctx_139", 3)}
-# As BATCH_CASES, with FP8 K/V (per token scales) and batch_invariant=True. By default
-# the first two requests alone have few enough union tasks to split their key ranges and
-# batched they do not: batch_invariant=True must not split.
+# name -> (layout, Q heads per KV head, scales): a fixed selection's FP8 K/V read through a
+# slot table, whose next calls find the pages (and per token scales) moved to other pool
+# rows and reuse the plan.
+FP8_SLOT_REUSE_CASES = {
+    "fp8_kv_slots_reuse_prefill_2048_tensor": ("prefill_2048", 12, "tensor"),
+    "fp8_kv_slots_reuse_prefill_2048_token": ("prefill_2048", 6, "token"),
+}
+# As BATCH_CASES, with FP8 K/V and batch_invariant=True: name -> (Q heads per KV head,
+# scales ("tensor": one [1] scale, the batch's, also for each request alone; or "token"),
+# requests). By default the first two requests of fp8_batch_invariance_token alone have
+# few enough union tasks to split their key ranges and batched they do not:
+# batch_invariant=True must not split.
 FP8_BATCH_CASES = {
     "fp8_batch_invariance_token": (
         3,
+        "token",
         ((768, 0, "shared"), (2048, 30000, "shared"), (64, 70001, "random")),
     ),
+    # Direct only, every row selecting T complete blocks: the batch's 700 rows fill a wave
+    # per SIMD, so its direct launch runs persistent (FP8_BATCH_PERSISTENT); alone each
+    # request runs one-row WGs.
+    "fp8_batch_invariance_persistent_tensor": (
+        12,
+        "tensor",
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
+    "fp8_batch_invariance_persistent_token": (
+        12,
+        "token",
+        ((300, 30000, "random"), (400, 30000, "random")),
+    ),
 }
+# FP8 batches whose batch-invariant direct launch must run persistent while their requests
+# alone do not (on MI308X's 80 CUs).
+FP8_BATCH_PERSISTENT = (
+    "fp8_batch_invariance_persistent_tensor",
+    "fp8_batch_invariance_persistent_token",
+)
 FP8_LAYOUT_CASES = {
     **FP8_CASES,
     **FP8_SINK_CASES,
@@ -450,6 +568,7 @@ FP8_LAYOUT_CASES = {
     **FP8_GRAPH_CASES,
     **FP8_WORKSPACE_CASES,
     **FP8_ERROR_CASES,
+    **FP8_SLOT_REUSE_CASES,
 }
 # name -> Q heads per KV head: these cases run once, at this group, whatever -g selects.
 # Group 16 is the most the interface accepts (BQ8 union tiles, a 16-head direct wave).
@@ -459,7 +578,7 @@ CASE_GROUPS = {
     **{name: group for name, (_, group, *_) in SCALE_CASES.items()},
     **{name: group for name, (group, *_) in BATCH_CASES.items()},
     **{name: group for name, (_, group, *_) in FP8_LAYOUT_CASES.items()},
-    **{name: group for name, (group, _) in FP8_BATCH_CASES.items()},
+    **{name: group for name, (group, *_) in FP8_BATCH_CASES.items()},
 }
 # FP8 workspaces' paths (see routes): union tiles ran, direct rows ("packed", "raw" or None),
 # union tile rows, key-range parts of the union tasks, core/residual tiles ran residual
@@ -489,6 +608,8 @@ FP8_ROUTES = {
     # These two run every tile union whole: no pack runs.
     "fp8_large_logits_prefill_768_token": (True, None, 32, 2, False, False),
     "fp8_prefill_4096_h3_tensor": (True, None, 42, 1, False, False),
+    "fp8_chunk_4096_ctx_131072_h6_token": (True, None, 21, 1, False, False),
+    "fp8_kv_slots_two_chunks_h3_tensor": (True, None, 42, 1, False, False),
     "fp8_prefill_12000_tensor": (True, None, 10, 1, True, True),
     # Past the pack budget: direct reads the raw K/V, the union the raw V.
     "fp8_4g_packed_token": (True, "raw", 10, 1, False, False),
@@ -498,11 +619,21 @@ FP8_ROUTES = {
     "fp8_sink_chunk_1024_ctx_4024_random_token": (True, None, 10, 1, True, True),
     "fp8_sink_extend_64_ctx_70065_tensor": (False, "packed", None, None, False, True),
     "fp8_uniform_ragged_3_random_token": (True, "packed", 32, 2, False, True),
+    "fp8_uniform_ragged_4_token": (True, None, 32, 2, False, False),
     "fp8_query_reference_prefill_4096_token": (True, None, 10, 1, True, True),
     "fp8_graph_kv_slots_ragged_4_tensor": (True, None, 10, 1, True, True),
     "fp8_graph_mixed_union_raw_token": (True, "packed", 32, 2, False, True),
     # The first request alone: no split with batch_invariant=True.
     "fp8_batch_invariance_token": (True, None, 32, 1, False, False),
+    "fp8_batch_invariance_persistent_tensor": (
+        False,
+        "packed",
+        None,
+        None,
+        False,
+        True,
+    ),
+    "fp8_batch_invariance_persistent_token": (False, "packed", None, None, False, True),
 }
 # name -> paths its call under test takes (see routes); for batch invariance, the first
 # request alone: whether union tiles ran, how direct rows read K/V ("packed", "raw", or
@@ -550,8 +681,11 @@ CORRELATED_PROFILES = (
 )
 
 
-def correlated_prefill(rows, seed=20260929):
-    """Selections simulating the real indexer distribution, one prefill, T = 512.
+@functools.lru_cache(maxsize=1)
+def correlated_selection(rows, seed=20260929):
+    """Selections simulating the real indexer distribution, one prefill, T = 512, as
+    an int32 host array (kept: the performance cases run a prefill at three groups in
+    a row).
 
     Mimics captured Qwen3.8 prefill selections: the first 2051 rows select their
     whole causal prefix. Later rows form 128-row windows, alternating the two
@@ -591,7 +725,12 @@ def correlated_prefill(rows, seed=20260929):
             rng.shuffle(chosen)
             indices[row, :2048] = (chosen[:, None] * 4 + np.arange(4)).reshape(-1)
             indices[row, 2048 : 2048 + visible % 4] = np.arange(blocks * 4, visible)
-    return torch.from_numpy(indices).cuda()
+    return indices
+
+
+def correlated_prefill(rows):
+    """correlated_selection's rows, on the GPU."""
+    return torch.from_numpy(correlated_selection(rows)).cuda()
 
 
 def make_indices(query_lens, prefix_lens, selection, generator, topk):
@@ -1071,8 +1210,8 @@ def routes():
     the context for the direct kernel ("pack_k": never for raw direct, and no pack runs
     when every tile runs union whole).
 
-    The helpers from latest_workspace to scratch_arena (and test_qsa_graph_replay's arena)
-    are the only code reading prefill internals:
+    The helpers from latest_workspace to union_tile_rows (and test_qsa_graph_replay's
+    arena) are the only code reading prefill internals:
       - flydsl_prefill._workspaces, the most recently used workspace last;
       - a workspace's fp8 (None for BF16 K/V, else the scale layout), its BF16
         direct.pack_shape (empty when direct reads the raw K/V) or FP8 direct.raw, and
@@ -1084,6 +1223,9 @@ def routes():
         when core_ratio > 0) and .direct_flag (entry 0 set when the pack must run);
       - flydsl_prefill.platform(None / "tensor" / "token"), the route calibrations;
       - a workspace's q8 / qs scratch, the FP8 Q of its latest call (fp8_query);
+      - a workspace's .static (a fixed selection's plan) and .arena.holds(workspace)
+        (plan_reused), its BF16 packed or FP8 direct.persistent (direct_persistent) and
+        its union plan's .metadata (union_tile_rows);
       - flydsl_prefill._arenas[(device, stream)].generation and .buffers.
     """
     workspace = latest_workspace()
@@ -1192,6 +1334,54 @@ def scratch_arena(stream):
     return arena.generation, [buffer.data_ptr() for buffer in arena.buffers]
 
 
+def plan_reused():
+    """Whether the latest call's workspace holds a fixed selection's plan (static) that its
+    stream's scratch arena still holds, so that its next call skips K1-K3 but K3's slot
+    table mapping (_Workspace.static, _Arena.holds)."""
+    workspace = latest_workspace()
+    return workspace.static and workspace.arena.holds(workspace)
+
+
+def direct_persistent():
+    """Whether the latest call's direct plan runs persistent: BF16 packed direct, or FP8
+    direct (a core/residual plan's rows only when its union keeps no tile)."""
+    return latest_workspace().direct.persistent
+
+
+def direct_split():
+    """Work items the latest call's BF16 packed direct launch split into key-tile parts:
+    unless batch_invariant, its last slots (_split_rule in
+    sparse_prefill_direct_packed: the slots of the inactive union tiles its pack lists,
+    gated, else of every row); 0 for a raw direct call."""
+    direct = latest_workspace().direct
+    if not direct.split or direct.packed_key is None:
+        return 0
+    ctas, hk = direct.ctas, direct.pack_shape[1]
+    if direct.gated:
+        tile = direct.union_tile * hk
+        slots = int(direct.listed.item()) * tile if int(direct.direct_flag[0]) else 0
+        launched = direct.union_tiles * tile
+    else:
+        slots = direct.num_tiles * hk
+        rows = min(slots, slots % ctas + ctas // 16)
+        extra = 3 * rows if rows * 4 <= ctas else slots if slots * 2 <= ctas else 0
+        launched = slots + extra
+    rows = min(slots, slots % ctas + ctas // 16)
+    shift = 2 if rows * 4 <= ctas else 1 if slots * 2 <= ctas else 0
+    rows = min(rows, (launched - slots) // 3 if shift == 2 else launched - slots)
+    return rows if shift and rows > 0 else 0
+
+
+def union_tile_rows():
+    """Query rows of the union tiles the latest call ran (its plan's tile metadata: first
+    row, rows, ...; active tiles ran union)."""
+    plan = latest_workspace().union
+    if plan is None:
+        return set()
+    rows = plan.metadata.view(-1, 5)[:, 1].cpu()
+    return set(rows[plan.active.bool().cpu()].tolist())
+
+
 def flydsl_variants():
     """FlyDSL specializations the QSA kernel modules hold so far, by FlyDSL's public
     JitFunction.cache_info(); None when FlyDSL's kernel cache is disabled."""
@@ -1218,6 +1408,15 @@ def mismatched_bits(a, b, msg):
     return int((a.view(torch.int16) != b.view(torch.int16)).sum().item())
 
 
+def perftest(case, fn, *args, **kwargs):
+    """run_perftest of fn: its defaults (2 warmup and 101 profiled calls) for the
+    performance cases, CHECK_PERFTEST for the others, whose checks only need an output
+    written after earlier calls."""
+    if case not in PERF_CASES and case not in FP8_PERF_CASES:
+        kwargs = {**CHECK_PERFTEST, **kwargs}
+    return run_perftest(fn, *args, **kwargs)
+
+
 @benchmark()
 def test_qsa_sparse_attention(case, heads):
     query_lens, prefix_lens, kv_heads, _, topk = CASES[case]
@@ -1227,7 +1426,9 @@ def test_qsa_sparse_attention(case, heads):
     q, k, v, indices = make_inputs(case, heads, generator)
     rows, kv_tokens = q.shape[0], k.shape[0]
 
-    # Both run as the SGLang QSA backend calls them; each allocates its output.
+    # Both run as the SGLang QSA backend calls them; each allocates its output. SGLang's
+    # kernels, a baseline compiled per group, run on the performance cases and at group
+    # 12 (TP2) on the others.
     candidates = {
         "flydsl": (
             qsa_sparse_prefill,
@@ -1238,8 +1439,12 @@ def test_qsa_sparse_attention(case, heads):
                 "softmax_scale": SCALE,
             },
         ),
-        "triton": (*sglang_triton(q, k, v, indices, query_lens, prefix_lens), {}),
     }
+    if case in PERF_CASES or heads == 12 * kv_heads:
+        candidates["triton"] = (
+            *sglang_triton(q, k, v, indices, query_lens, prefix_lens),
+            {},
+        )
     ref = run_torch(q, k, v, indices, query_lens, prefix_lens, SCALE)
     # QK^T and PV over the selected tokens; compulsory traffic reads Q/K/V/indices
     # and writes O once.
@@ -1255,7 +1460,7 @@ def test_qsa_sparse_attention(case, heads):
     # Rotated copies of the 1M-token contexts' K/V would take tens of GiB.
     rotate = 10 if k.nbytes < 2**30 else 1
     for name, (fn, args, kwargs) in candidates.items():
-        out, us = run_perftest(fn, *args, **kwargs, num_rotate_args=rotate)
+        out, us = perftest(case, fn, *args, **kwargs, num_rotate_args=rotate)
         err = checkAllclose(
             ref,
             out.to(dtypes.fp32),
@@ -1267,8 +1472,37 @@ def test_qsa_sparse_attention(case, heads):
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    fn, args, kwargs = candidates["flydsl"]
+    into = fn(*args, **kwargs, out=torch.full_like(q, float("nan")))
+    into_nan = checkAllclose(
+        ref,
+        into.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"{case} H{heads} flydsl into NaN: out",
+    )
+    if case in RAW_CHECKED:
+        packed, split = routes(), direct_split()
+        with raw_direct():
+            ret["raw direct differing"] = mismatched_bits(
+                fn(*args, **kwargs), into, f"{case} H{heads} raw direct vs packed: out"
+            )
+            raw = routes()
+        ret["direct split slots"] = split
+        group = heads // kv_heads
+        assert get_cu_num() != 80 or (
+            packed["direct"] == "packed"
+            and raw["direct"] == "raw"
+            and (split > 0) == (group in RAW_CHECKED[case])
+        ), f"{case} H{heads}: direct {packed} then {raw}, {split} split slots"
+        assert not ret["raw direct differing"], (
+            f"{case} H{heads}: raw direct differs from packed in "
+            f"{ret['raw direct differing']} elements"
+        )
     # The SGLang kernels are only the baseline: FlyDSL alone must pass the check.
-    assert ret["flydsl err"] == 0, f"{case} H{heads}: mismatch {ret['flydsl err']}"
+    assert (
+        ret["flydsl err"] == into_nan == 0
+    ), f"{case} H{heads}: mismatch {ret['flydsl err']}, into NaN {into_nan}"
     return ret
 
 
@@ -1385,10 +1619,32 @@ def make_pool(
     return *pools, slots
 
 
+def move_pages(pool_k, pool_v, slots, first_page, generator, *tables):
+    """Int32 slots of the pools' used PAGE-token pages moved to random unused pages from
+    first_page on, with the rows of per pool row tables (FP8 per token scales); the old
+    rows become NaN (FP8: the NaN byte)."""
+    rows = slots.long()
+    used = torch.unique(rows // PAGE)
+    unused = torch.ones(pool_k.shape[0] // PAGE, dtype=torch.bool, device=rows.device)
+    unused[:first_page] = False
+    unused[used] = False
+    free = unused.nonzero().flatten()
+    order = torch.randperm(free.numel(), generator=generator, device="cuda")
+    target = torch.full_like(unused, -1, dtype=torch.long)
+    target[used] = free[order[: used.numel()]]
+    moved = target[rows // PAGE] * PAGE + rows % PAGE
+    for pool in (pool_k, pool_v, *tables):
+        pool[moved] = pool[rows]
+        pool[rows] = float("nan")
+    return moved.to(dtypes.i32)
+
+
 @benchmark()
 def test_qsa_kv_slots(case, heads):
     """K/V read in place from a token pool through kv_slots, against the packed call on
-    the gathered rows (what a caller without kv_slots runs); both match bit for bit."""
+    the gathered rows (what a caller without kv_slots runs); both match bit for bit, also
+    in a next call after the pages moved to other pool rows (a fixed selection's plan is
+    then reused: plan_reused), and SLOT_RAW_CHECKED by raw direct."""
     layout, pool_rows, first_page = SLOT_CASES[case]
     query_lens, prefix_lens, kv_heads, *_ = CASES[layout]
     generator = torch.Generator(device="cuda").manual_seed(
@@ -1430,8 +1686,8 @@ def test_qsa_kv_slots(case, heads):
     }
     outputs = {}
     for name, (fn, args, kw) in candidates.items():
-        out, us = run_perftest(
-            fn, *args, **kw, num_rotate_args=10 if pool_k.nbytes < 2**30 else 1
+        out, us = perftest(
+            case, fn, *args, **kw, num_rotate_args=10 if pool_k.nbytes < 2**30 else 1
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -1453,6 +1709,40 @@ def test_qsa_kv_slots(case, heads):
         msg=f"{case} H{heads} flydsl_kv_slots vs flydsl_gather: out",
     )
     assert bitwise == 0, f"{case} H{heads}: kv_slots differs from the gathered call"
+    # Right after run_perftest's last kv_slots call, with the same K/V on other pages.
+    reused = plan_reused()
+    fixed = all(
+        n + p <= 4 * CASES[layout][4] + 3 for n, p in zip(*CASES[layout][:2]) if n
+    )
+    assert reused == fixed, f"{case} H{heads}: plan reused {reused}, fixed {fixed}"
+    moved = move_pages(pool_k, pool_v, slots, first_page, generator)
+    out = qsa_sparse_prefill(q, pool_k, pool_v, indices, **kwargs, kv_slots=moved)
+    moved_bits = checkAllclose(
+        outputs["flydsl_gather"],
+        out,
+        rtol=0,
+        atol=0,
+        msg=f"{case} H{heads} flydsl_kv_slots, pages moved, vs flydsl_gather: out",
+    )
+    assert (
+        moved_bits == 0
+    ), f"{case} H{heads}: moved pages differ from the gathered call"
+    if case in SLOT_RAW_CHECKED:
+        with raw_direct():
+            raw_bits = mismatched_bits(
+                qsa_sparse_prefill(
+                    q, pool_k, pool_v, indices, **kwargs, kv_slots=moved
+                ),
+                outputs["flydsl_gather"],
+                f"{case} H{heads} raw direct through kv_slots vs flydsl_gather: out",
+            )
+            taken = routes()
+        assert get_cu_num() != 80 or taken["direct"] == "raw", f"{case}: took {taken}"
+        assert (
+            not raw_bits
+        ), f"{case} H{heads}: raw direct differs in {raw_bits} elements"
+        ret["raw direct differing"] = raw_bits
+    ret["plan reused"] = reused
     return ret
 
 
@@ -1589,12 +1879,13 @@ def test_qsa_graph_new_scale(case, heads):
 def test_qsa_batch_invariance(case, heads):
     """With batch_invariant=True every request alone gives the bits it gives in one call
     with all of the batch's requests: union planning (the row threshold) and the union
-    tile rows (BQ21/BQ42 of a single full prefill) are decided per request, K3 routes no
-    tile by the others, and packed and raw direct agree bit for bit. The one exception, a
-    batch whose union scratch exceeds its budget running direct only, takes millions of
-    rows and is not tested. The batch first runs in the default mode, whose decisions span
-    the call: it must stay within tolerance, and batch_invariant=True must not reuse its
-    workspace (its plan would change the requests' bits)."""
+    tile rows (BQ21/BQ42 by the request's own rows) are decided per request, K3 routes no
+    tile by the others, and packed and raw direct agree bit for bit, as do the persistent
+    and one-wave direct launches (BATCH_PERSISTENT). The one exception, a batch whose
+    union scratch exceeds its budget running direct only, takes millions of rows and is
+    not tested. The batch first runs in the default mode, whose decisions span the call:
+    it must stay within tolerance, and batch_invariant=True must not reuse its workspace
+    (its plan would change the requests' bits)."""
     _, requests = BATCH_CASES[case]
     generator = torch.Generator(device="cuda").manual_seed(
         len(CASES) * 16 + list(BATCH_CASES).index(case) * 16 + heads
@@ -1630,6 +1921,16 @@ def test_qsa_batch_invariance(case, heads):
         msg=f"{case} H{heads} batched, default mode: out",
     )
     batched = qsa_sparse_prefill(q, k, v, indices, batch_invariant=True, **kwargs)
+    tile_rows = union_tile_rows()
+    persistent = direct_persistent()
+    assert get_cu_num() != 80 or persistent == (
+        case in BATCH_PERSISTENT
+    ), f"{case} H{heads}: the batch's direct launch runs persistent: {persistent}"
+    if case in BATCH_TILE_ROWS and get_cu_num() == 80:
+        wide, narrow = BATCH_TILE_ROWS[case]
+        assert any(narrow < rows <= wide for rows in tile_rows) and any(
+            rows <= narrow for rows in tile_rows
+        ), f"{case} H{heads}: union tiles of {sorted(tile_rows)} rows"
     err = checkAllclose(
         reference,
         batched.to(dtypes.fp32),
@@ -1665,6 +1966,8 @@ def test_qsa_batch_invariance(case, heads):
         "gfx": get_gfx(),
         "rows": q.shape[0],
         "requests": len(requests),
+        "union tile rows": sorted(tile_rows),
+        "persistent direct": persistent,
         "flydsl err": err,
         "default mode err": default_err,
         "differing elements": max(differing),
@@ -1815,10 +2118,10 @@ def test_qsa_fp8(case, heads):
     FP8_QUERY_CHECKED: fp8_query_error instead), its union plans routing with the FP8
     kernels' calibration rather than BF16's. compute="bf16": the bits of the BF16 path
     on the K/V the caller dequantizes, within 2e-2 of the reference. A repeated call
-    gives the same bits, and through a pool (unused rows and their per token scales NaN)
-    the bits of the packed call on the gathered K/V and scales. FP8_PERF_CASES also time
-    the BF16 path on the dequantized K/V and aiter's Triton FP8 GQA, and meet the
-    fp8_query check (see test_qsa_fp8_query)."""
+    into a NaN-filled out gives the same bits, and through a pool (unused rows and their
+    per token scales NaN) the bits of the packed call on the gathered K/V and scales.
+    FP8_PERF_CASES also time the BF16 path on the dequantized K/V and aiter's Triton FP8
+    GQA, and meet the fp8_query check (see test_qsa_fp8_query)."""
     layout, _, scales, compute, pool = FP8_CASES[case]
     query_lens, prefix_lens, kv_heads, _, topk = CASES[layout]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
@@ -1864,7 +2167,7 @@ def test_qsa_fp8(case, heads):
         "pool GiB": None if pool is None else args[1].nbytes / 2**30,
     }
     rotate = 10 if max(q.nbytes, args[1].nbytes) < 2**30 else 1
-    out, us = run_perftest(qsa_sparse_prefill, *args, **kw, num_rotate_args=rotate)
+    out, us = perftest(case, qsa_sparse_prefill, *args, **kw, num_rotate_args=rotate)
     query = fp8_query() if case in (*FP8_QUERY_CHECKED, *FP8_PERF_CASES) else None
     ret["routes"] = check_routes(case, heads)
     if compute == "fp8" and ret["routes"]["query_tile"] is not None:
@@ -1878,7 +2181,9 @@ def test_qsa_fp8(case, heads):
     ret["flydsl TB/s"] = nbytes / us / 1e6
     differing = {
         "repeated": mismatched_bits(
-            qsa_sparse_prefill(*args, **kw), out, f"{msg} repeated vs first: out"
+            qsa_sparse_prefill(*args, **kw, out=torch.full_like(out, float("nan"))),
+            out,
+            f"{msg} repeated into NaN vs first: out",
         )
     }
     if pool is not None:
@@ -2251,6 +2556,63 @@ def test_qsa_fp8_graph(case, heads):
 
 
 @benchmark()
+def test_qsa_fp8_kv_slots_reuse(case, heads):
+    """FP8 K/V of a fixed selection read through a slot table (unused pool rows and their
+    per token scales NaN) give the packed call's bits, also in the next calls after the
+    pages and their scales moved to other pool rows: those reuse the plan (plan_reused),
+    only K3 mapping the union blocks again."""
+    layout, _, scales = FP8_SLOT_REUSE_CASES[case]
+    query_lens, prefix_lens, *_ = CASES[layout]
+    generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
+    q, k8, ks, v8, vs, indices = make_fp8_inputs(
+        layout, heads, scales == "token", generator
+    )
+    kwargs = {
+        "query_lens": query_lens,
+        "prefix_lens": prefix_lens,
+        "softmax_scale": SCALE,
+    }
+    packed = qsa_sparse_prefill(q, k8, v8, indices, k_scale=ks, v_scale=vs, **kwargs)
+    pool_k, pool_v, slots = make_pool(
+        k8, v8, query_lens, prefix_lens, None, 1, generator
+    )
+    size = pool_k.shape[0]
+    pool_ks, pool_vs = pool_scale(ks, slots, size), pool_scale(vs, slots, size)
+    tables = [table for table in (pool_ks, pool_vs) if table.ndim == 2]
+    differing, reused = [], []
+    for call in range(3):
+        if call:
+            slots = move_pages(pool_k, pool_v, slots, 1, generator, *tables)
+        out = qsa_sparse_prefill(
+            q,
+            pool_k,
+            pool_v,
+            indices,
+            k_scale=pool_ks,
+            v_scale=pool_vs,
+            kv_slots=slots,
+            **kwargs,
+        )
+        # Whether the next call reuses this one's plan.
+        reused.append(plan_reused())
+        differing.append(
+            mismatched_bits(
+                out, packed, f"{case} H{heads} call {call}, kv_slots vs packed: out"
+            )
+        )
+    assert all(reused), f"{case} H{heads}: plan reused {reused}"
+    assert not any(differing), f"{case} H{heads}: differing elements {differing}"
+    return {
+        "gfx": get_gfx(),
+        "rows": q.shape[0],
+        "scales": scales,
+        "routes": routes(),
+        "plan reused": reused,
+        "differing": differing,
+    }
+
+
+@benchmark()
 def test_qsa_fp8_workspace(case, heads):
     """Workspaces are cached per stream and layout, so their key must hold the K/V dtype,
     the FP8 scale layout, the pool and the batch mode, and every call must bind its
@@ -2449,22 +2811,33 @@ def test_qsa_fp8_input_errors(case, heads):
 @benchmark()
 def test_qsa_fp8_batch_invariance(case, heads):
     """With batch_invariant=True every request alone gives the bits it gives batched
-    with the others (as test_qsa_batch_invariance), FP8 K/V with per token scales: union
-    planning and tile rows per request, no K3 routing by the others and no FP8 split of
-    the union tasks (by default the first two requests alone split their key ranges). The
-    batch is within FP8_TOL of the reference."""
-    _, requests = FP8_BATCH_CASES[case]
+    with the others (as test_qsa_batch_invariance), FP8 K/V: union planning and tile rows
+    per request, no K3 routing by the others and no FP8 split of the union tasks (by
+    default the first two requests of fp8_batch_invariance_token alone split their key
+    ranges), and the persistent and one-row direct launches agree bit for bit
+    (FP8_BATCH_PERSISTENT: direct only, the batch runs persistent, each request alone
+    does not). The batch is within FP8_TOL of the reference."""
+    _, scales, requests = FP8_BATCH_CASES[case]
+    per_token = scales == "token"
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
     parts = []
     for rows, prefix, selection in requests:
         q = torch.randn(rows, heads, HEAD_DIM, generator=generator, dtype=dtypes.bf16)
-        k8, ks = make_fp8_kv(rows + prefix, 1, True, generator)
-        v8, vs = make_fp8_kv(rows + prefix, 1, True, generator)
+        k8, ks = make_fp8_kv(rows + prefix, 1, per_token, generator)
+        v8, vs = make_fp8_kv(rows + prefix, 1, per_token, generator)
+        if parts and not per_token:
+            # One per tensor scale: the batch's, which each request alone reads too.
+            ks, vs = parts[0][4:]
         indices = make_indices((rows,), (prefix,), selection, generator, 512)
         parts.append((q, k8, v8, indices, ks, vs))
     query_lens = tuple(rows for rows, _, _ in requests)
     prefix_lens = tuple(prefix for _, prefix, _ in requests)
-    q, k8, v8, indices, ks, vs = (torch.cat(tensors) for tensors in zip(*parts))
+    columns = list(zip(*parts))
+    q, k8, v8, indices = (torch.cat(tensors) for tensors in columns[:4])
+    if per_token:
+        ks, vs = (torch.cat(tensors) for tensors in columns[4:])
+    else:
+        ks, vs = parts[0][4:]
     kwargs = {"softmax_scale": SCALE, "batch_invariant": True}
     batched = qsa_sparse_prefill(
         q,
@@ -2478,6 +2851,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
         **kwargs,
     )
     taken = routes()
+    persistent = direct_persistent()
     sampled = sample_rows(query_lens)
     mean, worst = fp8_error(
         batched[sampled],
@@ -2485,7 +2859,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
             q, k8, v8, indices, query_lens, prefix_lens, SCALE, (ks, vs), sampled
         ),
     )
-    differing, first, alone = [], 0, None
+    differing, first, alone, alone_persistent = [], 0, None, []
     for (*tensors, k_scale, v_scale), (rows, prefix, _) in zip(parts, requests):
         out = qsa_sparse_prefill(
             *tensors,
@@ -2498,6 +2872,7 @@ def test_qsa_fp8_batch_invariance(case, heads):
         if alone is None:
             # The first request alone takes the paths the batch must not change.
             alone = check_routes(case, heads)
+        alone_persistent.append(direct_persistent())
         differing.append(
             mismatched_bits(
                 out,
@@ -2506,10 +2881,22 @@ def test_qsa_fp8_batch_invariance(case, heads):
             )
         )
         first += rows
-    assert taken["union"] and taken["direct"], (
-        f"{case} H{heads}: the batch took {taken}; it must mix union tiles and "
-        "direct rows"
-    )
+    if case in FP8_BATCH_PERSISTENT:
+        assert (
+            not taken["union"] and taken["direct"]
+        ), f"{case} H{heads}: the batch took {taken}; it must run direct only"
+        assert get_cu_num() != 80 or (persistent and not any(alone_persistent)), (
+            f"{case} H{heads}: persistent direct launches: the batch's {persistent}, "
+            f"the requests' alone {alone_persistent}"
+        )
+    else:
+        assert taken["union"] and taken["direct"], (
+            f"{case} H{heads}: the batch took {taken}; it must mix union tiles and "
+            "direct rows"
+        )
+        assert (
+            get_cu_num() != 80 or not persistent
+        ), f"{case} H{heads}: the batch's direct launch runs persistent"
     assert bool(torch.isfinite(batched).all()), f"{case} H{heads}: non-finite output"
     assert (
         mean < FP8_TOL[0] and worst < FP8_TOL[1]
@@ -2522,7 +2909,9 @@ def test_qsa_fp8_batch_invariance(case, heads):
         "gfx": get_gfx(),
         "rows": q.shape[0],
         "requests": len(requests),
+        "scales": scales,
         "batch routes": taken,
+        "persistent direct": persistent,
         "first request alone": alone,
         "mean err": mean,
         "worst err": worst,
@@ -2562,7 +2951,7 @@ def main():
     suites = (
         (
             "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, *MIXED_CASES],
             test_qsa_sparse_attention,
         ),
         ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
@@ -2576,6 +2965,7 @@ def main():
         ("fp8 uniform", list(FP8_UNIFORM_CASES), test_qsa_fp8_uniform),
         ("fp8 query reference", list(FP8_QUERY_CASES), test_qsa_fp8_query),
         ("fp8 graph", list(FP8_GRAPH_CASES), test_qsa_fp8_graph),
+        ("fp8 kv_slots reuse", list(FP8_SLOT_REUSE_CASES), test_qsa_fp8_kv_slots_reuse),
         ("fp8 workspace", list(FP8_WORKSPACE_CASES), test_qsa_fp8_workspace),
         ("fp8 input errors", list(FP8_ERROR_CASES), test_qsa_fp8_input_errors),
         ("fp8 batch invariance", list(FP8_BATCH_CASES), test_qsa_fp8_batch_invariance),

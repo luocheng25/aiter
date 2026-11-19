@@ -56,7 +56,8 @@ def _aligned(nbytes):
 
 
 class _Arena:
-    """Scratch shared by one stream's workspaces: every call rewrites what it reads.
+    """Scratch shared by one stream's workspaces: every call rewrites what it reads, except
+    a static plan's repeated call (_Workspace.static).
 
     Growth replaces the buffer; captured workspaces keep theirs alive.
     """
@@ -65,6 +66,10 @@ class _Arena:
         self.buffers = [None]
         self.generation = 0
         self.users = weakref.WeakSet()
+        # The workspace whose call last used the buffer (a weak reference), and the
+        # generations a captured graph pins: its replays rewrite them unseen by the host.
+        self.owner = None
+        self.captured = set()
 
     def reserve(self, size, device):
         buffer = self.buffers[0]
@@ -73,8 +78,18 @@ class _Arena:
             size = max(size, growth // 100)
             self.buffers[0] = torch.empty(size, dtype=torch.uint8, device=device)
             self.generation += 1
+            self.owner = None
             for user in list(self.users):
                 user.release()
+
+    def holds(self, workspace):
+        """Whether the buffer still holds what workspace's last call on it wrote."""
+        return (
+            self.owner is not None
+            and self.owner() is workspace
+            and workspace.generation == self.generation
+            and self.generation not in self.captured
+        )
 
 
 # Weak values: an arena lives while a cached or captured workspace uses it.
@@ -90,6 +105,11 @@ class _Workspace:
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
+        # The indices layout fixes every selection when no row's causal window holds more
+        # than T complete blocks: each row then selects all of them. K1-K3 write the same
+        # plan every call (the task order up to equal-cost ties, which run the same tasks),
+        # only the slot table's pool blocks (K3) and the split counters change.
+        self.static = prepare.fixed_selection(query_lens, prefix_lens, topk)
         sequence = np.repeat(np.arange(len(q_lens)), q_lens)
         positions = np.arange(len(sequence)) + (lengths - np.cumsum(q_lens))[sequence]
         slotted = kv_slots is not None
@@ -133,9 +153,18 @@ class _Workspace:
             )
             if needed <= UNION_SCRATCH_LIMIT:
                 self.union = plan
+        # A reused plan skips K1, whose block_indices a core/residual plan's K3b rewrites in
+        # place every call: such plans (allocate_plan builds none for fixed selections) rerun.
+        if self.union is not None and self.union.core_ratio > 0:
+            self.static = False
         self.specs = [(self, "block_indices", (q.shape[0], topk), torch.int32)]
         if fp8 is None:
-            self.direct = direct.prepare(inputs=inputs, union=self.union, scratch=False)
+            self.direct = direct.prepare(
+                inputs=inputs,
+                union=self.union,
+                scratch=False,
+                batch_invariant=invariant,
+            )
             direct_specs = direct.scratch_specs(self.direct)
         else:
             self.direct = direct_fp8.prepare(
@@ -188,6 +217,7 @@ class _Workspace:
         if self.pinned is None and torch.cuda.is_current_stream_capturing():
             # Graph pointers must outlive arena growth.
             self.pinned = tuple(self.arena.buffers)
+            self.arena.captured.add(self.generation)
 
     def bind(self, q, k, v, indices, kv_slots, scale_log2, k_scale=None, v_scale=None):
         self.attach()
@@ -230,6 +260,9 @@ class _Hot:
         )
         prepare.run(inputs=inputs, plan=workspace.union)
         self.prepare = prepare.launchers(inputs=inputs, plan=workspace.union)
+        plan = workspace.union
+        self.counters = plan.split_counters if plan and plan.split > 1 else None
+        self.flag = plan.direct_flag if plan and plan.slotted else None
         self.compute = []
         self.fp8 = workspace.fp8 is not None
         if self.fp8:
@@ -265,8 +298,18 @@ class _Hot:
         )
         self.compute = [launch for launch in self.compute if launch is not None]
 
-    def prepare_call(self, indices, kv_slots):
+    def prepare_call(self, indices, kv_slots, static=False):
+        """K1-K3; static: the arena holds this static plan (_Workspace.static), so only
+        K3's pool blocks (after the direct flags K2 clears) or the split counters K3 clears
+        are redone."""
         recover, *rest = self.prepare
+        if static:
+            if self.flag is not None:
+                self.flag.zero_()
+                rest[-1](kv_slots)
+            elif self.counters is not None:
+                self.counters.zero_()
+            return
         recover(indices)
         for launch in rest:
             launch(kv_slots)
@@ -374,46 +417,50 @@ def flydsl_qsa_sparse_prefill(
     satisfy this), and the result is the same as for K/V packed by those slots. A
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
     validated. Hot calls rebuild the selection: per-layout plans share one private
-    per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
-    kv_slots. softmax_scale is a kernel argument (FP32 softmax_scale * log2(e)): a new
-    scale compiles nothing and reuses the layout's workspace, also under graph capture.
-    Warm the same stream and layout before graph capture. Captured
-    workspaces stay pinned for graph pointer lifetime and share their stream's
-    scratch: do not replay them concurrently with each other or with that stream's
-    calls. Each kernel variant compiles on its first use: a few seconds with empty
-    FlyDSL caches. One GPU per process (TP uses separate workers).
+    per-stream scratch arena. A layout whose every request spans at most 4T + 3
+    tokens (each row then selects all of its complete blocks) reuses its plan instead
+    while no other call on the stream, nor a graph capturing its scratch, ran since
+    its last call; such calls do not read indices. out is optional and must not
+    overlap Q/K/V, indices or kv_slots. softmax_scale is a kernel argument (FP32
+    softmax_scale * log2(e)): a new scale compiles nothing and reuses the layout's
+    workspace, also under graph capture. Warm the same stream and layout before graph
+    capture. Captured workspaces stay pinned for graph pointer lifetime and share
+    their stream's scratch: do not replay them concurrently with each other or with
+    that stream's calls. Each kernel variant compiles on its first use: a few seconds
+    with empty FlyDSL caches. One GPU per process (TP uses separate workers).
 
     Union tiles and the direct kernel round differently. By default the choice between
-    them spans the call: union tiles are planned by the call's row count, BQ21/BQ42
-    union tiles serve only a single full H6/H3 prefill, and a cost model over all
-    tiles routes them, so the low bits of a request's rows may change with the other
-    requests of the call. batch_invariant=True decides per request: only requests of
-    at least the union planning rows take union tiles, each request picks its own tile
-    rows and no tile is routed by the others, so a request gives the bits it gives
-    alone (with batch_invariant=True too; the modes may differ). Batches of short
-    requests then run more rows direct, which can be slower. In both modes, a layout
-    whose union scratch would exceed 4 GiB (millions of rows) runs direct only, so its
-    requests may differ from their runs alone. Whether direct reads packed or raw K/V
-    (a call-wide budget) does not change the bits. Tuning targets MI308X (gfx942,
-    80 CUs) only: other gfx942 parts log a warning and reuse the 80-CU MI308X
-    settings; plans and routes follow the CU count, performance may not be optimal.
+    them spans the call: union tiles are planned by the call's row count, which also
+    decides whether H6/H3 union tiles at one KV head take 21/42 queries (BQ21/BQ42),
+    a cost model over all tiles routes them, a short prefill's longest union tasks
+    split into two key ranges merged at the end and the direct kernel splits a call's
+    last rows into key-tile parts, so the low bits of a request's rows may change with
+    the other requests of the call. batch_invariant=True decides per request: only
+    requests of at least the union planning rows take union tiles, each request picks
+    its own tile rows, no tile is routed by the others and nothing splits, so a request
+    gives the bits it gives alone (with batch_invariant=True too; the modes may
+    differ). Batches of short requests then run more rows direct, which can be slower.
+    In both modes, a layout whose union scratch would exceed 4 GiB (millions of rows)
+    runs direct only, so its requests may differ from their runs alone. Whether direct
+    reads packed or raw K/V (a call-wide budget) does not change the bits. Tuning
+    targets MI308X (gfx942, 80 CUs) only: other gfx942 parts log a warning and reuse
+    the 80-CU MI308X settings; plans and routes follow the CU count, performance may
+    not be optimal.
 
     K/V may also be FP8 (gfx942's E4M3FNUZ, torch.float8_e4m3fnuz: aiter's dtypes.fp8)
     with FP32 dequantization scales k_scale / v_scale, both per token and KV head
     ([N,HK], with kv_slots [P,HK]) or both per tensor ([1]); K/V values are K8 * k_scale
     and V8 * v_scale. compute="fp8" (default) runs FP8 MFMA kernels: Q is quantized per
-    (query, head) row with scale amax / 240 and the probabilities in FP8 (relative output
-    error of a few percent on random data), and per-token V scales are clamped to
+    (query, head) row with scale amax / 240 and the probabilities in FP8 (relative
+    output error of a few percent on random data), and per-token V scales are clamped to
     [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct rows read the
-    context repacked per call while it fits a budget, else the raw K/V. Its union
-    plans may split a short prefill's longest tasks into two key ranges merged at the
-    end, and keep only a core of an H12/H6 union tile, the rows' other blocks running
-    direct and merging by log-sum-exp; whether a task splits depends on the whole
-    call, so batch_invariant=True does not split. compute="bf16" dequantizes the
-    request tokens to BF16 (each value the FP32 product rounded once) and runs the BF16
-    kernels (BF16 accuracy, temporary BF16 K/V of the packed context). Workspaces are
-    kept per K/V dtype and scale layout too; the scale tensors are read on every call,
-    also under graph replay.
+    context repacked per call while it fits a budget, else the raw K/V. Its union plans
+    may keep only a core of an H12/H6 union tile, the rows' other blocks running direct
+    and merging by log-sum-exp.
+    compute="bf16" dequantizes the request tokens to BF16 (each value the FP32 product
+    rounded once) and runs the BF16 kernels (BF16 accuracy, temporary BF16 K/V of the
+    packed context). Workspaces are kept per K/V dtype and scale layout too; the scale
+    tensors are read on every call, also under graph replay.
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -593,8 +640,17 @@ def flydsl_qsa_sparse_prefill(
         workspace.captured |= capturing
         workspace.attach()
         hot = workspace.hot
+        arena = workspace.arena
+        # Graphs record the whole preparation.
+        static = (
+            hot is not None
+            and workspace.static
+            and not capturing
+            and arena.holds(workspace)
+        )
+        arena.owner = None
         if hot is not None:
-            hot.prepare_call(indices, kv_slots)
+            hot.prepare_call(indices, kv_slots, static)
             hot.compute_call(q, k, v, out, kv_slots, scale_log2, k_scale, v_scale)
         else:
             workspace.hot = _Hot(
@@ -609,4 +665,5 @@ def flydsl_qsa_sparse_prefill(
                 k_scale,
                 v_scale,
             )
+        arena.owner = weakref.ref(workspace)
     return out

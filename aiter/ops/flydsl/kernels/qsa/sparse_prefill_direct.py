@@ -5,9 +5,10 @@
 Layouts whose packed PK/PV scratch fits the platform's packed-KV budget, or whose
 context has at most pack_tokens_per_row tokens per query row, use the private
 packed implementation: every call packs each request's KV into four-token blocks
-and runs one query wave per CTA. Other KV keeps the raw KV fallback below, where
-packing the whole context would cost more than it saves. Both paths preserve the
-public inputs and selection.
+and runs one query wave per CTA, or, for plans of equal rows that fill a wave per
+SIMD, one persistent WG of PERSIST_WAVES one-row waves per CU taking rows from a
+queue. Other KV keeps the raw KV fallback below, where packing the whole context
+would cost more than it saves. Both paths preserve the public inputs and selection.
 
 In the raw fallback, four query waves each own one query and its GQA heads.
 V loads directly from global memory into registers for the transpose; Q/K
@@ -20,7 +21,11 @@ adjacent lanes per token, then transpose at QK consumption. K addresses are
 reused for V; the first V segment is requested before QK. K completion is
 waited at the next QK consumer so PV can overlap its prefetch. Accumulation
 order and RNE probability packing are unchanged. The key loop is the packed
-path's _DirectLoop; _Raw gives it this layout.
+path's _DirectLoop; _Raw gives it this layout. Unless batch_invariant, the packed
+launch splits its last slots' key tiles into parts merged by log-sum-exp; a raw wave
+of such a slot (gated: its place among the direct tiles K3 ranks) cuts its key loop
+into the same parts and merges them the same way, so raw and packed direct give the
+same bits.
 """
 
 import functools
@@ -32,11 +37,14 @@ import numpy as np
 import torch
 from flydsl.expr import rocdl
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from . import sparse_prefill_common as prim
 from . import sparse_prefill_direct_packed as packed
 from .sparse_prefill_common import (
     _MAX_FLOOR,
     MAX_ROW_PACKED_KV_BYTES,
+    QUEUE_WORDS,
     _buffer,
     _buffer_words,
     _lds_load,
@@ -44,6 +52,7 @@ from .sparse_prefill_common import (
     _maximum,
     _min,
     _pin,
+    _pin_i32,
     _pv_step,
     _read_q_g2r,
     _stage_end,
@@ -53,7 +62,19 @@ from .sparse_prefill_common import (
     _v_pair,
     platform,
 )
-from .sparse_prefill_direct_packed import _DirectLoop, _enabled, _output
+from .sparse_prefill_direct_packed import (
+    DIRECT_PARTS,
+    DIRECT_WAVES_PER_CU,
+    PERSIST_WAVES,
+    _DirectLoop,
+    _enabled,
+    _merge_records,
+    _output,
+    _split_rule,
+    _store_record,
+    record_bytes,
+    split_extra,
+)
 from .sparse_prefill_prepare import allocate_scratch, upload
 
 
@@ -103,17 +124,45 @@ class DirectPlan:
     slotted: bool = False
     # The pool spans more than 4 GiB: raw direct uses 64-bit global loads.
     wide: bool = False
-    # Gated raw: K3's list of the row groups holding a direct row (count in direct_flag[1]).
+    # Gated raw: K3's list of the row groups holding a direct row (count in direct_flag[1])
+    # and the direct tiles' ranks (count in direct_flag[2]).
     group_list: torch.Tensor | None = None
+    tile_ranks: torch.Tensor | None = None
+    # The call's query rows (an ungated packed launch's slots per KV head).
+    rows: int = 0
+    # Packed launch: resident one-wave CTAs (the split's unit), whether its last slots may
+    # split into key-tile parts (not batch-invariant), a part's record bytes; scratch: the
+    # inactive union tiles' (first row, rows) and their count (gated), the split slots'
+    # part counts and records (raw: the records of the slots the packed launch splits).
+    ctas: int = 0
+    split: bool = False
+    record: int = 0
+    tile_list: torch.Tensor | None = None
+    listed: torch.Tensor | None = None
+    split_counts: torch.Tensor | None = None
+    records: torch.Tensor | None = None
+    # Packed plans of equal rows run persistent (packed.PERSIST_WAVES), with the launch
+    # queue (zero between launches; not scratch).
+    persistent: bool = False
+    queue: torch.Tensor | None = None
 
 
 def scratch_specs(prepared: DirectPlan) -> list:
+    records = ("records", (prepared.ctas * prepared.record // 4,), torch.float32)
     if not prepared.pack_shape:
-        return []
-    return [
+        return [records] if prepared.split else []
+    specs = [
         (name, prepared.pack_shape, prepared.pack_dtype)
         for name in ("packed_key", "packed_value")
     ]
+    if prepared.gated:
+        specs += [
+            ("tile_list", (prepared.union_tiles * 2,), torch.int32),
+            ("listed", (1,), torch.int32),
+        ]
+    if prepared.split:
+        specs += [("split_counts", (prepared.ctas // 2,), torch.int32), records]
+    return specs
 
 
 def prepare(
@@ -121,6 +170,7 @@ def prepare(
     inputs,
     union=None,
     scratch: bool = True,
+    batch_invariant: bool = False,
 ):
     """Bind private scratch; attention's recovery refreshes sorted block_indices each call."""
     # Each request with queries packs its KV into whole four-token blocks at a
@@ -171,11 +221,12 @@ def prepare(
             k_starts[owner] + 4 * (np.arange(len(owner)) - p_starts[owner]), device
         )
     metadata = upload(metadata, device)
-    group_list = None
+    group_list = tile_ranks = None
     if not packed and union is not None:
         group_list = torch.empty(len(metadata), dtype=torch.int32, device=device)
+        tile_ranks = torch.empty(union.num_tiles, dtype=torch.int32, device=device)
         union.direct_meta, union.direct_list = metadata, group_list
-        union.direct_groups = len(metadata)
+        union.direct_groups, union.tile_ranks = len(metadata), tile_ranks
     standin = inputs.query_positions  # tensor slots ungated launches do not read
     prepared = DirectPlan(
         metadata=metadata,
@@ -195,7 +246,25 @@ def prepare(
         slotted=slotted,
         wide=inputs.wide,
         group_list=group_list,
+        tile_ranks=tile_ranks,
+        rows=int(q_lens.sum()),
+        ctas=get_cu_num() * DIRECT_WAVES_PER_CU,
+        # Split parts merge in another order than one wave's key loop: never with
+        # batch_invariant (whether a slot splits depends on the call's other slots).
+        split=not batch_invariant,
+        record=record_bytes(inputs.q.shape[1] // hk),
     )
+    # Every row selects topk complete blocks (its first query sees prefix + 1 keys) and the
+    # rows fill a wave per SIMD: the packed launch runs persistent.
+    prefixes = np.asarray(inputs.prefix_lens, dtype=np.int64)[q_lens > 0]
+    prepared.persistent = bool(
+        packed
+        and len(prefixes)
+        and int(q_lens.sum()) * hk >= get_cu_num() * PERSIST_WAVES
+        and int(prefixes.min()) + 1 >= 4 * inputs.topk
+    )
+    if prepared.persistent:
+        prepared.queue = torch.zeros(QUEUE_WORDS, dtype=torch.int32, device=device)
     if scratch:
         allocate_scratch(prepared, scratch_specs(prepared), device)
     return prepared
@@ -285,6 +354,8 @@ class _Raw(_DirectLoop):
 
     # In K's load layout, lanes 0/16/32/48 hold block-first offsets.
     row_lane = 64
+    # A split slot's parts (split_part), set per wave.
+    split = None
 
     def __init__(
         self,
@@ -395,6 +466,78 @@ class _Raw(_DirectLoop):
         )
         return _untile(acc)
 
+    def part_boundary(self):
+        return fx.Int32(-1) if self.split is None else self.split[2][0]
+
+    def part_start(self, t, boundary, maximum, total, o0, o1):
+        if self.split is None:
+            return boundary, maximum, total, o0, o1
+        return self.split_part(t, boundary, maximum, total, o0, o1)
+
+    @flyc.jit
+    def split_part(self, t, boundary, maximum, total, o0, o1):
+        """At the first tile of a later part of a split slot (split: records, first record,
+        the parts' first tiles past part 0 in order (-1: none), heads, records extent) the
+        state so far is the previous part's record and restarts (an empty part's record is
+        the initial state): the K/V stream does not change with the parts."""
+        records, first_record, begins, group, extent = self.split
+        if t == boundary:
+            for p in fx.range_constexpr(DIRECT_PARTS - 1):
+                if t == begins[p]:
+                    # The lane through a pin: the record offsets are not hoisted out of
+                    # the key loop.
+                    _store_record(
+                        records,
+                        first_record + p * record_bytes(group),
+                        o0,
+                        o1,
+                        maximum,
+                        total,
+                        _pin_i32(self.lane),
+                        group,
+                        extent,
+                    )
+                    zeros = fx.Vector.filled(32, 0.0, fx.Float32)
+                    maximum, total = fx.Float32(_MAX_FLOOR), fx.Float32(0.0)
+                    o0, o1 = _pin(zeros), _pin(zeros)
+            following = fx.Int32(-1)
+            for begin in reversed(begins):
+                following = (begin > t).select(begin, following)
+            boundary = following
+        return boundary, maximum, total, o0, o1
+
+
+def _packed_split(
+    row,
+    hkv,
+    valid,
+    QUERY_TILES,
+    UNION_META,
+    TILE_RANKS,
+    DIRECT_FLAG,
+    HK,
+    BQ,
+    SLOTS,
+    LAUNCHED,
+    GATED,
+    CTAS,
+):
+    """(shift, index): the packed launch's split of this wave's (row, KV head) slot, split
+    slot `index` in 2^shift key-tile parts (shift 0: whole). The slot: ungated row * HK +
+    hkv; gated, past the slots of the direct tiles K3 ranks before the row's (row: as
+    _enabled reads its tile, whose loads these join)."""
+    if GATED:
+        tile = _uniform(fx.Int32(QUERY_TILES[row]))
+        first = _uniform(fx.Int32(UNION_META[tile * 5]))
+        rank = _uniform(fx.Int32(TILE_RANKS[tile]))
+        slot = rank * (BQ * HK) + (row - first) * HK + hkv
+        slots = _uniform(fx.Int32(DIRECT_FLAG[2])) * (BQ * HK)
+    else:
+        slot, slots = row * HK + hkv, SLOTS
+    split_rows, shift = _split_rule(slots, LAUNCHED, CTAS)
+    index = slot - (slots - split_rows)
+    return (valid & (index >= 0)).select(shift, fx.Int32(0)), index
+
 
 @flyc.jit
 def _body(
@@ -420,6 +563,15 @@ def _body(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    UNION_META: fx.Tensor,
+    DIRECT_FLAG: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
+    RECORDS: fx.Tensor,
+    BQ: fx.Int32,
+    PACKED_SLOTS: fx.Int32,
+    LAUNCHED: fx.Int32,
+    CTAS: fx.Constexpr[int],
+    SPLIT: fx.Constexpr[bool],
 ):
     load_key = functools.partial(_wide_key, row_bytes=HK * 512) if WIDE else _load_key
     source_offset = _source_row if WIDE else _source_offset
@@ -440,6 +592,31 @@ def _body(
     visible = position0 + wave + 1
     count = _min(visible >> 2, fx.Int32(TOPK)) * 4 + (visible & 3)
     tiles = valid_wave.select((count + 31) >> 5, fx.Int32(0))
+    # Unless batch_invariant, the packed launch splits its last slots' key tiles in parts,
+    # merged in part order by the part counting last (packed._finish). A wave of such a
+    # slot stores each part but the last as the packed parts do at its next part's first
+    # tile (split_part) and merges them the same way: raw and packed give the same bits.
+    if fx.const_expr(SPLIT):
+        shift, index = _packed_split(
+            first + _min(wave, rows - 1) if GATED else first + wave,
+            hkv,
+            valid_wave,
+            QUERY_TILES,
+            UNION_META,
+            TILE_RANKS,
+            DIRECT_FLAG,
+            HK,
+            BQ,
+            PACKED_SLOTS,
+            LAUNCHED,
+            GATED,
+            CTAS,
+        )
+        parts = fx.Int32(1) << shift
+        begins = [
+            (fx.Int32(p) < parts).select((p * tiles) >> shift, fx.Int32(-1))
+            for p in range(1, DIRECT_PARTS)
+        ]
     qe = fx.Uint32(NQ - first) * H * 256 * 2 - hkv * (H // HK) * 256 * 2
     qptr = fx.get_iter(Q) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
     qr = _buffer(fx.make_view(qptr, fx.make_layout(NQ * H * 256, 1)), qe)
@@ -522,6 +699,12 @@ def _body(
         SLOTTED,
         WIDE,
     )
+    if fx.const_expr(SPLIT):
+        group = H // HK
+        extent = CTAS * record_bytes(group)
+        records = _buffer(RECORDS, extent)
+        first_record = (index << shift) * record_bytes(group)
+        path.split = (records, first_record, begins, group, extent)
     maximum, total, o0, o1 = path.attend(
         q,
         kval,
@@ -537,6 +720,21 @@ def _body(
     )
     # Retire the final bounded speculative K prefetch before the epilogue.
     rocdl.s_waitcnt(vmcnt=0)
+    if fx.const_expr(SPLIT):  # noqa: SIM102 - a compile-time branch
+        if shift > 0:
+            o0, o1, total = _merge_records(
+                records,
+                first_record,
+                parts - 1,
+                parts,
+                o0,
+                o1,
+                maximum,
+                total,
+                _pin_i32(lane),
+                group,
+                extent,
+            )
     _stage_end()
     inv = (total > 0).select(fx.Float32(1.0) / total, fx.Float32(0.0))
     outptr = fx.get_iter(OUT) + (fx.Int64(first) * H + hkv * (H // HK)) * 256
@@ -576,6 +774,9 @@ def _kernel(
     QUERY_TILES: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    UNION_META: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
+    RECORDS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -588,8 +789,24 @@ def _kernel(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    BQ: fx.Int32,
+    PACKED_SLOTS: fx.Int32,
+    LAUNCHED: fx.Int32,
+    CTAS: fx.Constexpr[int],
+    SPLIT: fx.Constexpr[bool],
 ):
     body = _body
+    split = (
+        UNION_META,
+        DIRECT_FLAG,
+        TILE_RANKS,
+        RECORDS,
+        BQ,
+        PACKED_SLOTS,
+        LAUNCHED,
+        CTAS,
+        SPLIT,
+    )
     if fx.const_expr(GATED):
         # K3 listed the groups holding a direct row: they take the first CTAs, so the dispatch
         # slots share them evenly whatever the union/direct row pattern.
@@ -619,6 +836,7 @@ def _kernel(
                 TOPK,
                 SLOTTED,
                 WIDE,
+                *split,
             )
     else:
         body(
@@ -644,6 +862,7 @@ def _kernel(
             TOPK,
             SLOTTED,
             WIDE,
+            *split,
         )
 
 
@@ -661,6 +880,9 @@ def _launch(
     QUERY_TILES: fx.Tensor,
     DIRECT_FLAG: fx.Tensor,
     GROUP_LIST: fx.Tensor,
+    UNION_META: fx.Tensor,
+    TILE_RANKS: fx.Tensor,
+    RECORDS: fx.Tensor,
     H: fx.Constexpr[int],
     HK: fx.Constexpr[int],
     NQ: fx.Int32,
@@ -672,6 +894,11 @@ def _launch(
     TOPK: fx.Constexpr[int],
     SLOTTED: fx.Constexpr[bool],
     WIDE: fx.Constexpr[bool],
+    BQ: fx.Int32,
+    PACKED_SLOTS: fx.Int32,
+    LAUNCHED: fx.Int32,
+    CTAS: fx.Constexpr[int],
+    SPLIT: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     if TASKS > 0:
@@ -687,6 +914,9 @@ def _launch(
             QUERY_TILES,
             DIRECT_FLAG,
             GROUP_LIST,
+            UNION_META,
+            TILE_RANKS,
+            RECORDS,
             H,
             HK,
             NQ,
@@ -699,6 +929,11 @@ def _launch(
             TOPK,
             SLOTTED,
             WIDE,
+            BQ,
+            PACKED_SLOTS,
+            LAUNCHED,
+            CTAS,
+            SPLIT,
             value_attrs=prim.kernel_attrs(),
         ).launch(grid=(TASKS, 1, 1), block=(THREADS, 1, 1), stream=stream)
 
@@ -712,8 +947,17 @@ def _bound(inputs, prepared, out, stream):
     The fifth argument is the slot table (a stand-in without one) and the sixth the FP32
     softmax_scale * log2(e); launchers take both per call.
     """
-    tasks = prepared.num_tiles * inputs.k.shape[1]
+    hk = inputs.k.shape[1]
+    tasks = prepared.num_tiles * hk
     slots = inputs.kv_slots if prepared.slotted else prepared.metadata.view(-1)
+    stand_in = prepared.metadata.view(-1)
+    # The packed launch's slots of an ungated call, and the CTAs it launches for its split.
+    packed_slots = prepared.rows * hk
+    launched = (
+        prepared.union_tiles * prepared.union_tile * hk
+        if prepared.gated
+        else packed_slots + split_extra(packed_slots, prepared.ctas)
+    )
     args = (
         inputs.q.view(-1),
         inputs.k,
@@ -726,13 +970,14 @@ def _bound(inputs, prepared, out, stream):
         prepared.active,
         prepared.query_tiles,
         prepared.direct_flag,
-        (
-            prepared.metadata.view(-1)
-            if prepared.group_list is None
-            else prepared.group_list
+        stand_in if prepared.group_list is None else prepared.group_list,
+        prepared.union_meta.view(-1),
+        *(
+            stand_in if tensor is None else tensor
+            for tensor in (prepared.tile_ranks, prepared.records)
         ),
         inputs.q.shape[1],
-        inputs.k.shape[1],
+        hk,
         inputs.q.shape[0],
         inputs.k.shape[0],
         32,
@@ -742,6 +987,11 @@ def _bound(inputs, prepared, out, stream):
         inputs.topk,
         prepared.slotted,
         prepared.wide,
+        prepared.union_tile,
+        packed_slots,
+        launched,
+        prepared.ctas,
+        prepared.split,
         stream,
     )
     key = (
@@ -751,6 +1001,8 @@ def _bound(inputs, prepared, out, stream):
         prepared.gated,
         inputs.topk,
         prepared.slotted,
+        prepared.split,
+        prepared.persistent,
     )
     compiled = _COMPILED.get((*key, prepared.wide))
     if compiled is None:
@@ -762,7 +1014,7 @@ def _bound(inputs, prepared, out, stream):
             if key not in _COMPILED:
                 _COMPILED[key] = packed.compile_launch(inputs, prepared, out, stream)
             compiled = _COMPILED[(*key, prepared.wide)] = flyc.compile(
-                _launch, *args[:18], 0, *args[19:]
+                _launch, *args[:21], 0, *args[22:]
             )
     if prepared.packed_key is not None:
         return _COMPILED[key], packed.launch_args(inputs, prepared, out, tasks, stream)
