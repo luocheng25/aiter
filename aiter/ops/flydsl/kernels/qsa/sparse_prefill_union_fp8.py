@@ -54,7 +54,9 @@ causal or length edge: the centring folds the mask into the block's addend (-m o
 a wave whose tile holds a mixed block (ballot) masks each value instead. Both waves of a pair
 hold the same rows; per tensor L loads the membership words of both key halves and publishes
 F's nibbles through LDS (one vector load less in F's V-stage). The block ids of four tiles sit
-in one VGPR (lane l: tile t + (l >> 4), slot l & 15), reloaded every step.
+in one VGPR (lane l: tile t + (l >> 4), slot l & 15), reloaded every step; from its second step
+F takes L's window of the same tiles through LDS (written in L's M-stage, read in F's next
+one) instead of loading it.
 
 Registers: two waves per SIMD leave 256 VGPRs and no AGPRs, and a VGPR spill would take
 scratch. Lane ids are re-derived per task (and for the output, after the key loop) from mbcnt
@@ -131,8 +133,9 @@ SEL_TRADE, SEL_KEEP, SEL_DIM0, SEL_DIM1, SEL_FLIP = (
 DPP_SWAP = 0xB1  # quad_perm [1, 0, 3, 2]: lanes 2i and 2i + 1 swap
 # LDS: K halves of group g, buffer j at K_LDS + (2g + j) * HALF; V^T halves at V_LDS + g * HALF;
 # per pair p: P' words of group g (16 B per lane), lane maxima of group g (4 B per lane), F's
-# row-sum chains (16 B per lane, per token), the output scale 1 / l (4 B per lane) and F's
-# membership nibbles (4 B per lane, per tensor). A
+# row-sum chains (16 B per lane, per token), the output scale 1 / l (4 B per lane), F's
+# membership nibbles (4 B per lane, per tensor) and L's id window for F (4 B per lane, in the
+# chains' area per tensor, in the nibbles' per token). A
 # drained task's output rows reuse all of it (8 KiB per wave); a task's prologue stages its 128
 # Q rows in the upper half (Q_LDS), which the waves read before their first V^T and exchange
 # writes.
@@ -765,6 +768,9 @@ def _row_env(env):
     env.mx_rd = MX_LDS + other * 1024 + pair * 256 + lane * 4
     env.ch = CH_LDS + pair * 1024 + lane * 16
     env.mk = MK_LDS + pair * 256 + lane * 4
+    # The leader's id window for the follower: in the chains' area per tensor, in the nibbles'
+    # per token.
+    env.wn = (MK_LDS if env.per_token else CH_LDS) + pair * 256 + lane * 4
 
 
 def _step_l(env, st, u, buf, qk, ex, dec, cen, kmem, vw, kn):
@@ -809,6 +815,11 @@ def _step_l(env, st, u, buf, qk, ex, dec, cen, kmem, vw, kn):
             yield from _gen_v_words(env, st["vd"], vt)
         if cen:
             yield from _gen_terms(env, st["sc"], terms)
+        if dec:
+            # The id window of tiles u .. u + 3 for the follower's next V-stage (from step 1:
+            # in step 0 the Q rows staged over this area may still be read).
+            _write_lds(lds, env.wn, [st["win"]])
+            yield
 
     prim.s_setprio(M_PRIO)
     s_new, o = _m_stage(
@@ -950,7 +961,8 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
     sc = [fx.Float32(0.0)] * 2
     if env.per_token:
         sc = _scale_loads(env, win if env.full else _fix_win(env, win, u - 1), 1)
-    nwin = _load_win(env, u)
+    # Steps that decide get the next window from the leader (_step_l), the others load it.
+    nwin = [] if dec else [_load_win(env, u)]
     _pin()
     if kmem and env.k_mid:
         # K(u+1) to LDS between the M-stages' K and V^T reads (the V-stage's LDS write order is
@@ -1020,6 +1032,11 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
     def extra():
         yield from _gen_v_words(env, vd, vt)
         yield from _gen_terms(env, sc, terms)
+        if dec:
+            # The next V-stage's id window (tiles u .. u + 3), written by the leader's M-stage
+            # in the previous slot: one vector load less in the follower's V-stage.
+            nwin.append(prim._load_lds32(lds, env.wn))
+            yield
 
     s_new, o = _m_stage(
         env, buf, kpre, o, valu, pw_early, publish, qk, pv, publish_words, sums, extra()
@@ -1042,7 +1059,7 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
         "kd": kd,
         "vd": vt,
         "ws": ws,
-        "win": nwin,
+        "win": nwin[0],
         "sc": terms,
     }
 
@@ -2025,8 +2042,8 @@ def _task(
     # ---- Output of the drained task (or split record and merge); every wave takes the same
     # barriers ----
     o, m_run = st["o"], st["m"]
-    # A block id is below 2**31; the window from before the last drain step loaded ahead of the
-    # next entry's loads, so reading it waits for no more than itself.
+    # A block id is below 2**31; the window from before the last drain step arrived ahead of the
+    # next entry's loads (F's through LDS), so reading it waits for no more than itself.
     env = _out_env(env, prim._uniform(fx.Int32(win_out)) >> 31)
     if fx.const_expr(SPLIT > 1):
         if env.split != 0:
