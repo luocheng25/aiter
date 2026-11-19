@@ -2987,9 +2987,8 @@ def allocate_plan(
     requests of at least that many rows take union tiles of their own rows (the kernels
     compile for the widest), the others direct-only tiles after them, and K3 does not route.
 
-    fp8 ("tensor" / "token") plans for the FP8 kernels: their route calibration, BQ21/BQ42
-    tiles for full prefills only and core/residual tiles (H12/H6 without a split, nor a fixed
-    selection).
+    fp8 ("tensor" / "token") plans for the FP8 kernels: their route calibration and
+    core/residual tiles (H12/H6 without a split, nor a fixed selection).
     """
     group = inputs.q.shape[1] // inputs.k.shape[1]
     if query_tile < 1 or query_tile > 32:
@@ -3000,26 +2999,15 @@ def allocate_plan(
     q_lens = np.asarray(inputs.query_lens, dtype=np.int64)
     prefix = np.asarray(inputs.prefix_lens, dtype=np.int64)
     lengths = q_lens + prefix
-    # FP8 plans keep BQ21/BQ42 tiles to full prefills (a single one by default): the FP8
-    # kernels' route terms and errors were measured with those tiles only.
     if min_request_rows is None:
-        if fp8 is None:
-            query_tile = _batch_tile_rows(group, query_tile, q_lens, hk == 1)
-        else:
-            full = hk == 1 and len(q_lens) == 1 and prefix[0] == 0
-            query_tile = _tile_rows(group, query_tile, int(q_lens[0]), full)
+        query_tile = _batch_tile_rows(group, query_tile, q_lens, hk == 1)
         union = np.ones(len(q_lens), dtype=bool)
         rows = np.full(len(q_lens), query_tile)
         max_blocks = _cdiv(inputs.max_seqlen_k, 4)
     else:
         union = q_lens >= min_request_rows
         rows = np.array(
-            [
-                _tile_rows(
-                    group, query_tile, int(n), hk == 1 and (fp8 is None or p == 0)
-                )
-                for n, p in zip(q_lens, prefix)
-            ],
+            [_tile_rows(group, query_tile, int(n), hk == 1) for n in q_lens],
             dtype=np.int64,
         )
         query_tile = int(rows[union].max())

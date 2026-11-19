@@ -455,8 +455,8 @@ def flydsl_qsa_sparse_prefill(
     output error of a few percent on random data), and per-token V scales are clamped to
     [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct rows read the
     context repacked per call while it fits a budget, else the raw K/V. Its union plans
-    take BQ21/BQ42 tiles only for full prefills and may keep only a core of an H12/H6
-    union tile, the rows' other blocks running direct and merging by log-sum-exp.
+    may keep only a core of an H12/H6 union tile, the rows' other blocks running direct
+    and merging by log-sum-exp.
     compute="bf16" dequantizes the request tokens to BF16 (each value the FP32 product
     rounded once) and runs the BF16 kernels (BF16 accuracy, temporary BF16 K/V of the
     packed context). Workspaces are kept per K/V dtype and scale layout too; the scale

@@ -43,10 +43,11 @@ Cases needing more device memory than is free are skipped with a warning.
 Performance cases are single-request full prefills of 1k-32k tokens plus the
 12000-token serving prompt (T = 512); they are checked as well. H6/H3 union tiles
 take 21/42 queries (BQ21/BQ42) in calls of at least wide_tile_rows rows, with or
-without a prefix (FP8 K/V: full prefills): the larger performance cases, one batch
-invariance request, a 4096-row chunk and a 4096-row FP8 prefill run them. They and
-FP8_PERF_CASES alone take run_perftest's full timing; the other cases make the few
-calls their checks need (CHECK_PERFTEST), so their times are rough. ``shared``
+without a prefix: the larger performance cases, one batch invariance request, a
+4096-row chunk (BF16 and FP8 K/V), an FP8 batch of two 2048-row chunks and a 4096-row
+FP8 prefill run them. They and FP8_PERF_CASES alone take run_perftest's full timing;
+the other cases make the few calls their checks need (CHECK_PERFTEST), so their times
+are rough. ``shared``
 selections let 32-row windows share block priorities; ``random`` rows choose
 independently; ``correlated`` (performance cases) simulates the real indexer's
 selection distribution, captured Qwen3.8 layers whose neighbouring rows share about
@@ -232,6 +233,8 @@ FP8_LAYOUTS = {
     "topk256_hk2_ragged": ((7, 0, 9), (0, 5, 3000), 2, "shared", 256),
     "chunk_1024_ctx_4024_random": ((1024,), (3000,), 1, "random", 512),
     "ragged_3_random": ((480, 1000, 301), (11392, 3, 4001), 1, "random", 512),
+    # Two chunks after prefixes: at H3 their rows take BQ42 tiles together.
+    "two_chunks_2048": ((2048, 2048), (30000, 4000), 1, "shared", 512),
     "extend_9_ctx_139": ((9,), (130,), 1, "random", 512),
     # FP8 K/V past 4 GiB (16843185 tokens at HK1): the first two requests' K/V are the
     # longest a request may have (their BF16 span would be 4 GiB - 1 MiB), the last
@@ -378,7 +381,8 @@ FP8_POOL_4G_ROWS = (2**32 + 2**29) // HEAD_DIM
 # needed; first pool page; whether the last request's last page is the pool's last page)).
 # The first eight pair compute, scales, paths, pools and groups 12/6/3; then group 16
 # (direct through a pool at HK2 and T = 256, union with BQ8 tiles), large logits, the BQ42
-# tile of H3 full prefill (FP8 union with 64-bit membership), the 12000-token serving
+# tile of H3 full prefill (FP8 union with 64-bit membership), BQ21 tiles of an H6 chunk after
+# a prefix and BQ42 ones of an H3 batch of two chunks (through a pool), the 12000-token serving
 # prompt (see FP8_PERF_CASES), K/V past 4 GiB: packed (the last request crosses it) and a
 # 4.5 GiB pool whose pages start at 4 GiB and end at its last page, Q and out past 2 GiB
 # (see FP8_LARGE_Q_CASES), and union tasks past K3's first order chunk.
@@ -425,6 +429,20 @@ FP8_CASES = {
         None,
     ),
     "fp8_prefill_4096_h3_tensor": ("prefill_4096", 3, "tensor", "fp8", None),
+    "fp8_chunk_4096_ctx_131072_h6_token": (
+        "chunk_4096_ctx_131072",
+        6,
+        "token",
+        "fp8",
+        None,
+    ),
+    "fp8_kv_slots_two_chunks_h3_tensor": (
+        "two_chunks_2048",
+        3,
+        "tensor",
+        "fp8",
+        (None, 1, False),
+    ),
     "fp8_prefill_12000_tensor": ("prefill_12000", 12, "tensor", "fp8", None),
     "fp8_4g_packed_token": ("fp8_4g_packed", 12, "token", "fp8", None),
     "fp8_pool_4g_ragged_4_tensor": (
@@ -441,10 +459,11 @@ FP8_CASES = {
 # checked against the reference on the kernels' FP8 Q (see test_qsa_fp8_query).
 FP8_PERF_CASES = ("fp8_prefill_12000_tensor",)
 # Checked against the reference on the kernels' FP8 Q instead of within FP8_TOL: FP8 Q
-# rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads)
-# near FP8_TOL's worst bound, while what its K/V or out addressing can break shows on
-# either check.
+# rounding alone takes a few (row, head) vectors of its 4M-token rows (or of its 192 heads,
+# or of the H6 chunk's rows: 0.165 with BQ16 tiles as with BQ21) near FP8_TOL's worst bound,
+# while what its K/V or out addressing can break shows on either check.
 FP8_QUERY_CHECKED = (
+    "fp8_chunk_4096_ctx_131072_h6_token",
     "fp8_4g_packed_token",
     "fp8_hk16_prefill_24576_token",
     "fp8_hk16_k3_chunks_token",
@@ -589,6 +608,8 @@ FP8_ROUTES = {
     # These two run every tile union whole: no pack runs.
     "fp8_large_logits_prefill_768_token": (True, None, 32, 2, False, False),
     "fp8_prefill_4096_h3_tensor": (True, None, 42, 1, False, False),
+    "fp8_chunk_4096_ctx_131072_h6_token": (True, None, 21, 1, False, False),
+    "fp8_kv_slots_two_chunks_h3_tensor": (True, None, 42, 1, False, False),
     "fp8_prefill_12000_tensor": (True, None, 10, 1, True, True),
     # Past the pack budget: direct reads the raw K/V, the union the raw V.
     "fp8_4g_packed_token": (True, "raw", 10, 1, False, False),
