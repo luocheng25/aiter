@@ -55,14 +55,14 @@ ORDER_WORDS = EXCHANGE_WORDS + 8 + 4 * LIMITS
 # causal tiles run): K3 splits a task of more N64 steps than the even load (steps +
 # SPLIT_OVERHEAD per task over the CUs) into SPLIT_PARTS key ranges, run as separate CTA slots,
 # for at most SPLIT_SLOTS tasks; the part finishing last merges their partial O / m / l records
-# (PARTIAL_FLOATS each: 128 rows x 256 FP32, then m and l of 256 lanes, or of 128 rows). BF16
-# union tasks run about twice as long per step, and its plans split below twice the CUs (a
-# 2048-token prefill selecting every causal block, H6: -7%), as many tasks as their parts
-# fit a round or pair with tasks of at most half the longest's steps (8 extends of 256
-# tokens after 2k-16k, H3: 64 equal tasks, all split before, union -11%). FP8 plans of a
-# task per CU or more do not: the split saves less than it costs a reused plan, whose split
-# counters a separate launch zeroes before each call (the same prefill, every call reusing
-# its plan: +1.3%).
+# (PARTIAL_FLOATS each: 128 rows x 256 FP32, then m and l of 256 lanes, or of 128 rows). It
+# splits as many tasks as their parts fit a round or pair with tasks of at most half the
+# longest's steps (8 extends of 256 tokens after 2k-16k, H3: 64 equal tasks, all split
+# before: BF16 union -11%, FP8 call -13%). BF16 union tasks run about twice as long per step,
+# and its plans split below twice the CUs (a 2048-token prefill selecting every causal block,
+# H6: -7%). FP8 plans of a task per CU or more do not: the split saves less than it costs a
+# reused plan, whose split counters a separate launch zeroes before each call (the same
+# prefill, every call reusing its plan: +1.3%).
 SPLIT_PARTS = 2
 SPLIT_SLOTS = 64
 SPLIT_OVERHEAD = 6.0
@@ -186,9 +186,6 @@ class SparsePlan:
     # split > 1 task_order entries encode (task, slot, part, split) and the union kernel
     # writes / merges partial records (partials, split_counters).
     split: int = 1
-    # BF16 split plans: the parts past a round take at most the short tasks they pair with
-    # (K3's _order; FP8 plans split as their kernels were calibrated).
-    split_pairs: bool = False
     partials: torch.Tensor | None = None
     split_counters: torch.Tensor | None = None
     # Core/residual tiles (core_ratio > 0): K2 writes each tile's residual direct steps (0: whole
@@ -1907,7 +1904,6 @@ def _order(
     SLICES: fx.Constexpr[int],
     WIDTH: fx.Constexpr[int],
     SPLIT: fx.Constexpr[int],
-    SPLIT_PAIRS: fx.Constexpr[bool],
     CORE: fx.Constexpr[bool],
     BALANCE: fx.Constexpr[int],
     DESCENTS: fx.Constexpr[bool],
@@ -1966,10 +1962,10 @@ def _order(
     if fx.const_expr(SPLIT > 1):
         # Even per-CTA load of the active tasks (steps plus a task overhead), then the tasks
         # above it take a slot (task order, at most SPLIT_SLOTS) and SPLIT key ranges.
-        # SPLIT_PAIRS: a round deals an item per CTA and the next pairs the rest with the
-        # shortest ones, so the parts past a round take at most the tasks of at most half
-        # the longest's steps (64 tasks of 33 steps on 80 CTAs split 16: a pair of parts
-        # would run as long as a task, the parts' records and merges added).
+        # A round deals an item per CTA and the next pairs the rest with the shortest ones,
+        # so the parts past a round take at most the tasks of at most half the longest's
+        # steps (64 tasks of 33 steps on 80 CTAs split 16: a pair of parts would run as
+        # long as a task, the parts' records and merges added).
         base = ORDER_WORDS
         table = ORDER_WORDS + SPLIT_TABLE
         total, count, longest = zero, zero, zero
@@ -1978,27 +1974,19 @@ def _order(
             total = total + first.select(steps, zero)
             count = count + first.select(fx.Int32(1), zero)
             longest = fx.max(longest, first.select(steps, zero))
-        slots = fx.Int32(SPLIT_SLOTS)
-        if fx.const_expr(SPLIT_PAIRS):
-            total, count, longest = _block_reduce(
-                [total, count, longest],
-                [operator.add, operator.add, fx.max],
-                scratch,
-                base,
-                wave,
-            )
-            short = zero
-            for valid, part, steps, active in info:
-                first = valid & (part == 0) & active
-                short = short + (first & (2 * steps <= longest)).select(
-                    fx.Int32(1), zero
-                )
-            (short,) = _block_reduce([short], [operator.add], scratch, base + 12, wave)
-            slots = _min(slots, GRID + short - count)
-        else:
-            total, count = _block_reduce(
-                [total, count], [operator.add, operator.add], scratch, base, wave
-            )
+        total, count, longest = _block_reduce(
+            [total, count, longest],
+            [operator.add, operator.add, fx.max],
+            scratch,
+            base,
+            wave,
+        )
+        short = zero
+        for valid, part, steps, active in info:
+            first = valid & (part == 0) & active
+            short = short + (first & (2 * steps <= longest)).select(fx.Int32(1), zero)
+        (short,) = _block_reduce([short], [operator.add], scratch, base + 12, wave)
+        slots = _min(fx.Int32(SPLIT_SLOTS), GRID + short - count)
         even = (
             total.to(fx.Float32) + fx.Float32(SPLIT_OVERHEAD) * count.to(fx.Float32)
         ) / GRID.to(fx.Float32)
@@ -2448,7 +2436,6 @@ def _order_chunks(
     SLICES,
     WIDTH,
     SPLIT,
-    SPLIT_PAIRS,
     CORE,
     BALANCE,
     DESCENTS,
@@ -2476,7 +2463,6 @@ def _order_chunks(
             SLICES,
             WIDTH,
             SPLIT,
-            SPLIT_PAIRS,
             CORE,
             BALANCE,
             DESCENTS,
@@ -2504,7 +2490,6 @@ def _order_chunks(
             SLICES,
             WIDTH,
             SPLIT,
-            SPLIT_PAIRS,
             CORE,
             BALANCE,
             DESCENTS,
@@ -2560,7 +2545,6 @@ def _order_masks_kernel(
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
-    SPLIT_PAIRS: fx.Constexpr[bool],
     CORE: fx.Constexpr[bool],
     BALANCE: fx.Constexpr[int],
     MEMBERS64: fx.Constexpr[bool],
@@ -2638,7 +2622,6 @@ def _order_masks_kernel(
                         SLICES,
                         width,
                         SPLIT,
-                        SPLIT_PAIRS,
                         CORE,
                         BALANCE,
                         descents,
@@ -2730,7 +2713,6 @@ def _order_masks_launch(
     ROUTE_MODEL: fx.Constexpr[tuple],
     SLOTTED: fx.Constexpr[bool],
     SPLIT: fx.Constexpr[int],
-    SPLIT_PAIRS: fx.Constexpr[bool],
     CORE: fx.Constexpr[bool],
     BALANCE: fx.Constexpr[int],
     MEMBERS64: fx.Constexpr[bool],
@@ -2778,7 +2760,6 @@ def _order_masks_launch(
             ROUTE_MODEL,
             SLOTTED,
             SPLIT,
-            SPLIT_PAIRS,
             CORE,
             BALANCE,
             MEMBERS64,
@@ -3132,7 +3113,6 @@ def allocate_plan(
         routing=min_request_rows is None,
         slotted=slotted,
         split=split,
-        split_pairs=split > 1 and fp8 is None,
         core_ratio=core_ratio,
         residual=torch.zeros(tiles, **kwargs),
         rows=inputs.q.shape[0],
@@ -3300,7 +3280,6 @@ def _launches(inputs, plan, stream):
         plan.route_model,
         plan.slotted,
         plan.split,
-        plan.split_pairs,
         core,
         balance,
         members64,
@@ -3317,7 +3296,6 @@ def _launches(inputs, plan, stream):
         members64,
         plan.slotted,
         plan.split,
-        plan.split_pairs,
         core,
         balance,
         max_width,
