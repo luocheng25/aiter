@@ -112,12 +112,13 @@ SORT_TOTALS = SORT_HIST + SORT_BINS
 # plus its diagonal (blocks from the first row's causal tail block on). Each row's other complete
 # blocks are its residual, which the direct kernel attends and merges into the union output by
 # log-sum-exp. K2 keeps the core when its union steps plus the residual direct work cost less
-# than the whole union. Residual direct work in BN32 direct steps, per (row, block) pair and
-# per row by query heads per KV head (fitted on the residual direct of SGLang-captured 12k
-# selections, like FP8_ROUTES).
+# than the whole union. Residual direct work in BN32 direct steps, per (row, block) pair (a
+# chunk per eight blocks) and per row by query heads per KV head (the union output's merge and
+# the Q loads; fitted with FP8_ROUTES' direct terms, the step and intercept shared by the
+# groups: mean error 6%).
 CORE_RATIOS = {12: 0.5, 6: 0.2}
-RESIDUAL_PAIR = 0.112
-RESIDUAL_ROW = {12: 3.08, 6: 3.08}
+RESIDUAL_PAIR = 0.125
+RESIDUAL_ROW = {12: 2.9, 6: 1.7}
 # K2 weighs a core's residual direct work by CORE_MARGINS when it decides the core (the residual
 # steps K3 routes with are not scaled).
 CORE_MARGINS = {12: 1.0, 6: 1.0}

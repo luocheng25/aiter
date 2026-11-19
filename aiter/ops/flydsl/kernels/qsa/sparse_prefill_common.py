@@ -488,29 +488,34 @@ PLATFORMS = {
     ),
 }
 # FP8 K/V (sparse_prefill_*_fp8, by K/V scale layout): route terms fitted on the FP8 kernels'
-# phase timings, synthetic and SGLang-captured selections (median error 3%); the per-tile
-# ratio is the sweep's best with the global route on. Past the packed-KV budget, FP8 direct
-# packs up to 320 tokens per query row (its raw K/V reads cost more than BF16's). Union and
-# minimum-row thresholds otherwise follow the BF16 entry.
+# phase timings over synthetic, dense and SGLang-captured selections (12k prompts at TP2/4/8,
+# 16k-token chunks after 16k-1M prefixes) planned with per-tile ratios 0 / 1.2 / 2.0 / 3.0:
+# union_step on the union kernel's times of unsplit plans (union_fixed kept; mean error 7%),
+# direct_cu_step and row_step on the direct kernel's times of plans up to 128k-token contexts
+# (direct_fixed kept; mean error 6%), pack_block on the pack's (apart from its Q quantization).
+# The per-tile ratio is the sweep's best with them (from 1.7 down, short chunks after long
+# prefixes send whole tiles direct and pack the context: +35%). Past the packed-KV budget, FP8
+# direct packs up to 320 tokens per query row (its raw K/V reads cost more than BF16's). Union
+# and minimum-row thresholds otherwise follow the BF16 entry.
 FP8_ROUTES = {
     ("gfx942", 80): {
         "tensor": {
             "union_fixed": 5.7,
-            "union_step": 1.571,
-            "row_step": 1.05,
+            "union_step": 1.61,
+            "row_step": 0.54,
             "direct_fixed": 11.9,
-            "pack_block": 0.00184,
-            "direct_cu_step": 0.24,
+            "pack_block": 0.0016,
+            "direct_cu_step": 0.152,
             "union_ratio": 2.0,
             "pack_tokens_per_row": 320,
         },
         "token": {
             "union_fixed": 5.14,
-            "union_step": 1.771,
-            "row_step": 1.12,
+            "union_step": 1.94,
+            "row_step": 0.58,
             "direct_fixed": 11.87,
-            "pack_block": 0.00213,
-            "direct_cu_step": 0.3,
+            "pack_block": 0.0018,
+            "direct_cu_step": 0.158,
             "union_ratio": 2.0,
             "pack_tokens_per_row": 320,
         },
