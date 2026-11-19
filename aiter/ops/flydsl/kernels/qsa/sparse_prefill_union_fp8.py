@@ -51,8 +51,10 @@ A task's first and last two steps leave out the work of tiles outside 0 .. last.
 
 Membership is per key, but a four-key block's bits are all set or all clear except at a
 causal or length edge: the centring folds the mask into the block's addend (-m or -inf), and
-a wave whose tile holds a mixed block (ballot) masks each value instead. The block ids of four
-tiles sit in one VGPR (lane l: tile t + (l >> 4), slot l & 15), reloaded every step.
+a wave whose tile holds a mixed block (ballot) masks each value instead. Both waves of a pair
+hold the same rows; per tensor L loads the membership words of both key halves and publishes
+F's nibbles through LDS (one vector load less in F's V-stage). The block ids of four tiles sit
+in one VGPR (lane l: tile t + (l >> 4), slot l & 15), reloaded every step.
 
 Registers: two waves per SIMD leave 256 VGPRs and no AGPRs, and a VGPR spill would take
 scratch. Lane ids are re-derived per task (and for the output, after the key loop) from mbcnt
@@ -129,7 +131,8 @@ SEL_TRADE, SEL_KEEP, SEL_DIM0, SEL_DIM1, SEL_FLIP = (
 DPP_SWAP = 0xB1  # quad_perm [1, 0, 3, 2]: lanes 2i and 2i + 1 swap
 # LDS: K halves of group g, buffer j at K_LDS + (2g + j) * HALF; V^T halves at V_LDS + g * HALF;
 # per pair p: P' words of group g (16 B per lane), lane maxima of group g (4 B per lane), F's
-# row-sum chains (16 B per lane, per token) and the output scale 1 / l (4 B per lane). A
+# row-sum chains (16 B per lane, per token), the output scale 1 / l (4 B per lane) and F's
+# membership nibbles (4 B per lane, per tensor). A
 # drained task's output rows reuse all of it (8 KiB per wave); a task's prologue stages its 128
 # Q rows in the upper half (Q_LDS), which the waves read before their first V^T and exchange
 # writes.
@@ -139,6 +142,7 @@ P_LDS = V_LDS + 2 * HALF
 MX_LDS = P_LDS + 2 * 4096
 CH_LDS = MX_LDS + 2 * 1024
 INV_LDS = CH_LDS + 4096
+MK_LDS = INV_LDS + 1024
 LDS_COUNT = 0  # a split task's part count, read after every wave's last K read
 LDS_BYTES = 65536
 NEG_INF = -8388608  # FP32 -inf bits
@@ -437,11 +441,10 @@ def _v_write(env, vdata):
 # ---- Softmax pieces ----
 
 
-def _mask_nibbles(env, ws):
-    """The lane's membership nibbles: byte a holds keys 8a + 4h .. + 3 of its group's key half
-    (bit j: key 8a + 4h + j, one four-key block per byte); rows outside the task keep every
+def _mask_nibbles(env, ws, b):
+    """The lane's membership nibbles of key half b: byte a holds keys 8a + 4h .. + 3 (bit j:
+    key 8a + 4h + j, one four-key block per byte); rows outside the task keep every
     key."""
-    b = env.b
     select = b | ((2 + b) << 8) | ((4 + b) << 16) | ((6 + b) << 24)
     picked = fx.Int32(prim.perm_b32(fx.Int32(ws[1]), fx.Int32(ws[0]), select))
     nibbles = (picked >> (env.h * 4)) & fx.Int32(0x0F0F0F0F)
@@ -506,10 +509,11 @@ def _centre_tile(s_acc, c_scale, neg, nibbles, sk, lsv, PER_TOKEN: fx.Constexpr[
     return vals
 
 
-def _centre(env, s_acc, m_run, ws, sc, early):
+def _centre(env, s_acc, m_run, nibbles, sc, early):
     """S'' = S * c - m of the group's 16 values (per token S * sk * c - m + log2 sv, sc the
-    lane's scale entry), masked, and their lane max, written for the pair's other wave.
-    Returns (S'', lane max). early(): issued between the centring and the lane max."""
+    lane's scale entry), masked (nibbles: _mask_nibbles), and their lane max, written for the
+    pair's other wave. Returns (S'', lane max). early(): issued between the centring and the
+    lane max."""
     m_run = fx.Float32(m_run)
     fresh = m_run == fx.Float32(_MAX_FLOOR)
     neg = fresh.select(fx.Float32(0.0), fx.Float32(0.0) - m_run)
@@ -518,7 +522,7 @@ def _centre(env, s_acc, m_run, ws, sc, early):
             s_acc,
             env.c_scale,
             neg,
-            _mask_nibbles(env, ws),
+            nibbles,
             fx.Float32(sc[0]),
             fx.Float32(sc[1]),
             env.per_token,
@@ -760,6 +764,7 @@ def _row_env(env):
     env.mx_wr = MX_LDS + own * 1024 + pair * 256 + lane * 4
     env.mx_rd = MX_LDS + other * 1024 + pair * 256 + lane * 4
     env.ch = CH_LDS + pair * 1024 + lane * 16
+    env.mk = MK_LDS + pair * 256 + lane * 4
 
 
 def _step_l(env, st, u, buf, qk, ex, dec, cen, kmem, vw, kn):
@@ -881,7 +886,11 @@ def _step_l(env, st, u, buf, qk, ex, dec, cen, kmem, vw, kn):
     cross = env.kpre_cross and cen and kn
     if cen:
         early = (lambda: None) if cross else issue_kpre
-        vals, local = _centre(env, s_new, m_run, st["ws"], terms, early)
+        if not env.per_token:
+            # The follower's nibbles of tile u (it centres S''(u) in the next slot).
+            _write_lds(lds, env.mk, [_mask_nibbles(env, st["ws"], 0)])
+        nibbles = _mask_nibbles(env, st["ws"], env.b)
+        vals, local = _centre(env, s_new, m_run, nibbles, terms, early)
         rsv = terms[2]
     if cross:
         _barrier_reads(issue_kpre)
@@ -923,6 +932,11 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
         else:
             o = list(_scale_pending(o, st["corr"], st["pend"]))
     pm = _as_f32(prim._load_lds32(lds, env.mx_rd)) if dec else None
+    # Per tensor the membership nibbles of tile u - 1 come from the leader (written in the
+    # previous slot).
+    nibbles = None
+    if dec and not env.per_token:
+        nibbles = prim._load_lds32(lds, env.mk)
     # The window holds tiles u - 1 .. u + 2.
     win = st["win"]
     kd = st["kd"]
@@ -932,7 +946,7 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
     if vw:
         _v_write(env, st["vd"])
     vd = _v_loads(env, win, u - 1)
-    ws = _load_mask(env, u)
+    ws = _load_mask(env, u) if env.per_token else st["ws"]
     sc = [fx.Float32(0.0)] * 2
     if env.per_token:
         sc = _scale_loads(env, win if env.full else _fix_win(env, win, u - 1), 1)
@@ -957,7 +971,9 @@ def _step_f(env, st, u, buf, qk, ex, pv, dec, pend, kmem, vw):
     cross = env.kpre_cross and dec and qk
     if dec:
         early = (lambda: None) if cross else issue_kpre
-        vals, local = _centre(env, st["sacc"], m_run, st["ws"], st["sc"], early)
+        if nibbles is None:
+            nibbles = _mask_nibbles(env, st["ws"], env.b)
+        vals, local = _centre(env, st["sacc"], m_run, nibbles, st["sc"], early)
         rsv = st["sc"][2]
         sp, m_run, corr, ballot = _decision(local, pm, vals, m_run)
     if cross:
