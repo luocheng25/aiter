@@ -122,15 +122,17 @@ RESIDUAL_ROW = {12: 2.9, 6: 1.7}
 # K2 weighs a core's residual direct work by CORE_MARGINS when it decides the core (the residual
 # steps K3 routes with are not scaled).
 CORE_MARGINS = {12: 1.0, 6: 1.0}
-# Past 2**DIRECT_SPAN_KNEE tokens of context the BF16 route terms, fitted below 64k tokens,
-# favour one side by 1 + DIRECT_SPAN_SLOPE per doubling, depending on the K/V bytes the direct
-# kernel reads per query head and element:
-# - at least a third (group <= DIRECT_SPAN_GROUPS x 2 bytes: H3 / H6): a direct step costs more
-#   once the context outgrows the caches, and K2's budget weighs it by the tile's context;
-# - less (H12): the union takes those tiles slower than the direct does (weighing the direct
-#   side instead, a 16k-token chunk after a 1M-token prefix, 12 layers: +1.6%), and K3's route
-#   weighs the union step by the plan's longest context.
-# FP8 plans keep the unweighted terms that FP8_ROUTES were fitted with.
+# Past 2**DIRECT_SPAN_KNEE tokens of context the route terms, fitted below 64k (BF16) / 128k
+# (FP8) tokens, favour one side by 1 + DIRECT_SPAN_SLOPE per doubling, depending on the K/V
+# bytes the direct kernel reads per query head and element:
+# - at least a third (group <= DIRECT_SPAN_GROUPS x K/V bytes: BF16 at H3 / H6, FP8 at H3): a
+#   direct step costs more once the context outgrows the caches (FP8 direct at a 1M-token
+#   context: +40-60% over the route terms, the union step +3-8%), and K2's budget weighs it by
+#   the tile's context (a 16k-token chunk after a 1M-token prefix, FP8 at H3: -17%);
+# - less (BF16 at H12): the union takes those tiles slower than the direct does (weighing the
+#   direct side instead, the same chunk, 12 layers: +1.6%), and K3's route weighs the union
+#   step by the plan's longest context. FP8 plans at H6 / H12 weigh neither side (the same
+#   chunk at H12: K3's union step weight +6% per token, K2's direct weight +6% / +11%).
 DIRECT_SPAN_KNEE = 17
 DIRECT_SPAN_SLOPE = 0.2
 DIRECT_SPAN_GROUPS = 3
@@ -3050,17 +3052,18 @@ def allocate_plan(
     # Split plans run every CU (parts of a task are separate slots).
     launch_grid = num_cus if split > 1 else grid
     packed = int((-(-lengths // 4))[q_lens > 0].sum())
-    # BF16 plans: K2 weighs direct steps past the knee where they read at least a third of a
-    # K/V byte per query head (DIRECT_SPAN_GROUPS), K3 the union step in the other plans, at
-    # the plan's longest context.
-    weighted = fp8 is None
+    # K2 weighs direct steps past the knee where they read at least a third of a K/V byte per
+    # query head (DIRECT_SPAN_GROUPS), K3 the union step in the other BF16 plans, at the
+    # plan's longest context.
     span_slope = (
-        DIRECT_SPAN_SLOPE if weighted and group <= DIRECT_SPAN_GROUPS * 2 else 0.0
+        DIRECT_SPAN_SLOPE
+        if group <= DIRECT_SPAN_GROUPS * (2 if fp8 is None else 1)
+        else 0.0
     )
     doublings = math.log2(max(int(lengths.max()), 1)) - DIRECT_SPAN_KNEE
     union_weight = (
         1.0 + DIRECT_SPAN_SLOPE * max(doublings, 0.0)
-        if weighted and not span_slope
+        if fp8 is None and not span_slope
         else 1.0
     )
     route_costs = (
