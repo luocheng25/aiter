@@ -19,9 +19,13 @@ columns ``ni``). MFMA 16x16x32 FP8 takes W as A (16 channels) and X as B (16 tok
 ``4 (l // 16) + v`` of token ``l % 16``. After the K loop the groups add their sums pairwise
 through LDS (over the X buffers): groups ``[h, 2h)`` hand theirs to groups ``[0, h)``,
 ``h`` = k_groups / 2, 1/4 ... (fixed order, deterministic). Epilogue (group 0):
-``acc * s[channel] * x_scale[token]`` -> BF16, one 8-byte store per tile and lane; rows at
-or past M drop their stores (buffer bounds), channels past N (``N % block_n != 0``) are
-masked.
+``acc * s[channel] * x_scale[token]`` -> BF16. When the tile fits the LDS allocation
+(``_shuffled_store``), each lane writes its 8 bytes per MMA tile to an LDS copy of the
+output tile (token rows, pitch ``2 block_n + 16`` B) and, after a barrier, every lane stores
+16 bytes of a token row, so a store instruction writes whole 128-byte lines (an 8-byte
+store per tile and lane writes 32-byte pieces of 16 rows: tp2_qkv M = 64 GEMM +0.9 us);
+otherwise the 8-byte stores go out directly. Rows at or past M drop their stores (buffer
+bounds), channels past N (``N % block_n != 0``) are masked.
 
 Schedule: a 1-D grid, one tile per CTA, no split-K across CTAs. A super tile covers
 ``xcd_m`` M blocks x ``xcd_n = _XCDS / xcd_m`` N blocks and super tiles run M block major;
@@ -39,15 +43,18 @@ decoded into ``w_frag`` one 64-K sub-step before its MFMAs. A ``tile_k`` (128 or
 ``k`` is one pipeline stage of ``tile_k / 64`` sub-steps ``ki`` (two per 128-K step, halves
 ``h``); stage ``k`` reads LDS buffer ``k % 2`` and W slot ``k % num_slots``:
 
-    ki   MFMA (per wave)     LDS -> VGPR  VMEM (first MFMAs)           VALU (between MFMAs)
-    0    acc += W0(k) X0(k)  X0(k)        X(k+XS) W(k+P) D(k+P)        decode W1(k), same LUT
-    1    acc += W1(k) X1(k)  X1(k)        -                            decode W2(k) / W0(k+1)
+    ki   MFMA (per wave)     LDS -> VGPR  VMEM (between all MFMAs)     VALU (between MFMAs)
+    0    acc += W0(k) X0(k)  X0(k)        X(k+XS) W(k+P) D(k+P) ...    decode W1(k), same LUT
+    1    acc += W1(k) X1(k)  X1(k)        ... (evenly spread)          decode W2(k) / W0(k+1)
     ..   (tile_k 256: two more sub-steps, a new LUT at ki 2)
     end  X(k+1) VGPR -> LDS[(k+1) % 2]; s_barrier
 
 (``W0`` / ``X0``: the first 64-K block of tile ``k`` in MMA-side K order, ``D``: deltas,
 ``XS = x_stages``, ``P = prefetch``; ``k`` counts the group's tiles.) A W tile is in flight
-for ``P`` stages, an X tile for ``XS``. The runtime loop runs
+for ``P`` stages, an X tile for ``XS``. The stage's loads go out evenly between all its
+MFMAs (with ``P = 1`` between the first ones, as W(k+1) is decoded at the end of stage
+``k``): issued back to back they fill the CU's vector memory queue, which stalls the MFMA
+issue of every wave of the CTA (tp2_qkvz M = 64: GEMM 16.2 -> 14.5 us). The runtime loop runs
 ``unroll = lcm(num_slots, 2, XS)`` stages per iteration (slots, buffers and staging sets are
 static in it); the last ``unroll`` to ``2 unroll - 1`` stages are peeled and stop loading
 past the group's last tile. Inside a 128-K step lane group ``g`` reads 32-K group ``g`` in
@@ -140,6 +147,16 @@ def _lds_bytes(cfg):
     return x, part
 
 
+def _out_row_bytes(cfg):
+    """LDS row pitch of the BF16 output tile (+16 B: rows start in different banks)."""
+    return 2 * cfg.block_n + 16
+
+
+def _shuffled_store(cfg):
+    """Whether the epilogue goes through LDS: when the output tile fits the allocation."""
+    return cfg.block_m * _out_row_bytes(cfg) <= max(_lds_bytes(cfg))
+
+
 def gemm_config_supported(n, k, cfg):
     """Whether ``compile_gemm_a8w4_ptpc`` accepts ``cfg`` for a weight [n, k]."""
     tiles = k // cfg.tile_k
@@ -201,6 +218,7 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
     tail_stages = group_tiles - loop_iters * unroll
     x_tile_bytes = block_m * tile_k
     num_acc_tiles = m_reps * n_reps
+    shuffled = _shuffled_store(cfg)
 
     @fx.struct
     class SharedStorage:
@@ -384,22 +402,30 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
         a_vmem_cnt = block_m * tile_k // (_THREADS * 16)
         w_vmem_cnt = m_reps * (k_iters + 1)
 
+        # MFMAs the stage's loads are spread over: all of them, or with a one-stage W
+        # prefetch the first ones (W(k+1) is decoded at the end of stage k).
+        def vmem_span(n_vmem):
+            return mfma_per_ki * k_iters if prefetch > 1 else n_vmem
+
         def hot_loop_scheduler(load_x_, load_w, has_next):
-            # This stage's loads go out with the first MFMAs; the next 64-K block's LDS reads
-            # and FP4 decode hide under the current block's MFMAs (the last block decodes the
-            # next tile's first block); LDS writes close the stage.
+            # This stage's loads go out evenly between its MFMAs (back to back they fill the
+            # CU's vector memory queue and stall the MFMA issue of all its waves); the next
+            # 64-K block's LDS reads and FP4 decode hide under the current block's MFMAs (the
+            # last block decodes the next tile's first block); LDS writes close the stage.
             n_vmem = a_vmem_cnt * int(load_x_) + w_vmem_cnt * int(load_w)
             n_dswr = a_vmem_cnt * int(has_next)
+            span = vmem_span(n_vmem)
             rocdl.sched_dsrd(dsrd_per_ki)
-            issued = 0
             for ki in range_constexpr(k_iters):
                 last = ki + 1 == k_iters
                 valu_per_ki = valu_for(ki)
                 for j in range_constexpr(mfma_per_ki):
                     rocdl.sched_mfma(1)
-                    if const_expr(issued < n_vmem):
-                        rocdl.sched_vmem(1)
-                        issued += 1
+                    jj = ki * mfma_per_ki + j
+                    if const_expr(jj < span):
+                        due = (jj + 1) * n_vmem // span - jj * n_vmem // span
+                        for _ in range_constexpr(due):
+                            rocdl.sched_vmem(1)
                     if const_expr(not last or has_next):
                         cnt = (valu_per_ki * (j + 1)) // mfma_per_ki - (
                             valu_per_ki * j
@@ -518,17 +544,89 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
                     gpu.barrier()
         return acc
 
+    out_pitch = _out_row_bytes(cfg) // 4
+    out_units = block_m * (block_n // 8)
+
+    def load_scales(blk_n, s_buf, xs_buf):
+        # Lane l's token scales (token ni * 16 + l % 16) and channel scales (channels
+        # 4 (l // 16) .. + 3 of its 16-channel block of each m). Loading them before the K
+        # loop instead delays its first loads (tp2_qkv M = 32: GEMM +1 us).
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = tid // 64
+        x_scales = [
+            buf_copy_load(xs_buf, ni * 16 + lane % 16, elem=fx.Float32)
+            for ni in range_constexpr(n_reps)
+        ]
+        w_scales = [
+            buf_copy_load(
+                s_buf,
+                blk_n * (block_n // 4) + m * 16 + wave * 4 + lane // 16,
+                elem=fx.Float32,
+                unit_elems=4,
+            )
+            for m in range_constexpr(m_reps)
+        ]
+        return x_scales, w_scales
+
+    @flyc.jit
+    def stage_out_tile(acc, blk_n, s_buf, xs_buf, lds):
+        # The scaled BF16 tile goes to LDS, token-major (pitch out_pitch dwords): lane l
+        # writes channels 4 (l // 16) .. + 3 of its 16-channel block for token l % 16.
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = tid // 64
+        x_scales, w_scales = load_scales(blk_n, s_buf, xs_buf)
+        out_lds = fx.recast_iter(fx.Uint32, lds.a.ptr)
+        tokens = [ni * 16 + lane % 16 for ni in range(n_reps)]
+        for m in range_constexpr(m_reps):
+            w_scale = w_scales[m]
+            col = (m * 64 + wave * 16 + lane // 16 * 4) // 2
+            for ni in range_constexpr(n_reps):
+                c = acc[None, m, ni].load()
+                out = Vec.from_elements(
+                    [
+                        (c[v] * w_scale[v] * x_scales[ni]).to(fx.BFloat16)
+                        for v in range_constexpr(4)
+                    ],
+                    fx.BFloat16,
+                )
+                fx.ptr_store(
+                    Vec(out).bitcast(fx.Uint32), out_lds + tokens[ni] * out_pitch + col
+                )
+
+    @flyc.jit
+    def store_out_rows(blk_n, y_buf, lds):
+        # Each lane stores 16 B (8 channels) of a token row: a wave covers whole rows.
+        tid = gpu.thread_idx.x
+        out_lds = fx.recast_iter(fx.Uint32, lds.a.ptr)
+        vec4 = fx.Vector.make_type(4, fx.Uint32)
+        for it in range_constexpr((out_units + _THREADS - 1) // _THREADS):
+            u = tid + it * _THREADS
+            row = u // (block_n // 8)
+            chunk = u % (block_n // 8)
+            data = fx.ptr_load(out_lds + row * out_pitch + chunk * 4, result_type=vec4)
+            unit = row * (n // 8) + blk_n * (block_n // 8) + chunk
+            if const_expr(ragged_n or out_units % _THREADS != 0):
+                ok = u < out_units
+                if const_expr(ragged_n):
+                    ok = ok & (blk_n * (block_n // 8) + chunk < n // 8)
+                if ok:
+                    buf_copy_store(y_buf, unit, Vec(data), elem=fx.Uint32, unit_elems=4)
+            else:
+                buf_copy_store(y_buf, unit, Vec(data), elem=fx.Uint32, unit_elems=4)
+
     @flyc.jit
     def store_tile(acc, blk_n, s_buf, xs_buf, y_buf):
         # Lane l holds channels 4 * (l // 16) + v of token l % 16 in every (m, n) MMA tile.
         tid = gpu.thread_idx.x
         lane = tid % 64
         wave = tid // 64
+        x_scales, w_scales = load_scales(blk_n, s_buf, xs_buf)
         tokens = [ni * 16 + lane % 16 for ni in range(n_reps)]
-        x_scales = [buf_copy_load(xs_buf, t, elem=fx.Float32) for t in tokens]
         for m in range_constexpr(m_reps):
             ch4 = blk_n * (block_n // 4) + m * 16 + wave * 4 + lane // 16
-            w_scale = buf_copy_load(s_buf, ch4, elem=fx.Float32, unit_elems=4)
+            w_scale = w_scales[m]
             for ni in range_constexpr(n_reps):
                 c = acc[None, m, ni].load()
                 out = Vec.from_elements(
@@ -582,24 +680,42 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
                     p_wq, elem=fx.Uint32, unit_elems=2, num_records_bytes=w_bytes
                 )
                 d_buf = ptr_buf_tensor(p_wd, elem=fx.Uint32, num_records_bytes=d_bytes)
+                s_buf = ptr_buf_tensor(
+                    p_ws, elem=fx.Float32, unit_elems=4, num_records_bytes=n * 4
+                )
+                xs_buf = ptr_buf_tensor(
+                    buf_base_i64(p_xs) + fx.Int64(row0) * 4,
+                    elem=fx.Float32,
+                    num_records_bytes=nrows * 4,
+                )
                 acc = gemm_tile(x_tile, w_buf, d_buf, blk_n, lds)
 
-                if gpu.thread_idx.x < _THREADS:
-                    s_buf = ptr_buf_tensor(
-                        p_ws, elem=fx.Float32, unit_elems=4, num_records_bytes=n * 4
+                if const_expr(shuffled):
+                    # Whole 128-byte lines per store instead of 32-byte pieces of 16 rows
+                    # (tp2_qkvz M = 64: GEMM -0.5 us). The K loop ends with a barrier; the
+                    # K-group sums need one more before the tile overwrites them.
+                    y_buf = ptr_buf_tensor(
+                        buf_base_i64(p_y) + fx.Int64(row0) * (n * 2),
+                        elem=fx.Uint32,
+                        unit_elems=4,
+                        num_records_bytes=nrows * (n * 2),
                     )
-                    xs_buf = ptr_buf_tensor(
-                        buf_base_i64(p_xs) + fx.Int64(row0) * 4,
-                        elem=fx.Float32,
-                        num_records_bytes=nrows * 4,
-                    )
+                    if const_expr(k_groups > 1):
+                        gpu.barrier()
+                    if gpu.thread_idx.x < _THREADS:
+                        stage_out_tile(acc, blk_n, s_buf, xs_buf, lds)
+                    gpu.barrier()
+                    if gpu.thread_idx.x < _THREADS:
+                        store_out_rows(blk_n, y_buf, lds)
+                else:
                     y_buf = ptr_buf_tensor(
                         buf_base_i64(p_y) + fx.Int64(row0) * (n * 2),
                         elem=fx.BFloat16,
                         unit_elems=4,
                         num_records_bytes=nrows * (n * 2),
                     )
-                    store_tile(acc, blk_n, s_buf, xs_buf, y_buf)
+                    if gpu.thread_idx.x < _THREADS:
+                        store_tile(acc, blk_n, s_buf, xs_buf, y_buf)
 
     @flyc.jit
     def launch(

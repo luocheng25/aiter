@@ -19,9 +19,16 @@ f32 per lane in VGPRs. Epilogue: ``acc * w_scale * x_scale`` rounded to BF16, on
 store per lane and 16-token block.
 
 Schedule: persistent, ``G = min(tiles, num_cus)`` CTAs, one per CU (two waves per SIMD).
-CTA ``c`` takes tiles ``c, c + G, ...``; tile ``t`` is M block ``t // NB``, N block
-``t % NB``, so the CTAs running together share a few M blocks of X. The K loop runs through
-tile boundaries without draining.
+Plain order: CTA ``c`` takes tiles ``c, c + G, ...``; tile ``t`` is M block ``t // NB``, N
+block ``t % NB``, so the CTAs running together share a few M blocks of X. CTAs are dealt
+round-robin to the 4 XCDs (``c % 4``, each with its own L2), so XCD ``x`` sees the N blocks
+``= x`` mod ``gcd(NB, 4)``. Panel order (``panels`` = 1, 2 or 4, chosen per call by
+``xcd_panels``; it needs as many CTAs as tiles on every XCD): the N blocks are cut into
+panels of near-equal width; the list of all tiles, panel by panel and M-major inside a
+panel, is cut into 4 equal parts, and XCD ``x``'s CTAs take part ``x`` in turn. One panel
+puts whole M blocks of X on one XCD; two or four make each XCD hold the weights of about
+one panel in its L2 (the outputs are then stored nt). The K loop runs through tile
+boundaries without draining.
 
 Ping-pong: waves 0-3 (group 0) and 4-7 (group 1), one of each per SIMD, alternate a memory
 phase ``M(j)`` and a compute phase ``C(j)`` per K step ``j``, group 1 one phase behind; a CTA
@@ -77,6 +84,7 @@ Pipeline rules, to keep when editing the kernel body:
 """
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -95,6 +103,11 @@ _THREADS = 64 * _WAVES
 _WAVE_N = BLOCK_N // _WAVES
 # The first and last K-step pairs of a tile are peeled.
 MIN_K_TILES = 4
+# XCDs the CTAs are dealt to round-robin by linear id (MI308X). Another count only changes
+# L2 locality.
+_XCDS = 4
+# Bytes of weights or X that one XCD's L2 (MI308X: 4 MiB) holds well, for xcd_panels.
+_XCD_L2_BYTES = 3 << 20
 
 KERNEL_NAME = format_kernel_name(
     f"gemm_a8w4_ptpc_pp_bm{BLOCK_M}_bn{BLOCK_N}_tk{TILE_K}"
@@ -104,6 +117,39 @@ KERNEL_NAME = format_kernel_name(
 def large_m_supported(n, k):
     """Whether the large-M kernel handles weights of ``n`` channels and reduction ``k``."""
     return n % BLOCK_N == 0 and k % K_ALIGN == 0 and k // TILE_K >= MIN_K_TILES
+
+
+def xcd_panels(m, n, k, num_cus):
+    """N panels of the tile order for ``x [m, k]`` and weights ``[n, k]`` (0: plain order).
+
+    The plain order deals tile ``t`` (M block ``t // NB``, N block ``t % NB``) to CTA
+    ``t % G``, so XCD ``x`` sees the ``NB / gcd(NB, 4)`` N blocks ``= x`` mod ``gcd(NB, 4)``
+    and, per round of ``G`` tiles, ``G / NB`` M blocks, each M block on every XCD. A panel
+    order needs as many CTAs as tiles on every XCD (``tiles >= num_cus``, or a multiple of
+    4). One panel (whole M blocks per XCD) when the weights fit one L2 (``_XCD_L2_BYTES``),
+    or X does: the next call's quantization then rewrites each X row in one L2 only
+    (measured on MI308X: the quantization after the plain order is 2-3x slower).
+    Otherwise, when ``NB % 4 != 0``: four panels (about ``NB / 4`` N blocks per XCD) when
+    the plain order's weights per XCD alone exceed ``_XCD_L2_BYTES`` (they cannot stay in
+    the L2 from one round to the next), two (the same N blocks, half the M blocks) when its
+    weights and X of a round together do.
+    """
+    n_blocks = n // BLOCK_N
+    m_blocks = (m + BLOCK_M - 1) // BLOCK_M
+    tiles = m_blocks * n_blocks
+    if num_cus % _XCDS != 0 or (tiles < num_cus and tiles % _XCDS != 0):
+        return 0
+    x_bytes = m_blocks * BLOCK_M * k
+    if layout.weight_bytes(n, k) <= _XCD_L2_BYTES or x_bytes <= _XCD_L2_BYTES:
+        return 1
+    if n_blocks % _XCDS == 0:
+        return 0
+    w_xcd = n_blocks // math.gcd(n_blocks, _XCDS) * layout.weight_bytes(BLOCK_N, k)
+    if w_xcd > _XCD_L2_BYTES:
+        return _XCDS
+    x_xcd = num_cus * BLOCK_M * k // n_blocks
+    two = math.gcd(n_blocks, _XCDS) == 2 and w_xcd + x_xcd > _XCD_L2_BYTES
+    return 2 if two else 0
 
 
 def _bf16x2_rne(lo, hi):
@@ -123,10 +169,11 @@ def _bf16x2_rne(lo, hi):
 
 
 @functools.cache
-def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index):
+def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index, panels=0):
     """Launcher ``(xq, x_scale, wq, wd, ws, y, M, stream)`` of the large-M kernel.
 
-    Arguments as ``gemm.compile_gemm_a8w4_ptpc``; ``num_cus`` is the persistent grid size.
+    Arguments as ``gemm.compile_gemm_a8w4_ptpc``; ``num_cus`` is the persistent grid size,
+    ``panels`` the tile order (``xcd_panels``; any M runs correctly with any order).
     ``device_index`` only keys the cache.
     """
     del device_index
@@ -149,6 +196,14 @@ def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index):
     d_bytes = layout.delta_bytes(n, k)
     w_block_units = layout.W_BLOCK_BYTES // 8
     d_block_units = layout.D_BLOCK_BYTES // 4
+    if num_cus % _XCDS != 0 or n_blocks < panels:
+        panels = 0
+    # Two or four panels store the outputs nt (streaming), so they do not evict weights.
+    y_cache = 2 if panels > 1 else 0
+    ctas_per_xcd = num_cus // _XCDS
+    # Panel p holds N blocks bounds[p] .. bounds[p + 1] - 1 (widths differ by at most one).
+    bounds = [(p * n_blocks + panels // 2) // max(panels, 1) for p in range(panels + 1)]
+    widths = sorted({bounds[p + 1] - bounds[p] for p in range(panels)})
 
     @fx.struct
     class SharedStorage:
@@ -172,7 +227,19 @@ def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index):
         cta = fx.block_idx.x
         m_blocks = (M + BLOCK_M - 1) // BLOCK_M
         num_tiles = m_blocks * n_blocks
+        # Plain order: CTA c takes tiles c, c + G, ... of the M-major tile list.
         num_mine = (num_tiles - cta + num_cus - 1) // num_cus
+        if const_expr(panels > 0):
+            # Panel order, when every XCD gets as many CTAs as tiles (G = num_cus, or
+            # G = tiles, a multiple of 4, one tile each; else the plain order): see
+            # tile_coords.
+            xcd_ok = (num_tiles >= num_cus) | (num_tiles % _XCDS == 0)
+            xcd = cta % _XCDS
+            local = cta // _XCDS
+            part_lo = xcd * num_tiles // _XCDS
+            part_hi = (xcd + 1) * num_tiles // _XCDS
+            xcd_mine = (part_hi - part_lo - local + ctas_per_xcd - 1) // ctas_per_xcd
+            num_mine = xcd_ok.select(xcd_mine, num_mine)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fp8))
@@ -186,7 +253,29 @@ def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index):
 
         def tile_coords(i):
             t = cta + i * num_cus
-            return t // n_blocks, t % n_blocks
+            m_blk, n_blk = t // n_blocks, t % n_blocks
+            if const_expr(panels == 0):
+                return m_blk, n_blk
+            # Tile u of the panel list: panels in N order, M-major inside a panel.
+            u = part_lo + local + i * ctas_per_xcd
+            if const_expr(panels == 1):
+                return (
+                    xcd_ok.select(u // n_blocks, m_blk),
+                    xcd_ok.select(u % n_blocks, n_blk),
+                )
+            # Panel p starts at tile bounds[p] * m_blocks, so u // m_blocks finds it.
+            col = u // m_blocks
+            p = fx.Int32(0)
+            for b in bounds[1:-1]:
+                p = p + (col >= b).select(fx.Int32(1), fx.Int32(0))
+            b0 = (p * n_blocks + panels // 2) // panels
+            width = (p * n_blocks + n_blocks + panels // 2) // panels - b0
+            v = u - b0 * m_blocks
+            m_x = v // widths[0]
+            if const_expr(len(widths) > 1):
+                m_x = (width == widths[1]).select(v // widths[1], m_x)
+            n_x = b0 + v - m_x * width
+            return xcd_ok.select(m_x, m_blk), xcd_ok.select(n_x, n_blk)
 
         # ---- X: global -> VGPR (16 B per lane, 64 rows per pass) -> swizzled LDS ----
         buf_cp_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fp8)
@@ -396,6 +485,7 @@ def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index):
                 Vec.from_elements(words, fx.Uint32),
                 elem=fx.Uint32,
                 unit_elems=4,
+                cache_modifier=y_cache,
             )
 
         x_stage = fx.make_fragment_like(x_source(0)[None, None, None, 0])

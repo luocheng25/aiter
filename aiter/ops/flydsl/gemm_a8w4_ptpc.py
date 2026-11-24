@@ -34,8 +34,13 @@ from .kernels.gemm_a8w4_ptpc.gemm_large import (
     KERNEL_NAME as LARGE_GEMM_KERNEL_NAME,
     compile_gemm_a8w4_ptpc_large,
     large_m_supported,
+    xcd_panels,
 )
-from .kernels.gemm_a8w4_ptpc.quant import compile_quant_x, quant_kernel_name
+from .kernels.gemm_a8w4_ptpc.quant import (
+    compile_quant_x,
+    quant_config,
+    quant_kernel_name,
+)
 from .kernels.gemm_a8w4_ptpc.small_m import (
     compile_small_m,
     small_m_config,
@@ -70,15 +75,15 @@ _MID_TABLE = {
     (8192, 2560): {
         16: _SMALL,
         32: (32, 64, 2, 2, 1, 1, _TK256),
-        128: (64, 128, 2, 2, 1, 1, _TK256),
+        64: (64, 128, 2, 2, 1, 1, _TK256),
+        128: (64, 128, 2, 2, 2, 1, _TK256),
         256: _LARGE,
     },
     (6656, 2560): {
         16: _SMALL,
-        32: (32, 64, 2, 2, 1, 1, _TK256),
-        64: (32, 64, 1, 1, 1, 1, _TK256),
-        128: (48, 128, 1, 1, 1, 1, _TK256),
-        512: (64, 128, 1, 1, 2, 1, _TK256),
+        64: (32, 64, 2, 2, 1, 1, _TK256),
+        128: (48, 128, 2, 2, 1, 1, _TK256),
+        512: (64, 128, 2, 2, 2, 1, _TK256),
         1024: _LARGE,
     },
     (2560, 3072): {
@@ -93,18 +98,17 @@ _MID_TABLE = {
         16: _SMALL,
         32: (32, 64, 2, 2, 1, 2, _TK256),
         64: (32, 64, 2, 2, 1, 1, _TK256),
-        128: (64, 64, 1, 1, 2, 1, _TK256),
-        512: (64, 128, 1, 1, 4, 1, _TK256),
-        1024: _LARGE,
+        128: (64, 128, 2, 2, 2, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        2048: _LARGE,
     },
     (3584, 2560): {
         16: _SMALL,
         32: (32, 64, 2, 2, 1, 2, _TK256),
         64: (32, 64, 2, 2, 1, 1, _TK256),
         128: (32, 64, 2, 1, 2, 1, _TK256),
-        256: (64, 128, 1, 1, 2, 1, _TK256),
-        512: (64, 128, 2, 2, 4, 1, _TK256),
-        1024: (64, 128, 1, 1, 4, 1, _TK256),
+        256: (64, 128, 2, 2, 2, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
         2048: _LARGE,
     },
     (2560, 1536): {
@@ -112,10 +116,27 @@ _MID_TABLE = {
         32: (16, 64, 2, 2, 2, 2, _TK256),
         64: (32, 64, 2, 2, 2, 2, _TK256),
         128: (32, 64, 2, 2, 2, 1, _TK256),
+        256: (64, 64, 2, 2, 4, 1, _TK256),
         1024: (64, 128, 2, 2, 4, 1, _TK256),
         2048: _LARGE,
     },
 }
+
+# Small-M tile kernels (9 <= M <= 16) on fewer row blocks per CTA than small_m_config picks,
+# so all CUs get one: (N, K) -> (row blocks, CTAs); its LDS use only shrinks.
+_SMALL_TILE_SPREAD = {(6656, 2560): (6, 80)}
+
+
+def _small_config(m: int, n: int, k: int):
+    """small_m_config's kernel, with the row blocks per CTA of _SMALL_TILE_SPREAD."""
+    config = small_m_config(m, n, k)
+    spread = _SMALL_TILE_SPREAD.get((n, k))
+    if config is not None and spread is not None and config[0] == "tile" and m <= 16:
+        kind, rb, ks, tq, kp, _ = config
+        rb_new, num_wg = spread
+        if rb_new <= rb and -(-n // 16 // num_wg) <= rb_new:
+            config = (kind, rb_new, ks, tq, kp, num_wg)
+    return config
 
 
 @dataclass(frozen=True)
@@ -161,11 +182,11 @@ def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
         return ()
     choice = _gemm_choice(m, n, k)
     if choice == _SMALL:
-        return (small_m_kernel_name_of(small_m_config(m, n, k)),)
+        return (small_m_kernel_name_of(_small_config(m, n, k)),)
     gemm_name = (
         LARGE_GEMM_KERNEL_NAME if choice == _LARGE else gemm_kernel_name(choice)
     )
-    return (quant_kernel_name(k), gemm_name)
+    return (quant_kernel_name(k, quant_config(m, k)), gemm_name)
 
 
 def _gemm_choice(m: int, n: int, k: int):
@@ -279,7 +300,7 @@ def _quant_per_token(x: torch.Tensor):
     xq = torch.empty((m, k), dtype=torch.float8_e4m3fnuz, device=x.device)
     x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
     _run_compiled(
-        compile_quant_x(k, x.device.index),
+        compile_quant_x(k, x.device.index, quant_config(m, k)),
         ptr_arg(x),
         ptr_arg(xq),
         ptr_arg(x_scale),
@@ -331,7 +352,7 @@ def flydsl_gemm_a8w4_ptpc(
     if choice == _SMALL:
         # Small M: one kernel that quantizes x per token itself.
         _run_compiled(
-            compile_small_m(small_m_config(m, n, k), n, k, x.device.index),
+            compile_small_m(_small_config(m, n, k), n, k, x.device.index),
             ptr_arg(x),
             ptr_arg(weight.q),
             ptr_arg(weight.d),
@@ -341,15 +362,19 @@ def flydsl_gemm_a8w4_ptpc(
             current_stream_arg(x.device),
         )
         return out
-    xq, x_scale = _quant_per_token(x)
+    xq = torch.empty((m, k), dtype=torch.float8_e4m3fnuz, device=x.device)
+    x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
+    quant = compile_quant_x(k, x.device.index, quant_config(m, k))
     if choice == _LARGE:
+        num_cus = _num_cus(x.device.index)
         gemm = compile_gemm_a8w4_ptpc_large(
-            n, k, _num_cus(x.device.index), x.device.index
+            n, k, num_cus, x.device.index, xcd_panels(m, n, k, num_cus)
         )
     else:
         gemm = compile_gemm_a8w4_ptpc(n, k, x.device.index, choice)
-    _run_compiled(
-        gemm,
+    stream = current_stream_arg(x.device)
+    quant_args = (ptr_arg(x), ptr_arg(xq), ptr_arg(x_scale), m, stream)
+    gemm_args = (
         ptr_arg(xq),
         ptr_arg(x_scale),
         ptr_arg(weight.q),
@@ -357,6 +382,9 @@ def flydsl_gemm_a8w4_ptpc(
         ptr_arg(weight.s),
         ptr_arg(out),
         m,
-        current_stream_arg(x.device),
+        stream,
     )
+    # Both launches' arguments are built first, so the GPU waits less between the kernels.
+    _run_compiled(quant, *quant_args)
+    _run_compiled(gemm, *gemm_args)
     return out

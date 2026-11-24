@@ -10,10 +10,10 @@ One file, three regions:
   2. other coverage: what regions 1 and 3 cannot cover (tile boundaries, bit-exact
      quantization with its edge rows and weight layout, non-contiguous weight slices, input
      errors, preallocated output, CUDA graph, compile cache, M = 0, M past 32-bit byte
-     offsets, the large-M dispatch boundary and persistent-kernel edge cases, the small-M
-     dispatch boundaries and LDS fallbacks, partial token tiles and bit-exact in-kernel
-     quantization, the M where each target shape's dispatch switches kernels):
-     ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
+     offsets, the large-M dispatch boundary and persistent-kernel edge cases with its tile
+     orders, the small-M dispatch boundaries and LDS fallbacks, partial token tiles and
+     bit-exact in-kernel quantization, the M where each target shape's dispatch switches
+     kernels or tiles): ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
      M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, every timed output
      checked: ``python op_tests/test_gemm_a8w4_ptpc.py``.
@@ -206,15 +206,23 @@ def check_output(out, ref, msg=""):
     return err
 
 
-def launched_kernels(fn, attempts=3):
+def launched_kernels(fn, attempts=5):
     """Run ``fn`` under the profiler: (its result, names of the GPU kernels it launched).
 
-    The profiler now and then records no GPU event at all for a call that did launch kernels
-    (seen on shared MI308X GPUs, about one call in a hundred). A call with no recorded kernel
-    is therefore profiled again, up to ``attempts`` times in all: a call that launches nothing
-    (M = 0) still returns [], and whatever is recorded still has to match exactly.
+    The GPU is synchronized first, so the profiled window holds ``fn``'s kernels only. The
+    profiler records no GPU event at all for the calls made while another process starts HIP
+    on the same GPU (shared MI308X GPUs: a burst of about 0.1 s in which every call comes back
+    empty, so back-to-back retries all fail; no empty call in 5000 on a GPU of its own). A call
+    with no recorded kernel is therefore profiled again after growing pauses (0.05, 0.1, 0.2
+    and 0.4 s), up to ``attempts`` times in all: a call that launches nothing (M = 0) still
+    returns [], and whatever is recorded still has to match exactly.
     """
-    for _ in range(attempts):
+    import time
+
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(0.05 * 2 ** (attempt - 1))
+        torch.cuda.synchronize()
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA]
         ) as prof:
@@ -330,24 +338,78 @@ def test_tile_boundaries(m, n, k):
     check_output(out, run_torch(x, w, w_scale), msg=f"m{m}_n{n}_k{k}")
 
 
+def test_lds_epilogue_ragged_n():
+    """The general GEMM's epilogue through LDS (every tile with 256 K per stage) on a partly
+    filled last N block: 128-channel tiles on N = 320 leave the third block half empty, whose
+    16-byte row pieces past N are not stored, and M = 65 leaves 1 row in the last 64-row block;
+    written through ``out=`` (the head of a NaN buffer).
+
+    The dispatch never runs this: N % 128 == 64 gets 64-channel tiles, and the default tile
+    past M = 2048 (128 K per stage) stores directly. The kernel is compiled and launched here.
+    """
+    from aiter.ops.flydsl.kernels.gemm_a8w4_ptpc import gemm as gemm_kernels
+
+    m, n, k = 65, 320, 512
+    cfg = gemm_kernels.GemmConfig(64, 128, 2, 2, 1, 1, 256)
+    assert gemm_kernels.gemm_config_supported(n, k, cfg), cfg
+    assert gemm_kernels._shuffled_store(cfg), cfg  # the epilogue through LDS
+    w, w_scale = make_weight(n, k, case_seed("w", n, k))
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    x = make_x(m, k, case_seed("lds_epilogue", m, n, k))
+    xq, x_scale = a8w4_module._quant_per_token(x)
+    buffer = torch.full((m + 64, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    out = buffer[:m]
+    ptr = a8w4_module.ptr_arg
+    a8w4_module._run_compiled(
+        gemm_kernels.compile_gemm_a8w4_ptpc(n, k, x.device.index, cfg),
+        ptr(xq),
+        ptr(x_scale),
+        ptr(weight.q),
+        ptr(weight.d),
+        ptr(weight.s),
+        ptr(out),
+        m,
+        a8w4_module.current_stream_arg(x.device),
+    )
+    check_output(out, run_torch(x, w, w_scale), msg=f"m{m}_n{n}_k{k}")
+    assert bool(buffer[m:].isnan().all())
+
+
 # -- 2.2 per-token quantization, bit-exact -----------------------------------------------------
 
 
-@pytest.mark.parametrize("k", [2560, 256])
-def test_quant_bitexact(k):
+# (rows, K, lanes per row): up to 128 rows with K % 512 == 0 one CTA per row over K / 8 lanes
+# (K = 1536: 3 waves, 3072: 6, 8192: 16, the most a CTA holds; combining their maxima through
+# LDS), more rows one wave per row (64 lanes), K % 512 != 0 32 lanes (two rows per wave).
+QUANT_BITEXACT = [
+    (997, 2560, 64),
+    (997, 256, 32),
+    (128, 1536, 192),
+    (129, 1536, 64),
+    (128, 3072, 384),
+    (128, 8192, 1024),
+]
+
+
+@pytest.mark.parametrize(
+    "m, k, lanes", QUANT_BITEXACT, ids=[f"m{m}_k{k}" for m, k, _ in QUANT_BITEXACT]
+)
+def test_quant_bitexact(m, k, lanes):
     """The per-token quantization equals the reference bit for bit: scale = amax / 240 and
     q = RNE(x / scale) with the IEEE quotient (the kernel computes it as a reciprocal
-    multiply plus two FMA corrections, and divides per element when scale < 2**-64).
+    multiply plus one FMA correction, and divides per element when scale < 2**-64).
     Includes an all-zero row (scale 1), a row of exact FP8 rounding midpoints where a plain
     reciprocal multiply rounds the other way, the same row times 2**-70, and a row of -0 and
-    negatives that round to zero (no byte may be 0x80, NaN in FNUZ); K = 256 runs the
-    32-lanes-per-row variant.
+    negatives that round to zero (no byte may be 0x80, NaN in FNUZ), in each configuration
+    of the kernel: 128 rows run one row per CTA over 3, 6 or 16 waves, 129 rows (the switch)
+    and 997 one wave per row, K = 256 two rows per wave.
 
     End-to-end grading cannot see a few flipped FP8 codes: they move the GEMM output by far
     less than its tolerance.
     """
+    assert a8w4_module.quant_config(m, k).lanes == lanes  # the configuration under test
     gen = _generator(case_seed("quant", k))
-    x = torch.randn((997, k), generator=gen, device=DEVICE) * 3
+    x = torch.randn((m, k), generator=gen, device=DEVICE) * 3
     x[5].zero_()
     # Row 6: scale = 52.5 / 240 = 7/32 (not a power of two); every quotient is an FP8
     # rounding midpoint (mantissa 23/16 .. 31/16). Row 7: row 6 x 2**-70 (scale < 2**-64).
@@ -795,9 +857,9 @@ def test_large_m_dispatch(m, n, k, large):
 def test_large_m_tiles():
     """The persistent kernel with more tiles than CUs and a partial last M block, writing
     through ``out=`` (the head of a NaN buffer): N = 1024 (4 N blocks) and one 128-row M block
-    more than the CUs take, the last with 40 rows (80 CUs: M = 2600, 84 tiles), so the first
-    CTAs run a full tile and then a tail tile; K = 768 runs the K pair loop once. Every row
-    is written and nothing past it.
+    more than the CUs take, the last with 40 rows (80 CUs: M = 2600, 84 tiles), so some CTAs
+    run a second tile, one of them a full tile and then a tail tile; K = 768 runs the K pair
+    loop once. Every row is written and nothing past it.
 
     The benchmark's large-M cases have M a multiple of 128 and K >= 1536, and the op
     allocates their output.
@@ -816,6 +878,104 @@ def test_large_m_tiles():
     assert flydsl_gemm_a8w4_ptpc(x, weight, out=out) is out
     check_output(out, run_torch(x, w, w_scale), msg=f"m{m}_n{n}_k{k}")
     assert bool(buffer[m:].isnan().all())
+
+
+# (tile order of the persistent kernel: 0 = plain, 1 / 2 / 4 = N panels; CTAs short of a
+# multiple of 4)
+LARGE_M_ORDERS = [(0, 0), (1, 0), (2, 0), (4, 0), (4, 2)]
+
+
+@pytest.mark.parametrize(
+    "panels, short",
+    LARGE_M_ORDERS,
+    ids=["plain", "panels1", "panels2", "panels4", "panels4_ctas_not_x4"],
+)
+def test_large_m_tile_orders(panels, short):
+    """The persistent kernel computes every tile once in each tile order, whatever M (the entry
+    picks the order per call, see test_large_m_panel_choice; the kernel takes the plain order
+    when a grid of fewer CTAs than CUs is not a multiple of 4, which a panel order cannot share
+    evenly among the XCDs). N = 6656 (26 N blocks: two panels of 13, four of 7 / 6 / 7 / 6),
+    K = 512, a grid of the CU count rounded down to a multiple of 4, or 2 fewer (not a multiple
+    of 4: the plain order at compile time). M = 1: 26 tiles, fewer than CTAs and not a multiple
+    of 4 (the plain order at run time); M = 129: 52 tiles, one per CTA; M = 3001 and 4097: 624
+    and 858 tiles over several rounds (4097: XCD parts of 214 and 215 tiles, a 1-row last M
+    block). Written into NaN-filled outputs.
+
+    The benchmark and the other tests run each target shape in the one order the entry picks
+    for it at their M; a tile mapped twice or not at all in another order would go unseen.
+    """
+    n, k = 6656, 512
+    device = torch.cuda.current_device()
+    num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+    ctas = num_cus // 4 * 4 - short
+    launch = a8w4_module.compile_gemm_a8w4_ptpc_large(n, k, ctas, device, panels)
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", n, k))
+    ptr = a8w4_module.ptr_arg
+    for m in [1, 129, 3001, 4097]:
+        x = make_x(m, k, case_seed("tile_orders", m))
+        xq, x_scale = a8w4_module._quant_per_token(x)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+        a8w4_module._run_compiled(
+            launch,
+            ptr(xq),
+            ptr(x_scale),
+            ptr(weight.q),
+            ptr(weight.d),
+            ptr(weight.s),
+            ptr(out),
+            m,
+            a8w4_module.current_stream_arg(x.device),
+        )
+        check_output(out, run_torch(x, w, w_scale), msg=f"panels={panels} m{m}")
+
+
+# (shape, M, tile order the entry compiles the large-M kernel with). From the first large M
+# up to M = 1152 (K = 2560: X of 9 M blocks fits an XCD's 3 MiB) one panel, then the plain
+# order where the N blocks are a multiple of 4 and else two or four panels; tp2_o (K = 3072)
+# two panels from its first large M on; tp4_o one (its weights fit 3 MiB).
+LARGE_M_PANELS = [
+    ("tp2_qkvz", 1152, 1),
+    ("tp2_qkvz", 1153, 0),
+    ("tp2_qkv", 1152, 1),
+    ("tp2_qkv", 1153, 4),
+    ("tp4_qkvz", 1152, 1),
+    ("tp4_qkvz", 1153, 0),
+    ("tp4_qkv", 1152, 1),
+    ("tp4_qkv", 1153, 2),
+    ("tp2_o", 1025, 2),
+    ("tp4_o", 1025, 1),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, m, panels", LARGE_M_PANELS, ids=[f"{s}_m{m}" for s, m, _ in LARGE_M_PANELS]
+)
+def test_large_m_panel_choice(monkeypatch, shape, m, panels):
+    """The tile order the entry gives the persistent kernel on the target shapes (xcd_panels
+    on 80 CUs: these M are where it changes, above them it no longer depends on M; none on a
+    CU count that is not a multiple of 4), the order the call compiles the kernel with on
+    this GPU, and its output against the reference.
+
+    Every order has the same kernel name, so the profiler cannot tell which one ran, and the
+    benchmark does not check it.
+    """
+    n, k = SHAPES[shape]
+    assert a8w4_module.xcd_panels(m, n, k, 80) == panels
+    assert a8w4_module.xcd_panels(m, n, k, 78) == 0
+    compile_large = a8w4_module.compile_gemm_a8w4_ptpc_large
+    compiled = []
+
+    def spy(n, k, num_cus, device_index, panels=0):
+        compiled.append(panels)
+        return compile_large(n, k, num_cus, device_index, panels)
+
+    monkeypatch.setattr(a8w4_module, "compile_gemm_a8w4_ptpc_large", spy)
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    x = make_x(m, k, case_seed("panel_choice", shape, m))
+    out = flydsl_gemm_a8w4_ptpc(x, weight)
+    num_cus = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    assert compiled == [a8w4_module.xcd_panels(m, n, k, num_cus)], compiled
+    check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{m}")
 
 
 # -- 2.9 small M (M <= 32): the one-launch decode, dec2 and tile kernels ----------------------
@@ -884,6 +1044,8 @@ SMALL_M_PARTIAL = [
     (3, 8192, 2560),
     (3, 6656, 2560),
     (7, 6656, 2560),
+    # tp2_qkv: the tile kernel on 6 row blocks per CTA, so that its 416 row blocks fill 80 CTAs.
+    (9, 6656, 2560),
     (10, 3584, 2560),
     # N = 4160, off the dispatch table (its tile kernel configuration is tp4_qkvz's: 4 row
     # blocks x 4 K parts, two token tiles, two K windows), which runs M = 17..32 of the target
@@ -903,23 +1065,25 @@ def test_small_m_partial_tiles(m, n, k):
     (the decode kernels' stores past M fall outside the buffer bound), so every row matches
     the reference and nothing past ``out`` changes. M = 3 and 7: decode kernel with 4 and 8
     token slots (M = 7: 80 CTAs over 416 row blocks, 5 or 6 each); M = 3 on N = 6656: dec2 with
-    4 token slots, one X wave per slot, the last with no row to quantize; M = 10: tile kernel,
-    one 16-token tile; M = 23: two token tiles over two K windows, the K-part sums reusing the
-    token-row LDS; N = 5184: 41 tile CTAs over 324 row blocks (7 or 8 each), so some wave slots
-    compute a neighbouring block and store nothing; K = 8192: six K windows.
+    4 token slots, one X wave per slot, the last with no row to quantize; M = 9 on N = 6656 and
+    M = 10: tile kernel, one 16-token tile (M = 9: 80 CTAs over 416 row blocks, 5 or 6 each in
+    6 slots); M = 23: two token tiles over two K windows, the K-part sums reusing the token-row
+    LDS; N = 5184: 41 tile CTAs over 324 row blocks (7 or 8 each), so some wave slots compute a
+    neighbouring block and store nothing; K = 8192: six K windows.
 
     The benchmark's small-M cases are the token capacities (M = 1, 2, 4, 8, 16), its shapes give
-    every tile CTA the same number of row blocks and one K window, and the op allocates its
-    output.
+    the tile kernel one K window, and the op allocates its output.
     """
-    config = a8w4_module.small_m_config(m, n, k)
+    # The configuration the dispatch launches (small_m_config's, tp2_qkv's tile kernel spread
+    # over more CTAs).
+    config = a8w4_module._small_config(m, n, k)
     assert config is not None, config
     slots = config[3] if config[0] in ("decode", "dec2") else 16 * config[3]
     assert m < slots, config
     # The dispatch runs that kernel: a dispatch table may run the general GEMM where a small-M
     # kernel fits, which would silently skip what this test is for.
-    tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
-    assert tiers == (config[0],), tiers
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k)
+    assert names == (a8w4_module.small_m_kernel_name_of(config),), names
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
     x = make_x(m, k, case_seed("small_partial", m, n, k))
     buffer = torch.full((m + 32, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
@@ -1052,9 +1216,7 @@ def test_small_m_nonfinite_rows(shape, m, kind):
 
 # (shape, the last M of a tier, its tier, the tier from M + 1). The small-M kernel is picked by
 # its limits (dec2 on the two widest shapes up to M = 2 / 4); the dispatch table of each shape
-# then hands M to the per-token quant and the general GEMM, and to the large-M kernel. Where only
-# the two sides of a switch are pinned, the M is a pair: the last M pinned on the lower tier and
-# the first M pinned on the upper one.
+# then hands M to the per-token quant and the general GEMM, and to the large-M kernel.
 TARGET_DISPATCH = [
     ("tp2_qkvz", 2, "dec2", "decode"),
     ("tp2_qkv", 4, "dec2", "decode"),
@@ -1066,61 +1228,86 @@ TARGET_DISPATCH = [
     ("tp4_o", 20, "tile", "general"),
     ("tp2_qkvz", 128, "general", "large"),
     ("tp2_qkv", 512, "general", "large"),
-    # Two sides only: the mid-M table may switch tp4_qkvz anywhere in M = 513..1024. The exact
-    # switch is left to the review of the next milestone that retunes the mid-M table.
-    ("tp4_qkvz", (512, 1025), "general", "large"),
     ("tp2_o", 1024, "general", "large"),
+    ("tp4_qkvz", 1024, "general", "large"),
     ("tp4_qkv", 1024, "general", "large"),
     ("tp4_o", 1024, "general", "large"),
 ]
 
 
-def _target_dispatch_ms(m):
-    """(last M pinned on the lower tier, first M pinned on the upper tier) of a TARGET_DISPATCH
-    row."""
-    return m if isinstance(m, tuple) else (m, m + 1)
-
-
 @pytest.mark.parametrize(
     "shape, m, below, above",
     TARGET_DISPATCH,
-    ids=[
-        "{}_m{}_{}".format(s, *_target_dispatch_ms(m)) for s, m, _, _ in TARGET_DISPATCH
-    ],
+    ids=[f"{s}_m{m}_{m + 1}" for s, m, _, _ in TARGET_DISPATCH],
 )
 def test_target_shape_dispatch(shape, m, below, above):
     """Each target shape switches kernels at its own M: dec2 to the decode kernel after M = 2
     (tp2_qkvz) or 4 (tp2_qkv); the small-M kernels to the per-token quant and the general GEMM
     after M = 16 (tp4_o: 20); the general GEMM to the persistent large-M kernel after M = 128
-    (tp2_qkvz), 512 (tp2_qkv) or 1024 (tp2_o, tp4_qkv, tp4_o). On tp4_qkvz only the two sides
-    are pinned: the general GEMM at M = 512, the large-M kernel at M = 1025; M = 513 may run
-    either. At each pinned M the predicted kernels are of the expected tier; at every M the
-    launched ones are the predicted ones and the output matches the reference. The first M of
-    the general GEMM leaves its last row block partly filled (17 of 32 rows; 1 of 16 on tp2_o,
-    5 on tp4_o), that of the large-M kernel a 1-row last tile.
+    (tp2_qkvz), 512 (tp2_qkv) or 1024 (tp2_o, tp4_qkvz, tp4_qkv, tp4_o). On both sides the
+    predicted kernels are of the expected tier, the launched ones are the predicted ones and
+    the output matches the reference. The first M of the general GEMM leaves its last row
+    block partly filled (17 of 32 rows; 1 of 16 on tp2_o, 5 on tp4_o: fewer 16-byte row pieces
+    than threads in the epilogue through LDS), that of the large-M kernel a 1-row last tile.
 
     The benchmark runs one side of each switch at most (powers of two: neither M = 3, 5, 17,
     20, 21, 129, 513 nor 1025) and does not check which kernels ran.
     """
     n, k = SHAPES[shape]
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
-    lo, hi = _target_dispatch_ms(m)
-    # (M, the tiers it may run): a pinned side one, the M past an unpinned lower side either.
-    cases = [(lo, (below,)), (hi, (above,))]
-    if hi > lo + 1:
-        cases.insert(1, (lo + 1, (below, above)))
-    for mm, tiers in cases:
+    for mm, tier in [(m, below), (m + 1, above)]:
         names = gemm_a8w4_ptpc_kernel_names(mm, n, k)
-        expected = [
-            (tier,) if tier in ("decode", "dec2", "tile") else ("quant", tier)
-            for tier in tiers
-        ]
-        assert kernel_tiers(names) in expected, names
+        expected = (tier,) if tier in ("decode", "dec2", "tile") else ("quant", tier)
+        assert kernel_tiers(names) == expected, names
         x = make_x(mm, k, case_seed("target_dispatch", shape, mm))
         flydsl_gemm_a8w4_ptpc(x, weight)  # compile outside the profiler
-        out, kernels = launched_kernels(lambda: flydsl_gemm_a8w4_ptpc(x, weight))
+        out, kernels = launched_kernels(lambda x=x: flydsl_gemm_a8w4_ptpc(x, weight))
         assert kernels == list(names), kernels
         check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{mm}")
+
+
+# (shape, first M of a general GEMM tile): tile switches inside the general GEMM's range. The
+# others (M = 33; tp2_o's at 65 and 129, tp4_qkv's and tp4_o's at 65) are checked only by the
+# benchmark at the power of two below them; a partly filled last row block works the same in
+# every tile (test_target_shape_dispatch, test_tile_boundaries).
+TILE_SWITCHES = [
+    ("tp2_qkvz", 65),
+    ("tp2_qkv", 65),
+    ("tp2_qkv", 129),
+    ("tp4_qkvz", 65),
+    ("tp4_qkvz", 129),
+    ("tp4_qkv", 129),
+    ("tp4_qkv", 257),
+    ("tp4_o", 129),
+    ("tp4_o", 257),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, m", TILE_SWITCHES, ids=[f"{s}_m{m}" for s, m in TILE_SWITCHES]
+)
+def test_target_shape_tile_switches(shape, m):
+    """Inside the general GEMM's range a target shape's dispatch table switches the tile (its
+    size, pipeline depths, XCD super tile or K groups) from one M bucket to the next: the
+    predicted general GEMM at M differs from that at M - 1, the launched kernels are the
+    predicted ones and the output matches the reference with the new tile's last row block
+    holding 1 row (17 of 48 on tp2_qkv at M = 65). At M = 129 the quantization also switches
+    from one CTA to one wave per row.
+
+    The benchmark runs M - 1 (powers of two), with full row blocks, and does not check which
+    kernels ran.
+    """
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    below = gemm_a8w4_ptpc_kernel_names(m - 1, n, k)
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k)
+    assert kernel_tiers(below) == kernel_tiers(names) == ("quant", "general"), names
+    assert below[1] != names[1], names
+    x = make_x(m, k, case_seed("tile_switch", shape, m))
+    flydsl_gemm_a8w4_ptpc(x, weight)  # compile outside the profiler
+    out, kernels = launched_kernels(lambda: flydsl_gemm_a8w4_ptpc(x, weight))
+    assert kernels == list(names), kernels
+    check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{m}")
 
 
 # =============================================================================================
