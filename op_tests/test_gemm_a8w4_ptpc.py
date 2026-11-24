@@ -8,8 +8,9 @@ One file, three regions:
   1. basic functionality (``@pytest.mark.basic``): one case per target shape, the first
      thing to run after every change: ``pytest op_tests/test_gemm_a8w4_ptpc.py -m basic``;
   2. other coverage: what regions 1 and 3 cannot cover (tile boundaries, bit-exact
-     quantization and weight layout, non-contiguous weight slices, input errors,
-     preallocated output, CUDA graph, compile cache, M = 0, M past 32-bit byte offsets):
+     quantization with its edge rows and weight layout, non-contiguous weight slices, input
+     errors, preallocated output, CUDA graph, compile cache, M = 0, M past 32-bit byte
+     offsets, the large-M dispatch boundary and persistent-kernel edge cases):
      ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
      M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, every timed output
@@ -225,7 +226,8 @@ def cached_weight(n, k, seed):
 # Region 1: basic functionality (@pytest.mark.basic)
 # prepare_gemm_a8w4_ptpc_weight + flydsl_gemm_a8w4_ptpc on each target shape with one
 # representative M (M = 1, non-powers of two crossing the 64-row tile, up to 4096); asserts
-# the launched FlyDSL kernels (per-token quant, then the one GEMM kernel that serves every M).
+# the launched FlyDSL kernels (per-token quant, then the GEMM kernel the dispatch picks: the
+# general GEMM up to M = 2048, the persistent large-M kernel for tp4_o at M = 4096).
 # =============================================================================================
 
 BASIC_CASES = [
@@ -326,6 +328,54 @@ def test_quant_bitexact(k):
     naive = naive.to(torch.float8_e4m3fnuz).view(torch.uint8)
     exact = ref_q.view(torch.uint8)
     assert bool((exact[6] != naive[6]).any()) and bool((exact[7] != naive[7]).any())
+
+
+@pytest.mark.parametrize("k", [2560, 256])
+def test_quant_max_quotient_and_nonfinite(k):
+    """Rows the bit-pattern amax and the clamp-free FP8 conversion must get right: a row
+    whose max |x| / scale rounds to the float above 240 in the reciprocal path (negative
+    maximum, stored as -240) and one in the per-element path (subnormal scale, quotient
+    240.0004) match the reference bit for bit; rows with +NaN, -NaN, or Inf and NaN get
+    scale NaN and only NaN codes (0x80), like the reference; +-Inf rows get scale Inf.
+    Every other row, including those sharing a wave with these (K = 256: 32 lanes per row),
+    matches the reference bit for bit.
+
+    The codes of a +-Inf row are not compared: the reciprocal path turns 0 * Inf into NaN
+    for every element where torch gives 0 for the finite ones; the GEMM row is NaN either
+    way. test_quant_bitexact's random rows reach a quotient above 240 only by chance, and no
+    other test has a non-finite or subnormal-scale input.
+    """
+    gen = _generator(case_seed("quant_edge", k))
+    x = (torch.randn((16, k), generator=gen, device=DEVICE) * 0.5).clamp(-1, 1)
+    x[1, 3] = -1.09375
+    x[2] *= 1e-39
+    x[2, 5] = 2.0**-126 * 1.0625  # BF16 0x0088; scale = it / 240 is subnormal
+    x[3, 7] = float("nan")
+    x[4, 9] = -float("nan")
+    x[5, 1], x[5, 2] = float("inf"), float("nan")
+    x[6, 11] = float("inf")
+    x[7, 13] = -float("inf")
+    x = x.to(torch.bfloat16)
+
+    q, scale = a8w4_module._quant_per_token(x)
+    ref_q, ref_scale = quant_per_token(x)
+    q, ref_q = q.view(torch.uint8), ref_q.view(torch.uint8)
+    scale, ref_scale = scale.view(-1), ref_scale.view(-1)
+    quotient = x.float().abs().amax(dim=-1) / ref_scale
+    assert float(quotient[1]) > FP8_MAX and float(quotient[2]) > FP8_MAX
+    assert 0 < float(ref_scale[2]) < torch.finfo(torch.float32).tiny
+    assert int(ref_q[1, 3]) == 0xFF and int(ref_q[2, 5]) == 0x7F  # -240, 240
+
+    nan_rows, inf_rows = [3, 4, 5], [6, 7]
+    assert bool(scale[nan_rows].isnan().all())
+    assert bool(ref_scale[nan_rows].isnan().all())
+    assert torch.equal(q[nan_rows], ref_q[nan_rows])
+    assert bool((q[nan_rows] == 0x80).all())
+    assert torch.equal(scale[inf_rows], ref_scale[inf_rows])
+    assert bool((scale[inf_rows] == float("inf")).all())
+    rest = [r for r in range(x.shape[0]) if r not in nan_rows + inf_rows]
+    assert torch.equal(scale[rest], ref_scale[rest])
+    assert torch.equal(q[rest], ref_q[rest])
 
 
 # -- 2.3 weight layout, the delta flush rule and weight slices ---------------------------------
@@ -540,15 +590,18 @@ def test_m_zero():
     assert flydsl_gemm_a8w4_ptpc(x, weight, out=out) is out
 
 
-def test_cuda_graph_replay():
+@pytest.mark.parametrize("m", [48, 2049], ids=["m48", "m2049_large"])
+def test_cuda_graph_replay(m):
     """The whole call (its activation buffers and output allocated inside the capture) is
-    captured in a CUDA graph and replays on new input: no host synchronization.
+    captured in a CUDA graph and replays on new input: no host synchronization. M = 48 runs
+    the general GEMM, M = 2049 the persistent large-M kernel.
 
     The basic cases and the benchmark call the op eagerly.
     """
     n, k = SHAPES["tp2_o"]
     w, w_scale, weight = cached_weight(n, k, case_seed("w", "tp2_o"))
-    m = 48
+    gemm = gemm_a8w4_ptpc_kernel_names(m, n, k)[-1]
+    assert (gemm == a8w4_module.LARGE_GEMM_KERNEL_NAME) == (m > 2048)
     x = make_x(m, k, case_seed("graph", 0))
     flydsl_gemm_a8w4_ptpc(x, weight)  # compile outside the capture
     torch.cuda.synchronize()
@@ -592,17 +645,22 @@ def test_compile_cache():
 # -- 2.7 M past 32-bit byte offsets ------------------------------------------------------------
 
 
-def test_m_past_32bit_offsets():
-    """M = 4194401 with N = 320, K = 512: BF16 X spans more than 2**32 bytes, FP8 X and Y more
-    than 2**31, and the GEMM grid has 65538 row tiles (grid.y > 65535, last tile 33 rows); both
-    kernels rebase their buffers at each CTA's first row. X is zero except the first tile, the
-    tiles around each 2**31 / 2**32 byte boundary and the end; Y starts as NaN. The data rows
-    match the reference and every other row is exactly zero, so a lost or misplaced store shows.
+@pytest.mark.parametrize("n", [320, 256], ids=["n320", "n256_large"])
+def test_m_past_32bit_offsets(n):
+    """M = 4194401 with K = 512: BF16 X spans more than 2**32 bytes, FP8 X and Y more than
+    2**31. N = 320 runs the general GEMM with 65538 row tiles (grid.y > 65535, last tile 33
+    rows); N = 256 the persistent large-M kernel over 32769 tiles of 128 rows (last tile 97
+    rows, starting exactly at byte 2**31 of Y and of FP8 X). Every kernel rebases its buffers
+    at the first row of its CTA or tile. X is zero except the first tile, the tiles around
+    each 2**31 / 2**32 byte boundary and the end; Y starts as NaN. The data rows match the
+    reference and every other row is exactly zero, so a lost or misplaced store shows.
 
     The benchmark stops at M = 32768 (Y at most 512 MiB, X 192 MiB), far from 2**31 bytes.
     Needs about 9 GB of GPU memory.
     """
-    m, n, k = 4194401, 320, 512
+    m, k = 4194401, 512
+    gemm = gemm_a8w4_ptpc_kernel_names(m, n, k)[-1]
+    assert (gemm == a8w4_module.LARGE_GEMM_KERNEL_NAME) == (n % 256 == 0)
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
     weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
     # First rows at or past 2**31 bytes of BF16 X, of Y and of FP8 X (= 2**32 of BF16 X).
@@ -623,6 +681,69 @@ def test_m_past_32bit_offsets():
     assert torch.equal(nonzero, data), "rows written to the wrong place or not at all"
     del x, out
     torch.cuda.empty_cache()
+
+
+# -- 2.8 large-M dispatch and the persistent kernel --------------------------------------------
+
+LARGE_M_DISPATCH = [
+    (2048, 256, 512, False),
+    (2049, 256, 512, True),
+    (2049, 320, 512, False),
+    (2049, 256, 256, False),
+]
+
+
+@pytest.mark.parametrize(
+    "m, n, k, large",
+    LARGE_M_DISPATCH,
+    ids=[f"m{m}_n{n}_k{k}" for m, n, k, _ in LARGE_M_DISPATCH],
+)
+def test_large_m_dispatch(m, n, k, large):
+    """M > 2048 with N % 256 == 0 and K >= 512 runs the persistent large-M kernel; M = 2048,
+    N % 256 != 0 or K = 256 run the general GEMM. The predicted and the launched kernels are
+    that one and the output matches the reference. M = 2049, N = 256, K = 512 is the large
+    kernel's smallest case: 17 tiles (fewer than CUs, one per CTA), a 1-row last tile, and
+    K = 512 leaves no K pair loop iteration between the peeled first and last pairs.
+
+    The basic cases and the benchmark run target shapes (N % 256 == 0, K >= 1536) at
+    M = 4096 or powers of two: never at the M boundary, never ruled out by N or K, and their
+    large-M tiles are full and outnumber the CUs.
+    """
+    gemm = a8w4_module.LARGE_GEMM_KERNEL_NAME if large else a8w4_module.GEMM_KERNEL_NAME
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k)
+    assert names[-1] == gemm, names
+    w, w_scale = make_weight(n, k, case_seed("w", n, k))
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    x = make_x(m, k, case_seed("large_dispatch", m, n, k))
+    flydsl_gemm_a8w4_ptpc(x, weight)  # compile outside the profiler
+    out, kernels = launched_kernels(lambda: flydsl_gemm_a8w4_ptpc(x, weight))
+    assert kernels == list(names), kernels
+    check_output(out, run_torch(x, w, w_scale), msg=f"m{m}_n{n}_k{k}")
+
+
+def test_large_m_tiles():
+    """The persistent kernel with more tiles than CUs and a partial last M block, writing
+    through ``out=`` (the head of a NaN buffer): N = 1024 (4 N blocks) and one 128-row M block
+    more than the CUs take, the last with 40 rows (80 CUs: M = 2600, 84 tiles), so the first
+    CTAs run a full tile and then a tail tile; K = 768 runs the K pair loop once. Every row
+    is written and nothing past it.
+
+    The benchmark's large-M cases have M a multiple of 128 and K >= 1536, and the op
+    allocates their output.
+    """
+    n, k = 1024, 768
+    num_cus = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    m = max(num_cus // (n // 256), 16) * 128 + 40
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k)
+    assert names[-1] == a8w4_module.LARGE_GEMM_KERNEL_NAME, names
+    w, w_scale = make_weight(n, k, case_seed("w", n, k))
+    x = make_x(m, k, case_seed("large_tiles", m))
+    buffer = torch.full((m + 128, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    out = buffer[:m]
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    assert flydsl_gemm_a8w4_ptpc(x, weight, out=out) is out
+    check_output(out, run_torch(x, w, w_scale), msg=f"m{m}_n{n}_k{k}")
+    assert bool(buffer[m:].isnan().all())
 
 
 # =============================================================================================

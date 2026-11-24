@@ -7,11 +7,19 @@
 ``q = RNE(x / scale)`` with the IEEE quotient (FNUZ has no -0: it is stored as 0): bit-exact with
 ``(x.float() / scale).to(torch.float8_e4m3fnuz)``.
 
-A row is split over ``lanes`` lanes of one wave, each owning a contiguous run read with
-16-byte loads. The quotient uses ``y = 1 / scale`` (IEEE, once per row) and two FMA
-corrections ``q += (x - q * scale) * y`` (Markstein): the first makes ``q`` faithful, the
-second yields the correctly rounded quotient. Rows with ``scale < 2**-64``, where the
-residual could underflow, divide per element instead.
+A row is split over ``lanes`` lanes of one wave. Load ``v`` of lane ``sub`` reads the eight
+BF16 at 16-byte unit ``sub + v * lanes`` of the row and its FP8 store writes eight bytes at
+unit ``sub + v * lanes``: every load and store instruction covers a contiguous run of
+``16 * lanes`` / ``8 * lanes`` bytes. ``amax`` is the unsigned maximum of the BF16 bit patterns
+with the sign cleared, two per ``v_pk_max_u16``: it orders like the magnitudes and propagates
+NaN as torch's ``amax`` does.
+
+The quotient uses ``y = 1 / scale`` (IEEE, once per row) and two FMA corrections
+``q += (x - q * scale) * y`` (Markstein): the first makes ``q`` faithful, the second yields
+the correctly rounded quotient. Rows with ``scale < 2**-64``, where the residual could
+underflow, divide per element instead. No clamp precedes the conversion: ``|x| / scale``
+is at most the float just above 240, which ``v_cvt_pk_fp8_f32`` rounds to 240 like the
+reference does, and NaN stays NaN.
 """
 
 import functools
@@ -42,11 +50,19 @@ def quant_kernel_name(cols):
 
 
 def _pack_fp8x4(q):
-    """4 clamped f32 -> one dword of FP8 E4M3FNUZ, RNE (-0 and values rounding to 0 give 0x00)."""
+    """4 f32 (|q| < 248) -> one dword of FP8 E4M3FNUZ, RNE (-0 and values rounding to 0 give 0x00)."""
     # FlyDSL 0.5.3 cannot lower the typed `.to(fx.Float8E4M3FNUZ)` (arith.truncf to FP8
     # has no LLVM translation); the rocdl op is v_cvt_pk_fp8_f32, two values per op.
     packed = fx.rocdl.cvt_pk_fp8_f32(T.i32, q[0], q[1], fx.Int32(0), False)
     return fx.Uint32(fx.rocdl.cvt_pk_fp8_f32(T.i32, q[2], q[3], packed, True))
+
+
+def _max_u16x2(vals):
+    """Pairwise-tree unsigned maximum of 2 x u16 vectors (one v_pk_max_u16 per pair)."""
+    while len(vals) > 1:
+        tail = [vals[-1]] if len(vals) % 2 else []
+        vals = [fx.max(vals[i], vals[i + 1]) for i in range(0, len(vals) - 1, 2)] + tail
+    return vals[0]
 
 
 @functools.cache
@@ -98,39 +114,49 @@ def compile_quant_x(cols, device_index):
         )
 
         values = []
-        unit0 = local * (row_bytes // 16) + sub * loads
+        raw_words = []
+        unit0 = local * (row_bytes // 16) + sub
         for v in range_constexpr(loads):
-            raw = buf_copy_load(x_buf, unit0 + v, elem=fx.Uint32, unit_elems=4)
+            raw = buf_copy_load(x_buf, unit0 + v * lanes, elem=fx.Uint32, unit_elems=4)
             for j in range_constexpr(4):
                 word = raw[j]
+                raw_words.append(word)
                 values.append((word << 16).bitcast(fx.Float32))
                 values.append((word & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
-        amax = abs(values[0])
-        for j in range_constexpr(1, per_lane):
-            amax = amax.maximumf(abs(values[j]))
+        # amax on the BF16 bit patterns: |x| as unsigned 16-bit integers orders like the
+        # values and puts NaN above Inf (NaN propagates, as torch's amax does); two per
+        # dword (v_pk_max_u16) instead of a NaN-propagating float max (three VALU each).
+        packed = _max_u16x2(
+            [
+                Vec.from_elements([w & fx.Uint32(0x7FFF7FFF)], fx.Uint32).bitcast(fx.Uint16)
+                for w in raw_words
+            ]
+        ).bitcast(fx.Uint32)[0]
+        amax_bits = fx.max(packed & fx.Uint32(0xFFFF), packed >> 16)
         for i in range_constexpr(len(shuffles)):
-            amax = amax.maximumf(amax.shuffle_xor(fx.Int32(shuffles[i]), fx.Int32(64)))
+            amax_bits = fx.max(
+                amax_bits,
+                fx.Uint32(
+                    fx.Int32(amax_bits).shuffle_xor(fx.Int32(shuffles[i]), fx.Int32(64))
+                ),
+            )
+        amax = (amax_bits << 16).bitcast(fx.Float32)
         scale = amax / FP8_MAX
         scale = (scale == 0.0).select(fx.Float32(1.0), scale)
         if sub == 0:
             buf_copy_store(s_buf, local, scale, elem=fx.Float32)
 
-        q_unit0 = local * (cols // 8) + sub * (per_lane // 8)
+        q_unit0 = local * (cols // 8) + sub
 
         def emit(quotient):
             dwords = []
             for w in range_constexpr(words):
-                q = [
-                    quotient(values[4 * w + i])
-                    .maximumf(fx.Float32(-FP8_MAX))
-                    .minimumf(fx.Float32(FP8_MAX))
-                    for i in range_constexpr(4)
-                ]
+                q = [quotient(values[4 * w + i]) for i in range_constexpr(4)]
                 dwords.append(_pack_fp8x4(q))
             for w in range_constexpr(words // 2):
                 buf_copy_store(
                     q_buf,
-                    q_unit0 + w,
+                    q_unit0 + w * lanes,
                     Vec.from_elements([dwords[2 * w], dwords[2 * w + 1]], fx.Uint32),
                     elem=fx.Uint32,
                     unit_elems=2,

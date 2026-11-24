@@ -13,6 +13,7 @@ synchronization and can be captured in a CUDA graph.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +27,11 @@ from .kernels.gemm_a8w4_ptpc.gemm import (
     K_ALIGN,
     N_ALIGN,
     compile_gemm_a8w4_ptpc,
+)
+from .kernels.gemm_a8w4_ptpc.gemm_large import (
+    KERNEL_NAME as LARGE_GEMM_KERNEL_NAME,
+    compile_gemm_a8w4_ptpc_large,
+    large_m_supported,
 )
 from .kernels.gemm_a8w4_ptpc.quant import compile_quant_x, quant_kernel_name
 from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
@@ -44,6 +50,8 @@ _MAX_WEIGHT_BYTES = 1 << 31
 _E8M0_NAN = 255
 _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 _E8M0_DTYPES = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
+# Token counts above this use the persistent large-M kernel when the shape allows it.
+_LARGE_M = 2048
 
 
 @dataclass(frozen=True)
@@ -87,7 +95,17 @@ def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
-    return (quant_kernel_name(k), GEMM_KERNEL_NAME)
+    gemm_name = LARGE_GEMM_KERNEL_NAME if _use_large_m(m, n, k) else GEMM_KERNEL_NAME
+    return (quant_kernel_name(k), gemm_name)
+
+
+def _use_large_m(m: int, n: int, k: int) -> bool:
+    return m > _LARGE_M and large_m_supported(n, k)
+
+
+@functools.cache
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _shape_error(n: int, k: int) -> str:
@@ -214,8 +232,14 @@ def flydsl_gemm_a8w4_ptpc(
         return out
 
     xq, x_scale = _quant_per_token(x)
+    if _use_large_m(m, n, k):
+        gemm = compile_gemm_a8w4_ptpc_large(
+            n, k, _num_cus(x.device.index), x.device.index
+        )
+    else:
+        gemm = compile_gemm_a8w4_ptpc(n, k, x.device.index)
     _run_compiled(
-        compile_gemm_a8w4_ptpc(n, k, x.device.index),
+        gemm,
         ptr_arg(xq),
         ptr_arg(x_scale),
         ptr_arg(weight.q),
