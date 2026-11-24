@@ -165,7 +165,10 @@ def gemm_config_supported(n, k, cfg):
         and n % N_ALIGN == 0
         and k > 0
         and k % K_ALIGN == 0
-        and (cfg.block_m in (32, 64, 128) or (cfg.block_m in (16, 48) and cfg.tile_k == 256))
+        and (
+            cfg.block_m in (32, 64, 128)
+            or (cfg.block_m in (16, 48) and cfg.tile_k == 256)
+        )
         and cfg.block_n in (64, 128, 256)
         and cfg.prefetch >= 1
         and cfg.x_stages >= 1
@@ -443,7 +446,9 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
             if const_expr(do_x):
                 load_x(j % x_stages, k_tile + x_stages)  # VMEM X(k+XS)
             if const_expr(do_w):
-                load_weights((j + prefetch) % num_slots, k_tile + prefetch)  # VMEM W(k+P)
+                load_weights(
+                    (j + prefetch) % num_slots, k_tile + prefetch
+                )  # VMEM W(k+P)
             for ki in range_constexpr(k_iters):
                 fx.copy(
                     uni_cp_atom,
@@ -663,8 +668,9 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG):
         blk_n = sup % super_n * xcd_n + xcd % xcd_n
         row0 = m_blk * block_m
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # Edge super tiles have CTAs without a tile (uniform per CTA).
-        if blk_n < fx.Int32(n_blocks):
+        # Edge super tiles have CTAs without a tile (uniform per CTA). Two nested runtime
+        # branches (scf.if) on purpose: `and` would emit one branch on the combined condition.
+        if blk_n < fx.Int32(n_blocks):  # noqa: SIM102
             if row0 < M:
                 # Per-workgroup buffers start at the tile's first row: offsets stay 32-bit
                 # for any M, and rows at or past M read zeros and drop their stores.

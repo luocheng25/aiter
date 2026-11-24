@@ -30,8 +30,8 @@ from .kernels.gemm_a8w4_ptpc.gemm import (
     gemm_config_supported,
     gemm_kernel_name,
 )
+from .kernels.gemm_a8w4_ptpc.gemm_large import KERNEL_NAME as LARGE_GEMM_KERNEL_NAME
 from .kernels.gemm_a8w4_ptpc.gemm_large import (
-    KERNEL_NAME as LARGE_GEMM_KERNEL_NAME,
     compile_gemm_a8w4_ptpc_large,
     large_m_supported,
     xcd_panels,
@@ -183,9 +183,7 @@ def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
     choice = _gemm_choice(m, n, k)
     if choice == _SMALL:
         return (small_m_kernel_name_of(_small_config(m, n, k)),)
-    gemm_name = (
-        LARGE_GEMM_KERNEL_NAME if choice == _LARGE else gemm_kernel_name(choice)
-    )
+    gemm_name = LARGE_GEMM_KERNEL_NAME if choice == _LARGE else gemm_kernel_name(choice)
     return (quant_kernel_name(k, quant_config(m, k)), gemm_name)
 
 

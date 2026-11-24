@@ -94,7 +94,7 @@ GEMM 把 xq 行留在多个 XCD 的 L2 里，带缓存的写会慢（tp4_qkvz M 
 
 **资源**：宽配置 26 VGPR、16 SGPR、LDS 4·max(W, 4) B；窄配置无 LDS，52 VGPR（K = 1536）、78 VGPR（K = 2560）。
 
-## gemm_a8w4_ptpc_bm{BM}_bn{BN}_tk{TK}_p{P}_x{XS}_g{xcd_m}_kg{kg}（[代码](gemm.py#L181-L738)）
+## gemm_a8w4_ptpc_bm{BM}_bn{BN}_tk{TK}_p{P}_x{XS}_g{xcd_m}_kg{kg}（[代码](gemm.py#L184-L744)）
 算 y = (xq·xs) · (fd2 解码后的 W · ws)ᵀ：权重在寄存器里按每组 LUT 解成 fp8，走 fp8 MFMA，收尾乘两个 scale 写 bf16。
 tile 由 `GemmConfig`（BM, BN, P, XS, xcd_m, kg, TK）给出，入口按 (N, K) × M 档查表选；表外与大 M 核不接的形状用通用回退。
 
@@ -245,7 +245,7 @@ tile 次序（CTA 按线性号轮流派到 4 个 XCD，各有 4 MiB L2）：原�
 W 超 3 MiB 用 4 面板（tp2_qkv），W 加一轮 X 超 3 MiB 且 gcd(NB, 4) = 2 用 2 面板（tp4_qkv、tp2_o），每个 XCD 约留一个
 面板的 W；其余（tp2_qkvz、tp4_qkvz 的大 M）原次序。CU 数不是 4 的倍数时一律原次序。
 
-**流水线**（相位表与 tile 交界见 [gemm_large.py 模块 docstring](gemm_large.py#L33-L59)）
+**流水线**（相位表与 tile 交界见 [gemm_large.py 模块 docstring](gemm_large.py#L35-L61)）
 ```text
 序言（每 CTA 一次）：VMEM X(0)、W0(0)+D(0)、W1(0)、W0(1)+D(1) → vmcnt(0) → X(0) 写 L[0]、VMEM X(1) → LUT、解码 W0(0) → barrier
 组 1 再等一个 barrier；之后每个 wave 依次 M(0) C(0) M(1) C(1) … C(T−1) M(0′) …，每相以一次 CTA barrier 结束
@@ -261,11 +261,11 @@ tile 交界：M(T−2) 起换读下一 tile 的 X(0)、W0(0)、D(0)，并读本 
 | C(j) 后半 | 32：W1(j)·X1(j) | — | — | — | 建 LUT(j+1)、解码 W0(j+1) |
 | C(T−1) 后半 | 4 对 token 块 × 8 条 | — | 写 y：上一对块各 16 B | — | 第一对建 LUT、解码 W0(0′)；其余缩放、bf16 RNE |
 
-**命名**与**流水线不变量**：见 [gemm_large.py 模块 docstring](gemm_large.py#L61-L83)（Naming、Pipeline rules 1–7）。
+**命名**与**流水线不变量**：见 [gemm_large.py 模块 docstring](gemm_large.py#L63-L85)（Naming、Pipeline rules 1–7）。
 
 **资源**：LDS 32 KB（2 × 128 × 128 B）；256 VGPR（无 AGPR）、58 SGPR、无 spill；`waves_per_eu = 2`，每 CU 1 个 CTA。
 
-## gemm_a8w4_ptpc_decode_rb{rb}_ks{ks}_m{mcap}_g{G}（[代码](small_m.py#L294-L584)）
+## gemm_a8w4_ptpc_decode_rb{rb}_ks{ks}_m{mcap}_g{G}（[代码](small_m.py#L304-L631)）
 M ≤ 8 时的整个调用（最宽两形状的 M ≤ 2 / 4 换 dec2）：一次 launch 里把 x 按 token 量化进 LDS 并算完 y；块对映射让 ≤ 8 个 token 也不空转 MFMA 的半边。
 
 **Gluon 风格**
@@ -333,7 +333,7 @@ delta 写 LDS → barrier → 全部块对的 x（16 B）与 delta（8 B）读�
 **资源**：LDS = mcap·(K+16) + rb·⌈K/256⌉·128 + 部分和 rb·(ks−1)·512 B（目标形状 6–34 KB）；68–124 VGPR、无 spill。
 LDS 随 mcap·K 增长：分派按 `_decode_lds`（与 SharedStorage 逐段一致）检查，超过 64 KiB 时退到 tile 或通用路径，compile 报错。
 
-## gemm_a8w4_ptpc_dec_rb{rb}_ks{ks}_x{xw}_m{mcap}_g{G}（[代码](small_m.py#L587-L918)）
+## gemm_a8w4_ptpc_dec_rb{rb}_ks{ks}_x{xw}_m{mcap}_g{G}（[代码](small_m.py#L634-L1004)）
 最宽两个形状（tp2_qkvz M ≤ 2、tp2_qkv M ≤ 4）的 decode：映射与运算同上，wave 分角色，权重 wave 不等 CTA barrier。
 
 **Gluon 风格**
@@ -376,7 +376,7 @@ X wave：VMEM x 行、delta → 量化 → 写 LDS（x、xs、delta）→ atomic
 
 **资源**：LDS = decode 的各段 + 16 B 计数器（每段 16 B 对齐，`_decode_lds`）；超过 64 KiB 时分派退到 decode，compile 报错。
 
-## gemm_a8w4_ptpc_tile_rb{rb}_ks{ks}_t{tq}_kp{kp}_g{G}（[代码](small_m.py#L921-L1189)）
+## gemm_a8w4_ptpc_tile_rb{rb}_ks{ks}_t{tq}_kp{kp}_g{G}（[代码](small_m.py#L1007-L1308)）
 9 ≤ M ≤ 16（tp4_o ≤ 20，表外 ≤ 32）时的整个调用：与 decode 一样在 CTA 内量化，换标准映射（权重作 A、16-token 片作 B），K 分窗口让 32 行 fp8 装进 LDS。
 
 **Gluon 风格**

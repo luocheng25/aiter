@@ -4,8 +4,10 @@
 """gfx942 eight-wave persistent ping-pong 128x256 (K step 128) dense A8W4 GEMM for large M.
 
 Same operands and arithmetic as ``gemm.py`` (per-token FP8 X x fd2 MXFP4 W -> BF16
-Y = X W^T, W decoded to FP8 in VGPRs by ``layout``), for M large enough to give every CU many
-tiles (the entry sends M > 2048 with N % 256 == 0 here). Differences from ``gemm.py``: a
+Y = X W^T, W decoded to FP8 in VGPRs by ``layout``), for large M: the entry's
+``_gemm_choice`` sends M > 2048 here when ``large_m_supported`` (N % 256 == 0, K >= 512),
+and the six (N, K) of its measured ``_MID_TABLE`` from lower M (8192 x 2560 from M = 129,
+6656 x 2560 from 513, the other four from 1025). Differences from ``gemm.py``: a
 128 x 256 tile, a persistent grid, two wave groups in ping-pong, a channel permutation for
 16-byte weight loads and output stores, and the output written inside the K loop.
 
@@ -392,7 +394,8 @@ def compile_gemm_a8w4_ptpc_large(n, k, num_cus, device_index, panels=0):
         d_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Uint32)
         # W slot, 64-K half: dwords 2 m + c (tile m, K 8c .. 8c + 7 of the lane group).
         w_regs = [
-            [fx.make_rmem_tensor(4, fx.Uint32) for _ in range(k_iters)] for _ in range(2)
+            [fx.make_rmem_tensor(4, fx.Uint32) for _ in range(k_iters)]
+            for _ in range(2)
         ]
         d_regs = [fx.make_rmem_tensor(m_reps, fx.Uint32) for _ in range(2)]
 

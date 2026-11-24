@@ -1098,7 +1098,8 @@ def _small_m_quant_rows(k):
     """11 BF16 rows for the in-kernel quantization: 0..4 random, 5 all zero, 6 FP8 rounding
     midpoints (as in test_quant_bitexact), 7 row 6 x 2**-70 and 9 a random row x 1e-30
     (scale < 2**-64), 8 -0 and negatives that round to zero, 10 a maximum whose quotient is
-    the float above 240 (as in test_quant_max_quotient_and_nonfinite: stored as -240)."""
+    the float above 240 (as in test_quant_max_quotient_and_nonfinite: stored as -240).
+    """
     gen = _generator(case_seed("small_quant", k))
     x = torch.randn((11, k), generator=gen, device=DEVICE) * 3
     x[5].zero_()

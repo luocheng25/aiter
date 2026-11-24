@@ -91,7 +91,9 @@ def decode_kernel_name(rb, ks, mcap, num_wg):
 
 
 def tile_kernel_name(rb, ks, tq, kp, num_wg):
-    return format_kernel_name(f"gemm_a8w4_ptpc_tile_rb{rb}_ks{ks}_t{tq}_kp{kp}_g{num_wg}")
+    return format_kernel_name(
+        f"gemm_a8w4_ptpc_tile_rb{rb}_ks{ks}_t{tq}_kp{kp}_g{num_wg}"
+    )
 
 
 def _tile_windows(k, kp):
@@ -152,7 +154,9 @@ def small_m_config(m, n, k):
         # Every CTA quantizes all M rows and reads them for its weights, so wider CTAs pay
         # off as M grows; CTAs beyond one per CU only pay where two fit on a CU.
         if blocks > 6 * _CUS:
-            rb, ks, num_wg = (8, 2, -(-blocks // 8)) if mcap == 8 else (4, 2, -(-blocks // 4))
+            rb, ks, num_wg = (
+                (8, 2, -(-blocks // 8)) if mcap == 8 else (4, 2, -(-blocks // 4))
+            )
         elif blocks > 4 * _CUS:
             rb, ks, num_wg = 6, 2, _CUS
         elif blocks > 3 * _CUS:
@@ -172,7 +176,9 @@ def small_m_config(m, n, k):
         rb, ks = 2, 4
     for kp in range(1, k // 512 + 1):
         x, delta, part, xscale = _tile_lds(n, k, rb, ks, tq, kp)
-        if x + delta + xscale <= _LDS_BYTES and part <= max(x, _LDS_BYTES - x - delta - xscale):
+        if x + delta + xscale <= _LDS_BYTES and part <= max(
+            x, _LDS_BYTES - x - delta - xscale
+        ):
             return "tile", rb, ks, tq, kp, -(-blocks // rb)
     return None
 
@@ -192,7 +198,9 @@ def compile_small_m(config, n, k, device_index):
     if kind == "decode":
         return compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, tokens, num_wg, device_index)
     if kind == "dec2":
-        return compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, kp, tokens, num_wg, device_index)
+        return compile_gemm_a8w4_ptpc_decode2(
+            n, k, rb, ks, kp, tokens, num_wg, device_index
+        )
     return compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tokens, kp, num_wg, device_index)
 
 
@@ -245,7 +253,9 @@ def _row_scale(raw_units):
     words = [fx.Uint32(u[j]) for u in raw_units for j in range(4)]
 
     def mag16(w):
-        return Vec.from_elements([w & fx.Uint32(0x7FFF7FFF)], fx.Uint32).bitcast(fx.Uint16)
+        return Vec.from_elements([w & fx.Uint32(0x7FFF7FFF)], fx.Uint32).bitcast(
+            fx.Uint16
+        )
 
     acc = mag16(words[0])
     for w in words[1:]:
@@ -328,7 +338,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
             f"num_wg={num_wg}"
         )
     if _decode_lds(k, rb, ks, mcap) > _LDS_BYTES:
-        raise ValueError(f"decode A8W4 GEMM: LDS too small for K={k} rb={rb} ks={ks} mcap={mcap}")
+        raise ValueError(
+            f"decode A8W4 GEMM: LDS too small for K={k} rb={rb} ks={ks} mcap={mcap}"
+        )
     fp8 = fx.Float8E4M3FNUZ
     ppw = pairs // ks
     kb_total = k // 64
@@ -358,7 +370,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
         part: fx.Array[fx.Float32, max(1, rb * (ks - 1) * part_floats), 16]
         xscale: fx.Array[fx.Float32, max(4, mcap), 16]
 
-    @flyc.kernel(name=decode_kernel_name(rb, ks, mcap, num_wg), known_block_size=[threads, 1, 1])
+    @flyc.kernel(
+        name=decode_kernel_name(rb, ks, mcap, num_wg), known_block_size=[threads, 1, 1]
+    )
     def gemm_a8w4_ptpc_decode_kernel(
         p_x: fx.Pointer,
         p_wq: fx.Pointer,
@@ -378,9 +392,15 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
         rbg = rb0 + r_local
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        x_buf = ptr_buf_tensor(p_x, elem=fx.Uint32, unit_elems=4, num_records_bytes=M * (k * 2))
-        w_buf = ptr_buf_tensor(p_wq, elem=fx.Uint32, unit_elems=4, num_records_bytes=w_bytes)
-        d_buf = ptr_buf_tensor(p_wd, elem=fx.Uint32, unit_elems=4, num_records_bytes=d_bytes)
+        x_buf = ptr_buf_tensor(
+            p_x, elem=fx.Uint32, unit_elems=4, num_records_bytes=M * (k * 2)
+        )
+        w_buf = ptr_buf_tensor(
+            p_wq, elem=fx.Uint32, unit_elems=4, num_records_bytes=w_bytes
+        )
+        d_buf = ptr_buf_tensor(
+            p_wd, elem=fx.Uint32, unit_elems=4, num_records_bytes=d_bytes
+        )
 
         # ======== Prologue: token rows and deltas of the CTA, then the wave's weights ========
         q_vals = [
@@ -408,14 +428,21 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
         s0 = k_part * ppw
         raws = [
             buf_copy_load(
-                w_buf, (rbg * kb_total + 2 * (s0 + i)) * 32 + lane, elem=fx.Uint32, unit_elems=4
+                w_buf,
+                (rbg * kb_total + 2 * (s0 + i)) * 32 + lane,
+                elem=fx.Uint32,
+                unit_elems=4,
             )
             for i in range(ppw)
         ]
         rocdl.sched_barrier(0)
         # Epilogue operands: channels 2 (l % 8) + h, tokens 8 q + 4 ((l // 16) % 2) + v.
-        s_buf = ptr_buf_tensor(p_ws, elem=fx.Float32, unit_elems=2, num_records_bytes=n * 4)
-        w_scale = buf_copy_load(s_buf, rbg * 8 + lane % 8, elem=fx.Float32, unit_elems=2)
+        s_buf = ptr_buf_tensor(
+            p_ws, elem=fx.Float32, unit_elems=2, num_records_bytes=n * 4
+        )
+        w_scale = buf_copy_load(
+            s_buf, rbg * 8 + lane % 8, elem=fx.Float32, unit_elems=2
+        )
         rocdl.sched_barrier(0)
 
         # ======== In-CTA per-token quantization: BF16 rows -> FP8 rows in LDS ========
@@ -430,15 +457,17 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
                 if scale >= fx.Float32(_SMALL_SCALE):
                     dws = _quant_units(q_vals[j], range(q_units), _quotient(scale))
                     for u in range_constexpr(q_units):
-                        _lds_bytes(lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8).store(
-                            dws[u].bitcast(fx.Uint8)
-                        )
+                        _lds_bytes(
+                            lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8
+                        ).store(dws[u].bitcast(fx.Uint8))
                 else:
-                    dws = _quant_units(q_vals[j], range(q_units), lambda v: v / scale)
+                    dws = _quant_units(
+                        q_vals[j], range(q_units), lambda v, sc=scale: v / sc
+                    )
                     for u in range_constexpr(q_units):
-                        _lds_bytes(lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8).store(
-                            dws[u].bitcast(fx.Uint8)
-                        )
+                        _lds_bytes(
+                            lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8
+                        ).store(dws[u].bitcast(fx.Uint8))
 
         for i in range_constexpr(d_loads):
             u = tid + threads * i
@@ -446,13 +475,18 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
                 _lds_bytes(lds.delta.ptr, u * 16, 16).store(d_vals[i].bitcast(fx.Uint8))
             else:
                 if u < d_units:
-                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(d_vals[i].bitcast(fx.Uint8))
+                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(
+                        d_vals[i].bitcast(fx.Uint8)
+                    )
         gpu.barrier()
         x_scales = [
             Vec(
                 _lds_bytes(
                     lds.xscale.ptr,
-                    fx.min(fx.Int32(q * 8) + ((lane // 16) % 2) * 4, fx.Int32(max(4, mcap) - 4))
+                    fx.min(
+                        fx.Int32(q * 8) + ((lane // 16) % 2) * 4,
+                        fx.Int32(max(4, mcap) - 4),
+                    )
                     * 4,
                     16,
                 ).load()
@@ -462,15 +496,21 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
 
         # ======== Block pairs: decode W(s), acc += X(s) W(s) ========
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fp8))
-        accs = [[fx.make_rmem_tensor(4, fx.Float32) for _ in range(tq)] for _ in range(2)]
+        accs = [
+            [fx.make_rmem_tensor(4, fx.Float32) for _ in range(tq)] for _ in range(2)
+        ]
         for h in range_constexpr(2):
             for q in range_constexpr(tq):
                 accs[h][q].store(Vec.filled(4, 0.0, fx.Float32))
         x_lane = (lane // 32) * 64 + ((lane % 32) // 8) * 16
-        x_rows = [fx.min(fx.Int32(q * 8) + lane % 8, fx.Int32(rows - 1)) for q in range(tq)]
-        d_lane = (r_local * kq_total) * layout.D_BLOCK_BYTES + ((lane % 32) // 16) * 64 + (
-            lane % 8
-        ) * 8
+        x_rows = [
+            fx.min(fx.Int32(q * 8) + lane % 8, fx.Int32(rows - 1)) for q in range(tq)
+        ]
+        d_lane = (
+            (r_local * kq_total) * layout.D_BLOCK_BYTES
+            + ((lane % 32) // 16) * 64
+            + (lane % 8) * 8
+        )
         # LDS reads of every pair first (X operands, delta dwords), so the per-pair chain is
         # only weight load -> decode -> MFMA.
         xa = [
@@ -504,7 +544,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
                 for c in range_constexpr(2):
                     frag = fx.make_rmem_tensor(8, fp8)
                     frag.store(
-                        Vec.from_elements([v[2 * c], v[2 * c + 1]], fx.Uint32).bitcast(fp8)
+                        Vec.from_elements([v[2 * c], v[2 * c + 1]], fx.Uint32).bitcast(
+                            fp8
+                        )
                     )
                     per_c.append(frag)
                 a_ops.append(per_c)
@@ -531,7 +573,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
         if const_expr(ks > 1):
             slot = (lane // 16) * 8 + lane % 8
             if (k_part > 0) & useful & valid:
-                base = ((r_local * (ks - 1) + k_part - 1) * 16 + slot) * (2 * tq * 4) * 4
+                base = (
+                    ((r_local * (ks - 1) + k_part - 1) * 16 + slot) * (2 * tq * 4) * 4
+                )
                 for j in range_constexpr(2 * tq * 4):
                     _lds_bytes(lds.part.ptr, base + j * 4, 4).store(
                         Vec.from_elements([sums[j]], fx.Float32).bitcast(fx.Uint8)
@@ -540,9 +584,12 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
             for p in range_constexpr(1, ks):
                 base = ((r_local * (ks - 1) + p - 1) * 16 + slot) * (2 * tq * 4) * 4
                 for j in range_constexpr(2 * tq * 4):
-                    sums[j] = sums[j] + Vec(
-                        _lds_bytes(lds.part.ptr, base + j * 4, 4).load()
-                    ).bitcast(fx.Float32)[0]
+                    sums[j] = (
+                        sums[j]
+                        + Vec(_lds_bytes(lds.part.ptr, base + j * 4, 4).load()).bitcast(
+                            fx.Float32
+                        )[0]
+                    )
         if (k_part == 0) & useful & valid:
             y_buf = ptr_buf_tensor(
                 p_y, elem=fx.BFloat16, unit_elems=2, num_records_bytes=M * (n * 2)
@@ -552,9 +599,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
                     token = q * 8 + (lane // 16) * 4 + v
                     out = Vec.from_elements(
                         [
-                            (sums[(h * tq + q) * 4 + v] * w_scale[h] * x_scales[q][v]).to(
-                                fx.BFloat16
-                            )
+                            (
+                                sums[(h * tq + q) * 4 + v] * w_scale[h] * x_scales[q][v]
+                            ).to(fx.BFloat16)
                             for h in range_constexpr(2)
                         ],
                         fx.BFloat16,
@@ -585,7 +632,9 @@ def compile_gemm_a8w4_ptpc_decode(n, k, rb, ks, mcap, num_wg, device_index):
 
 
 def decode2_kernel_name(rb, ks, xw, mcap, num_wg):
-    return format_kernel_name(f"gemm_a8w4_ptpc_dec_rb{rb}_ks{ks}_x{xw}_m{mcap}_g{num_wg}")
+    return format_kernel_name(
+        f"gemm_a8w4_ptpc_dec_rb{rb}_ks{ks}_x{xw}_m{mcap}_g{num_wg}"
+    )
 
 
 @functools.cache
@@ -644,7 +693,10 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
         xscale: fx.Array[fx.Float32, max(4, mcap), 16]
         ready: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=decode2_kernel_name(rb, ks, xw, mcap, num_wg), known_block_size=[threads, 1, 1])
+    @flyc.kernel(
+        name=decode2_kernel_name(rb, ks, xw, mcap, num_wg),
+        known_block_size=[threads, 1, 1],
+    )
     def gemm_a8w4_ptpc_dec_kernel(
         p_x: fx.Pointer,
         p_wq: fx.Pointer,
@@ -711,7 +763,9 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                                 lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8
                             ).store(dws[u].bitcast(fx.Uint8))
                     else:
-                        dws = _quant_units(q_vals[j], range(q_units), lambda v: v / scale)
+                        dws = _quant_units(
+                            q_vals[j], range(q_units), lambda v, sc=scale: v / sc
+                        )
                         for u in range_constexpr(q_units):
                             _lds_bytes(
                                 lds.x.ptr, row * x_stride + (lane + 64 * u) * 8, 8
@@ -719,7 +773,9 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
             for i in range_constexpr(d_loads):
                 u = tid + 64 * xw * i
                 if const_expr(64 * xw * (i + 1) <= d_units):
-                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(d_vals[i].bitcast(fx.Uint8))
+                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(
+                        d_vals[i].bitcast(fx.Uint8)
+                    )
                 else:
                     if u < d_units:
                         _lds_bytes(lds.delta.ptr, u * 16, 16).store(
@@ -748,8 +804,12 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
             )
             s0 = k_part * ppw
             # Epilogue operands: channels 2 (l % 8) + h, tokens 8 q + 4 ((l // 16) % 2) + v.
-            s_buf = ptr_buf_tensor(p_ws, elem=fx.Float32, unit_elems=2, num_records_bytes=n * 4)
-            w_scale = buf_copy_load(s_buf, rbg * 8 + lane % 8, elem=fx.Float32, unit_elems=2)
+            s_buf = ptr_buf_tensor(
+                p_ws, elem=fx.Float32, unit_elems=2, num_records_bytes=n * 4
+            )
+            w_scale = buf_copy_load(
+                s_buf, rbg * 8 + lane % 8, elem=fx.Float32, unit_elems=2
+            )
 
             def load_pair(i):
                 return buf_copy_load(
@@ -786,7 +846,8 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                     _lds_bytes(
                         lds.xscale.ptr,
                         fx.min(
-                            fx.Int32(q * 8) + ((lane // 16) % 2) * 4, fx.Int32(max(4, mcap) - 4)
+                            fx.Int32(q * 8) + ((lane // 16) % 2) * 4,
+                            fx.Int32(max(4, mcap) - 4),
                         )
                         * 4,
                         16,
@@ -797,20 +858,30 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
 
             # ======== Block pairs: decode W(s), acc += X(s) W(s) ========
             mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fp8))
-            accs = [[fx.make_rmem_tensor(4, fx.Float32) for _ in range(tq)] for _ in range(2)]
+            accs = [
+                [fx.make_rmem_tensor(4, fx.Float32) for _ in range(tq)]
+                for _ in range(2)
+            ]
             for h in range_constexpr(2):
                 for q in range_constexpr(tq):
                     accs[h][q].store(Vec.filled(4, 0.0, fx.Float32))
             x_lane = (lane // 32) * 64 + ((lane % 32) // 8) * 16
-            x_rows = [fx.min(fx.Int32(q * 8) + lane % 8, fx.Int32(rows - 1)) for q in range(tq)]
-            d_lane = (r_local * kq_total) * layout.D_BLOCK_BYTES + ((lane % 32) // 16) * 64 + (
-                lane % 8
-            ) * 8
+            x_rows = [
+                fx.min(fx.Int32(q * 8) + lane % 8, fx.Int32(rows - 1))
+                for q in range(tq)
+            ]
+            d_lane = (
+                (r_local * kq_total) * layout.D_BLOCK_BYTES
+                + ((lane % 32) // 16) * 64
+                + (lane % 8) * 8
+            )
             xa = [
                 [
                     Vec(
                         _lds_bytes(
-                            lds.x.ptr, x_rows[q] * x_stride + x_lane + (s0 + i) * 128, 16
+                            lds.x.ptr,
+                            x_rows[q] * x_stride + x_lane + (s0 + i) * 128,
+                            16,
                         ).load()
                     ).bitcast(fx.Uint32)
                     for i in range(ppw)
@@ -820,7 +891,9 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
             deltas = [
                 Vec(
                     _lds_bytes(
-                        lds.delta.ptr, d_lane + ((s0 + i) // 2) * layout.D_BLOCK_BYTES, 8
+                        lds.delta.ptr,
+                        d_lane + ((s0 + i) // 2) * layout.D_BLOCK_BYTES,
+                        8,
                     ).load()
                 ).bitcast(fx.Uint32)
                 for i in range(ppw)
@@ -837,7 +910,9 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                     for c in range_constexpr(2):
                         frag = fx.make_rmem_tensor(8, fp8)
                         frag.store(
-                            Vec.from_elements([v[2 * c], v[2 * c + 1]], fx.Uint32).bitcast(fp8)
+                            Vec.from_elements(
+                                [v[2 * c], v[2 * c + 1]], fx.Uint32
+                            ).bitcast(fp8)
                         )
                         per_c.append(frag)
                     a_ops.append(per_c)
@@ -862,9 +937,15 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                         sums.append(acc[v] + gpu.shuffle_xor(acc[v], 40, 64))
             useful = ((lane % 16) < 8) & (lane < 32)
             slot = (lane // 16) * 8 + lane % 8
-            if const_expr(ks > 1):
+            # Kept nested: a trace-time const_expr test outside a runtime one (scf.if); `and`
+            # would turn the pair into one runtime condition.
+            if const_expr(ks > 1):  # noqa: SIM102
                 if (k_part > 0) & useful & valid:
-                    base = ((r_local * (ks - 1) + k_part - 1) * 16 + slot) * (2 * tq * 4) * 4
+                    base = (
+                        ((r_local * (ks - 1) + k_part - 1) * 16 + slot)
+                        * (2 * tq * 4)
+                        * 4
+                    )
                     for j in range_constexpr(2 * tq * 4):
                         _lds_bytes(lds.part.ptr, base + j * 4, 4).store(
                             Vec.from_elements([sums[j]], fx.Float32).bitcast(fx.Uint8)
@@ -874,9 +955,12 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                 for p in range_constexpr(1, ks):
                     base = ((r_local * (ks - 1) + p - 1) * 16 + slot) * (2 * tq * 4) * 4
                     for j in range_constexpr(2 * tq * 4):
-                        sums[j] = sums[j] + Vec(
-                            _lds_bytes(lds.part.ptr, base + j * 4, 4).load()
-                        ).bitcast(fx.Float32)[0]
+                        sums[j] = (
+                            sums[j]
+                            + Vec(
+                                _lds_bytes(lds.part.ptr, base + j * 4, 4).load()
+                            ).bitcast(fx.Float32)[0]
+                        )
             if (k_part == 0) & useful & valid:
                 y_buf = ptr_buf_tensor(
                     p_y, elem=fx.BFloat16, unit_elems=2, num_records_bytes=M * (n * 2)
@@ -886,9 +970,11 @@ def compile_gemm_a8w4_ptpc_decode2(n, k, rb, ks, xw, mcap, num_wg, device_index)
                         token = q * 8 + (lane // 16) * 4 + v
                         out = Vec.from_elements(
                             [
-                                (sums[(h * tq + q) * 4 + v] * w_scale[h] * x_scales[q][v]).to(
-                                    fx.BFloat16
-                                )
+                                (
+                                    sums[(h * tq + q) * 4 + v]
+                                    * w_scale[h]
+                                    * x_scales[q][v]
+                                ).to(fx.BFloat16)
                                 for h in range_constexpr(2)
                             ],
                             fx.BFloat16,
@@ -970,8 +1056,12 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
     d_units = rb * kq_total * layout.D_BLOCK_BYTES // 16
     d_loads = (d_units + threads - 1) // threads
     part_alias = x_bytes + d_units * 16 + part_bytes + tokens * 4 > 65536
-    if (part_alias and part_bytes > x_bytes) or x_bytes + d_units * 16 + tokens * 4 > 65536:
-        raise ValueError(f"A8W4 tile GEMM: LDS too small for N={n} K={k} rb={rb} ks={ks}")
+    if (
+        part_alias and part_bytes > x_bytes
+    ) or x_bytes + d_units * 16 + tokens * 4 > 65536:
+        raise ValueError(
+            f"A8W4 tile GEMM: LDS too small for N={n} K={k} rb={rb} ks={ks}"
+        )
     w_bytes = layout.weight_bytes(n, k)
     d_bytes = layout.delta_bytes(n, k)
 
@@ -982,7 +1072,9 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
         part: fx.Array[fx.Uint8, 16 if part_alias else max(16, part_bytes), 16]
         xscale: fx.Array[fx.Float32, tokens, 16]
 
-    @flyc.kernel(name=tile_kernel_name(rb, ks, tq, kp, num_wg), known_block_size=[threads, 1, 1])
+    @flyc.kernel(
+        name=tile_kernel_name(rb, ks, tq, kp, num_wg), known_block_size=[threads, 1, 1]
+    )
     def gemm_a8w4_ptpc_tile_kernel(
         p_x: fx.Pointer,
         p_wq: fx.Pointer,
@@ -1004,9 +1096,15 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
         rbg = rb0 + r_local
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
 
-        x_buf = ptr_buf_tensor(p_x, elem=fx.Uint32, unit_elems=4, num_records_bytes=M * (k * 2))
-        w_buf = ptr_buf_tensor(p_wq, elem=fx.Uint32, unit_elems=2, num_records_bytes=w_bytes)
-        d_buf = ptr_buf_tensor(p_wd, elem=fx.Uint32, unit_elems=4, num_records_bytes=d_bytes)
+        x_buf = ptr_buf_tensor(
+            p_x, elem=fx.Uint32, unit_elems=4, num_records_bytes=M * (k * 2)
+        )
+        w_buf = ptr_buf_tensor(
+            p_wq, elem=fx.Uint32, unit_elems=2, num_records_bytes=w_bytes
+        )
+        d_buf = ptr_buf_tensor(
+            p_wd, elem=fx.Uint32, unit_elems=4, num_records_bytes=d_bytes
+        )
 
         # ======== Prologue: token rows and deltas of the CTA, then the wave's weights ========
         # Wave w quantizes token rows w + waves * j; lane l holds the 16-byte BF16 units
@@ -1052,7 +1150,9 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
             for p in range(kp)
         ]
         rocdl.sched_barrier(0)
-        s_buf = ptr_buf_tensor(p_ws, elem=fx.Float32, unit_elems=4, num_records_bytes=n * 4)
+        s_buf = ptr_buf_tensor(
+            p_ws, elem=fx.Float32, unit_elems=4, num_records_bytes=n * 4
+        )
         w_scale = buf_copy_load(s_buf, rbg * 4 + g, elem=fx.Float32, unit_elems=4)
         rocdl.sched_barrier(0)
 
@@ -1072,7 +1172,9 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
                 _lds_bytes(lds.delta.ptr, u * 16, 16).store(d_vals[i].bitcast(fx.Uint8))
             else:
                 if u < d_units:
-                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(d_vals[i].bitcast(fx.Uint8))
+                    _lds_bytes(lds.delta.ptr, u * 16, 16).store(
+                        d_vals[i].bitcast(fx.Uint8)
+                    )
 
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fp8))
         accs = [fx.make_rmem_tensor(4, fx.Float32) for _ in range(tq)]
@@ -1094,19 +1196,27 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
                         dws = _quant_units(q_vals[j], units, _quotient(scales[j]))
                         for i, u in enumerate(units):
                             off = qrow * x_stride + (lane + 64 * (u - u0[p])) * 8
-                            _lds_bytes(lds.x.ptr, off, 8).store(dws[i].bitcast(fx.Uint8))
+                            _lds_bytes(lds.x.ptr, off, 8).store(
+                                dws[i].bitcast(fx.Uint8)
+                            )
                     else:
-                        dws = _quant_units(q_vals[j], units, lambda v, sc=scales[j]: v / sc)
+                        dws = _quant_units(
+                            q_vals[j], units, lambda v, sc=scales[j]: v / sc
+                        )
                         for i, u in enumerate(units):
                             off = qrow * x_stride + (lane + 64 * (u - u0[p])) * 8
-                            _lds_bytes(lds.x.ptr, off, 8).store(dws[i].bitcast(fx.Uint8))
+                            _lds_bytes(lds.x.ptr, off, 8).store(
+                                dws[i].bitcast(fx.Uint8)
+                            )
             gpu.barrier()
 
             # ======== Window p steps: decode W(s), acc += W(s) X(s) ========
             for i in range_constexpr(spw[p]):
                 s = win_s0[p] + i
                 delta = Vec(
-                    _lds_bytes(lds.delta.ptr, d_lane + (s // 2) * layout.D_BLOCK_BYTES, 4).load()
+                    _lds_bytes(
+                        lds.delta.ptr, d_lane + (s // 2) * layout.D_BLOCK_BYTES, 4
+                    ).load()
                 ).bitcast(fx.Uint32)[0]
                 if const_expr(spw[p] % 2 == 0):
                     sel = sel_g + fx.Uint32((i % 2) * 0x02020202)
@@ -1132,7 +1242,8 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
                             b = fx.make_rmem_tensor(8, fp8)
                             b.store(
                                 Vec.from_elements(
-                                    [xb[t][4 * h + 2 * c], xb[t][4 * h + 2 * c + 1]], fx.Uint32
+                                    [xb[t][4 * h + 2 * c], xb[t][4 * h + 2 * c + 1]],
+                                    fx.Uint32,
                                 ).bitcast(fp8)
                             )
                             fx.gemm(mma, accs[t], a, b, accs[t])
@@ -1145,7 +1256,9 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
                 gpu.barrier()
             if (k_part > 0) & valid:
                 for t in range_constexpr(tq):
-                    base = (((r_local * (ks - 1) + k_part - 1) * tq + t) * 64 + lane) * 16
+                    base = (
+                        ((r_local * (ks - 1) + k_part - 1) * tq + t) * 64 + lane
+                    ) * 16
                     _lds_bytes(part_ptr, base, 16).store(totals[t].bitcast(fx.Uint8))
             gpu.barrier()
             for kp_i in range_constexpr(1, ks):
@@ -1159,7 +1272,9 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
         )
         for t in range_constexpr(tq):
             token = 16 * t + row
-            x_scale = Vec(_lds_bytes(lds.xscale.ptr, token * 4, 4).load()).bitcast(fx.Float32)[0]
+            x_scale = Vec(_lds_bytes(lds.xscale.ptr, token * 4, 4).load()).bitcast(
+                fx.Float32
+            )[0]
             if (k_part == 0) & valid & (token < M):
                 out = Vec.from_elements(
                     [
@@ -1169,7 +1284,11 @@ def compile_gemm_a8w4_ptpc_tile(n, k, rb, ks, tq, kp, num_wg, device_index):
                     fx.BFloat16,
                 )
                 buf_copy_store(
-                    y_buf, token * (n // 4) + rbg * 4 + g, out, elem=fx.BFloat16, unit_elems=4
+                    y_buf,
+                    token * (n // 4) + rbg * 4 + g,
+                    out,
+                    elem=fx.BFloat16,
+                    unit_elems=4,
                 )
 
     @flyc.jit
