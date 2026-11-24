@@ -11,7 +11,8 @@ One file, three regions:
      quantization with its edge rows and weight layout, non-contiguous weight slices, input
      errors, preallocated output, CUDA graph, compile cache, M = 0, M past 32-bit byte
      offsets, the large-M dispatch boundary and persistent-kernel edge cases, the small-M
-     dispatch boundaries, partial token tiles and bit-exact in-kernel quantization):
+     dispatch boundaries and LDS fallbacks, partial token tiles and bit-exact in-kernel
+     quantization, the M where each target shape's dispatch switches kernels):
      ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
      M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, every timed output
@@ -226,11 +227,13 @@ def launched_kernels(fn, attempts=3):
 
 
 # Kernel name prefix -> dispatch tier. The tests name the tier of a kernel rather than its full
-# name, so that a kernel name that gains configuration fields (a tile picked per shape and M)
-# does not break them; what ran is still checked against gemm_a8w4_ptpc_kernel_names.
+# name: the general GEMM's name carries the tile the entry picks per shape and M, and the
+# small-M kernels' names their configuration; what ran is still checked against
+# gemm_a8w4_ptpc_kernel_names.
 _KERNEL_TIERS = (
     ("gemm_a8w4_ptpc_quant_", "quant"),
     ("gemm_a8w4_ptpc_decode_", "decode"),
+    ("gemm_a8w4_ptpc_dec_", "dec2"),
     ("gemm_a8w4_ptpc_tile_", "tile"),
     ("gemm_a8w4_ptpc_bm", "general"),
     ("gemm_a8w4_ptpc_pp_", "large"),
@@ -238,9 +241,10 @@ _KERNEL_TIERS = (
 
 
 def kernel_tiers(names):
-    """Tier of each kernel name: ``quant``, the one-launch small-M kernels ``decode`` and
-    ``tile``, ``general`` (the general GEMM) or ``large`` (the persistent large-M kernel); an
-    unknown name is returned as it is, so it matches no tier."""
+    """Tier of each kernel name: ``quant``, the one-launch small-M kernels ``decode``, ``dec2``
+    (the role-split decode kernel) and ``tile``, ``general`` (the GEMM with a configurable tile)
+    or ``large`` (the persistent large-M kernel); an unknown name is returned as it is, so it
+    matches no tier."""
     return tuple(
         next((tier for prefix, tier in _KERNEL_TIERS if name.startswith(prefix)), name)
         for name in names
@@ -257,18 +261,18 @@ def cached_weight(n, k, seed):
 # =============================================================================================
 # Region 1: basic functionality (@pytest.mark.basic)
 # prepare_gemm_a8w4_ptpc_weight + flydsl_gemm_a8w4_ptpc on each target shape with one
-# representative M, one case per dispatch tier: M = 1 (decode kernel), M = 20 on tp4_o (tile
-# kernel, two token tiles), M = 33..2048 with non-powers of two (per-token quant, then the
-# general GEMM) and M = 4096 (quant, then the persistent large-M kernel); asserts that the
-# launched FlyDSL kernels are the ones the dispatch predicts.
+# representative M, one case per dispatch tier: M = 1 on tp2_qkvz (dec2, the role-split decode
+# kernel), M = 3 on tp4_qkv (decode kernel), M = 20 on tp4_o (tile kernel, two token tiles),
+# M = 33..1000 with non-powers of two (per-token quant, then the general GEMM, each with the
+# tile its shape's dispatch table picks) and M = 4096 (quant, then the persistent large-M
+# kernel); asserts that the launched FlyDSL kernels are the ones the dispatch predicts.
 # =============================================================================================
 
 BASIC_CASES = [
     ("tp2_qkvz", 1),
-    # tp4_o, not tp4_qkv: the per-shape mid-M dispatch moves M = 17..32 of the target shapes
-    # to the quant and the general GEMM (tp4_o from M = 21), so tp4_o M = 20 runs the tile
-    # kernel before and after that change, where tp4_qkv M = 20 would silently switch tiers.
-    # Two K windows are covered in region 2.9 (N = 4160).
+    ("tp4_qkv", 3),
+    # tp4_o: the only target shape whose dispatch table keeps the small-M kernels past M = 16
+    # (up to 20). Two K windows are covered in region 2.9 (N = 4160).
     ("tp4_o", 20),
     ("tp2_qkv", 33),
     ("tp2_o", 130),
@@ -310,12 +314,15 @@ BOUNDARY_CASES = [(63, 192, 256), (65, 64, 768), (129, 320, 512)]
     "m, n, k", BOUNDARY_CASES, ids=[f"m{m}_n{n}_k{k}" for m, n, k in BOUNDARY_CASES]
 )
 def test_tile_boundaries(m, n, k):
-    """M one below / above the 64-row tile, N with a half-empty 128-channel tile
-    (N % 128 == 64, masked stores and zero-filled weight loads), and K = 256 / 512 / 768
-    (zero, one and two pipelined loop iterations).
+    """Off the dispatch table the general GEMM takes 32 x 64 tiles up to M = 128 and 64-row
+    tiles above, 64 channels wide where N % 128 == 64 (N = 320), both with 256 K per stage:
+    the last row block one row short (M = 63) or holding one row (M = 65 of 32-row blocks,
+    M = 129 of 64-row blocks), K = 256 / 512 / 768 (1, 2, 3 K tiles: fewer than or about the
+    prefetch depth of 2, all stages peeled, no runtime loop iteration), and M = 129 with 3 row
+    blocks in super tiles of 4 (one CTA of each super tile has no tile and exits).
 
-    The target shapes have N % 128 == 0 and K >= 1536; the benchmark uses powers of two
-    for M and the basic cases one M per shape.
+    The target shapes are on the table, with N % 128 == 0 and K >= 1536; the benchmark uses
+    powers of two for M and the basic cases one M per shape.
     """
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
     x = make_x(m, k, case_seed("x", m, n, k))
@@ -628,23 +635,32 @@ def test_m_zero():
     assert flydsl_gemm_a8w4_ptpc(x, weight, out=out) is out
 
 
+GRAPH_CASES = [
+    ("tp4_o", 5, "decode"),
+    ("tp2_qkv", 4, "dec2"),
+    ("tp4_o", 20, "tile"),
+    ("tp4_o", 48, "general"),
+    ("tp4_o", 2049, "large"),
+]
+
+
 @pytest.mark.parametrize(
-    "m", [5, 20, 48, 2049], ids=["m5_decode", "m20_tile", "m48", "m2049_large"]
+    "shape, m, tier",
+    GRAPH_CASES,
+    ids=["m5_decode", "m4_dec2", "m20_tile", "m48", "m2049_large"],
 )
-def test_cuda_graph_replay(m):
+def test_cuda_graph_replay(shape, m, tier):
     """The whole call (its activation buffers and output allocated inside the capture) is
     captured in a CUDA graph and replays on new input: no host synchronization. M = 5 runs
-    the decode kernel and M = 20 the tile kernel (both quantize X themselves), M = 48 the
-    general GEMM, M = 2049 the persistent large-M kernel.
+    the decode kernel, M = 4 on tp2_qkv the role-split decode kernel (its weight waves spin on
+    an LDS counter that the CTA zeroes first) and M = 20 the tile kernel (all three quantize X
+    themselves), M = 48 the general GEMM, M = 2049 the persistent large-M kernel.
 
     The basic cases and the benchmark call the op eagerly.
     """
-    # tp4_o, not tp2_o: the per-shape mid-M dispatch moves tp2_o M = 17..32 to the quant and
-    # the general GEMM but keeps tp4_o M = 20 on the tile kernel. Each M asserts the tier it is
-    # here for (by kernel name tier, not by an internal kernel name constant).
-    n, k = SHAPES["tp4_o"]
-    w, w_scale, weight = cached_weight(n, k, case_seed("w", "tp4_o"))
-    tier = {5: "decode", 20: "tile", 48: "general", 2049: "large"}[m]
+    # Each M asserts the tier it is here for: tp4_o's table keeps the tile kernel up to M = 20.
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
     tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
     assert tiers[-1] == tier, tiers
     x = make_x(m, k, case_seed("graph", 0))
@@ -698,12 +714,14 @@ def test_compile_cache():
 @pytest.mark.parametrize("n", [320, 256], ids=["n320", "n256_large"])
 def test_m_past_32bit_offsets(n):
     """M = 4194401 with K = 512: BF16 X spans more than 2**32 bytes, FP8 X and Y more than
-    2**31. N = 320 runs the general GEMM with 65538 row tiles (grid.y > 65535, last tile 33
-    rows); N = 256 the persistent large-M kernel over 32769 tiles of 128 rows (last tile 97
-    rows, starting exactly at byte 2**31 of Y and of FP8 X). Every kernel rebases its buffers
-    at the first row of its CTA or tile. X is zero except the first tile, the tiles around
-    each 2**31 / 2**32 byte boundary and the end; Y starts as NaN. The data rows match the
-    reference and every other row is exactly zero, so a lost or misplaced store shows.
+    2**31. N = 320 runs the general GEMM (past M = 2048 off the large kernel: 64 x 128 tiles,
+    the last 128-channel block half empty and its stores masked) over 65538 row blocks, last
+    block 33 rows, in a 1-D grid of 4 CTAs per row block (the fourth without a tile); N = 256
+    the persistent large-M kernel over 32769 tiles of 128 rows (last tile 97 rows, starting
+    exactly at byte 2**31 of Y and of FP8 X). Every kernel rebases its buffers at the first
+    row of its CTA or tile. X is zero except the first tile, the tiles around each 2**31 /
+    2**32 byte boundary and the end; Y starts as NaN. The data rows match the reference and
+    every other row is exactly zero, so a lost or misplaced store shows.
 
     The benchmark stops at M = 32768 (Y at most 512 MiB, X 192 MiB), far from 2**31 bytes.
     Needs about 9 GB of GPU memory.
@@ -750,19 +768,19 @@ LARGE_M_DISPATCH = [
     ids=[f"m{m}_n{n}_k{k}" for m, n, k, _ in LARGE_M_DISPATCH],
 )
 def test_large_m_dispatch(m, n, k, large):
-    """These N, K are not target shapes, whose dispatch may switch at an M of their own:
-    M > 2048 with N % 256 == 0 and K >= 512 runs the persistent large-M kernel; M = 2048,
-    N % 256 != 0 or K = 256 run the general GEMM. The predicted and the launched kernels are
-    that one and the output matches the reference. M = 2049, N = 256, K = 512 is the large
-    kernel's smallest case: 17 tiles (fewer than CUs, one per CTA), a 1-row last tile, and
-    K = 512 leaves no K pair loop iteration between the peeled first and last pairs.
+    """Off the dispatch table (each target shape switches at the M its table gives, see
+    test_target_shape_dispatch), M > 2048 with N % 256 == 0 and K >= 512 runs the persistent
+    large-M kernel; M = 2048, N % 256 != 0 or K = 256 run the general GEMM (M = 2049, N = 320:
+    64 x 128 tiles, the last 128-channel block half empty). The predicted and the launched
+    kernels are that one and the output matches the reference. M = 2049, N = 256, K = 512 is
+    the large kernel's smallest case: 17 tiles (fewer than CUs, one per CTA), a 1-row last
+    tile, and K = 512 leaves no K pair loop iteration between the peeled first and last pairs.
 
     The basic cases and the benchmark run target shapes (N % 256 == 0, K >= 1536) at
     M = 4096 or powers of two: never at M = 2049, never ruled out by N or K, and their
     large-M tiles are full.
     """
-    # By kernel name tier, not by the kernel name constants: the general GEMM's kernel name
-    # may carry the tile the entry picks per shape and M (no single general kernel name).
+    # By kernel name tier: the general GEMM's kernel name carries the tile the entry picks.
     names = gemm_a8w4_ptpc_kernel_names(m, n, k)
     assert kernel_tiers(names) == ("quant", "large" if large else "general"), names
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
@@ -800,58 +818,58 @@ def test_large_m_tiles():
     assert bool(buffer[m:].isnan().all())
 
 
-# -- 2.9 small M (M <= 32): the one-launch decode and tile kernels -----------------------------
+# -- 2.9 small M (M <= 32): the one-launch decode, dec2 and tile kernels ----------------------
 
-# (m, n, k, kernel kinds the dispatch may run: "decode", "tile" or None for the per-token quant
-# and the general GEMM; token slots of the decode kernel or 16-token tiles of the tile kernel)
+# (m, n, k, small-M kernel kind or None for the per-token quant and the general GEMM, token slots
+# of the decode / dec2 kernel or 16-token tiles of the tile kernel)
 SMALL_M_DISPATCH = [
-    (8, 2560, 1536, ("decode",), 8),
-    (9, 2560, 1536, ("tile",), 1),
-    (16, 2560, 1536, ("tile",), 1),
-    (17, 2560, 1536, ("tile",), 2),
-    # Not pinned (was the tile kernel): the per-shape mid-M dispatch moves a target shape's
-    # M = 17..32 (tp4_o's M = 21..32) to the quant and the general GEMM, so tp4_o M = 32 may
-    # run either, as long as it is the predicted one and the tile kernel fits. Pin it again
-    # once that dispatch has landed.
-    (32, 2560, 1536, ("tile", None), 2),
-    # The tile kernel's 32-token limit, moved off the target shapes (this pair was tp4_o
-    # M = 32 / 33): N = 4160 is under no per-shape dispatch; two K windows.
-    (32, 4160, 2560, ("tile",), 2),
-    (33, 4160, 2560, (None,), 0),
-    (5, 128, 768, (None,), 0),
-    (20, 5184, 12288, (None,), 0),
+    (8, 2560, 1536, "decode", 8),
+    (9, 2560, 1536, "tile", 1),
+    (16, 2560, 1536, "tile", 1),
+    (17, 2560, 1536, "tile", 2),
+    # The tile kernel's 32-token limit only shows off the dispatch table (the target shapes'
+    # tables end the small-M kernels at M = 16 or 20): N = 4160, two K windows.
+    (32, 4160, 2560, "tile", 2),
+    (33, 4160, 2560, None, 0),
+    (5, 128, 768, None, 0),
+    (20, 5184, 12288, None, 0),
+    # LDS: the next kernel that fits runs where one would exceed 64 KiB.
+    (8, 64, 7168, "tile", 1),  # decode too large: tile kernel, two K windows
+    (2, 8192, 12288, "decode", 2),  # dec2 too large: decode kernel
+    (3, 5632, 14336, None, 0),  # dec2, decode and tile too large
+    (4, 64, 12288, "decode", 4),  # decode kernel just fits (64592 B)
+    (2, 5632, 13824, "dec2", 2),  # dec2 just fits (64832 B)
 ]
 
 
 @pytest.mark.parametrize(
-    "m, n, k, kinds, tokens",
+    "m, n, k, kind, tokens",
     SMALL_M_DISPATCH,
     ids=[f"m{m}_n{n}_k{k}" for m, n, k, _, _ in SMALL_M_DISPATCH],
 )
-def test_small_m_dispatch(m, n, k, kinds, tokens):
-    """M <= 8 runs the decode kernel alone, M = 9..16 the tile kernel with one 16-token tile,
-    M = 17..32 with two, up to the tile kernel's 32-token limit; M = 33, K % 512 != 0
-    (K = 768) and a tile kernel whose token rows and deltas do not fit in the LDS (N = 5184,
-    K = 12288) run the per-token quant and the general GEMM. A target shape may hand
-    M = 17..32 to the quant and the general GEMM instead: tp4_o M = 32 accepts either. The
-    predicted and the launched kernels are those and the output matches the reference.
+def test_small_m_dispatch(m, n, k, kind, tokens):
+    """Where the dispatch leaves M to the small-M kernels (off the table; up to M = 16 or 20 on
+    the target shapes, tp4_o here): M <= 8 runs the decode kernel alone (dec2 on the widest N,
+    see test_target_shape_dispatch), M = 9..16 the tile kernel with one 16-token tile,
+    M = 17..32 with two, up to the tile kernel's 32-token limit; M = 33 and K % 512 != 0
+    (K = 768) run the per-token quant and the general GEMM. decode and dec2 hold the FP8 token
+    rows of all of K in LDS and the tile kernel those of a K window: a kernel that would exceed
+    64 KiB gives way to the next one that fits (dec2, decode, tile, then the quant and the
+    general GEMM), and one just under the limit still runs (its LDS estimate is not below what
+    it allocates). The predicted and the launched kernels are those and the output matches the
+    reference.
 
-    The benchmark runs M = 8, 16, 32 and 64 (one side of each boundary), all its shapes have
-    K % 512 == 0 and fit, and it does not check which kernels ran.
+    The benchmark runs M = 8 and 16 (one side of each boundary), all its shapes have
+    K % 512 == 0 and K <= 3072, and it does not check which kernels ran.
     """
     config = a8w4_module.small_m_config(m, n, k)
     names = gemm_a8w4_ptpc_kernel_names(m, n, k)
-    small = [kind for kind in kinds if kind is not None]
-    if small:
-        assert config is not None and config[0] in small and config[3] == tokens, config
-    else:
+    if kind is None:
         assert config is None, config
-    # The quant + general GEMM pair by kernel name tier, not by the kernel name constants: the
-    # general GEMM's kernel name may carry the tile the entry picks per shape and M.
-    if kernel_tiers(names) == ("quant", "general"):
-        assert None in kinds, names
+        # By kernel name tier: the general GEMM's kernel name carries the tile the entry picks.
+        assert kernel_tiers(names) == ("quant", "general"), names
     else:
-        assert config is not None, names
+        assert config is not None and config[0] == kind and config[3] == tokens, config
         assert names == (a8w4_module.small_m_kernel_name_of(config),), names
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
     weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
@@ -864,11 +882,12 @@ def test_small_m_dispatch(m, n, k, kinds, tokens):
 
 SMALL_M_PARTIAL = [
     (3, 8192, 2560),
+    (3, 6656, 2560),
     (7, 6656, 2560),
     (10, 3584, 2560),
-    # N = 4160, not tp4_qkvz's 4096: the per-shape mid-M dispatch moves tp4_qkvz M = 17..32 to
-    # the general GEMM; N = 4160 is under no per-shape dispatch and gets the same tile kernel
-    # configuration (4 row blocks x 4 K parts, two token tiles, two K windows).
+    # N = 4160, off the dispatch table (its tile kernel configuration is tp4_qkvz's: 4 row
+    # blocks x 4 K parts, two token tiles, two K windows), which runs M = 17..32 of the target
+    # shapes on the general GEMM.
     (23, 4160, 2560),
     (20, 5184, 1024),
     (20, 2560, 8192),
@@ -881,22 +900,24 @@ SMALL_M_PARTIAL = [
 def test_small_m_partial_tiles(m, n, k):
     """The small-M kernels with M below their token capacity, written through ``out=`` (the
     head of a NaN buffer): token rows >= M are not quantized and their outputs are not stored
-    (the decode kernel's stores past M fall outside the buffer bound), so every row matches
+    (the decode kernels' stores past M fall outside the buffer bound), so every row matches
     the reference and nothing past ``out`` changes. M = 3 and 7: decode kernel with 4 and 8
-    token slots (M = 7: 80 CTAs over 416 row blocks, 5 or 6 each); M = 10: tile kernel, one
-    16-token tile; M = 23: two token tiles over two K windows, the K-part sums reusing the
+    token slots (M = 7: 80 CTAs over 416 row blocks, 5 or 6 each); M = 3 on N = 6656: dec2 with
+    4 token slots, one X wave per slot, the last with no row to quantize; M = 10: tile kernel,
+    one 16-token tile; M = 23: two token tiles over two K windows, the K-part sums reusing the
     token-row LDS; N = 5184: 41 tile CTAs over 324 row blocks (7 or 8 each), so some wave slots
     compute a neighbouring block and store nothing; K = 8192: six K windows.
 
-    The benchmark's M are the token capacities (1, 2, 4, 8, 16, 32), its shapes give every
-    tile CTA the same number of row blocks and at most two K windows, and the op allocates
-    its output.
+    The benchmark's small-M cases are the token capacities (M = 1, 2, 4, 8, 16), its shapes give
+    every tile CTA the same number of row blocks and one K window, and the op allocates its
+    output.
     """
     config = a8w4_module.small_m_config(m, n, k)
     assert config is not None, config
-    assert m < (config[3] if config[0] == "decode" else 16 * config[3]), config
-    # The dispatch runs that kernel: a per-shape dispatch may run the general GEMM where a
-    # small-M kernel fits, which would silently skip what this test is for.
+    slots = config[3] if config[0] in ("decode", "dec2") else 16 * config[3]
+    assert m < slots, config
+    # The dispatch runs that kernel: a dispatch table may run the general GEMM where a small-M
+    # kernel fits, which would silently skip what this test is for.
     tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
     assert tiers == (config[0],), tiers
     w, w_scale = make_weight(n, k, case_seed("w", n, k))
@@ -931,8 +952,22 @@ def _small_m_quant_rows(k):
     return x.to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("m", [2, 5, 10, 23], ids=["m2", "m5", "m10", "m23"])
-def test_small_m_quant_bitexact(m):
+# (m, n, small-M kernel the dispatch runs); K = 2560 and N >= K for the one-hot weight.
+SMALL_M_QUANT = [
+    (2, 4160, "decode"),
+    (4, 6656, "dec2"),
+    (5, 4160, "decode"),
+    (10, 4160, "tile"),
+    (23, 4160, "tile"),
+]
+
+
+@pytest.mark.parametrize(
+    "m, n, kind",
+    SMALL_M_QUANT,
+    ids=["m2", "m4_dec2", "m5", "m10", "m23"],
+)
+def test_small_m_quant_bitexact(m, n, kind):
     """The small-M kernels quantize X inside each CTA exactly like the reference. With a
     one-hot weight (channel c reads K position c % K with weight 1.0; N >= K) the output is
     Y[t, c] = bf16(xq[t, c % K] * x_scale[t]) bit for bit, which exposes every FP8 code and
@@ -940,16 +975,17 @@ def test_small_m_quant_bitexact(m):
     multiply rounds some the other way), two rows with scale < 2**-64 (per-element division),
     -0 with negatives that round to zero (a NaN code 0x80 would turn the whole output row
     NaN) and a quotient just above 240 (no clamp: it must round to -240, not NaN). M = 2 and
-    5: decode kernel (2 and 8 token slots); M = 10: tile kernel; M = 23: two token tiles,
-    both holding special rows, over two separately quantized K windows.
+    5: decode kernel (2 and 8 token slots); M = 4 on N = 6656: dec2, whose X waves quantize
+    one row each (midpoints, quotient above 240, scale < 2**-64, all zero); M = 10: tile
+    kernel; M = 23: two token tiles, both holding special rows, over two separately quantized
+    K windows.
 
     test_quant_bitexact covers the separate quantization kernel of the other paths; with
     random weights a few flipped FP8 codes move the output far less than its tolerance.
     """
-    # N = 4160, not tp4_qkvz's 4096, so that M = 23 runs the tile kernel: the per-shape mid-M
-    # dispatch moves tp4_qkvz M = 17..32 to the general GEMM; N = 4160 is under no per-shape
-    # dispatch and gets the same small-M kernel configurations.
-    n, k = 4160, 2560
+    # N = 4160 is off the dispatch table, so that M = 23 runs the tile kernel (the target
+    # shapes run M = 17..32 on the general GEMM); N = 6656 (tp2_qkv) runs dec2 up to M = 4.
+    k = 2560
     probe = _small_m_quant_rows(k)
     probe_q, probe_scale = quant_per_token(probe)
     assert float(probe_scale[7]) < 2.0**-64 <= float(probe_scale[6])
@@ -964,30 +1000,41 @@ def test_small_m_quant_bitexact(m):
     codes = torch.full((n, k // 32), 127, dtype=torch.uint8, device=DEVICE)  # 2**0
     weight = prepare_gemm_a8w4_ptpc_weight(pack_fp4(nibbles), codes)
     config = a8w4_module.small_m_config(m, n, k)
-    assert config is not None and config[0] == ("decode" if m <= 8 else "tile"), config
+    assert config is not None and config[0] == kind, config
     tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
-    assert tiers == (config[0],), tiers  # the dispatch runs that kernel
+    assert tiers == (kind,), tiers  # the dispatch runs that kernel
     out = flydsl_gemm_a8w4_ptpc(x, weight)
     xq, x_scale = quant_per_token(x)
     expected = (xq.float()[:, columns] * x_scale).to(torch.bfloat16)
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("m", [5, 20], ids=["m5_decode", "m20_tile"])
-def test_small_m_nonfinite_rows(m):
+SMALL_M_NONFINITE = [
+    ("tp4_o", 5, "decode"),
+    ("tp2_qkv", 4, "dec2"),
+    ("tp4_o", 20, "tile"),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, m, kind",
+    SMALL_M_NONFINITE,
+    ids=["m5_decode", "m4_dec2", "m20_tile"],
+)
+def test_small_m_nonfinite_rows(shape, m, kind):
     """A token row holding NaN or +-Inf gets scale NaN or Inf inside the small-M kernels
     and turns only its own output row NaN, as in the reference; every other token of the
-    CTA, in the same and the other token tile, still matches the reference.
+    CTA, in the same and the other token tile, still matches the reference (dec2: rows
+    quantized by other X waves of the CTA).
 
     The basic cases and the benchmark only pass finite activations;
     test_quant_max_quotient_and_nonfinite covers the separate quantization kernel.
     """
-    # tp4_o, not tp2_o: the per-shape mid-M dispatch moves tp2_o M = 17..32 to the quant and
-    # the general GEMM but keeps tp4_o M = 20 on the tile kernel; the tier is asserted.
-    n, k = SHAPES["tp4_o"]
-    w, w_scale, weight = cached_weight(n, k, case_seed("w", "tp4_o"))
+    # tp4_o's table keeps the tile kernel up to M = 20; the tier is asserted.
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
     tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
-    assert tiers == ("decode" if m <= 8 else "tile",), tiers
+    assert tiers == (kind,), tiers
     x = make_x(m, k, case_seed("small_nonfinite", m))
     bad = [1, 3] if m <= 8 else [1, 3, 17]
     x[1, 7] = float("nan")
@@ -999,6 +1046,81 @@ def test_small_m_nonfinite_rows(m):
     ref = run_torch(x, w, w_scale)
     assert bool(out[bad].isnan().all()) and bool(ref[bad].isnan().all())
     check_output(out[good], ref[good], msg=f"m{m} finite rows")
+
+
+# -- 2.10 the target shapes' dispatch: where each switches kernels -----------------------------
+
+# (shape, the last M of a tier, its tier, the tier from M + 1). The small-M kernel is picked by
+# its limits (dec2 on the two widest shapes up to M = 2 / 4); the dispatch table of each shape
+# then hands M to the per-token quant and the general GEMM, and to the large-M kernel. Where only
+# the two sides of a switch are pinned, the M is a pair: the last M pinned on the lower tier and
+# the first M pinned on the upper one.
+TARGET_DISPATCH = [
+    ("tp2_qkvz", 2, "dec2", "decode"),
+    ("tp2_qkv", 4, "dec2", "decode"),
+    ("tp2_qkvz", 16, "tile", "general"),
+    ("tp2_qkv", 16, "tile", "general"),
+    ("tp2_o", 16, "tile", "general"),
+    ("tp4_qkvz", 16, "tile", "general"),
+    ("tp4_qkv", 16, "tile", "general"),
+    ("tp4_o", 20, "tile", "general"),
+    ("tp2_qkvz", 128, "general", "large"),
+    ("tp2_qkv", 512, "general", "large"),
+    # Two sides only: the mid-M table may switch tp4_qkvz anywhere in M = 513..1024. The exact
+    # switch is left to the review of the next milestone that retunes the mid-M table.
+    ("tp4_qkvz", (512, 1025), "general", "large"),
+    ("tp2_o", 1024, "general", "large"),
+    ("tp4_qkv", 1024, "general", "large"),
+    ("tp4_o", 1024, "general", "large"),
+]
+
+
+def _target_dispatch_ms(m):
+    """(last M pinned on the lower tier, first M pinned on the upper tier) of a TARGET_DISPATCH
+    row."""
+    return m if isinstance(m, tuple) else (m, m + 1)
+
+
+@pytest.mark.parametrize(
+    "shape, m, below, above",
+    TARGET_DISPATCH,
+    ids=[
+        "{}_m{}_{}".format(s, *_target_dispatch_ms(m)) for s, m, _, _ in TARGET_DISPATCH
+    ],
+)
+def test_target_shape_dispatch(shape, m, below, above):
+    """Each target shape switches kernels at its own M: dec2 to the decode kernel after M = 2
+    (tp2_qkvz) or 4 (tp2_qkv); the small-M kernels to the per-token quant and the general GEMM
+    after M = 16 (tp4_o: 20); the general GEMM to the persistent large-M kernel after M = 128
+    (tp2_qkvz), 512 (tp2_qkv) or 1024 (tp2_o, tp4_qkv, tp4_o). On tp4_qkvz only the two sides
+    are pinned: the general GEMM at M = 512, the large-M kernel at M = 1025; M = 513 may run
+    either. At each pinned M the predicted kernels are of the expected tier; at every M the
+    launched ones are the predicted ones and the output matches the reference. The first M of
+    the general GEMM leaves its last row block partly filled (17 of 32 rows; 1 of 16 on tp2_o,
+    5 on tp4_o), that of the large-M kernel a 1-row last tile.
+
+    The benchmark runs one side of each switch at most (powers of two: neither M = 3, 5, 17,
+    20, 21, 129, 513 nor 1025) and does not check which kernels ran.
+    """
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    lo, hi = _target_dispatch_ms(m)
+    # (M, the tiers it may run): a pinned side one, the M past an unpinned lower side either.
+    cases = [(lo, (below,)), (hi, (above,))]
+    if hi > lo + 1:
+        cases.insert(1, (lo + 1, (below, above)))
+    for mm, tiers in cases:
+        names = gemm_a8w4_ptpc_kernel_names(mm, n, k)
+        expected = [
+            (tier,) if tier in ("decode", "dec2", "tile") else ("quant", tier)
+            for tier in tiers
+        ]
+        assert kernel_tiers(names) in expected, names
+        x = make_x(mm, k, case_seed("target_dispatch", shape, mm))
+        flydsl_gemm_a8w4_ptpc(x, weight)  # compile outside the profiler
+        out, kernels = launched_kernels(lambda: flydsl_gemm_a8w4_ptpc(x, weight))
+        assert kernels == list(names), kernels
+        check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{mm}")
 
 
 # =============================================================================================

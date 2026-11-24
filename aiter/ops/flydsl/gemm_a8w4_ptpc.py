@@ -23,10 +23,12 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.gemm_a8w4_ptpc import layout
 from .kernels.gemm_a8w4_ptpc.gemm import (
-    GEMM_KERNEL_NAME,
     K_ALIGN,
     N_ALIGN,
+    GemmConfig,
     compile_gemm_a8w4_ptpc,
+    gemm_config_supported,
+    gemm_kernel_name,
 )
 from .kernels.gemm_a8w4_ptpc.gemm_large import (
     KERNEL_NAME as LARGE_GEMM_KERNEL_NAME,
@@ -57,6 +59,63 @@ _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 _E8M0_DTYPES = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
 # Token counts above this use the persistent large-M kernel when the shape allows it.
 _LARGE_M = 2048
+# Per weight shape (N, K) and token bucket (M up to the bucket): "small" for the single
+# small-M kernel, the general kernel's GemmConfig fields (block_m, block_n, prefetch,
+# x_stages, xcd_m, k_groups, tile_k) or "large" for the persistent kernel (both after the
+# quantization); measured on MI308X with the end-to-end benchmark protocol.
+_SMALL = "small"
+_LARGE = "large"
+_TK256 = 256
+_MID_TABLE = {
+    (8192, 2560): {
+        16: _SMALL,
+        32: (32, 64, 2, 2, 1, 1, _TK256),
+        128: (64, 128, 2, 2, 1, 1, _TK256),
+        256: _LARGE,
+    },
+    (6656, 2560): {
+        16: _SMALL,
+        32: (32, 64, 2, 2, 1, 1, _TK256),
+        64: (32, 64, 1, 1, 1, 1, _TK256),
+        128: (48, 128, 1, 1, 1, 1, _TK256),
+        512: (64, 128, 1, 1, 2, 1, _TK256),
+        1024: _LARGE,
+    },
+    (2560, 3072): {
+        16: _SMALL,
+        32: (16, 64, 2, 2, 2, 2, _TK256),
+        64: (32, 64, 2, 2, 2, 2, _TK256),
+        128: (32, 64, 2, 2, 4, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        2048: _LARGE,
+    },
+    (4096, 2560): {
+        16: _SMALL,
+        32: (32, 64, 2, 2, 1, 2, _TK256),
+        64: (32, 64, 2, 2, 1, 1, _TK256),
+        128: (64, 64, 1, 1, 2, 1, _TK256),
+        512: (64, 128, 1, 1, 4, 1, _TK256),
+        1024: _LARGE,
+    },
+    (3584, 2560): {
+        16: _SMALL,
+        32: (32, 64, 2, 2, 1, 2, _TK256),
+        64: (32, 64, 2, 2, 1, 1, _TK256),
+        128: (32, 64, 2, 1, 2, 1, _TK256),
+        256: (64, 128, 1, 1, 2, 1, _TK256),
+        512: (64, 128, 2, 2, 4, 1, _TK256),
+        1024: (64, 128, 1, 1, 4, 1, _TK256),
+        2048: _LARGE,
+    },
+    (2560, 1536): {
+        20: _SMALL,
+        32: (16, 64, 2, 2, 2, 2, _TK256),
+        64: (32, 64, 2, 2, 2, 2, _TK256),
+        128: (32, 64, 2, 2, 2, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        2048: _LARGE,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -100,15 +159,44 @@ def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
-    small = small_m_config(m, n, k)
-    if small is not None:
-        return (small_m_kernel_name_of(small),)
-    gemm_name = LARGE_GEMM_KERNEL_NAME if _use_large_m(m, n, k) else GEMM_KERNEL_NAME
+    choice = _gemm_choice(m, n, k)
+    if choice == _SMALL:
+        return (small_m_kernel_name_of(small_m_config(m, n, k)),)
+    gemm_name = (
+        LARGE_GEMM_KERNEL_NAME if choice == _LARGE else gemm_kernel_name(choice)
+    )
     return (quant_kernel_name(k), gemm_name)
 
 
-def _use_large_m(m: int, n: int, k: int) -> bool:
-    return m > _LARGE_M and large_m_supported(n, k)
+def _gemm_choice(m: int, n: int, k: int):
+    """Path for x [m, k] x weight [n, k]: ``_SMALL`` (the single small-M kernel), or after the
+    quantization ``_LARGE`` or a GemmConfig."""
+    large_ok = large_m_supported(n, k)
+    small_ok = small_m_config(m, n, k) is not None
+    if m > _LARGE_M:
+        if large_ok:
+            return _LARGE
+        return GemmConfig()
+    table = _MID_TABLE.get((n, k))
+    if table is None:
+        if small_ok:
+            return _SMALL
+    else:
+        # The smallest bucket that holds M; past the last one, the last one.
+        entry = table[next((b for b in sorted(table) if m <= b), max(table))]
+        if entry == _SMALL and small_ok:
+            return _SMALL
+        if entry == _LARGE and large_ok:
+            return _LARGE
+        if entry not in (_SMALL, _LARGE):
+            cfg = GemmConfig(*entry)
+            if gemm_config_supported(n, k, cfg):
+                return cfg
+    if m <= 128:
+        cfg = GemmConfig(32, 64, 2, 2, 1, 1, _TK256)
+    else:
+        cfg = GemmConfig(64, 128 if n % 128 == 0 else 64, 2, 2, 4, 1, _TK256)
+    return cfg if gemm_config_supported(n, k, cfg) else GemmConfig()
 
 
 @functools.cache
@@ -239,11 +327,11 @@ def flydsl_gemm_a8w4_ptpc(
     if m == 0:
         return out
 
-    small = small_m_config(m, n, k)
-    if small is not None:
+    choice = _gemm_choice(m, n, k)
+    if choice == _SMALL:
         # Small M: one kernel that quantizes x per token itself.
         _run_compiled(
-            compile_small_m(small, n, k, x.device.index),
+            compile_small_m(small_m_config(m, n, k), n, k, x.device.index),
             ptr_arg(x),
             ptr_arg(weight.q),
             ptr_arg(weight.d),
@@ -254,12 +342,12 @@ def flydsl_gemm_a8w4_ptpc(
         )
         return out
     xq, x_scale = _quant_per_token(x)
-    if _use_large_m(m, n, k):
+    if choice == _LARGE:
         gemm = compile_gemm_a8w4_ptpc_large(
             n, k, _num_cus(x.device.index), x.device.index
         )
     else:
-        gemm = compile_gemm_a8w4_ptpc(n, k, x.device.index)
+        gemm = compile_gemm_a8w4_ptpc(n, k, x.device.index, choice)
     _run_compiled(
         gemm,
         ptr_arg(xq),
