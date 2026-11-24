@@ -935,11 +935,45 @@ def test_small_m_nonfinite_rows(m):
 # this op and for aiter's FP8 per-token GEMM, as SGLang's gfx942 apply_fp8_ptpc_linear runs it:
 # per_token_quant_hip + gemm_a8w8_bpreshuffle on the same MXFP4 weight dequantized (flush
 # rule included) and quantized per channel to FP8. Both use run_perftest (inputs deep-copied
-# and rotated, all kernels of a call summed) and grade the timed output with checkAllclose
-# against an fp32 reference of their own quantized operands.
+# and rotated, >= ~12 ms of warm-up calls, all kernels of a call summed) and grade the timed
+# output with checkAllclose against an fp32 reference of their own quantized operands.
 # =============================================================================================
 
 BENCH_M = [1 << i for i in range(16)]
+
+# Warm-up before every timed loop, the same for both implementations. The host work between
+# timed loops (inputs, references, grading, deep copies; ~0.1 s) leaves the GPU idle, its
+# memory clock (UCLK / fabric) drops, and it takes ~5 ms of load to come back up (measured on
+# MI308X). With run_perftest's default 2 warm-up calls, the timed loops of the middle M range
+# (~6 ms) start inside that ramp: a contiguous slow head (GEMM +43% at M = 256) that the IQR
+# filter keeps once it spans more than ~25-32% of the iterations, so 5-20% of those runs read
+# 10-30% high, always the op timed first; the short loops of small M can run slow in part or
+# throughout. run_perftest runs its warm-up calls back to back right before the timed loop
+# (after the deep copies), so each run gets enough of them for >= ~12 ms of load: WARMUP_MS
+# of calls as timed on the cold GPU, which run faster once the clock is up.
+WARMUP_MS = 18.0
+
+
+def _warmup_calls(fn, args, calls=8, bursts=3):
+    """run_perftest num_warmup: max(2, the fewest calls taking longer than WARMUP_MS).
+
+    The time per call is the fastest of ``bursts`` runs of ``calls`` back-to-back calls timed
+    with CUDA events, as the warm-up runs them. Each run starts behind a leading call, which
+    keeps the launch latency after the synchronization out of it (otherwise up to a third of
+    a small-M call); the first leading call also compiles or loads the kernels.
+    """
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    ms = []
+    for _ in range(bursts):
+        fn(*args)
+        start.record()
+        for _ in range(calls):
+            fn(*args)
+        end.record()
+        end.synchronize()
+        ms.append(start.elapsed_time(end) / calls)
+    return max(2, int(WARMUP_MS / min(ms)) + 1)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1002,7 +1036,7 @@ def bench_gemm_a8w4_ptpc(shape, m):
     }
     ret = {"gfx": get_gfx_runtime(), "N": n, "K": k}
     for name, (fn, args, reference, nbytes) in candidates.items():
-        out, us = run_perftest(fn, *args)
+        out, us = run_perftest(fn, *args, num_warmup=_warmup_calls(fn, args))
         err = check_output(out, reference(), msg=f"{case} {name}")
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
