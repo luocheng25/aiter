@@ -1,8 +1,8 @@
 # gemm_a8w4_ptpc：kernel 设计（任务划分与流水线）
 
 <!-- 入口文档第 2 节只放骨架；这里给每个核心 kernel 的完整任务划分与逐拍流水线，写给要读 / 改 kernel 的人。
-     只写当前实现，不写过程；与代码对不上就改这里。两个 GEMM 的 region 表、命名与流水线不变量写在 gemm.py、
-     gemm_large.py 的模块 docstring，这里链接过去，只补 Gluon 风格写法、任务划分与资源。 -->
+     只写当前实现，不写过程；与代码对不上就改这里。三个 GEMM 模块的 region 表 / 阶段表、命名与流水线不变量写在
+     gemm.py、gemm_large.py、small_m.py 的模块 docstring，这里链接过去，只补 Gluon 风格写法、任务划分与资源。 -->
 
 ## 先读：Gluon 风格的分阶段写法
 下面每个 kernel 先用 Gluon 风格写一遍：Triton 风格只有块级张量，写不出操作数放在哪（直读 VGPR 还是经 LDS）、
@@ -19,21 +19,25 @@
 # cdna3.buffer_store(v, t[下标])   VGPR → global；越界的写被硬件丢弃
 # L = gl.allocate_shared_memory(fp8, [2, 64, 128], 布局)：两槽 LDS；L.index(i).store(r) / .load(布局)
 # gl.barrier()                     CTA 内同步：之前的 LDS 写对所有 wave 可见，之前读完的槽此后可覆盖
-# acc = cdna3.mfma(a, b, acc)      fp8 MFMA 16x16x32，f32 累加：acc[通道, token] += a[通道, K]·b[K, token]
+# acc = cdna3.mfma(a, b, acc)      fp8 MFMA 16x16x32，f32 累加：acc[i, j] += a[i, K]·b[K, j]（通常 a = 权重 16 通道、
+#                                  b = 16 个 token；decode 核反过来：a = token，b = 权重）
 # —— 伪操作 ——
 # wave_id() / lane_id()：wave / lane 编号；lane 组 g = lane // 16，行 r = lane % 16；tid() = 64·wave_id() + lane_id()
 # lut(d, j)：delta 字节 d[j] → 8 项 fp8 表 |e2m1| × 2^(5 − delta)（v_perm 广播 + 两次减法）
 # decode(wr, lut)：一个 fp4 dword（8 个码）→ 8 个 fp8（两次 v_perm 查表 + 符号位）
 # wave_max(v)：同一行的 lanes 之间求 max（shuffle_xor）；to_fp8(v)：RNE 转 fp8（v_cvt_pk_fp8_f32）
+# shuffle_xor(v, m)：取 lane ^ m 的 v（wave 内跨 lane 交换）
 # max_u16(v)：bf16 位模式按 16 位无符号两两取 max（v_pk_max_u16）；bits(v) / as_f32(u)：按位重解释
 # setprio(p)：本 wave 的发射优先级（s_setprio）；计算相设 1，MFMA 先于同 SIMD 另一个 wave 的访存发射
 # —— 语义 ——
 # row_scale(amax) = amax / 240（IEEE 除法），为 0（全零行）时取 1；amax 为 NaN 时 scale 为 NaN
 # quant(v, s) = to_fp8(v / s)，v / s 为 IEEE 商（倒数乘加两次 FMA 修正；s < 2^-64 时逐元素除）；
 #   |v / s| 至多略超 240（< 248），RNE 舍到 ±240，所以不必 clamp；NaN 仍是 NaN（0x80）
-# —— 调用顺序（按 M 分两档，都是两次 launch）——
-# flydsl_gemm_a8w4_ptpc(x, w)：quant_x(x) → xq, xs；然后
-#   M > 2048 且 N % 256 == 0、K ≥ 512：gemm_large(xq, xs, wq, wd, ws) → y；否则 gemm(xq, xs, wq, wd, ws) → y
+# —— 调用顺序（按 M 分三档）——
+# flydsl_gemm_a8w4_ptpc(x, w)：
+#   M ≤ 32 且 K % 512 == 0（tile 核还要 LDS 放得下）：一次 launch，M ≤ 8 decode(x, wq, wd, ws) → y，否则 tile(…) → y
+#   其余：quant_x(x) → xq, xs；然后 M > 2048 且 N % 256 == 0、K ≥ 512：gemm_large(xq, xs, wq, wd, ws) → y；
+#     否则 gemm(xq, xs, wq, wd, ws) → y
 ```
 
 ## gemm_a8w4_ptpc_quant_k{K}（[代码](quant.py)）
@@ -230,3 +234,136 @@ tile 交界：M(T−2) 起换读下一 tile 的 X(0)、W0(0)、D(0)，并读本 
 **命名**与**流水线不变量**：见 [gemm_large.py 模块 docstring](gemm_large.py#L54-L76)（Naming、Pipeline rules 1–7）。
 
 **资源**：LDS 32 KB（2 × 128 × 128 B）；256 VGPR（无 AGPR）、58 SGPR、无 spill；`waves_per_eu = 2`，每 CU 1 个 CTA。
+
+## gemm_a8w4_ptpc_decode_rb{rb}_ks{ks}_m{mcap}_g{G}（[代码](small_m.py#L251-L539)）
+M ≤ 8 时的整个调用：一次 launch 里把 x 按 token 量化进 LDS 并算完 y；块对映射让 ≤ 8 个 token 也不空转 MFMA 的半边。
+
+**Gluon 风格**
+```python
+# grid = (G,)，G、rb、ks 按 (M, N, K) 查表（small_m_config，目标形状 G = 64–128）；线程 = 64·rb·ks（8 或 16 wave）
+# CTA b 管 16 行块 [b·NB/G, (b+1)·NB/G)（NB = N/16，至多 rb 个）× 全部 token（M 补到 mcap = 1、2、4、8）× 全部 K
+# 放置：x 行 global → VGPR（lane l 读行内第 l + 64u 个 16 B 单元）→ CTA 内量化成 fp8 写 LDS（mcap 行 × (K+16) B），
+#   xs 进 LDS；本 CTA 行块的 delta global → LDS；权重 global → VGPR 直读，本 wave 的全部块对一次发完（每块对每 lane
+#   一条 16 B）；不预取、不流水（K 由 wave 分段并行）；acc 在 VGPR；K 段部分和经 LDS 相加；收尾直写 y
+def decode(x, wq, wd, ws, y, M):
+    w, l = wave_id(), lane_id()
+    slot, kpart = w % rb, w // rb                    # 行块槽、K 段：块对 [kpart·P/ks, (kpart+1)·P/ks)，P = K/128
+    blk = b·NB/G + slot; valid = slot < 本 CTA 的行块数  # 越过的槽照算相邻块、不写
+    X = gl.allocate_shared_memory(fp8, [mcap, K + 16])  # 另有 D（delta）、XS（xs）、Pt（K 段部分和）
+    # 序言：先发全部 VMEM，按使用顺序（sched_barrier 隔开：vmcnt 按发射顺序计数）
+    xr[j] = cdna3.buffer_load(x[w + rb·ks·j, 单元 l + 64u])   # 本 wave 要量化的行；≥ M 的行读 0
+    dr = cdna3.buffer_load(wd[本 CTA 行块])                   # 全 CTA 线程分摊
+    wr[s] = cdna3.buffer_load(wq[blk, 块对 s, 第 l 个 16 B])  # 块 l//32、lane 组 (l%32)//8 的 2 行 × 16 个码
+    wsr = cdna3.buffer_load(ws[16·blk + 2·(l%8) + h] for h in (0, 1))
+    for j:                                            # CTA 内量化：wave w 管 token 行 w, w + rb·ks, …（< M 的）
+        sj = row_scale(as_f32(wave_max(max_u16(bits(xr[j]) & 0x7FFF)) << 16))
+        XS[行] = sj（lane 0）; X[行, 单元 l + 64u] = quant(xr[j], sj)     # 每单元 8 B
+    D.store(dr)
+    gl.barrier()                                      # 保护：X、XS、D 写完才读
+    xa[s] = X.load(token l%8, 块对 s 中块 l//32、lane 组 (l%32)//8 的 16 B)   # 先读全部块对的 x 与 delta
+    dd[s] = D.load(blk, 半区 (l%32)//16, 通道 2·(l%8) 与 2·(l%8)+1, 块对 s)
+    for s in 本 wave 的块对:                            # 展开；每块对的链只剩 等权重 → 解码 → MFMA
+        for h in (0, 1):                              # lane 的两行 = 通道 2·(l%8)+h
+            lr = lut(dd[s][h], 2·(s%2) + l//32)
+            for c in (0, 1):                          # 16 个码 = 两条 MFMA 的 K
+                acc[h] = cdna3.mfma(xa[s].k(c), decode(wr[s][h][c], lr), acc[h])
+                # a 行 t 与 8+t 都是 token t（K 分属偶 / 奇 lane 组），b 列 j 与 8+j 都是通道 2·(j%8)+h
+    v = acc + shuffle_xor(acc, 40)                    # 列 j 的偶组半段 + 列 8+j 的奇组半段 = 本 K 段的完整和
+    if ks > 1:                                        # 有用 lane：l < 32 且 l%16 < 8，持 token 4·(l//16)+v
+        if kpart > 0 and valid and 有用 lane: Pt[slot, kpart] = v
+        gl.barrier()                                  # 保护：各 K 段部分和写完才读
+        v = v + Pt[slot, 1] + … + Pt[slot, ks−1]      # 按 K 段号顺序：结果与 wave 时序无关
+    if kpart == 0 and valid and 有用 lane:
+        cdna3.buffer_store((v · wsr · XS[token]).to(bf16), y[token, 16·blk + 2·(l%8) + h])  # ≥ M 的 token 越界丢弃
+```
+
+**任务划分**
+| 层级 | 形状 / 数量 | 负责的数据 |
+|---|---|---|
+| grid | G（查表，目标形状 64–128） | CTA b：连续 ≤ rb 个 16 行块 × 全部 token × 全部 K |
+| CTA（64·rb·ks 线程） | rb·ks = 8 或 16 个 wave | 量化全部 M 行进 LDS；本 CTA 的 delta 进 LDS |
+| wave | 1 个 16 行块 × K/ks | 本 K 段的全部块对；量化 token 行 w, w+rb·ks, … |
+| lane | 块对内第 l 个 16 B | 2 个通道 × 16 个码；A 为 token l%8 的同段 x（16 B） |
+| 块对（K 步） | 128 K = 两个 64-K 块 | 每 wave 4 条 MFMA、2 个 LUT |
+
+CTA 数不整除行块数时（如 tp2_qkv：416 个行块分给 80 个 CTA）各 CTA 管 5 或 6 块，多出的槽照算相邻块、不写。
+y 的 buffer 记录数是 M 行：≥ M 的 token（含 MFMA 8 行里多出的）照算照写，写被硬件丢弃。
+
+**流水线**（不流水；阶段表见 [small_m.py 模块 docstring](small_m.py#L30-L40)）
+```text
+序言：VMEM x 行（每 lane K/512 条 16 B × ⌈mcap/波数⌉ 行）→ delta（16 B，全 CTA 分摊）→ 权重（每块对 1 条 16 B）→ ws
+量化：等 x → lane 内 max_u16 + 6 次 shuffle_xor 得 amax → scale → 倒数与两次 FMA（packed f32）→ fp8 → 8 B 写 LDS
+delta 写 LDS → barrier → 全部块对的 x（16 B）与 delta（8 B）读进 VGPR
+块对 s（展开 P/ks 个）：等 wr[s] → 2 个 LUT → 解码 4 个 dword → 4 条 MFMA
+收尾：lane^40 相加 → K 段 1..ks−1 写部分和（每 lane 8 个 f32）→ barrier → K 段 0 按段号相加 → × ws × xs → bf16 → 4 B 写
+```
+
+**命名**与**流水线不变量**：见 [small_m.py 模块 docstring](small_m.py#L42-L53)（Naming、Rules 1–4）。
+
+**资源**：LDS = mcap·(K+16) + rb·⌈K/256⌉·128 + 部分和 rb·(ks−1)·512 B（目标形状 6–34 KB）；68–124 VGPR、无 spill。
+LDS 随 mcap·K 增长，分派没有检查：K 大时（如 M 5–8 且 K ≥ 7168）超过 64 KB、编译失败（见入口文档第 6 节）。
+
+## gemm_a8w4_ptpc_tile_rb{rb}_ks{ks}_t{tq}_kp{kp}_g{G}（[代码](small_m.py#L542-L810)）
+9 ≤ M ≤ 32 时的整个调用：与 decode 一样在 CTA 内量化，换标准映射（权重作 A、16-token 片作 B），K 分窗口让 32 行 fp8 装进 LDS。
+
+**Gluon 风格**
+```python
+# grid = (G,)，G = ⌈NB/rb⌉（rb、ks、kp 查表，目标形状 G = 52–80）；线程 = 64·rb·ks（8 或 16 wave）；每 CU 1 个 CTA
+# CTA b 管 16 行块 [b·NB/G, (b+1)·NB/G)（至多 rb 个）× tq 个 16-token 片（M ≤ 16 时 1 个，否则 2 个）× 全部 K
+# 放置：x 行 global → VGPR（同 decode，全部 K 一次读完），按 K 窗口量化成 fp8 写 LDS（16·tq 行 × 窗口宽 + 16 B，
+#   kp 个窗口轮流用同一块）；xs、delta 进 LDS；权重 global → VGPR 直读，本 wave 在各窗口的全部 K 步一次发完（每步
+#   每 lane 2 × 8 B）；不预取、不流水；acc 在 VGPR；K 段部分和经 LDS（与 X 合计放不下时复用 X 区）；收尾直写 y
+def tile(x, wq, wd, ws, y, M):
+    w, r, g = wave_id(), lane_id() % 16, lane_id() // 16   # r：a 的通道行、b 的 token 列；g：MFMA 的 K 块
+    slot, kpart = w % rb, w // rb; blk = b·NB/G + slot; valid = slot < 本 CTA 的行块数
+    X = gl.allocate_shared_memory(fp8, [16·tq, 最宽窗口 K + 16])   # 另有 D、XS、Pt
+    # 序言：先发全部 VMEM（按使用顺序，sched_barrier 隔开）
+    xr[j] = cdna3.buffer_load(x[w + rb·ks·j, 单元 l + 64u])     # 16·tq 行轮流分给各 wave；≥ M 的行读 0
+    dr = cdna3.buffer_load(wd[本 CTA 行块])
+    wr[p][s][h] = cdna3.buffer_load(wq[blk, 通道 r, 块 2s + g//2, lane 组 2·(g%2) + h, 8 B])  # 窗口 p 中本 K 段的步
+    wsr = cdna3.buffer_load(ws[16·blk + 4g … 4g+3])
+    sc[j] = row_scale(…)（整行，各窗口共用）; XS[行] = sc[j]（行 < M，lane 0）; D.store(dr)
+    for p in range(kp):                               # K 窗口：整 512-K 单元，大的在前
+        if p > 0: gl.barrier()                        # 保护：上一窗口的 X 读完才覆盖（WAR）
+        X[行, 窗口内单元] = quant(xr[j][窗口 p 的单元], sc[j]) for 行 < M   # 每单元 8 B
+        gl.barrier()                                  # 保护：本窗口的 X（首个窗口还有 XS、D）写完才读
+        for s in 本 K 段在窗口 p 的 spw 个连续步:         # 展开
+            lr = lut(D[blk, 半区 g%2, 通道 r, 步 s], 2·(s%2) + g//2)   # 每步每 lane 一个 LUT（32-K 组 4s+g）
+            xb[t] = X.load(token 16t + r, K 128s + 32g 起 32 B) for t in range(tq)
+            for h in (0, 1): for c in (0, 1):
+                acc[t] = cdna3.mfma(decode(wr[p][s][h][c], lr), xb[t].k(h, c), acc[t])   # a = 16 通道，b = 16 token
+    if ks > 1:
+        if Pt 复用 X: gl.barrier()                     # 保护：X 全部读完才写部分和
+        if kpart > 0 and valid: Pt[slot, kpart, t] = acc[t]   # 每 lane 每片 16 B
+        gl.barrier()                                  # 保护：部分和写完才读
+        acc[t] = acc[t] + Pt[slot, 1, t] + … + Pt[slot, ks−1, t]   # 按 K 段号顺序
+    if kpart == 0 and valid and 16t + r < M:
+        cdna3.buffer_store((acc[t] · wsr · XS[16t + r]).to(bf16), y[16t + r, 16·blk + 4g … 4g+3])   # 8 B
+```
+
+**任务划分**
+| 层级 | 形状 / 数量 | 负责的数据 |
+|---|---|---|
+| grid | G = ⌈NB/rb⌉（目标形状 52–80） | CTA b：连续 ≤ rb 个 16 行块 × 全部 token × 全部 K |
+| CTA（64·rb·ks 线程） | rb·ks = 8 或 16 个 wave | 量化 < M 的 token 行进 LDS；delta 进 LDS |
+| wave | 1 个 16 行块 × 每个窗口的 1/ks | tq 块 y[16 token, 16 通道]；量化 token 行 w, w+rb·ks, … |
+| lane | 通道 r = l%16、K 块 g = l//16 | 每步每半 8 B 码；每片 32 B x；每片出 4 通道 × 1 token |
+| K 步 | 128 K | 每片 4 条 MFMA；1 个 LUT |
+| K 窗口 | kp 个，整 512-K 单元 | 本窗口 16·tq 行 fp8 在 LDS（tq = 2 且 K = 2560、3072 时 kp = 2） |
+
+lane 组 g 每步只读第 4s+g 个 32-K 组，所以每 lane 每步一个 delta、一个 LUT；部分和与 X 合计超过 64 KB 时
+（目标形状里 N ≥ 3584 的四个在 M 17–32 时）复用 X 区，前面多一次 barrier。
+
+**流水线**（不流水；阶段表见 [small_m.py 模块 docstring](small_m.py#L30-L40)）
+```text
+序言：VMEM x 行（每 lane K/512 条 16 B × ⌈16tq/波数⌉ 行）→ delta → 各窗口权重（每步每半 1 条 8 B）→ ws
+求每行 scale（整行，各窗口共用）→ lane 0 写 xs；delta 写 LDS
+窗口 p：[p > 0：barrier] → 量化窗口 p 的单元 → 8 B 写 LDS → barrier
+  步 s（展开 spw 个）：LDS 读 delta 4 B、每片 x 32 B → 建 LUT → 每半解码 2 个 dword → 每片 2 条 MFMA
+收尾：[部分和复用 X：barrier] → K 段 1..ks−1 写部分和（每 lane 每片 16 B）→ barrier → 按段号相加 → × ws × xs → bf16 → 8 B 写
+```
+
+**命名**与**流水线不变量**：见 [small_m.py 模块 docstring](small_m.py#L42-L53)（Naming、Rules 1–4）。
+
+**资源**：LDS = 16·tq·(最宽窗口 K + 16) + rb·⌈K/256⌉·128 + 部分和 rb·(ks−1)·tq·1 KB（可复用 X）+ xs；目标形状 57–64 KB，
+每 CU 1 个 CTA；125–169 VGPR、无 spill。x 行与全部权重常驻 VGPR，寄存器随 K 增长：K = 8192 时 256 VGPR 且有 spill。

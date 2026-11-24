@@ -34,6 +34,11 @@ from .kernels.gemm_a8w4_ptpc.gemm_large import (
     large_m_supported,
 )
 from .kernels.gemm_a8w4_ptpc.quant import compile_quant_x, quant_kernel_name
+from .kernels.gemm_a8w4_ptpc.small_m import (
+    compile_small_m,
+    small_m_config,
+    small_m_kernel_name_of,
+)
 from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 __all__ = [
@@ -95,6 +100,9 @@ def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
+    small = small_m_config(m, n, k)
+    if small is not None:
+        return (small_m_kernel_name_of(small),)
     gemm_name = LARGE_GEMM_KERNEL_NAME if _use_large_m(m, n, k) else GEMM_KERNEL_NAME
     return (quant_kernel_name(k), gemm_name)
 
@@ -231,6 +239,20 @@ def flydsl_gemm_a8w4_ptpc(
     if m == 0:
         return out
 
+    small = small_m_config(m, n, k)
+    if small is not None:
+        # Small M: one kernel that quantizes x per token itself.
+        _run_compiled(
+            compile_small_m(small, n, k, x.device.index),
+            ptr_arg(x),
+            ptr_arg(weight.q),
+            ptr_arg(weight.d),
+            ptr_arg(weight.s),
+            ptr_arg(out),
+            m,
+            current_stream_arg(x.device),
+        )
+        return out
     xq, x_scale = _quant_per_token(x)
     if _use_large_m(m, n, k):
         gemm = compile_gemm_a8w4_ptpc_large(
