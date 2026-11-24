@@ -1,7 +1,7 @@
 # gemm_a8w4_ptpc（gfx942 dense GEMM：按 token fp8 激活 × mxfp4 权重）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-24 12:59）· 目标：aiter FlyDSL dense A8W4 GEMM on MI308X (gfx942): Y[M,N] = X[M,K] W^T, bf16 out; X bf16 quantized per token to FP8 E4M3FNUZ, W MXFP4 (E2M1 + one E8M0 per 32 K) converted once at load; Qwen3.8-Flash-Next dense linear layers at TP2/TP4 (6 (N,K)) x M = 1..32768: correct everywhere, small M near the HBM bound (clearly faster than aiter FP8 per-token GEMM), large M near the FP8 MFMA bound（1.13× 相对冻结基线）· 已完成 4 个里程碑（含本提交 M6） · 最佳累计 — · 下一步：M5 小 M 第二轮（M ≤ 32）：x 只量化一次的软件流水、权重分批流式、解码与访存重叠，冲剩余 21 例 ≤0.7× aiter；之后：M3 中间档（16 < M ≤ 2048，下沿按实测定）：按形状选 tile 让 WG 数铺满 80 CU、单 kernel split-K、XCD 映射按 4（承诺）；M4 大 M 尾轮 split-K：tile 占用 91–94% 的尾轮拆 K，救 tp4_qkv M4096/8192、tp4_qkvz M4096、tp2_qkv M4096 到 ≥453 TF（承诺）；M7 量化核提速（小/中 M 延迟、大 M 吞吐）+ 中间档 GEMM 对齐 CK：冲超线约 7 例到 ≤1.05× aiter（承诺）
+> 由 mf 生成（11-24 15:22）· 目标：aiter FlyDSL dense A8W4 GEMM on MI308X (gfx942): Y[M,N] = X[M,K] W^T, bf16 out; X bf16 quantized per token to FP8 E4M3FNUZ, W MXFP4 (E2M1 + one E8M0 per 32 K) converted once at load; Qwen3.8-Flash-Next dense linear layers at TP2/TP4 (6 (N,K)) x M = 1..32768: correct everywhere, small M near the HBM bound (clearly faster than aiter FP8 per-token GEMM), large M near the FP8 MFMA bound（1.13× 相对冻结基线）· 已完成 5 个里程碑（含本提交 M8） · 最佳累计 — · 下一步：M3 中间档（16 < M ≤ 2048，下沿按实测定）：按形状选 tile 让 WG 数铺满 80 CU、单 kernel split-K、XCD 映射按 4；M7 量化核提速（小/中 M 延迟、大 M 吞吐）+ 中间档 GEMM 对齐 CK：冲超线约 7 例到 ≤1.05× aiter；M4 大 M 的 L2 局部性与 W 预取提前量：按 XCD 安排 tile 让 X / W 复用留在 L2，冲 M≥8192 的 tp4_qkvz / tp2_qkv / tp4_qkv 到 ≥453 TF
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -213,10 +213,12 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 | 通用 GEMM：6 形状 × M = 64…2048（2 的幂） | `<形状>_m<M>` ×36 | 校验通过；1.22× 对照，147 TFLOPS |
 | 大 M 核：6 形状 × M = 4096…32768（2 的幂） | `<形状>_m<M>` ×24 | 校验通过；0.87× 对照，433 TFLOPS |
 
-**其他覆盖测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"`，45 例，冷编译约 30 秒，峰值约 9 GB 显存）
+**其他覆盖测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"`，46 例，冷编译约 30 秒，峰值约 9 GB 显存）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
-| 小 M 交界 M = 8/9、16/17、32/33；K%512≠0、LDS 不够时回落 | bench 只测交界一侧，不核对 kernel | `test_small_m_dispatch` ×8 | 通过 |
+| 小 M 交界 M = 8/9、16/17（tp4_o），tile 核上限 32/33（N = 4160） | bench 只测一侧，不核对 kernel | `test_small_m_dispatch` ×6 | 通过 |
+| 小 M 回落：K%512≠0、LDS 放不下时走量化 + 通用 GEMM | bench 形状都不触发 | `test_small_m_dispatch` ×2 | 通过 |
+| 目标形状 M 17–32（tp4_o M = 32）：tile 核或量化 + 通用 GEMM 均可，须与预测一致 | bench 不核对 kernel | `test_small_m_dispatch` ×1 | 通过 |
 | 小 M：M 不满 token 槽 / 片、out= 不越界、行块不均、6 个 K 窗口 | bench 的 M 恰为 2 的幂，行块整除、≤ 2 窗口 | `test_small_m_partial_tiles` ×6 | 通过 |
 | 小 M 核内量化逐位（one-hot 权重；全零、中点、极小 scale、-0、商超 240） | 少数 fp8 码翻转在 GEMM 容差内 | `test_small_m_quant_bitexact` ×4 | 通过 |
 | 小 M：NaN / ±Inf 行只让本行输出为 NaN | 前两类的输入都是有限值 | `test_small_m_nonfinite_rows` ×2 | 通过 |
@@ -243,6 +245,7 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - 大 M 核按实际 CU 数开 grid、小 M 配置表按 80 CU 定：只在 80 CU 的 MI308X 上跑过；用例按实际 CU 数构造形状。
 - decode 核 LDS 超 64 KB 的形状（如 M 5–8 且 K ≥ 7168）launch 失败：已知问题（第 6 节），没有用例。
 - bench 的预热是否够长：只影响离群率、不影响输出，要多次同卡 bench 统计才看得出，没有用例。
+- 目标形状 M 17–32 走 tile 核还是通用 GEMM：中间档分派正按形状调整，暂只核对与预测一致，中间档里程碑复核时钉回。
 
 ## 6. 风险与待定
 - 小 M 只有 14/36 例 ≤ 0.7×（M 16–32 为 0.76–1.38×）：解码 VALU、每 CTA 重复量化、x 晚到被 barrier 串行 → 小 M 第二轮里程碑换结构（下界约 0.6×）。
@@ -261,10 +264,11 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - M1 ✅ 已推送 · 性能 · 小 M 路径（M ≤ 32）：单次 launch 的 decode 式 ker… · 1.489× 对 M2（预期 1.5×） · [提交](https://github.com/luocheng25/aiter/commit/4a3a218da94a44734da171fa8fc4f744e48834fe)
 - M2 ✅ 已推送 · 性能 · 大 M 路径（M > 2048）：持久化 8-wave ping-pong G… · 1.105× 对基线（预期 1.07×） · [提交](https://github.com/luocheng25/aiter/commit/7b705ef77971e5830b72bf3fa755661a95b831c2)
 - M3 ⏳ 承诺 · 性能 · 中间档（16 < M ≤ 2048，下沿按实测定）：按形状选 tile 让 W… · 预期 1.1×
-- M4 ⏳ 承诺 · 性能 · 大 M 尾轮 split-K：tile 占用 91–94% 的尾轮拆 K，救 … · 预期 1.01×
-- M5 ⏳ 承诺 · 性能 · 小 M 第二轮（M ≤ 32）：x 只量化一次的软件流水、权重分批流式、解码与… · 预期 1.08×
-- M6 ✅ 本提交 · 维护 · bench 维护：每次 run_perftest 前按耗时预热约 12 ms，…
+- M4 ⏳ 承诺 · 性能 · 大 M 的 L2 局部性与 W 预取提前量：按 XCD 安排 tile 让 X… · 预期 1.01×
+- M5 ✖ 放弃 · 性能 · 小 M 第二轮（M ≤ 32）：x 只量化一次的软件流水、权重分批流式、解码与… · 预期 1.08×
+- M6 ✅ 已推送 · 维护 · bench 维护：每次 run_perftest 前按耗时预热约 12 ms，… · [提交](https://github.com/luocheng25/aiter/commit/2c4bce7a925254bb65a12bddcf66effec84a6df6)
 - M7 ⏳ 承诺 · 性能 · 量化核提速（小/中 M 延迟、大 M 吞吐）+ 中间档 GEMM 对齐 CK：… · 预期 1.04×
+- M8 ✅ 本提交 · 维护 · 用例去耦：分派用例改为经公开 kernel_names 核对实际 launch…
 
-下一步（本提交的承诺）：M5 小 M 第二轮（M ≤ 32）：x 只量化一次的软件流水、权重分批流式、解码与访存重叠，冲剩余 21 例 ≤0.7× aiter；之后：M3 中间档（16 < M ≤ 2048，下沿按实测定）：按形状选 tile 让 WG 数铺满 80 CU、单 kernel split-K、XCD 映射按 4（承诺）；M4 大 M 尾轮 split-K：tile 占用 91–94% 的尾轮拆 K，救 tp4_qkv M4096/8192、tp4_qkvz M4096、tp2_qkv M4096 到 ≥453 TF（承诺）；M7 量化核提速（小/中 M 延迟、大 M 吞吐）+ 中间档 GEMM 对齐 CK：冲超线约 7 例到 ≤1.05× aiter（承诺）
+下一步（本提交的承诺）：M3 中间档（16 < M ≤ 2048，下沿按实测定）：按形状选 tile 让 WG 数铺满 80 CU、单 kernel split-K、XCD 映射按 4；M7 量化核提速（小/中 M 延迟、大 M 吞吐）+ 中间档 GEMM 对齐 CK：冲超线约 7 例到 ≤1.05× aiter；M4 大 M 的 L2 局部性与 W 预取提前量：按 XCD 安排 tile 让 X / W 复用留在 L2，冲 M≥8192 的 tp4_qkvz / tp2_qkv / tp4_qkv 到 ≥453 TF
 <!-- /mf:roadmap -->
