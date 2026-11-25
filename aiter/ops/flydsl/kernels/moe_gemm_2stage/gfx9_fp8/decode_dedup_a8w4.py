@@ -22,8 +22,10 @@ M * TOPK)``, workgroup ``(j, route)``) and its block-pair weight loads; a workgr
 and exits unless it leads. A leader stages the group's FP8 token rows in LDS, reads the expert's
 16-channel block once and runs the MFMAs with route ``m`` of the group in A rows ``m`` and ``8 + m``
 (see "Block pairs" in ``decode_a8w4``), so a fused shared expert chosen by every token is read
-``ceil(M / GROUP)`` times instead of ``M`` times. Outputs are ``SiLU(gate) * up`` as float32 per route,
-bit-identical to the per-route kernel (with the same SwiGLU limit).
+``ceil(M / GROUP)`` times instead of ``M`` times. Outputs are ``SiLU(gate) * up`` as float32 per route. With
+4 waves (two halves of K, as in the per-route kernel) they are bit-identical to the per-route kernel (with the
+same SwiGLU limit); with 8 waves the four parts of K round differently and some outputs differ by a few ulp
+(measured on the MiMo four-kernel path, M <= 16: 0.3-2.3% of the elements, at most 3.6e-7 apart).
 
 ``compile_a8w4_down_decode_dd`` is the Down counterpart on the same plan: grid ``(N / (64 * CB), M * TOPK)``,
 four waves of ``CB`` 16-channel blocks each read the expert's blocks once (block-pair 16-byte loads) for the
@@ -445,8 +447,8 @@ def _gateup_group(
     up = _tree_sum(sums[1::2]) * ws_up * x_scale
     gate, up = a8w4.swiglu_clamp(gate, up, c["SWIGLU_LIMIT"])
     # Bare v_exp_f32 / v_rcp_f32 (raw rocdl), as decode_a8w4's Gate/Up epilogue: fx.math.exp2 and the f32 division
-    # lower to the denormal-scaled exp and the correctly rounded divide, several VALU ops more per element; the
-    # outputs stay bit-identical to the per-route kernel.
+    # lower to the denormal-scaled exp and the correctly rounded divide, several VALU ops more per element; with
+    # 4 waves the outputs stay bit-identical to the per-route kernel (8 waves: see the module docstring).
     tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
     value = fx.Float32((gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up)
     out_rsrc = _rsrc(_address(p_out), M * (TOPK * I * 4))
@@ -462,7 +464,8 @@ def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=
 
     Arguments and output of ``decode_a8w4.compile_a8w4_gateup_decode(PREQUANT=True)`` plus ``plan`` from
     ``compile_a8w4_row_quant_plan`` (same ``GROUP``): x FP8 [M, K] with x_scale f32 [M]; topk_ids int32
-    [M, TOPK]; out f32 [M, TOPK, I]. ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K.
+    [M, TOPK]; out f32 [M, TOPK, I]. ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K
+    (8: a few ulp off the per-route kernel in some outputs, see the module docstring).
     ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
     """
     I = N // 2

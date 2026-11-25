@@ -23,12 +23,21 @@ per-row FP8 quantization of the input that sets ``loc_ids`` to -1), the A8W4 Gat
 f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the intermediate, the A8W4 Down
 kernel (routing weight applied; it also records each route's sorted row in ``loc_ids``) and ``sorted_sum``. The
 calls issue no host synchronization.
+
+``aiter.fused_moe`` is the other entry: ``prepare_moe_a8w4_ptpc_weight`` tags the ``w1`` / ``w2`` it returns with the
+attribute ``WEIGHT_TAG`` (as ``shuffle_weight`` sets ``is_shuffled``), and ``fused_moe(hidden_states, weight.w1,
+weight.w2, topk_weight, topk_ids, activation=ActivationType.Silu, quant_type=QuantType.per_1x32,
+quant_type_a=QuantType.per_Token, swiglu_limit=...)`` calls ``flydsl_moe_a8w4_ptpc`` on them on gfx942 (the kernels and
+results of a direct call), before its custom op, its tuned-config lookup and its sorting (``_fused_moe_route`` lists
+how every other ``fused_moe`` parameter is treated). Untagged MXFP4 weights with that quantization raise there,
+pointing here.
 """
 
 import functools
+import inspect
 import math
 import numbers
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -207,6 +216,72 @@ class MoeA8W4PtpcWeight:
     inter_padded: int
 
 
+# Attribute of the ``w1`` / ``w2`` tensors that ``prepare_moe_a8w4_ptpc_weight`` returns (as ``shuffle_weight`` sets
+# ``is_shuffled``); ``aiter.fused_moe`` sends tensors carrying it to ``_fused_moe_route``.
+WEIGHT_TAG = "aiter_moe_a8w4_ptpc"
+
+
+@dataclass(frozen=True, eq=False)
+class _WeightTag:
+    """The ``WEIGHT_TAG`` value: ``role`` "w1" or "w2", and ``rest`` = ``(w1_delta, w1_scale, w2_delta, w2_scale,
+    experts, hidden, inter, inter_padded)`` of the weight, one tuple shared by the two tags of a
+    ``prepare_moe_a8w4_ptpc_weight`` call. It holds no reference to the tagged tensors (no reference cycle keeps
+    them alive), so it can also be copied onto another tensor object of the same storage, e.g. an
+    ``nn.Parameter`` wrapper (views, copies and wrappers do not carry it, as ``is_shuffled``).
+    """
+
+    role: str
+    rest: tuple = field(repr=False)
+
+
+def _tag_weight(weight):
+    rest = (
+        weight.w1_delta,
+        weight.w1_scale,
+        weight.w2_delta,
+        weight.w2_scale,
+        weight.experts,
+        weight.hidden,
+        weight.inter,
+        weight.inter_padded,
+    )
+    setattr(weight.w1, WEIGHT_TAG, _WeightTag("w1", rest))
+    setattr(weight.w2, WEIGHT_TAG, _WeightTag("w2", rest))
+    return weight
+
+
+def _tagged_weight(w1, w2):
+    """The ``MoeA8W4PtpcWeight`` of ``w1`` / ``w2`` from one ``prepare_moe_a8w4_ptpc_weight`` call (their tags)."""
+    t1, t2 = getattr(w1, WEIGHT_TAG, None), getattr(w2, WEIGHT_TAG, None)
+    if not (
+        isinstance(t1, _WeightTag)
+        and isinstance(t2, _WeightTag)
+        and (t1.role, t2.role) == ("w1", "w2")
+        and t1.rest is t2.rest
+    ):
+        raise ValueError(
+            "w1 and w2 must be the w1 and w2 of one prepare_moe_a8w4_ptpc_weight result (tensor copies and views do "
+            "not carry its tag)"
+        )
+    w1_delta, w1_scale, w2_delta, w2_scale, E, H, I, ip = t1.rest
+    if (
+        w1.dtype != torch.uint8
+        or w2.dtype != torch.uint8
+        or tuple(w1.shape) != (E, ip * H)
+        or tuple(w2.shape) != (E, H * ip // 2)
+        or not (w1.is_contiguous() and w2.is_contiguous())
+        or {w1.device, w2.device} != {w1_delta.device}
+    ):
+        raise ValueError(
+            f"w1 / w2 do not match their A8W4 tag: expected contiguous uint8 [{E}, {ip * H}] / [{E}, {H * ip // 2}] "
+            f"on {w1_delta.device}, got {w1.dtype} {tuple(w1.shape)} / {w2.dtype} {tuple(w2.shape)} on "
+            f"{w1.device} / {w2.device}"
+        )
+    return MoeA8W4PtpcWeight(
+        w1, w1_delta, w1_scale, w2, w2_delta, w2_scale, E, H, I, ip
+    )
+
+
 def _require_supported_gfx():
     arch = get_gfx_runtime()
     if arch not in SUPPORTED_GFX:
@@ -294,6 +369,11 @@ def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeigh
     more than 11 codes (2**11) below that maximum are treated as zero (``common_a8w4.MAX_DELTA``); an E8M0
     code 255 (NaN) is rejected. One result serves every token count of ``flydsl_moe_a8w4_ptpc``.
     Synchronizes with the host once per scale tensor. Raises ``RuntimeError`` off gfx942.
+
+    The returned ``w1`` / ``w2`` carry the attribute ``WEIGHT_TAG`` (values and shapes unchanged), so that
+    ``aiter.fused_moe(hidden_states, weight.w1, weight.w2, topk_weight, topk_ids,
+    activation=ActivationType.Silu, quant_type=QuantType.per_1x32, quant_type_a=QuantType.per_Token)`` runs this
+    op on them (``_fused_moe_route``); the scales travel with the tags (pass no ``w1_scale`` / ``w2_scale``).
     """
     _require_supported_gfx()
     if w1.dim() != 3:
@@ -336,7 +416,7 @@ def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeigh
         c2 = F.pad(c2, (0, pad // 32))
     w1q, w1d, w1s = _convert(q1.contiguous(), c1.contiguous())
     w2q, w2d, w2s = _convert(q2.contiguous(), c2.contiguous())
-    return MoeA8W4PtpcWeight(w1q, w1d, w1s, w2q, w2d, w2s, E, H, I, ip)
+    return _tag_weight(MoeA8W4PtpcWeight(w1q, w1d, w1s, w2q, w2d, w2s, E, H, I, ip))
 
 
 def _trace_constants():
@@ -1247,6 +1327,10 @@ def flydsl_moe_a8w4_ptpc(
     and activation scales). 0 (default) turns it off and runs exactly the kernels without it; otherwise
     the limit is a compile-time constant (kernels compiled per value, names ending in ``_swiglu``). Must
     be finite and >= 0 (``ValueError``).
+
+    ``aiter.fused_moe`` calls this function for the tagged ``w1`` / ``w2`` of a prepared weight (``_fused_moe_route``),
+    with its ``swiglu_limit`` normalized as on aiter's other SiLU paths and without tile options: it takes only the
+    automatic ``block_size_M``, so pinning the prefill tile (``block_m``) needs this function.
     """
     from aiter.fused_moe import moe_sorting
 
@@ -1352,3 +1436,152 @@ def flydsl_moe_a8w4_ptpc(
     sorted_sum(topk, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
     return output
+
+
+# fused_moe parameters that _fused_moe_route reads; every other one must keep its fused_moe default, except these
+# hints that do not change the result: moe_sorting_dispatch_policy only schedules aiter's own moe_sorting (this op
+# sorts with its own prep kernel or moe_sorting's default), splitk only moves the order of the K sums (fused_moe_
+# lets a provider ignore it), herd_routed_scaling_factor is unused while herd_topk is 0 (which is required).
+_ROUTE_ARGS = frozenset(
+    (
+        "hidden_states",
+        "w1",
+        "w2",
+        "topk_weight",
+        "topk_ids",
+        "activation",
+        "quant_type",
+        "quant_type_a",
+        "swiglu_limit",
+        "block_size_M",
+        "dtype",
+        "output",
+        "quant_dtype_a",
+        "quant_dtype_a2",
+    )
+)
+_ROUTE_IGNORED = frozenset(
+    ("moe_sorting_dispatch_policy", "splitk", "herd_routed_scaling_factor")
+)
+
+
+@functools.cache
+def _fused_moe_defaults():
+    from aiter.fused_moe import fused_moe
+
+    return {
+        name: p.default for name, p in inspect.signature(fused_moe).parameters.items()
+    }
+
+
+def _is_default(value, default):
+    return value is default or (
+        default is not None and not isinstance(value, torch.Tensor) and value == default
+    )
+
+
+def _fused_moe_route(args):
+    """``aiter.fused_moe`` on the tagged ``w1`` / ``w2`` of ``prepare_moe_a8w4_ptpc_weight`` (``args``: every
+    ``fused_moe`` argument by name): one ``flydsl_moe_a8w4_ptpc`` call on the weight rebuilt from the tags, so the
+    kernels and results of a direct call. Raises ``RuntimeError`` off gfx942. ``fused_moe`` calls it before its custom
+    op (which drops tensor attributes), its tuned-config lookup and ``moe_sorting``. The parameters:
+
+    - ``hidden_states``, ``topk_weight``, ``topk_ids``: passed on (BF16 [M, H]; a non-contiguous ``hidden_states`` is
+      copied contiguous first, as ``fused_moe`` does for layouts its kernels cannot read);
+    - ``w1``, ``w2``: the ``w1`` and ``w2`` of one ``prepare_moe_a8w4_ptpc_weight`` result (``ValueError``);
+    - ``activation``, ``quant_type``, ``quant_type_a``: ``ActivationType.Silu``, ``QuantType.per_1x32`` (MXFP4
+      weights) and ``QuantType.per_Token`` (FP8 activations, one scale per token) only (``ValueError``);
+    - ``swiglu_limit``: ``normalize_swiglu_limit`` as on aiter's other SiLU paths (None, 0 and inf turn it off; NaN
+      and negative values raise ``ValueError``), then passed on;
+    - ``block_size_M``: only None, 0 or -1 (this op chooses its path and tiles); another value raises
+      ``NotImplementedError`` (``flydsl_moe_a8w4_ptpc(..., block_m=...)`` pins the prefill tile);
+    - ``output``: ``fused_moe``'s checks (a contiguous [M, H] tensor of the output dtype on the input's device, not
+      overlapping ``hidden_states``; ``RuntimeError``), then passed on and returned;
+    - ``dtype``: None or ``torch.bfloat16``; ``quant_dtype_a``, ``quant_dtype_a2``: None or ``dtypes.fp8`` (the
+      FP8 E4M3FNUZ of this op); other values raise ``NotImplementedError``;
+    - ignored, hints that do not change the result: ``moe_sorting_dispatch_policy``, ``splitk``,
+      ``herd_routed_scaling_factor`` (see ``_ROUTE_IGNORED``);
+    - only at their ``fused_moe`` defaults (``NotImplementedError`` naming them): ``expert_mask``,
+      ``doweight_stage1``, ``w1_scale`` / ``w2_scale`` (the scales travel with the tagged weights), ``a1_scale`` /
+      ``a2_scale`` (this op quantizes its activations), ``num_local_tokens``, ``hidden_pad`` / ``intermediate_pad``
+      (the weight carries its sizes), ``bias1`` / ``bias2``, ``beta`` / ``linear_beta``, ``gate_mode``, the shared
+      expert (``shared_w1``, ``shared_w2``, ``shared_w1_scale``, ``shared_w2_scale``, ``shared_expert_id``; a fused
+      shared expert is an ordinary expert id here), ``stage2_scatter``, ``clamp_shared``, ``herd_topk``,
+      ``deterministic`` (this op picks its kernels by token count and some paths add with atomics),
+      ``w1_global_scale`` / ``w2_global_scale``, and any parameter ``fused_moe`` gains later.
+    """
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import (
+        _validate_output_buffer_metadata,
+        _validate_output_buffer_no_overlap,
+    )
+    from aiter.ops.moe_limits import normalize_swiglu_limit
+
+    _require_supported_gfx()
+    weight = _tagged_weight(args["w1"], args["w2"])
+    activation, quant_type, quant_type_a = (
+        args["activation"],
+        args["quant_type"],
+        args["quant_type_a"],
+    )
+    if (
+        ActivationType(activation) != ActivationType.Silu
+        or QuantType(quant_type) != QuantType.per_1x32
+        or quant_type_a is None
+        or QuantType(quant_type_a) != QuantType.per_Token
+    ):
+        raise ValueError(
+            "the w1 / w2 of prepare_moe_a8w4_ptpc_weight run with activation=ActivationType.Silu, "
+            "quant_type=QuantType.per_1x32 and quant_type_a=QuantType.per_Token, got activation="
+            f"{activation}, quant_type={quant_type}, quant_type_a={quant_type_a}"
+        )
+    defaults = _fused_moe_defaults()
+    unsupported = [
+        name
+        for name, value in args.items()
+        if name not in _ROUTE_ARGS
+        and name not in _ROUTE_IGNORED
+        and not _is_default(value, defaults[name])
+    ]
+    if args["dtype"] not in (None, torch.bfloat16):
+        unsupported.append(f"dtype={args['dtype']}")
+    for name in ("quant_dtype_a", "quant_dtype_a2"):
+        if args[name] not in (None, dtypes.fp8):
+            unsupported.append(f"{name}={args[name]}")
+    hints = []
+    if {"w1_scale", "w2_scale"} & set(unsupported):
+        hints.append("the scales travel with the tagged w1 / w2")
+    if args["block_size_M"] not in (None, 0, -1):
+        unsupported.append(f"block_size_M={args['block_size_M']}")
+        hints.append(
+            "this op chooses its tiles; flydsl_moe_a8w4_ptpc(..., block_m=...) pins the prefill tile"
+        )
+    if unsupported:
+        raise NotImplementedError(
+            "fused_moe on the w1 / w2 of prepare_moe_a8w4_ptpc_weight does not support "
+            + ", ".join(unsupported)
+            + "".join(f" ({hint})" for hint in hints)
+        )
+    limit = normalize_swiglu_limit(args["swiglu_limit"])
+    hidden_states, topk_ids, output = (
+        args["hidden_states"],
+        args["topk_ids"],
+        args["output"],
+    )
+    _validate_output_buffer_metadata(
+        output,
+        (topk_ids.shape[0], weight.hidden),
+        hidden_states.dtype if args["dtype"] is None else args["dtype"],
+        hidden_states.device,
+    )
+    _validate_output_buffer_no_overlap(output, hidden_states)
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    return flydsl_moe_a8w4_ptpc(
+        hidden_states,
+        weight,
+        args["topk_weight"],
+        topk_ids,
+        output=output,
+        swiglu_limit=0.0 if limit is None else limit,
+    )

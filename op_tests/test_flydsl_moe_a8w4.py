@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests and benchmark of the gfx942 FlyDSL A8W4 MoE (``flydsl_moe_a8w4_ptpc``): BF16 activations quantized
+"""Tests and benchmark of the gfx942 FlyDSL A8W4 MoE (``flydsl_moe_a8w4_ptpc``, also reached through
+``aiter.fused_moe`` with the tagged weights of ``prepare_moe_a8w4_ptpc_weight``): BF16 activations quantized
 per token to FP8 E4M3FNUZ, MXFP4 weights (E2M1 + one E8M0 per 32 K), SiLU, BF16 output.
 
 One file, four regions:
   0. shared: the independent fp32 reference (a port of pyhip's ``testing/moe_a8w4.py``: weights and inputs drawn
      with the same generators and seeds as pyhip's benchmark, exact MXFP4 dequantization, per-row FP8
      activations) and the grading (``calc_diff <= 1e-3`` and every element within 4.5% of ``max|ref|``);
-  1. basic functionality (``@pytest.mark.basic``): one case per target shape and token-count tier, the first
-     thing to run after every change: ``pytest op_tests/test_flydsl_moe_a8w4.py -m basic``;
+  1. basic functionality (``@pytest.mark.basic``): one case per target shape and token-count tier and one for the
+     ``aiter.fused_moe`` entry, the first thing to run after every change:
+     ``pytest op_tests/test_flydsl_moe_a8w4.py -m basic``;
   2. other coverage: what regions 1 and 3 cannot cover (weight layout and delta flush, bit-exact row
      quantization, dedup plan, streaming prep and fused quantization, decode dispatch boundaries (per route and
      expert-deduplicated), streaming boundaries and variants, the prefill sorting front end, prefill tile options and
      the half-block / XCD / two-pass / Down-split variants, CUDA graph, input errors and the gfx942 gate, compile-cache
-     keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit):
+     keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit, and the
+     ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag):
      ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): Qwen3.8 TP2 / TP4 (against aiter's FP8 per-token
      ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48,
@@ -23,12 +26,15 @@ One file, four regions:
 """
 
 import argparse
+import copy
 import functools
+import gc
 import itertools
 import math
 import os
 import shutil
 import tempfile
+import weakref
 from pathlib import Path
 
 import pandas as pd
@@ -440,6 +446,8 @@ def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
 # TP4 M 257 and MiMo TP4 M 1600, the expert-deduplicated decode for MiMo TP8 M 5 (two kernels) and TP4 M 24 (four
 # kernels), and for DeepSeek M 8 the decode that deduplicates Gate/Up only while H 5120 decodes M 8, else the
 # streaming kernels (_assert_h5120 follows the H 5120 decode limit DECODE_WIDE_MAX_M).
+# The aiter.fused_moe entry (test_fused_moe_entry): fused_moe on the tagged w1 / w2 of a prepared weight with
+# activation=Silu, quant_type=per_1x32 and quant_type_a=per_Token runs flydsl_moe_a8w4_ptpc (one Qwen decode case).
 # =================================================================================================
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -584,6 +592,44 @@ def test_deepseek_swiglu(tokens):
         _assert_h5120(tokens, _DEDUP_PATHS["wide"])
 
 
+def _fused_moe(x, w1, w2, topk_weight, topk_ids, **options):
+    """``aiter.fused_moe`` with the A8W4 combination of its entry: ``activation=Silu``, ``quant_type=per_1x32`` (MXFP4
+    weights) and ``quant_type_a=per_Token`` (FP8 activations, one scale per token); ``options`` add or override.
+    """
+    from aiter.fused_moe import fused_moe
+
+    a8w4 = {
+        "activation": aiter.ActivationType.Silu,
+        "quant_type": aiter.QuantType.per_1x32,
+        "quant_type_a": aiter.QuantType.per_Token,
+    }
+    return fused_moe(x, w1, w2, topk_weight, topk_ids, **{**a8w4, **options})
+
+
+def _bits(t):
+    return t.view(torch.int16)
+
+
+@pytest.mark.basic
+def test_fused_moe_entry():
+    """``aiter.fused_moe`` on the tagged w1 / w2 of a prepared weight runs the kernels of flydsl_moe_a8w4_ptpc with its
+    bits, writes the given output and returns it, within the tolerance of the reference (Qwen TP2 M 3, the per-route
+    decode, the weights and inputs of test_tp2[m3])."""
+    w, prepared = _weights(EXPERTS, HIDDEN, 320, 11)
+    x, topk_weight, topk_ids = make_inputs(3, HIDDEN, EXPERTS, TOPK, seed=12)
+    want, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    path = list(moe_a8w4.last_path)
+    out = torch.full_like(x, float("nan"))
+    assert (
+        _fused_moe(x, prepared.w1, prepared.w2, topk_weight, topk_ids, output=out)
+        is out
+    )
+    assert moe_a8w4.last_path == path
+    _assert_kernels("_decode")
+    assert torch.equal(_bits(out), _bits(want))
+    assert_close(out, ref)
+
+
 # =================================================================================================
 # Region 2: other coverage (not basic)
 # Only what region 1 and the benchmark (region 3) cannot cover; each docstring says why ("the basic tests" are
@@ -606,6 +652,8 @@ def test_deepseek_swiglu(tokens):
 # tests stream blocks of 16 and 32, the benchmark 16 / 32 / 64 without asserting kernels; here its boundaries with
 # decode and prefill, the bit-exact prep and fused quantization, ACT_STEPS, the prefill Down behind the streaming
 # Gate/Up, grid shrinking, CUDA graph, compile-cache keys, repeated ids, in-place output and the SwiGLU limit.
+# The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
+# benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
 # =================================================================================================
 
 
@@ -2206,8 +2254,8 @@ def test_rejects_bad_inputs(monkeypatch):
 
 
 def test_requires_gfx942(monkeypatch):
-    """Off gfx942 both public entries raise RuntimeError before any kernel runs (FP8 E4M3FNUZ, the MFMA tiles and
-    the MI308X tuning are gfx942-only).
+    """Off gfx942 the public entries raise RuntimeError before any kernel runs (FP8 E4M3FNUZ, the MFMA tiles and
+    the MI308X tuning are gfx942-only): prepare, flydsl_moe_a8w4_ptpc and aiter.fused_moe on the tagged weights.
 
     The basic tests and the benchmark run on gfx942 only.
     """
@@ -2218,6 +2266,8 @@ def test_requires_gfx942(monkeypatch):
         prepare_moe_a8w4_ptpc_weight(w["w1"], w["w1_scale"], w["w2"], w["w2_scale"])
     with pytest.raises(RuntimeError, match="gfx942"):
         flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+    with pytest.raises(RuntimeError, match="gfx942"):
+        _fused_moe(x, prepared.w1, prepared.w2, topk_weight, topk_ids)
 
 
 def test_compile_cache_keys(monkeypatch):
@@ -2788,6 +2838,463 @@ def test_swiglu_gate_upper_only(tokens, options):
         swiglu_limit=SWIGLU_LIMIT,
     )
     assert_close(out, ref)
+
+
+# -- 2.9 the aiter.fused_moe entry: tiers, arguments, errors, untagged weights, CUDA graph, the weight tag --------
+# fused_moe hands a call on tagged weights to moe_a8w4._fused_moe_route, which checks the arguments and makes one
+# flydsl_moe_a8w4_ptpc call; the dispatch inside that call is covered by the cases above. Here: one case per tier and
+# output form through fused_moe, what its arguments become, what it refuses, the weights it does not route, and the
+# tag. Weights are those of the basic tests (cached by _weights).
+
+# shape: (experts, hidden, inter, topk, fused shared expert, weight seed, swiglu_limit); DeepSeek with its limit and
+# the amplified inputs of test_deepseek_swiglu.
+_FUSED_SHAPES = {
+    "tp2": (EXPERTS, HIDDEN, 320, TOPK, True, 11, 0.0),
+    "tp4": (EXPERTS, HIDDEN, 160, TOPK, True, 21, 0.0),
+    "mimo_tp8": (MIMO_EXPERTS, MIMO_HIDDEN, 256, MIMO_TOPK, False, 41, 0.0),
+    "ds": (DS_EXPERTS, DS_HIDDEN, DS_INTER, DS_TOPK, False, 400, SWIGLU_LIMIT),
+}
+
+
+def _fused_inputs(shape, tokens, seed):
+    """Weights and inputs of a _FUSED_SHAPES shape; DeepSeek's inputs scaled by SWIGLU_AMPLIFY (its limit is hit)."""
+    experts, hidden, inter, topk, shared, weight_seed, limit = _FUSED_SHAPES[shape]
+    w, prepared = _weights(experts, hidden, inter, weight_seed)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, hidden, experts, topk, seed=seed, shared=shared
+    )
+    if limit:
+        x = (x.float() * SWIGLU_AMPLIFY).to(torch.bfloat16)
+    return w, prepared, x, topk_weight, topk_ids, limit
+
+
+def _path_tier(path):
+    """The tier of a kernel path, told by its Gate/Up kernel: per-route or deduplicated decode, streaming, prefill."""
+    gateup = next(name for name in path if name.startswith("a8w4_gateup"))
+    if "_decode" in gateup:
+        dedup = any("_dd" in name or "plan" in name for name in path)
+        return "dedup" if dedup else "decode"
+    return "stream" if "_stream" in gateup else "prefill"
+
+
+def _path_atomic(path):
+    """Whether a path adds the routes into the output with BF16x2 atomics (an order that changes from run to run, also
+    between two direct calls): the deduplicated decode Down, or the streaming Down without a8w4_route_sum.
+    """
+    return "a8w4_down_decode_dd" in path or (
+        any(name.startswith("a8w4_down_stream") for name in path)
+        and "a8w4_route_sum" not in path
+    )
+
+
+# (shape, tokens, tier): one case per tier and output form, at token counts that select it with the cut E (asserted):
+# the per-route decode (TP4 M 8, with the I 160 -> 192 padding that the tag must carry), the deduplicated decode with
+# its atomic Down (MiMo TP8 M 8) and with H 5120's slot-pair Down (DeepSeek M 8), streaming with the atomic Down
+# (TP2 M 48) and with a8w4_route_sum (DeepSeek M 64), prefill (TP2 M 300).
+_FUSED_CASES = [
+    ("tp4", 8, "decode"),
+    ("mimo_tp8", 8, "dedup"),
+    ("ds", 8, "dedup"),
+    ("tp2", 48, "stream"),
+    ("ds", 64, "stream"),
+    ("tp2", 300, "prefill"),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, tokens, tier", _FUSED_CASES, ids=[f"{s}_m{m}" for s, m, _ in _FUSED_CASES]
+)
+def test_fused_moe_matches_api(shape, tokens, tier):
+    """fused_moe runs the kernels of flydsl_moe_a8w4_ptpc on every tier; where the sum order is fixed its output has
+    the same bits, where routes are added with BF16x2 atomics it is graded against the reference. DeepSeek passes
+    swiglu_limit=10 as fused_moe's swiglu_limit and the limit changes the result of its inputs (a route that dropped
+    it would fail); the other shapes pass fused_moe's default None. One case per tier and output form: the route
+    passes every call on unchanged, so the variants inside a tier (decode nn / np / pp, dedup two / four kernels,
+    sorting blocks) and the boundaries between tiers are left to the flydsl_moe_a8w4_ptpc cases above.
+
+    The basic test checks one decode case; the benchmark calls flydsl_moe_a8w4_ptpc directly.
+    """
+    if shape == "ds" and tokens > moe_a8w4.DECODE_WIDE_MAX_M:
+        tier = "stream"  # past the H 5120 decode limit, as in _assert_h5120
+    w, prepared, x, topk_weight, topk_ids, limit = _fused_inputs(
+        shape, tokens, seed=600 + tokens
+    )
+    want = torch.full_like(x, float("nan"))
+    flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, output=want, swiglu_limit=limit
+    )
+    path = list(moe_a8w4.last_path)
+    assert _path_tier(path) == tier, path
+    got = torch.full_like(x, float("nan"))
+    result = _fused_moe(
+        x,
+        prepared.w1,
+        prepared.w2,
+        topk_weight,
+        topk_ids,
+        output=got,
+        swiglu_limit=limit or None,
+    )
+    assert result is got
+    assert moe_a8w4.last_path == path
+    if _path_atomic(path):
+        ref = reference(
+            x,
+            w["w1"],
+            w["w1_scale"],
+            w["w2"],
+            w["w2_scale"],
+            topk_weight,
+            topk_ids,
+            swiglu_limit=limit,
+        )
+        assert_close(got, ref)
+    else:
+        assert torch.equal(_bits(got), _bits(want))
+    if limit:
+        off = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+        assert not torch.equal(_bits(off), _bits(want))
+
+
+def test_fused_moe_arguments(monkeypatch):
+    """What the route hands flydsl_moe_a8w4_ptpc: the weight rebuilt from the tags (the prepared tensors themselves),
+    hidden_states, the routing tensors and the output as given; swiglu_limit normalized as on aiter's other SiLU paths
+    (None, 0 and inf off, passed as 0.0; NaN and negative values raise ValueError); never a tile option. block_size_M
+    None, 0 and -1 are the automatic choice (other values raise, test_fused_moe_rejects); the hints
+    moe_sorting_dispatch_policy, splitk and herd_routed_scaling_factor change nothing; dtype=bf16 and quant_dtype_a /
+    quant_dtype_a2=fp8 are accepted; a non-contiguous hidden_states is passed as a contiguous copy. With the kernels,
+    block_size_M None, 0 and -1 run the default dispatch of flydsl_moe_a8w4_ptpc with its bits (Qwen TP2 M 8, the
+    per-route decode, where a pinned tile would select the prefill kernels).
+
+    The basic test and test_fused_moe_matches_api pass only fused_moe's default tuning arguments.
+    """
+    _, prepared, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 40, seed=500)
+    calls = []
+    monkeypatch.setattr(
+        moe_a8w4,
+        "flydsl_moe_a8w4_ptpc",
+        lambda *a, **k: calls.append((a, k)) or "ran",
+    )
+
+    def passed(hidden_states=x, **options):
+        calls.clear()
+        assert (
+            _fused_moe(
+                hidden_states,
+                prepared.w1,
+                prepared.w2,
+                topk_weight,
+                topk_ids,
+                **options,
+            )
+            == "ran"
+        )
+        ((args, kwargs),) = calls
+        return args, kwargs
+
+    out = torch.empty_like(x)
+    args, kwargs = passed(output=out)
+    assert args[0] is x and args[2] is topk_weight and args[3] is topk_ids
+    assert kwargs["output"] is out and set(kwargs) == {"output", "swiglu_limit"}
+    for name in ("w1", "w1_delta", "w1_scale", "w2", "w2_delta", "w2_scale"):
+        assert getattr(args[1], name) is getattr(prepared, name), name
+    sizes = ("experts", "hidden", "inter", "inter_padded")
+    assert [getattr(args[1], n) for n in sizes] == [getattr(prepared, n) for n in sizes]
+    for value, limit in (
+        (None, 0.0),
+        (0, 0.0),
+        (-0.0, 0.0),
+        (math.inf, 0.0),
+        (10, 10.0),
+        (7.5, 7.5),
+    ):
+        _, kwargs = passed(swiglu_limit=value)
+        assert kwargs["swiglu_limit"] == limit, (value, kwargs)
+        assert type(kwargs["swiglu_limit"]) is float, (value, kwargs)
+    for value in (math.nan, -1.0, -math.inf):
+        with pytest.raises(ValueError):
+            passed(swiglu_limit=value)
+    for value in (None, 0, -1):
+        assert passed(block_size_M=value)[1] == {"output": None, "swiglu_limit": 0.0}
+    args, kwargs = passed(
+        moe_sorting_dispatch_policy=1,
+        splitk=4,
+        herd_routed_scaling_factor=2.5,
+        dtype=torch.bfloat16,
+        quant_dtype_a=aiter.dtypes.fp8,
+        quant_dtype_a2=aiter.dtypes.fp8,
+    )
+    assert args[0] is x and kwargs == {"output": None, "swiglu_limit": 0.0}
+    wide = torch.zeros((x.shape[0], 2 * x.shape[1]), dtype=x.dtype)[:, : x.shape[1]]
+    wide.copy_(x)
+    args, _ = passed(hidden_states=wide)
+    assert args[0] is not wide and args[0].is_contiguous() and torch.equal(args[0], x)
+    monkeypatch.undo()
+    _, prepared, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 8, seed=501)
+    want = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+    path = list(moe_a8w4.last_path)
+    assert _path_tier(path) == "decode", path
+    for value in (None, 0, -1):
+        got = _fused_moe(
+            x, prepared.w1, prepared.w2, topk_weight, topk_ids, block_size_M=value
+        )
+        assert moe_a8w4.last_path == path, value
+        assert torch.equal(_bits(got), _bits(want)), value
+
+
+def test_fused_moe_rejects():
+    """The route raises before any kernel runs: for every fused_moe parameter it cannot honour, naming it
+    (NotImplementedError; w1_scale / w2_scale too, the scales travel with the tagged weights; block_size_M other than
+    None / 0 / -1, pointing at flydsl_moe_a8w4_ptpc(block_m=...) to pin a tile); for another activation / quant_type /
+    quant_type_a (ValueError); for w1 / w2 that are not the pair of one prepare call (another call's w2, swapped, one
+    of them an untagged copy) or do not match their tag (ValueError); for an output that breaks fused_moe's contract
+    (shape, dtype, layout, overlapping hidden_states: RuntimeError). Off gfx942: test_requires_gfx942.
+
+    The basic test and the other cases pass only supported arguments.
+    """
+    w, prepared, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 4, seed=510)
+    E, H, I = prepared.experts, prepared.hidden, prepared.inter
+
+    def run(w1=prepared.w1, w2=prepared.w2, **options):
+        return _fused_moe(x, w1, w2, topk_weight, topk_ids, **options)
+
+    unsupported = {
+        "expert_mask": torch.ones(E, dtype=torch.int32),
+        "doweight_stage1": True,
+        "w1_scale": w["w1_scale"],
+        "w2_scale": w["w2_scale"],
+        "a1_scale": torch.ones(1),
+        "a2_scale": torch.ones(1),
+        "num_local_tokens": torch.tensor([4], dtype=torch.int32),
+        "hidden_pad": 64,
+        "intermediate_pad": 64,
+        "bias1": torch.zeros((E, 2 * I)),
+        "bias2": torch.zeros((E, H)),
+        "beta": 1.0,
+        "linear_beta": 1.0,
+        "gate_mode": "interleave",
+        "shared_w1": prepared.w1,
+        "shared_w2": prepared.w2,
+        "shared_w1_scale": w["w1_scale"],
+        "shared_w2_scale": w["w2_scale"],
+        "shared_expert_id": 0,
+        "stage2_scatter": object(),
+        "clamp_shared": False,
+        "herd_topk": 1,
+        "deterministic": True,
+        "w1_global_scale": torch.ones((E, 2)),
+        "w2_global_scale": torch.ones(E),
+        "dtype": torch.float16,
+        "quant_dtype_a": aiter.dtypes.fp4x2,
+        "quant_dtype_a2": torch.bfloat16,
+    }
+    for name, value in unsupported.items():
+        with pytest.raises(NotImplementedError, match=name):
+            run(**{name: value})
+    with pytest.raises(NotImplementedError, match="scales travel"):
+        run(w1_scale=w["w1_scale"], w2_scale=w["w2_scale"])
+    for value in (64, 32):
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"block_size_M={value} .*flydsl_moe_a8w4_ptpc\(.*block_m=",
+        ):
+            run(block_size_M=value)
+    for options in (
+        {"activation": aiter.ActivationType.Swiglu},
+        {"activation": aiter.ActivationType.Gelu},
+        {"quant_type": aiter.QuantType.per_Token},
+        {"quant_type": aiter.QuantType.No},
+        {"quant_type_a": None},
+        {"quant_type_a": aiter.QuantType.per_1x32},
+    ):
+        with pytest.raises(ValueError, match="quant_type_a=QuantType.per_Token"):
+            run(**options)
+    other = _a8w4_prepare(w)
+    for w1, w2 in (
+        (prepared.w1, other.w2),
+        (prepared.w2, prepared.w1),
+        (prepared.w1, prepared.w2.clone()),
+        (prepared.w1.clone(), prepared.w2),
+    ):
+        with pytest.raises(ValueError, match="one prepare_moe_a8w4_ptpc_weight"):
+            run(w1, w2)
+    short = prepared.w1[:, :-16].contiguous()
+    setattr(short, moe_a8w4.WEIGHT_TAG, getattr(prepared.w1, moe_a8w4.WEIGHT_TAG))
+    with pytest.raises(ValueError, match="do not match their A8W4 tag"):
+        run(short)
+    for out in (
+        torch.empty((5, H), dtype=torch.bfloat16),
+        torch.empty((4, H), dtype=torch.float16),
+        torch.empty((H, 4), dtype=torch.bfloat16).T,
+        x,
+    ):
+        with pytest.raises(RuntimeError):
+            run(output=out)
+
+
+def test_untagged_mxfp4_points_to_prepare(monkeypatch):
+    """MXFP4 weights without the tag (a checkpoint's fp4x2 or uint8 weights, or copies of prepared tensors, which do
+    not carry it) with quant_type=per_1x32 and quant_type_a=per_Token never reach the route and still raise aiter's
+    NotImplementedError for mixed granularity, now pointing at prepare_moe_a8w4_ptpc_weight; other mixed pairs keep
+    the message without it.
+
+    The basic test and the other cases pass tagged weights.
+    """
+    w, prepared, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 4, seed=520)
+    monkeypatch.setattr(
+        moe_a8w4,
+        "_fused_moe_route",
+        lambda args: pytest.fail("untagged weights were routed"),
+    )
+    scales = {"w1_scale": w["w1_scale"], "w2_scale": w["w2_scale"]}
+    for w1, w2 in (
+        (w["w1"], w["w2"]),
+        (w["w1"].view(torch.uint8), w["w2"].view(torch.uint8)),
+        (prepared.w1.clone(), prepared.w2.clone()),
+    ):
+        with pytest.raises(NotImplementedError, match="prepare_moe_a8w4_ptpc_weight"):
+            _fused_moe(x, w1, w2, topk_weight, topk_ids, **scales)
+    for quant_type, quant_type_a in (
+        (aiter.QuantType.per_1x32, aiter.QuantType.per_1x128),
+        (aiter.QuantType.per_Token, aiter.QuantType.per_1x32),
+    ):
+        with pytest.raises(NotImplementedError, match="mixed") as raised:
+            _fused_moe(
+                x,
+                w["w1"],
+                w["w2"],
+                topk_weight,
+                topk_ids,
+                quant_type=quant_type,
+                quant_type_a=quant_type_a,
+                **scales,
+            )
+        assert "prepare_moe_a8w4_ptpc_weight" not in str(raised.value)
+
+
+def test_untagged_weights_keep_their_dispatch(monkeypatch):
+    """Weights without the tag (here the FP8 per-token combination of the benchmark's aiter reference) never reach the
+    route: fused_moe hands the layer beneath (fused_moe_) the arguments it handed it before. That the layer still
+    runs aiter's tuned kernels is asserted by the benchmark (the tuned table row of every Qwen case).
+
+    The basic test and the other cases pass tagged weights.
+    """
+    import aiter.fused_moe as aiter_fused_moe
+
+    _, _, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 4, seed=530)
+    calls = []
+    monkeypatch.setattr(
+        moe_a8w4,
+        "_fused_moe_route",
+        lambda args: pytest.fail("untagged weights were routed"),
+    )
+    monkeypatch.setattr(
+        aiter_fused_moe,
+        "fused_moe_",
+        lambda **kwargs: calls.append(kwargs) or "native",
+    )
+    w1 = torch.empty((EXPERTS, 640, HIDDEN), dtype=aiter.dtypes.fp8)
+    w2 = torch.empty((EXPERTS, HIDDEN, 320), dtype=aiter.dtypes.fp8)
+    w1.is_shuffled = w2.is_shuffled = True
+    s1 = torch.ones((EXPERTS, 640, 1))
+    s2 = torch.ones((EXPERTS, HIDDEN, 1))
+    result = aiter_fused_moe.fused_moe(
+        x,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.per_Token,
+        w1_scale=s1,
+        w2_scale=s2,
+    )
+    assert result == "native"
+    (kwargs,) = calls
+    assert kwargs["w1"] is w1 and kwargs["w2"] is w2
+    assert kwargs["w1_scale"] is s1 and kwargs["w2_scale"] is s2
+    assert kwargs["hidden_states"] is x and kwargs["topk_ids"] is topk_ids
+    assert kwargs["topk_weight"] is topk_weight
+    assert kwargs["quant_type"] == aiter.QuantType.per_Token.value
+    assert kwargs["activation"] == aiter.ActivationType.Silu.value
+    assert kwargs["quant_type_a"] is None and kwargs["block_size_M"] == -1
+
+
+def test_fused_moe_graph_replay():
+    """fused_moe on tagged weights can be captured in a CUDA graph (the route adds host work only) and replayed: the
+    replay reads newly written inputs and gives the bits of a direct call on them. Compiled by an eager call outside
+    the capture first (Qwen TP2 M 8, the per-route decode).
+
+    The basic test and the other cases call fused_moe eagerly; the graph cases above call flydsl_moe_a8w4_ptpc.
+    """
+    _, prepared, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 8, seed=540)
+    out = torch.empty_like(x)
+    _fused_moe(x, prepared.w1, prepared.w2, topk_weight, topk_ids, output=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _fused_moe(x, prepared.w1, prepared.w2, topk_weight, topk_ids, output=out)
+    _, _, x2, topk_weight2, topk_ids2, _ = _fused_inputs("tp2", 8, seed=541)
+    x.copy_(x2)
+    topk_weight.copy_(topk_weight2)
+    topk_ids.copy_(topk_ids2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    want = flydsl_moe_a8w4_ptpc(x2, prepared, topk_weight2, topk_ids2)
+    assert _path_tier(moe_a8w4.last_path) == "decode"
+    assert torch.equal(_bits(out), _bits(want))
+
+
+def test_weight_tag_lifetime():
+    """The tags keep a prepared weight's other tensors but hold no reference back to w1 / w2: dropping the weight frees
+    every tensor by reference counting alone (garbage collection off), and w1 / w2 kept on their own keep the rest
+    alive through the tags. The tag can be copied onto an nn.Parameter wrapper of the same storage (wrappers, views and
+    copies do not carry Python attributes, as with is_shuffled), and a deep copy of the pair in one call (as
+    run_perftest rotates its arguments) is a pair of its own; fused_moe gives the same bits on both. The tag changes
+    neither values nor shapes (uint8 [E, I_pad * H] and [E, H * I_pad / 2]).
+
+    The basic test and the other cases keep the prepared weight alive and pass its own w1 / w2.
+    """
+    w, _, x, topk_weight, topk_ids, _ = _fused_inputs("tp2", 3, seed=550)
+    names = ("w1", "w1_delta", "w1_scale", "w2", "w2_delta", "w2_scale")
+    gc.collect()
+    gc.disable()
+    try:
+        prepared = _a8w4_prepare(w)
+        refs = {name: weakref.ref(getattr(prepared, name)) for name in names}
+        del prepared
+        assert all(ref() is None for ref in refs.values()), [
+            name for name, ref in refs.items() if ref() is not None
+        ]
+        prepared = _a8w4_prepare(w)
+        refs = {name: weakref.ref(getattr(prepared, name)) for name in names}
+        w1, w2 = prepared.w1, prepared.w2
+        del prepared
+        assert all(ref() is not None for ref in refs.values())
+        del w1, w2
+        assert all(ref() is None for ref in refs.values())
+    finally:
+        gc.enable()
+    prepared = _a8w4_prepare(w)
+    E, H, ip = prepared.experts, prepared.hidden, prepared.inter_padded
+    assert (prepared.w1.dtype, tuple(prepared.w1.shape)) == (torch.uint8, (E, ip * H))
+    assert (prepared.w2.dtype, tuple(prepared.w2.shape)) == (
+        torch.uint8,
+        (E, H * ip // 2),
+    )
+    want = _fused_moe(x, prepared.w1, prepared.w2, topk_weight, topk_ids)
+    p1 = torch.nn.Parameter(prepared.w1, requires_grad=False)
+    p2 = torch.nn.Parameter(prepared.w2, requires_grad=False)
+    assert not hasattr(p1, moe_a8w4.WEIGHT_TAG)
+    for p, t in ((p1, prepared.w1), (p2, prepared.w2)):
+        setattr(p, moe_a8w4.WEIGHT_TAG, getattr(t, moe_a8w4.WEIGHT_TAG))
+    got = _fused_moe(x, p1, p2, topk_weight, topk_ids)
+    assert torch.equal(_bits(got), _bits(want))
+    c1, c2 = copy.deepcopy((prepared.w1, prepared.w2))
+    assert c1.data_ptr() != prepared.w1.data_ptr()
+    got = _fused_moe(x, c1, c2, topk_weight, topk_ids)
+    assert torch.equal(_bits(got), _bits(want))
 
 
 # =================================================================================================

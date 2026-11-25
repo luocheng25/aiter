@@ -1277,7 +1277,23 @@ def fused_moe(
     gfx950 NVFP4 MoE (:mod:`aiter.ops.moe_nvfp4`): w1 / w2 in the
     ``shuffle_weight(w, (16, 32))`` layout, E4M3 ``w1_scale`` / ``w2_scale`` in
     the ``shuffle_scale_nvfp4_moe`` layout.
+
+    The ``w1`` / ``w2`` of ``aiter.ops.flydsl.prepare_moe_a8w4_ptpc_weight``
+    (MXFP4 weights converted for the gfx942 FlyDSL A8W4 MoE, tagged as
+    ``shuffle_weight`` tags ``is_shuffled``) run that MoE with
+    ``activation=ActivationType.Silu``, ``quant_type=QuantType.per_1x32`` and
+    ``quant_type_a=QuantType.per_Token`` (BF16 input quantized to FP8 per
+    token): the result of ``flydsl_moe_a8w4_ptpc`` on them. Parameters it
+    cannot honour raise (``aiter.ops.flydsl.moe_a8w4._fused_moe_route``).
     """
+    if hasattr(w1, "aiter_moe_a8w4_ptpc") or hasattr(w2, "aiter_moe_a8w4_ptpc"):
+        # Tagged by prepare_moe_a8w4_ptpc_weight (moe_a8w4.WEIGHT_TAG). Routed
+        # before the custom op, which drops tensor attributes, the tuned-config
+        # lookup and moe_sorting: the A8W4 op sorts and quantizes itself.
+        args = dict(locals())
+        from aiter.ops.flydsl.moe_a8w4 import _fused_moe_route
+
+        return _fused_moe_route(args)
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
     has_shared_expert = (
@@ -1866,9 +1882,22 @@ def _fused_moe_impl(
         )
     gate_mode = GateMode(gate_mode)
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
+        hint = ""
+        if (
+            quant_type == QuantType.per_1x32
+            and QuantType(quant_type_a) == QuantType.per_Token
+            and w1.dtype in (dtypes.fp4x2, torch.uint8)
+        ):
+            # Only weights prepared for the FlyDSL A8W4 MoE run this pair
+            # (fused_moe routes their tagged w1 / w2 before this op).
+            hint = (
+                "; MXFP4 weights with per-token FP8 activations run on gfx942 "
+                "once converted by aiter.ops.flydsl.prepare_moe_a8w4_ptpc_weight: "
+                "pass its w1 / w2 to fused_moe, without w1_scale / w2_scale"
+            )
         raise NotImplementedError(
             f"quant_type_a={QuantType(quant_type_a)!s} != quant_type={quant_type!s}: "
-            "mixed activation/weight quant granularity is not supported"
+            "mixed activation/weight quant granularity is not supported" + hint
         )
     if block_size_M == -1:
         block_size_M = None

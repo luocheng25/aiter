@@ -1,32 +1,31 @@
 # gfx9_fp8 的 A8W4 MoE（FP8 按 token 激活 × MXFP4 权重）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-25 12:48）· 目标：把 pyhip moe-ptpc-a8w4-r2-M17（811e03a47e）的 MoE A8W4 移植到 aiter（FlyDSL 0.5.3）并接入 aiter.fused_moe 分派：bench 85 例逐 case 耗时 ≤ M17 ×1.02（同卡、run_perftest 同协议、分进程交替测），同输入输出与 M17 逐位一致；另用一个里程碑采纳 int9-A2（1.345× 相对冻结基线）· 已完成 4 个里程碑（含本提交 M3） · 最佳累计 1.359× · 下一步：M4 接入 aiter.fused_moe 分派（接口 A）：prepare 时给 w1 / w2 打标记，gfx942 上 per_1x32 权重 + per_Token 激活的带标记调用路由到 FlyDSL A8W4
+> 由 mf 生成（11-25 14:38）· 目标：把 pyhip moe-ptpc-a8w4-r2-M17（811e03a47e）的 MoE A8W4 移植到 aiter（FlyDSL 0.5.3）并接入 aiter.fused_moe 分派：bench 85 例逐 case 耗时 ≤ M17 ×1.02（同卡、run_perftest 同协议、分进程交替测），同输入输出与 M17 逐位一致；int9-A2 已评估、按用户 11-25 决定不采纳（1.345× 相对冻结基线）· 已完成 5 个里程碑（含本提交 M4） · 最佳累计 1.359× · 下一步：写报告
 <!-- /mf:summary -->
-
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
      做什么 · 整体怎么做 · 为什么这样做 · 做到什么程度 · 风险与下一步。
      正文 ≤150 行；一行只说一件事（≤120 字，链接地址不计）；每节第一句是结论；只写当前设计（过程写在提交信息里）；
      接口细节、报错清单、数据格式留在代码 docstring，这里只给链接。这些注释读者看不到，也不计入篇幅。 -->
-
 本文只讲 A8W4（本目录的 `*_a8w4.py` 与入口 `aiter/ops/flydsl/moe_a8w4.py`）；同目录的 FP8 / BF16 两阶段底座不在范围内。
 
 ## 1. 目标与范围
 <!-- ≤8 行：做什么；输入 / 输出、目标硬件与形状；验收（性能对照谁、精度参考谁）；不做什么。 -->
 在 MI308X（gfx942）上提供 MXFP4 权重、FP8 按 token 激活的两阶段 FlyDSL MoE，逐位移植自 pyhip `moe-ptpc-a8w4-r2-M17`（811e03a47e）。
-- 入口：`prepare_moe_a8w4_ptpc_weight`（加载时把标准 MXFP4 权重转成私有布局）与 `flydsl_moe_a8w4_ptpc`（bf16 进出，SiLU，可选 `swiglu_limit`）。
+- 入口：`prepare_moe_a8w4_ptpc_weight`（加载时转成私有布局，返回的 w1 / w2 带标记）与 `flydsl_moe_a8w4_ptpc`（bf16 进出，SiLU，可选 `swiglu_limit`）。
+- 框架入口：`aiter.fused_moe` 收到带标记的 w1 / w2 与 Silu、`per_1x32`、`per_Token` 时转调后者，同 kernel、确定性路径逐位相同。
 - 目标形状：Qwen3.8-Flash-Next TP2 / TP4（H2560 E513 topk11 I320 / 160→192）、MiMo-V2.6-Flash TP8 / TP4（H4096 E256 topk8
   I256 / 512）、DeepSeek-V4.1-Flash TP4（H5120 E384 topk6 I576，swiglu_limit=10）。
-- 四档与 M17 相同：M ≤ 32 不排序的逐路由 decode、H4096 / H5120 小 M 按 expert 去重的 decode、每 expert 行少的流式、其余 prefill。
 - 验收：bench 85 例逐 case 耗时 ≤ M17 × 1.02（同卡分进程，CUDA graph 重放计时，见第 4 节）；确定性路径的输出与 M17 逐位一致。
 - 精度：对独立 fp32 参考 calc_diff ≤ 1e-3、最大误差 ≤ 4.5%·max|ref|；aiter fp8 per-token 只作性能参照（第 4 节）。
-- 不做：EP / expert_mask、bias、SiLU 以外的激活、预量化输入、gfx950；接入 `aiter.fused_moe` 分派是下一步（M4）。
+- 不做：EP / expert_mask、bias、SiLU 以外的激活、预量化输入、gfx950；经 fused_moe 时这些参数和指定 tile（`block_size_M`）报错。
 
 ## 2. 总体设计
 <!-- ≤35 行：数据流图（≤12 行）；分档表；每个核心 kernel ≤8 行伪代码（tile 划分与流水线的骨架，不写寄存器与偏移）。 -->
-权重在寄存器里按每 32-K 组的 LUT 解成 fp8 走 fp8 MFMA；激活按行量化成 fp8，与参考的量化点逐位一致；按 M 与每 expert 行数分四档。
+权重在寄存器里按每 32-K 组的 LUT 解成 fp8 走 fp8 MFMA；激活按行量化成 fp8，与参考的量化点逐位一致；按 M 与每 expert 行数分四档（同 M17）。
 ```text
 加载时 prepare_moe_a8w4_ptpc_weight：mxfp4 → 私有布局（按 MFMA K 序排的 fp4、每 32-K 组 delta、每通道因子），I 补零到 64 的倍数
+aiter.fused_moe(x, w.w1, w.w2, …, Silu, per_1x32, per_Token)：首行见 w1 / w2 的标记 → _fused_moe_route（门禁、配对、查参数）→ ↓
 flydsl_moe_a8w4_ptpc（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 CUDA graph 捕获）：
   decode：[行量化(x)] → Gate/Up decode（WG 管一条路由）→ mid f32 → [行量化(mid)] → Down decode（WG 管一个 token）→ out
   去重 decode：计划 + 行量化(x) + 清零 out → Gate/Up 去重（组首 WG 算同 expert 的 2–3 条路由）→ 行量化(mid) → Down 去重
@@ -49,6 +48,7 @@ flydsl_moe_a8w4_ptpc（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 
 | 其余 M；给了 tile 参数 | prefill BM64·BN128；行多（给参数时 M > 2048）TK128 | 多行共用权重；TK128 的 LDS 与寄存器减半 |
 | （prefill）H ≥ 2560 且 M·topk ≤ 24576（H5120 为 12288） | 排序与 x 量化改用 prep（一次 launch） | TP2 M2048 快 2.1%；路由多则 prep 慢 |
 | （prefill）I ≥ 256 且排序块少；I > 512 且 WG > 80 | Down 的 H 切给 2 / 4 个 WG；激活分两段 | 末轮少空闲（M2048 快 10%）；每 CU 2 WG |
+- fused_moe 入口：标记带同一次 prepare 的其余张量与尺寸、不引用 w1 / w2；参数处理全表见 [`_fused_moe_route`](../../../moe_a8w4.py#L1483)。
 - 核心 kernel 骨架（完整的 Gluon 风格写法、任务划分与逐拍流水线见 [kernels.md](kernels.md)）：
 ```text
 Gate/Up prefill：grid (2I/128, 排序块)，4 wave 管 TILE_M 行 × 64 gate 与同号 64 up；权重进 VGPR 提前 2 tile，x 经 LDS 双缓冲
@@ -70,7 +70,7 @@ Down decode：grid (H/16, M)，wave 按槽取 mid 行（槽对版 16 B 覆盖两
 
 ## 3. 关键决策
 <!-- 3–6 条；“为什么”给一个关键数字。 -->
-主线是逐位移植 M17、只改 aiter 规则要求的部分：prefill kernel 只差 import 与 FlyDSL 0.5.3 的两处修正，其余 kernel 的 ISA 与 M17 逐行相同。
+主线是逐位移植 M17、只改 aiter 规则要求的部分（如编译缓存加 device 键）：prefill kernel 只差 import 与 FlyDSL 0.5.3 的两处修正，其余 kernel 的 ISA 与 M17 逐行相同。
 | 决策 | 备选 | 为什么 | 代价 / 限制 |
 |---|---|---|---|
 | fp4 经 LUT 解成 fp8 走 fp8 MFMA | 解成 bf16（A16W4） | gfx942 无 fp4 MFMA；bf16 的 MFMA 与解码 VALU 都翻倍 | delta > 11 的组按 0 |
@@ -78,7 +78,7 @@ Down decode：grid (H/16, M)，wave 按槽取 mid 行（槽对版 16 B 覆盖两
 | 行量化的商逐位等于 IEEE 除法 | aiter HIP 量化（乘倒数） | 量化不翻转，与 M17 / 参考逐位一致 | 倒数 + 两次 FMA；scale < 2^-64 逐元素除 |
 | M ≤ 32 不排序、每 lane 16 B；H4096 去重；行少时 16–64 行小块流式 | 全走 BM64；逐路由读 | M128 时 BM64 块内约 95% 是填充 | 四套 kernel；原子加不逐位确定 |
 | 保留 M17 的 raw rocdl / buffer op，逐处注明缺的稳定 API | 改写成 typed API | 改写会变 ISA，危及逐位一致与性能 | 依赖 FlyDSL 0.5.3 的 raw 方言接口 |
-| 编译句柄缓存按 device 与影响构建的模块常量作键 | 只按形状（M17） | 句柄只能在编译它的 GPU 上发射（AGENTS.md） | 形状不变时无额外编译 |
+| fused_moe 按 w1 / w2 的标记转调，tile 自动 | 内部转换缓存；按 block_size_M 钉 tile | 内部转换要双份权重；钉 tile 时 DS M=1 慢 3.5 倍 | 标记是 Python 属性 |
 
 ## 4. 性能与精度
 <!-- ≤15 行，写在生成块前面。 -->
@@ -98,6 +98,7 @@ Down decode：grid (H/16, M)，wave 按槽取 mid 行（槽对版 16 B 覆盖两
 - 对 M17（验收口径，graph）：85 例路径相同，geomean 0.998（最小 0.969），84 例 ≤ 1.02；唯一超限的 tp2_m256 为 1.021（两边都呈双峰）。
 - 对 M17（参考口径，eager，bench 协议）：geomean 1.017，17 例 > 1.02（最大 1.18）；同 ISA 同路径，差在 host 下发节奏（见第 6 节）。
 - 逐位：确定性的 55 例输出与 M17 逐位相同；原子加的 30 例（流式 Down 18、去重 Down 12）与 M17 最大差 0.0156（M17 自身 0.0234）。
+- 前向代码同 M3，数字不变；经 fused_moe 同 kernel，只在 eager 多入队开销（TP2 M1/8/64 每次：直接 63/92/147、经它 98/127/181、aiter fp8 174/174/330 µs）。
 - 精度：独立 fp32 参考（MXFP4 精确反量化，输入与中间按行 fp8），bench 最大误差逐路由 0.31%、去重 1.10%、流式 1.42%、prefill 1.37%；
   真实权重见 [pyhip 文档](https://github.com/luocheng25/pyhip/blob/moe-ptpc-a8w4-r2-M17/src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)第 4 节（模型参考的 0.48–0.98 倍）。
 
@@ -204,12 +205,13 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 ## 5. 测试覆盖
 三类用例都在 [op_tests/test_flydsl_moe_a8w4.py](../../../../../../op_tests/test_flydsl_moe_a8w4.py)（参考、基本、其他、bench 四个注释区），分派断言与 M17 的最终分派一致。
 
-**基本功能测试**（每次改动先跑：`pytest op_tests/test_flydsl_moe_a8w4.py -m basic`，10 例，约 30 秒）
+**基本功能测试**（每次改动先跑：`pytest op_tests/test_flydsl_moe_a8w4.py -m basic`，11 例，约 30 秒）
 | 覆盖什么（每例断言误差与恰一个 Gate/Up、一个 Down kernel） | 用例 | 结果 |
 |---|---|---|
 | Qwen TP2 / TP4（E33，I160 补零到 192）：M3 逐路由 decode、M64 流式、M1031 / 257 prefill | `test_tp2` ×3、`test_tp4_padded` | 通过 |
 | MiMo TP8 / TP4（E256）：M5 去重两个 kernel、M24 去重四个 kernel、M300 流式、M1600 prefill | `test_mimo` ×4 | 通过 |
 | DeepSeek TP4 + swiglu_limit=10（截断大量触发）：M8 只去重 Gate/Up、M64 流式 | `test_deepseek_swiglu` ×2 | 通过 |
+| `aiter.fused_moe` 入口（Qwen M3）：与直接调用同 kernel、逐位相同，写进给定 output | `test_fused_moe_entry` | 通过 |
 
 **性能测试**（`python op_tests/test_flydsl_moe_a8w4.py`，5 形状 × M=1…32768（2 的幂）与 48，85 例，约 2 分钟；每例也校验输出）
 | 覆盖什么（分档 / 形状） | case | 结果 |
@@ -219,7 +221,7 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 | 流式：Qwen M48–1024（TP4 到 2048）、MiMo M64–1024、DeepSeek M48–1024（29 例） | `tp2_m48` 等 | Qwen ÷ aiter 0.68–0.91；≤2.38 TB/s |
 | prefill：M2048 由 prep 排序（4 例）、M ≥ 4096 由 Opus 排序（20 例） | `tp2_m2048` 等 | Qwen ÷ aiter 0.80–0.94；≤319 TFLOPS |
 
-**其他覆盖测试**（只测前两类覆盖不了的；`-m "not basic"`，124 例，约 2–3 分钟）
+**其他覆盖测试**（只测前两类覆盖不了的；`-m "not basic"`，136 例，约 2–3 分钟）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
 | 逐路由 decode 交界：M4、11/12、19/20、32/33（M33 流式）；topk 8/17 | 不在交界、不查 kernel | `test_decode_dispatch_boundaries` 等 2 个 | 通过 |
@@ -231,38 +233,39 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 | prep / Opus 排序的路由数上限、重复 expert；流式接 prefill Down 切 1/2/4 | 不在交界；只一种切分 | `test_prefill_prep_routes_limit` 等 2 个 | 通过 |
 | 逐位：布局、delta、各版行量化、prep 排序、尾部量化、ACT_STEPS、loc 置 −1、XCD / 两段 | 随机数据碰不到；位错在判据内 | `test_row_quant_bitexact` 等 9 个 | 通过 |
 | prefill 的 tile 参数、半块交界；非目标形状 7 种（含流式 Down 共享 tile 的 LDS 上限） | 只跑默认 tile 与目标形状 | `test_shape_fallbacks` 等 3 个 | 通过 |
-| graph（流式、prep / Opus + prefill）、报错、gfx942 门禁、prefill 与流式缓存键 | 只 eager、合法输入、单卡 | `test_graph_replay` 等 5 个 | 通过 |
+| graph（流式、prep / Opus + prefill）、报错、三个入口的 gfx942 门禁、prefill 与流式缓存键 | 只 eager、合法输入、单卡 | `test_graph_replay` 等 5 个 | 通过 |
 | Opus 排序重复 expert 留后一槽、原地输出、路由 dtype、M=0；各类 Gate/Up 的截断 | 输入规整、另给 out；bench 几乎不截断 | `test_inplace_output` 等 7 个 | 通过 |
+| fused_moe 各档（确定性逐位、原子加对参考、DS 截断）；graph 重放 | 基本只测一个 decode；bench 直接调用 | `test_fused_moe_matches_api` ×6 等 7 个 | 通过 |
+| fused_moe 参数透传与各类报错；未标记权重原样下传、fp4x2 提示 prepare；标记生命周期 | 基本只传默认参数、带标记权重 | `test_fused_moe_rejects` 等 5 个 | 通过 |
 
-未覆盖 / 跳过：与 M17 的逐位与计时对照（任务工具做）；H4096 去重到 M64（要 E ≥ 342）；去重 Down 的 WG 内量化只靠端到端；
-I_pad > 1024 的 prefill；`STREAM_ATOMIC` / `STREAM_PREFILL_DOWN` 的诊断取值；多卡；gfx950。
+未覆盖 / 跳过：与 M17 的逐位与计时对照（任务工具做）；H4096 去重到 M64（要 E ≥ 342）；去重 Down 的 WG 内量化只靠端到端；I_pad > 1024 的
+prefill；`STREAM_ATOMIC` / `STREAM_PREFILL_DOWN` 的诊断取值；多卡；gfx950；fused_moe 的 torch.compile 与性能 case（同 kernel）；
+aiter 自带的其余 fused_moe 用例（只跑 `test_moe_2stage` 的 FP8 per_Token 子集，6 例通过；bench 也逐例断言 aiter 对照命中调优表行）。
 
 ## 6. 风险与待定
 <!-- ≤5 条：风险 → 影响 → 打算。 -->
-四档已与 M17 一致；剩下的是计时口径与原子加的确定性，下一步 M4 接入 `aiter.fused_moe` 分派。
-- eager 下本实现 host 下发约 120 µs / 次（M17 约 185），kernel 背靠背、PTL 降频更多 → 同 ISA 17 例慢 2–18% → 验收以 graph 为准；
-  其中 ds_tp4_m16 的 eager 回退来自保留 M17 的只去重 Gate/Up decode（取舍见下面 int9-A2 一条）。
+四档与 M17 一致并已接入 `aiter.fused_moe`；剩下的是计时口径、原子加的确定性与标记的局限；下一步是总结报告，没有计划中的里程碑。
+- eager 下本实现 host 下发约 120 µs / 次（M17 约 185），kernel 背靠背、PTL 降频更多 → 同 ISA 17 例慢 2–18% → 验收以 graph 为准。
 - 原子加（I < 512 的流式 Down、MiMo 去重 Down）→ 输出不逐位可复现，多一次 bf16 舍入（bench 最大 1.42%）→ 同 M17，按判据验收。
 - int9-A2（H5120 decode 上限 32 → 5，M6–32 改走流式）已评估、不采纳：路径与 M17 + int9-A2 85/85 相同、确定性例逐位一致，
   但 ds_tp4_m8 bench 慢 21%（88.5 → 106.9 µs），graph 配对 M8 / M16 慢 9.8% / 7.7%（eager M16 快 7%）；pyhip 打同一补丁也变慢 → 保持 32。
-- 现在只有独立入口 → 框架调不到 → M4 在 prepare 时给权重打标记，gfx942 上带标记的 per_1x32 + per_Token 调用路由到本算子。
+- fused_moe 路由靠 Python 属性、不是 torch custom op：view / 拷贝 / 新 `nn.Parameter` 不带标记（w1、w2 分两次 deepcopy 会失配），
+  torch.compile 会追进 FlyDSL，`resolve_activation_dtype` 不认标记（须传 bf16）→ 报错或要手工拷属性 → 现支持 eager 与 CUDA graph。
 - 依赖 FlyDSL 0.5.3 的 raw 接口、门槛只在 MI308X 上调过；底座 `sorted_sum` 缓存不按 device → 换版本、换卡或多卡可能出错 → 重跑对照，底座报上游。
 
 ## 7. 进一步阅读
-- 代码入口：[moe_a8w4.py](../../../moe_a8w4.py)（两个入口的 docstring 写明接口、报错与数值约定）；kernel：[gemm1_a8w4.py](gemm1_a8w4.py)、
-  [gemm2_a8w4.py](gemm2_a8w4.py)、[decode_a8w4.py](decode_a8w4.py)（块对 / 槽对的 lane 映射见其 docstring）、
-  [decode_dedup_a8w4.py](decode_dedup_a8w4.py)（去重计划与组首 WG）、[stream_a8w4.py](stream_a8w4.py)（流式 prep、Gate/Up、Down 与 route_sum）、
-  [quant_a8w4.py](quant_a8w4.py)、[common_a8w4.py](common_a8w4.py)（私有布局）。
-- kernel 设计（任务划分与流水线）：[kernels.md](kernels.md)；移植源的设计文档：[pyhip M17 README](https://github.com/luocheng25/pyhip/blob/moe-ptpc-a8w4-r2-M17/src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
-- 里程碑（每个提交写了改了什么、为什么）：分支 `luocheng/moe-a8w4` 的 `moe-a8w4-M<k>` tag。
+- 代码入口：[moe_a8w4.py](../../../moe_a8w4.py)（各入口的 docstring 写明接口、报错与数值约定）、[fused_moe.py](../../../../../fused_moe.py)（首行按标记转调）。
+- kernel（任务划分与流水线见 [kernels.md](kernels.md)）：[gemm1_a8w4.py](gemm1_a8w4.py)、[gemm2_a8w4.py](gemm2_a8w4.py)、[decode_a8w4.py](decode_a8w4.py)（块对 /
+  槽对的 lane 映射）、[decode_dedup_a8w4.py](decode_dedup_a8w4.py)（去重计划与组首 WG）、[stream_a8w4.py](stream_a8w4.py)（流式 prep、Gate/Up、Down 与
+  route_sum）、[quant_a8w4.py](quant_a8w4.py)、[common_a8w4.py](common_a8w4.py)（私有布局）；移植源：[pyhip M17 README](https://github.com/luocheng25/pyhip/blob/moe-ptpc-a8w4-r2-M17/src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
 
 <!-- mf:roadmap -->
 - M0 ✅ 已推送 · 功能 · prefill 一档到底：A8W4 prefill 两段 kernel、权重准… · [提交](https://github.com/luocheng25/aiter/commit/ef512a48aab14baef550a666837139cbd778ce1b)
 - M1 ✅ 已推送 · 性能 · decode 档：移植 M17 decode kernel（逐路由 Gate/… · 1.235× 对基线（预期 1.2×） · [提交](https://github.com/luocheng25/aiter/commit/cad96b4026bcb260a113e7088f4211a3ba87d90c)
 - M2 ✅ 已推送 · 性能 · decode 去重档：移植 M17 dedup decode（MiMo B1/… · 1.024× 对 M1（预期 1.06×） · [提交](https://github.com/luocheng25/aiter/commit/d4e7ed64116f5bc30588b410f88496f22ac620ef)
-- M3 ✅ 本提交 · 性能 · 流式档：移植 M17 stream（prep 排序+量化、流式 Gate/Up… · 1.067× 对 M2（预期 1.07×）
-- M4 ⏳ 承诺 · 功能 · 接入 aiter.fused_moe 分派（接口 A）：prepare 时给 … · 预期 1×
+- M3 ✅ 已推送 · 性能 · 流式档：移植 M17 stream（prep 排序+量化、流式 Gate/Up… · 1.067× 对 M2（预期 1.07×） · [提交](https://github.com/luocheng25/aiter/commit/6aad36907daab12251f551548bb055627f3ec18b)
+- M4 ✅ 本提交 · 功能 · 接入 aiter.fused_moe 分派（接口 A）：prepare 时给 … · 预期 1×
 - M5 ✖ 放弃 · 功能 · 接入 aiter.fused_moe 分派（接口 A）：prepare 时给 …
 
-下一步（本提交的承诺）：M4 接入 aiter.fused_moe 分派（接口 A）：prepare 时给 w1 / w2 打标记，gfx942 上 per_1x32 权重 + per_Token 激活的带标记调用路由到 FlyDSL A8W4
+下一步（本提交的承诺）：写报告
 <!-- /mf:roadmap -->
