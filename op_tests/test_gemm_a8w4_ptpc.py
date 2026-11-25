@@ -1,24 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests and benchmark of the gfx942 FlyDSL A8W4 GEMM: Y = X W^T, BF16 X quantized per
-token to FP8 E4M3FNUZ, MXFP4 W (E2M1 + one E8M0 per 32 K), BF16 Y.
+"""Tests and benchmark of the gfx942 FlyDSL A8W4 GEMM: Y = X W^T, BF16 X quantized to FP8
+E4M3FNUZ per token or 1x32 (one E8M0 per token and 32 K, also taken pre-quantized by
+flydsl_gemm_a8w4_mxfp8), MXFP4 W (E2M1 + one E8M0 per 32 K), BF16 Y.
 
 One file, three regions:
-  1. basic functionality (``@pytest.mark.basic``): every target shape and dispatch tier, the
-     first thing to run after every change: ``pytest op_tests/test_gemm_a8w4_ptpc.py -m basic``;
+  1. basic functionality (``@pytest.mark.basic``): every target shape and dispatch tier and
+     both 1x32 entries, the first thing to run after every change:
+     ``pytest op_tests/test_gemm_a8w4_ptpc.py -m basic``;
   2. other coverage: what regions 1 and 3 cannot cover (tile boundaries, bit-exact
      quantization with its edge rows and weight layout, non-contiguous weight slices, input
      errors, preallocated output, CUDA graph, compile cache, M = 0, M past 32-bit byte
      offsets, the large-M dispatch boundary and persistent-kernel edge cases with its tile
      orders, the small-M dispatch boundaries and LDS fallbacks, partial token tiles and
      bit-exact in-kernel quantization, the M where each target shape's dispatch switches
-     kernels or tiles): ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
+     kernels or tiles; for 1x32: bit-exact quantization against the DeepSeek-V4.1 rule and
+     aiter's, extreme E8M0 scales, the M where its tile switches, a ragged N off the table,
+     input errors, M = 0, CUDA graph, compile cache):
+     ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
-     M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, every timed output
-     checked: ``python op_tests/test_gemm_a8w4_ptpc.py``.
-Every output is graded against the independent fp32 torch reference ``run_torch``;
-``MF_SEED`` seeds all inputs.
+     M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, per-token quantization,
+     every timed output checked: ``python op_tests/test_gemm_a8w4_ptpc.py``.
+Every output is graded against an independent fp32 torch reference (``run_torch``,
+``run_torch_1x32``); ``MF_SEED`` seeds all inputs.
 """
 
 import argparse
@@ -266,6 +271,69 @@ def cached_weight(n, k, seed):
     return w, w_scale, prepare_gemm_a8w4_ptpc_weight(w, w_scale)
 
 
+# -- 1x32 activations: one E8M0 scale per token and 32 K -------------------------------------
+
+# The pre-quantized entry and its kernel names, from aiter.ops.flydsl's public (lazy) exports.
+flydsl_gemm_a8w4_mxfp8 = aiter.ops.flydsl.flydsl_gemm_a8w4_mxfp8
+gemm_a8w4_mxfp8_kernel_names = aiter.ops.flydsl.gemm_a8w4_mxfp8_kernel_names
+X_BLOCK = 32
+# DeepSeek-V4.1's act_quant: E4M3FN values (largest 448), block amax at least 1e-4.
+FP8_FN_MAX = 448.0
+X_AMAX_FLOOR = 1e-4
+
+
+def make_x_1x32(m, k, seed):
+    """make_x with every 32-K block times 2**r (r = -6..6): each block of a row has its own
+    scale, so a scale read for the wrong block or token shows in the output."""
+    x = make_x(m, k, seed).float().view(m, k // X_BLOCK, X_BLOCK)
+    gen = _generator(seed + 1)
+    r = torch.randint(-6, 7, (m, k // X_BLOCK, 1), generator=gen, device=DEVICE)
+    return (x * torch.exp2(r.float())).view(m, k).to(torch.bfloat16)
+
+
+def quant_1x32_ref(x):
+    """1x32 FP8 E4M3FNUZ [m, k] and E8M0 bytes [m, k / 32] of BF16 ``x``: DeepSeek-V4.1's
+    reference ``act_quant(x, block_size=32)`` with UE8M0 scales (inference/kernel.py), mapped
+    to FNUZ.
+
+    amax = max |x| of the block with NaN ignored (CUDA's fmaxf), at least f32 1e-4;
+    e = ceil(log2(amax * f32(1 / 448))) from the f32 bits (the exponent, plus one for a
+    nonzero mantissa); q_fn = RNE_e4m3fn(clamp(x / 2**e, -448, 448)). FNUZ doubles the scale:
+    byte e + 128 with the same FP8 codes, -0 stored as 0x00 and NaN as 0x80. A block holding
+    +-Inf (e = 128, an E8M0 NaN scale in the reference) gets byte 254, as the kernel
+    documents; its finite values quantize to 0 and +-Inf to NaN.
+    """
+    m, k = x.shape
+    xf = x.float().view(m, k // X_BLOCK, X_BLOCK)
+    a = xf.abs()
+    amax = torch.where(a.isnan(), torch.zeros_like(a), a).amax(dim=-1)
+    amax = torch.maximum(amax, torch.full_like(amax, X_AMAX_FLOOR))
+    inv_max = torch.ones_like(amax) / torch.full_like(amax, FP8_FN_MAX)
+    bits = (amax * inv_max).view(torch.int32)
+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    scale_fn = ((e + 127) << 23).view(torch.float32).unsqueeze(-1)
+    q_fn = (xf / scale_fn).clamp(-FP8_FN_MAX, FP8_FN_MAX).to(torch.float8_e4m3fn)
+    q_fn = q_fn.view(torch.uint8)
+    q = torch.where(q_fn == 0x80, torch.zeros_like(q_fn), q_fn)
+    q = torch.where((q_fn & 0x7F) == 0x7F, torch.full_like(q_fn, 0x80), q)
+    scale = (e + 128).clamp(max=254).to(torch.uint8)
+    return q.view(m, k).view(torch.float8_e4m3fnuz), scale
+
+
+def dequant_1x32(xq, x_scale, dtype=torch.float32):
+    """Exact value of a 1x32 activation [m, k]: xq x 2**(x_scale - 127) per 32-K block."""
+    m, k = xq.shape
+    scale = torch.exp2(x_scale.view(torch.uint8).double() - 127).to(dtype)
+    blocks = xq.float().to(dtype).view(m, k // X_BLOCK, X_BLOCK) * scale.unsqueeze(-1)
+    return blocks.view(m, k)
+
+
+def run_torch_1x32(xq, x_scale, w, w_scale):
+    """Independent fp32 reference of the 1x32 GEMM: the sum over 32-K blocks of
+    2**(e - 127) x sum(q x w), W exact with the prepare flush rule."""
+    return fp32_matmul(dequant_1x32(xq, x_scale), dequant_mxfp4(w, w_scale))
+
+
 # =============================================================================================
 # Region 1: basic functionality (@pytest.mark.basic)
 # prepare_gemm_a8w4_ptpc_weight + flydsl_gemm_a8w4_ptpc on each target shape with one
@@ -273,7 +341,8 @@ def cached_weight(n, k, seed):
 # kernel), M = 3 on tp4_qkv (decode kernel), M = 20 on tp4_o (tile kernel, two token tiles),
 # M = 33..1000 with non-powers of two (per-token quant, then the general GEMM, each with the
 # tile its shape's dispatch table picks) and M = 4096 (quant, then the persistent large-M
-# kernel); asserts that the launched FlyDSL kernels are the ones the dispatch predicts.
+# kernel); asserts that the launched FlyDSL kernels are the ones the dispatch predicts. The
+# 1x32 activations: both entries once (test_gemm_1x32).
 # =============================================================================================
 
 BASIC_CASES = [
@@ -306,6 +375,45 @@ def test_gemm(shape, m):
     assert kernels == list(gemm_a8w4_ptpc_kernel_names(m, n, k)), kernels
     assert out.dtype == torch.bfloat16 and out.device == x.device
     check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{m}")
+
+
+# 1x32 activations, one case per entry on tp2_qkv, M = 100 (a 48 x 128 tile of the shape's
+# table, last row block 4 rows): x_quant="1x32" runs the 1x32 quantization and then the general
+# GEMM scaling every 32-K block; flydsl_gemm_a8w4_mxfp8 runs that GEMM on an activation
+# quantized beforehand.
+
+
+@pytest.mark.basic
+@pytest.mark.parametrize("entry", ["x_quant_1x32", "mxfp8"])
+def test_gemm_1x32(entry):
+    """``flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")`` launches the 1x32 quantization and
+    1x32 GEMM that ``gemm_a8w4_ptpc_kernel_names(..., x_quant="1x32")`` predicts and matches
+    the fp32 reference on the reference quantization; ``flydsl_gemm_a8w4_mxfp8`` on that
+    quantization (uint8 E8M0) launches the GEMM alone and gives the same output bit for bit.
+    """
+    shape, m = "tp2_qkv", 100
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    x = make_x_1x32(m, k, case_seed("x_1x32", shape, m))
+    xq, x_scale = quant_1x32_ref(x)
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
+    assert names[0].startswith("gemm_a8w4_ptpc_quant1x32_"), names
+    assert names[1].endswith("_1x32") and len(names) == 2, names
+    if entry == "mxfp8":
+        call = functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight)
+        names = gemm_a8w4_mxfp8_kernel_names(m, n, k)
+        assert names == gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")[1:]
+    else:
+        call = functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32")
+    call()  # compile outside the profiler
+    out, kernels = launched_kernels(call)
+    assert kernels == list(names), kernels
+    assert out.dtype == torch.bfloat16 and tuple(out.shape) == (m, n)
+    ref = run_torch_1x32(xq, x_scale, w, w_scale)
+    check_output(out, ref, msg=f"{shape}_m{m}_{entry}")
+    if entry == "mxfp8":
+        y = flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")
+        assert torch.equal(out.view(torch.int16), y.view(torch.int16))
 
 
 # =============================================================================================
@@ -1309,6 +1417,472 @@ def test_target_shape_tile_switches(shape, m):
     out, kernels = launched_kernels(lambda: flydsl_gemm_a8w4_ptpc(x, weight))
     assert kernels == list(names), kernels
     check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{m}")
+
+
+# -- 2.11 1x32 activations: x_quant="1x32" and flydsl_gemm_a8w4_mxfp8 -------------------------
+# The benchmark runs the per-token path only; the basic cases run each 1x32 entry once.
+
+
+def _bf16_block(head, fill=(0x3F80, 0x3F00, 0xBF40, 0x3E80)):
+    """32 BF16 bit patterns: ``head``, then ``fill`` repeated (default 1, 0.5, -0.75, 0.25)."""
+    return list(head) + [fill[i % len(fill)] for i in range(X_BLOCK - len(head))]
+
+
+_TINY = (0x3800, 0xB7A0, 0x3700, 0x0001)  # 3.1e-5, -1.9e-5, 7.6e-6, a subnormal
+_SUBNORMALS = (0x0001, 0x0010, 0x0040, 0x007F, 0x8001, 0x8040)
+
+# 32-K blocks the 1x32 quantization must get right: name -> (BF16 bit patterns, scale byte
+# derived by hand from the DeepSeek rule: log2 of amax / 448 rounded up, + 128).
+QUANT_1X32_BLOCKS = {
+    "zero": ([0x0000] * X_BLOCK, 106),
+    "plus_minus_zero": ([0x0000, 0x8000] * (X_BLOCK // 2), 106),
+    # amax with the mantissa 1.75: 1.75 / 448 = 2**-8 exactly, kept (aiter rounds it up).
+    "amax_1.75": (_bf16_block([0x3FE0], [0x3F00]), 120),
+    "amax_-1.75": (_bf16_block([0xBFE0, 0x3FDF], [0xBF00]), 120),
+    "amax_1.7578": (_bf16_block([0x3FE1], [0x3F00]), 121),
+    "amax_1.75*2^100": (_bf16_block([0x71E0], [0x7100, 0x3F80]), 220),
+    # amax around the 1e-4 floor (BF16 0x38D1 < 1e-4 < 0x38D2), the largest amax that keeps
+    # the floor's scale (1.75 x 2**-14) and the next one, and far below the floor.
+    "amax_below_1e-4": (_bf16_block([0x38D1], _TINY), 106),
+    "amax_above_1e-4": (_bf16_block([0xB8D2], _TINY), 106),
+    "amax_1.75*2^-14": (_bf16_block([0x38E0], _TINY), 106),
+    "amax_1.7578*2^-14": (_bf16_block([0x38E1], _TINY), 107),
+    "amax_1e-30": (_bf16_block([0x0DA2], [0x0D00]), 106),
+    "subnormals": (_bf16_block(_SUBNORMALS, [0x0001]), 106),
+    "2^-120_and_subnormals": (_bf16_block((0x0380,) + _SUBNORMALS, [0x0001]), 106),
+    # BF16's largest magnitudes, and tiny values next to a huge one.
+    "bf16_max": (_bf16_block([0x7F7F, 0x3F80, 0x0001, 0x7F00]), 248),
+    "bf16_-max": (_bf16_block([0xFF7F, 0x3F80, 0x7F00]), 248),
+    "amax_1.75*2^127": (_bf16_block([0x7F60, 0x3F80, 0x7E00]), 247),
+    "huge_and_tiny": (_bf16_block([0x7F00, 0x0001, 0x0080, 0x3F80]), 247),
+    # Scale 2**-7: 1.1875, 1.0625, 0.53125 and 0.59375 x 128 are FP8 rounding ties.
+    "ties": (_bf16_block([0x3F98, 0x3F88, 0xBF88, 0x3F08, 0x3F18, 0xBF18]), 120),
+    # NaN is left out of the maximum and stored as 0x80; +-Inf gives byte 254.
+    "nan": (_bf16_block([0x7FC0, 0x4000]), 121),
+    "-nan": (_bf16_block([0xFFC0, 0x4000]), 121),
+    "signaling_nan": (_bf16_block([0x7F81, 0x4000]), 121),
+    "all_nan": ([0x7FC0] * X_BLOCK, 106),
+    "nan_and_zero": ([0x7FC0] + [0x0000] * (X_BLOCK - 1), 106),
+    "inf": (_bf16_block([0x7F80, 0x4000]), 254),
+    "-inf": (_bf16_block([0xFF80, 0x4000]), 254),
+    "inf_and_nan": (_bf16_block([0x7F80, 0x7FC0, 0x4000]), 254),
+    "all_inf": ([0x7F80] * X_BLOCK, 254),
+}
+
+
+def _bf16_rows(bit_rows):
+    """BF16 tensor of bit patterns (Python ints 0..0xFFFF)."""
+    bits = torch.tensor(bit_rows, dtype=torch.int32).to(torch.int16)
+    return bits.view(torch.bfloat16).to(DEVICE)
+
+
+def _random_blocks_bf16(m, k, gen):
+    """BF16 [m, k]: Gaussian blocks of magnitude 2**-40 .. 2**40 (a third below the 1e-4
+    floor)."""
+    x = torch.randn((m, k // X_BLOCK, X_BLOCK), generator=gen, device=DEVICE)
+    r = torch.randint(-40, 41, (m, k // X_BLOCK, 1), generator=gen, device=DEVICE)
+    return (x * torch.exp2(r.float())).view(m, k).to(torch.bfloat16)
+
+
+# (rows, K, lanes per row of the quantization): up to 128 rows with K % 512 == 0 one CTA per row
+# over K / 8 lanes (one load each), more rows one wave per row (64 lanes, K / 512 loads each),
+# K % 512 != 0 two rows per wave (32 lanes).
+QUANT_1X32_CONFIGS = [(100, 2560, 320), (130, 2560, 64), (130, 768, 32)]
+
+
+@pytest.mark.parametrize(
+    "m, k, lanes",
+    QUANT_1X32_CONFIGS,
+    ids=[f"m{m}_k{k}" for m, k, _ in QUANT_1X32_CONFIGS],
+)
+def test_1x32_quant_bitexact(m, k, lanes):
+    """The 1x32 quantization equals DeepSeek-V4.1's rule mapped to FNUZ (quant_1x32_ref) bit
+    for bit in each configuration of the kernel: the blocks of QUANT_1X32_BLOCKS (all zero,
+    +-0, amax with the mantissa 1.75 and one step above it, around the 1e-4 floor and far
+    below it, subnormals, BF16's largest values, rounding ties, NaN and +-Inf), each with its
+    first value in each of the four lanes that share a block; random blocks of magnitude
+    2**-40 .. 2**40; and random bit patterns (any NaN, Inf or subnormal). The scale bytes of
+    the named blocks also equal the ones derived by hand.
+
+    End-to-end grading cannot see a few flipped FP8 codes or a scale one step off with codes
+    to match: they move the GEMM output by less than its tolerance.
+    """
+    assert a8w4_module.quant_config(m, k).lanes == lanes  # the configuration under test
+    per_row = k // X_BLOCK
+    blocks, first = [], {}
+    for name, (bits, _) in QUANT_1X32_BLOCKS.items():
+        first[name] = len(blocks)
+        for lane in range(4):
+            # The block's first value lands in lane `lane` of the four (8 values each).
+            shift = X_BLOCK - 9 * lane
+            blocks.append(bits[shift:] + bits[:shift])
+    special_rows = -(-len(blocks) // per_row)
+    blocks += [[0x3F80] * X_BLOCK] * (special_rows * per_row - len(blocks))
+    gen = _generator(case_seed("quant_1x32", m, k))
+    x = _random_blocks_bf16(m, k, gen)
+    x[:special_rows] = _bf16_rows(blocks).view(special_rows, k)
+    bits = torch.randint(-(1 << 15), 1 << 15, (m // 3, k), generator=gen, device=DEVICE)
+    x[m - m // 3 :] = bits.to(torch.int16).view(torch.bfloat16)
+
+    q, scale = a8w4_module._quant_1x32(x)
+    ref_q, ref_scale = quant_1x32_ref(x)
+    assert torch.equal(scale, ref_scale)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    flat = scale.view(-1)
+    for name, (_, byte) in QUANT_1X32_BLOCKS.items():
+        got = flat[first[name] : first[name] + 4].tolist()
+        assert got == [byte] * 4, (name, got)
+
+
+def test_1x32_quant_vs_aiter():
+    """Against aiter's ``dynamic_mxfp8_quant(x, quant_dtype=torch.float8_e4m3fnuz)`` (the
+    MXFP8 activation of gfx950's aiter GEMM), the 1x32 quantization differs only in the blocks
+    quant_1x32.py documents, and in each kind of them: amax with the mantissa 1.75 exactly
+    (aiter rounds the scale up), amax < 1e-4 (aiter has no floor) and amax >= BF16 0x7F61
+    (aiter saturates the scale byte). Finite inputs: with NaN aiter's maximum depends on its
+    reduction order.
+
+    The basic cases and the benchmark do not compare with aiter's quantization.
+    """
+    from aiter.ops.triton.quant import dynamic_mxfp8_quant
+
+    m, k = 512, 1536
+    per_row = k // X_BLOCK
+    x = _random_blocks_bf16(m, k, _generator(case_seed("quant_1x32_aiter")))
+    finite = [
+        bits
+        for name, (bits, _) in QUANT_1X32_BLOCKS.items()
+        if "nan" not in name and "inf" not in name
+    ]
+    x.view(m, per_row, X_BLOCK)[0, : len(finite)] = _bf16_rows(finite)
+    q, scale = a8w4_module._quant_1x32(x)
+    aiter_q, aiter_scale = dynamic_mxfp8_quant(x, quant_dtype=torch.float8_e4m3fnuz)
+    differs = (q.view(torch.uint8) != aiter_q.view(torch.uint8)).view(m, per_row, -1)
+    differs = differs.any(dim=-1) | (scale != aiter_scale)
+    amax16 = (x.view(torch.int16).int() & 0x7FFF).view(m, per_row, -1).amax(dim=-1)
+    amax = (amax16 << 16).view(torch.float32)
+    kinds = {
+        "mantissa 1.75": ((amax16 & 0x7F) == 0x60) & (amax >= X_AMAX_FLOOR),
+        "amax < 1e-4": amax < X_AMAX_FLOOR,
+        "amax >= 0x7F61": amax16 >= 0x7F61,
+    }
+    documented = functools.reduce(torch.logical_or, kinds.values())
+    assert not bool((differs & ~documented).any()), (differs & ~documented).nonzero()
+    for name, mask in kinds.items():
+        assert bool((differs & mask).any()), name
+
+
+# (E8M0 bytes of X's blocks, E8M0 bytes of W's 32-K groups) for flydsl_gemm_a8w4_mxfp8.
+EXTREME_1X32 = [((0, 1), (247, 250)), ((200, 226), (40, 45))]
+
+
+@pytest.mark.parametrize(
+    "x_codes, w_codes", EXTREME_1X32, ids=["x_e8m0_0_1", "x_e8m0_200_226"]
+)
+def test_1x32_extreme_scales(x_codes, w_codes):
+    """The 1x32 GEMM scales every block exactly at both ends of the E8M0 range it takes, with
+    random FP8 codes (all but NaN) against a float64 reference: X bytes 0 and 1 with large W
+    scales (byte 0 is the f32 subnormal 2**-127, which the kernel keeps; the byte-0 blocks
+    make up a large part of the output, checked) and X bytes up to 226 (a block amax just
+    under 2**107, the bound gemm.py documents for its f32 accumulator) with tiny W scales.
+
+    The quantization of x_quant="1x32" writes bytes 106..248 only (254 for a block holding
+    +-Inf), and the basic cases and the benchmark use moderate scales.
+    """
+    shape, m = "tp4_o", 37
+    n, k = SHAPES[shape]
+    gen = _generator(case_seed("extreme_1x32", x_codes))
+    codes = torch.randint(0, 256, (m, k), generator=gen, device=DEVICE).to(torch.uint8)
+    codes[codes == 0x80] = 0  # 0x80 is NaN in FNUZ
+    xq = codes.view(torch.float8_e4m3fnuz)
+    lo, hi = x_codes
+    x_scale = torch.randint(lo, hi + 1, (m, k // X_BLOCK), generator=gen, device=DEVICE)
+    x_scale = x_scale.to(torch.uint8)
+    nibbles = torch.randint(0, 16, (n, k), generator=gen, device=DEVICE).to(torch.uint8)
+    lo, hi = w_codes
+    group_codes = torch.randint(lo, hi + 1, (n, k // 32), generator=gen, device=DEVICE)
+    w, w_scale = pack_fp4(nibbles), group_codes.to(torch.uint8)
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    w_exact = dequant_mxfp4(w, w_scale).double()
+    x_exact = dequant_1x32(xq, x_scale, torch.float64)
+    ref = x_exact @ w_exact.T
+    assert bool(torch.isfinite(ref).all())
+    out = flydsl_gemm_a8w4_mxfp8(xq, x_scale, weight)
+    check_output(out, ref.float(), msg=f"X E8M0 {x_codes}, W E8M0 {w_codes}")
+    if x_codes[0] == 0:
+        # Flushing the subnormal 2**-127 to zero would drop the byte-0 blocks.
+        x_exact.view(m, -1, X_BLOCK)[x_scale == 0] = 0
+        dropped = float((x_exact @ w_exact.T - ref).abs().amax())
+        assert dropped > 0.05 * float(ref.abs().amax()), dropped
+
+
+# (shape, first M of a 1x32 GEMM tile). The 1x32 GEMM runs every M with the general GEMM: the
+# tile of the shape's dispatch table at M, and the default 64 x 128 tile (128 K per stage) in
+# the M buckets of the small-M and large-M kernels; these are the M where its tile changes.
+SWITCHES_1X32 = [
+    ("tp2_qkvz", 17),
+    ("tp2_qkvz", 33),
+    ("tp2_qkvz", 65),
+    ("tp2_qkvz", 129),
+    ("tp2_qkv", 17),
+    ("tp2_qkv", 65),
+    ("tp2_qkv", 129),
+    ("tp2_qkv", 513),
+    ("tp2_o", 17),
+    ("tp2_o", 33),
+    ("tp2_o", 65),
+    ("tp2_o", 129),
+    ("tp2_o", 1025),
+    ("tp4_qkvz", 17),
+    ("tp4_qkvz", 33),
+    ("tp4_qkvz", 65),
+    ("tp4_qkvz", 129),
+    ("tp4_qkvz", 1025),
+    ("tp4_qkv", 17),
+    ("tp4_qkv", 33),
+    ("tp4_qkv", 65),
+    ("tp4_qkv", 129),
+    ("tp4_qkv", 257),
+    ("tp4_qkv", 1025),
+    ("tp4_o", 21),
+    ("tp4_o", 33),
+    ("tp4_o", 65),
+    ("tp4_o", 129),
+    ("tp4_o", 257),
+    ("tp4_o", 1025),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, m", SWITCHES_1X32, ids=[f"{s}_m{m}" for s, m in SWITCHES_1X32]
+)
+def test_1x32_tile_switches(shape, m):
+    """x_quant="1x32" at each M where the 1x32 GEMM's tile changes on a target shape (the
+    GemmConfig at M differs from the one at M - 1: size, pipeline depths, XCD super tile, K
+    groups or K per stage): the launched kernels are the predicted ones and the output matches
+    the reference, the new tile's last row block partly filled. Every tile the six shapes use
+    runs here once, and both configurations of the quantization (one CTA per row up to
+    M = 128, one wave per row above).
+
+    The basic cases run one tile (tp2_qkv, M = 100) and the benchmark the per-token path only.
+    """
+    n, k = SHAPES[shape]
+    config = a8w4_module._config_1x32(m, n, k)
+    assert config != a8w4_module._config_1x32(m - 1, n, k), config
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    x = make_x_1x32(m, k, case_seed("tile_switch_1x32", shape, m))
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
+    call = functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32")
+    call()  # compile outside the profiler
+    out, kernels = launched_kernels(call)
+    assert kernels == list(names), kernels
+    xq, x_scale = quant_1x32_ref(x)
+    check_output(out, run_torch_1x32(xq, x_scale, w, w_scale), msg=f"{shape}_m{m}")
+
+
+OFF_TABLE_1X32 = [(65, 320, 512), (1, 192, 256)]
+
+
+@pytest.mark.parametrize(
+    "m, n, k", OFF_TABLE_1X32, ids=[f"m{m}_n{n}_k{k}" for m, n, k in OFF_TABLE_1X32]
+)
+def test_1x32_off_table_ragged_n(m, n, k):
+    """Off the dispatch table the 1x32 GEMM takes the default 64 x 128 tile (128 K per stage)
+    and stores directly: with N % 128 == 64 the last channel block is half empty, and its
+    stores past N go to a unit past the output buffer, which drops them, instead of branching.
+    M = 65 leaves 1 row in the last row block; K = 256 is two K tiles. Both entries write
+    through ``out=`` (the head of a NaN buffer), flydsl_gemm_a8w4_mxfp8 with the scales as
+    uint8 and as torch.float8_e8m0fnu: every row matches the reference, nothing past ``out``
+    changes and the three outputs are equal bit for bit.
+
+    The target shapes are on the table with N % 128 == 0, the basic cases pass uint8 scales
+    and let the op allocate its output, and the benchmark runs the per-token path only.
+    """
+    from aiter.ops.flydsl.kernels.gemm_a8w4_ptpc import gemm as gemm_kernels
+
+    config = a8w4_module._config_1x32(m, n, k)
+    assert config == gemm_kernels.GemmConfig() and n % config.block_n != 0, config
+    assert not gemm_kernels._shuffled_store(config), config  # direct stores
+    w, w_scale = make_weight(n, k, case_seed("w", n, k))
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    x = make_x_1x32(m, k, case_seed("off_table_1x32", m, n, k))
+    xq, x_scale = quant_1x32_ref(x)
+    ref = run_torch_1x32(xq, x_scale, w, w_scale)
+    outs = []
+    for call in [
+        functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32"),
+        functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight),
+        functools.partial(
+            flydsl_gemm_a8w4_mxfp8, xq, x_scale.view(torch.float8_e8m0fnu), weight
+        ),
+    ]:
+        buffer = torch.full(
+            (m + 64, n), float("nan"), dtype=torch.bfloat16, device=DEVICE
+        )
+        out = buffer[:m]
+        assert call(out=out) is out
+        check_output(out, ref, msg=f"m{m}_n{n}_k{k}")
+        assert bool(buffer[m:].isnan().all())
+        outs.append(out.view(torch.int16))
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
+def test_1x32_rejects_bad_inputs(monkeypatch):
+    """Unsupported inputs raise instead of computing garbage: an ``x_quant`` other than
+    "per_token" / "1x32" (entry and kernel_names) and a bad BF16 X with x_quant="1x32"; for
+    flydsl_gemm_a8w4_mxfp8 a foreign weight, xq that is not FP8 E4M3FNUZ (BF16, uint8,
+    E4M3FN), x_scale that is not uint8 / E8M0 (int32, f32), wrong ranks or shapes (xq's K,
+    x_scale's K and M), CPU tensors, non-contiguous xq or x_scale, xq not 16-byte or x_scale
+    not 4-byte aligned, a bad ``out`` (shape, dtype, layout, device), unsupported weight
+    shapes in gemm_a8w4_mxfp8_kernel_names, and any GPU other than gfx942 (simulated).
+
+    The basic cases and the benchmark only pass valid inputs on gfx942.
+    """
+    n, k, m = 128, 512, 4
+    w, w_scale = make_weight(n, k, case_seed("errors"))
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    x = make_x(m, k, case_seed("errors_x"))
+    xq, x_scale = quant_1x32_ref(x)
+    fnuz = torch.float8_e4m3fnuz
+
+    for x_quant in ["1x16", "per_tensor", None]:
+        with pytest.raises(ValueError, match="x_quant"):
+            flydsl_gemm_a8w4_ptpc(x, weight, x_quant=x_quant)
+        with pytest.raises(ValueError, match="x_quant"):
+            gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant=x_quant)
+    with pytest.raises(TypeError):
+        flydsl_gemm_a8w4_ptpc(x.half(), weight, x_quant="1x32")
+    with pytest.raises(ValueError):
+        flydsl_gemm_a8w4_ptpc(torch.cat([x, x], dim=1)[:, :k], weight, x_quant="1x32")
+
+    # xq 8 bytes past a 16-byte boundary, x_scale 2 bytes past a 4-byte one; strided rows.
+    xq_buf = torch.empty(m * k + 16, dtype=torch.uint8, device=DEVICE)
+    xq_off = xq_buf[8 : 8 + m * k].view(m, k).view(fnuz)
+    s_buf = torch.empty(m * k // X_BLOCK + 4, dtype=torch.uint8, device=DEVICE)
+    s_off = s_buf[2 : 2 + m * k // X_BLOCK].view(m, k // X_BLOCK)
+    xq_strided = torch.cat([xq.view(torch.uint8)] * 2, dim=1)[:, :k].view(fnuz)
+    s_strided = torch.cat([x_scale, x_scale], dim=1)[:, : k // X_BLOCK]
+    half_k = (xq[:, : k // 2].contiguous(), x_scale[:, : k // 64].contiguous())
+    good = (xq, x_scale, weight)
+    for args, kwargs, error in [
+        ((xq, x_scale, (w, w_scale)), {}, TypeError),
+        ((x, x_scale, weight), {}, TypeError),
+        ((xq.view(torch.uint8), x_scale, weight), {}, TypeError),
+        ((xq.view(torch.float8_e4m3fn), x_scale, weight), {}, TypeError),
+        ((xq, x_scale.int(), weight), {}, TypeError),
+        ((xq, x_scale.float(), weight), {}, TypeError),
+        ((xq.view(-1), x_scale, weight), {}, ValueError),
+        ((*half_k, weight), {}, ValueError),
+        ((xq, x_scale[:, :-1].contiguous(), weight), {}, ValueError),
+        ((xq, x_scale[:-1].contiguous(), weight), {}, ValueError),
+        ((xq, x_scale.view(-1), weight), {}, ValueError),
+        ((xq.cpu(), x_scale, weight), {}, ValueError),
+        ((xq, x_scale.cpu(), weight), {}, ValueError),
+        ((xq_strided, x_scale, weight), {}, ValueError),
+        ((xq, s_strided, weight), {}, ValueError),
+        ((xq_off, x_scale, weight), {}, ValueError),
+        ((xq, s_off, weight), {}, ValueError),
+        (good, {"out": _empty((m, n + 64), torch.bfloat16)}, ValueError),
+        (good, {"out": _empty((m, n), torch.float16)}, ValueError),
+        (good, {"out": _empty((n, m), torch.bfloat16).t()}, ValueError),
+        (good, {"out": _empty((m, n), torch.bfloat16).cpu()}, ValueError),
+    ]:
+        with pytest.raises(error):
+            flydsl_gemm_a8w4_mxfp8(*args, **kwargs)
+    for n_, k_ in [(96, 2560), (2560, 128), (0, 256)]:
+        with pytest.raises(ValueError):
+            gemm_a8w4_mxfp8_kernel_names(1, n_, k_)
+
+    monkeypatch.setattr(a8w4_module, "get_gfx_runtime", lambda: "gfx950")
+    with pytest.raises(RuntimeError, match="gfx942"):
+        flydsl_gemm_a8w4_mxfp8(xq, x_scale, weight)
+    with pytest.raises(RuntimeError, match="gfx942"):
+        flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")
+
+
+def test_1x32_m_zero():
+    """M = 0: both 1x32 entries return an empty BF16 [0, N] tensor (or the given ``out``) and
+    launch nothing; both kernel_names functions return ().
+
+    The basic cases and the benchmark have M >= 1.
+    """
+    n, k = SHAPES["tp4_o"]
+    _, _, weight = cached_weight(n, k, case_seed("w", "tp4_o"))
+    x = torch.empty((0, k), dtype=torch.bfloat16, device=DEVICE)
+    xq = torch.empty((0, k), dtype=torch.float8_e4m3fnuz, device=DEVICE)
+    x_scale = torch.empty((0, k // X_BLOCK), dtype=torch.uint8, device=DEVICE)
+    for call in [
+        functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32"),
+        functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight),
+    ]:
+        y, kernels = launched_kernels(call)
+        assert tuple(y.shape) == (0, n) and y.dtype == torch.bfloat16, y
+        assert y.device == weight.q.device and kernels == [], kernels
+        out = torch.empty((0, n), dtype=torch.bfloat16, device=DEVICE)
+        assert call(out=out) is out
+    assert gemm_a8w4_ptpc_kernel_names(0, n, k, x_quant="1x32") == ()
+    assert gemm_a8w4_mxfp8_kernel_names(0, n, k) == ()
+
+
+def test_1x32_cuda_graph_replay():
+    """Both 1x32 entries (x_quant="1x32" allocating its FP8 and E8M0 buffers and its output
+    inside the capture, and flydsl_gemm_a8w4_mxfp8) are captured in one CUDA graph and replay
+    on new input: no host synchronization. Both replayed outputs equal an eager call on the
+    new input bit for bit and match the reference. tp2_o, M = 48: a 32 x 64 tile with two K
+    groups (their sums added through LDS before the epilogue).
+
+    The basic cases and the benchmark call the op eagerly.
+    """
+    shape, m = "tp2_o", 48
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    assert a8w4_module._config_1x32(m, n, k).k_groups == 2
+    x = make_x_1x32(m, k, case_seed("graph_1x32", 0))
+    xq, x_scale = quant_1x32_ref(x)
+    flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")  # compile outside the capture
+    flydsl_gemm_a8w4_mxfp8(xq, x_scale, weight)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")
+        y_mxfp8 = flydsl_gemm_a8w4_mxfp8(xq, x_scale, weight)
+    x_new = make_x_1x32(m, k, case_seed("graph_1x32", 1))
+    xq_new, x_scale_new = quant_1x32_ref(x_new)
+    x.copy_(x_new)
+    xq.copy_(xq_new)
+    x_scale.copy_(x_scale_new)
+    y.fill_(float("nan"))
+    y_mxfp8.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check_output(y, run_torch_1x32(xq_new, x_scale_new, w, w_scale), msg="graph replay")
+    eager = flydsl_gemm_a8w4_ptpc(x_new, weight, x_quant="1x32").view(torch.int16)
+    assert torch.equal(y.view(torch.int16), eager)
+    assert torch.equal(y_mxfp8.view(torch.int16), eager)
+
+
+def test_1x32_compile_cache():
+    """Per-token and 1x32 calls alternate on a shape and M where both GEMMs take the same tile
+    (tp2_qkv, M = 100: 48 x 128): the two compile-time variants are compiled and cached apart
+    (the 1x32 one's name ends in _1x32), so every call matches its own reference.
+
+    The benchmark runs the per-token path only and every other test one mode per call site.
+    """
+    shape, m = "tp2_qkv", 100
+    n, k = SHAPES[shape]
+    w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
+    per_token = gemm_a8w4_ptpc_kernel_names(m, n, k)
+    block_scaled = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
+    assert block_scaled[1] == per_token[1] + "_1x32", (per_token, block_scaled)
+    x = make_x_1x32(m, k, case_seed("cache_1x32", m))
+    xq, x_scale = quant_1x32_ref(x)
+    refs = {
+        "per_token": run_torch(x, w, w_scale),
+        "1x32": run_torch_1x32(xq, x_scale, w, w_scale),
+    }
+    for x_quant in ["per_token", "1x32", "per_token", "1x32"]:
+        out = flydsl_gemm_a8w4_ptpc(x, weight, x_quant=x_quant)
+        check_output(out, refs[x_quant], msg=x_quant)
 
 
 # =============================================================================================

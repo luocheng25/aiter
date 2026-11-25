@@ -85,7 +85,12 @@ _LAZY_IMPORTS = {
     ),
     "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "GemmA8W4PtpcWeight": (".gemm_a8w4_ptpc", "GemmA8W4PtpcWeight"),
+    "flydsl_gemm_a8w4_mxfp8": (".gemm_a8w4_ptpc", "flydsl_gemm_a8w4_mxfp8"),
     "flydsl_gemm_a8w4_ptpc": (".gemm_a8w4_ptpc", "flydsl_gemm_a8w4_ptpc"),
+    "gemm_a8w4_mxfp8_kernel_names": (
+        ".gemm_a8w4_ptpc",
+        "gemm_a8w4_mxfp8_kernel_names",
+    ),
     "gemm_a8w4_ptpc_kernel_names": (
         ".gemm_a8w4_ptpc",
         "gemm_a8w4_ptpc_kernel_names",
@@ -282,6 +287,7 @@ __all__ = [
     "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_fp8_paged_mqa_logits_gfx1250",
     "flydsl_fp8_quant",
+    "flydsl_gemm_a8w4_mxfp8",
     "flydsl_gemm_a8w4_ptpc",
     "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
@@ -303,6 +309,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "gemm_a8w4_mxfp8_kernel_names",
     "gemm_a8w4_ptpc_kernel_names",
     "gemm_a8w4_ptpc_shape_supported",
     "make_fp4_mqa_plan",

@@ -1,31 +1,31 @@
-# gemm_a8w4_ptpc（gfx942 dense GEMM：按 token fp8 激活 × mxfp4 权重）：设计说明
+# gemm_a8w4_ptpc（gfx942 dense GEMM：fp8 激活（按 token 或 1x32）× mxfp4 权重）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-25 02:55）· 目标：aiter FlyDSL dense A8W4 GEMM on MI308X (gfx942): Y[M,N] = X[M,K] W^T, bf16 out; X bf16 quantized per token to FP8 E4M3FNUZ, W MXFP4 (E2M1 + one E8M0 per 32 K) converted once at load; Qwen3.8-Flash-Next dense linear layers at TP2/TP4 (6 (N,K)) x M = 1..32768: correct everywhere, small M near the HBM bound (clearly faster than aiter FP8 per-token GEMM), large M near the FP8 MFMA bound. Round 4 (user 11-25, SPEC §9): X also quantized 1x32 (FP8 E4M3FNUZ + one E8M0 per 32 K, rounding as the DeepSeek-V4.1 reference act_quant mapped to fnuz), from BF16 X or pre-quantized input (flydsl_gemm_a8w4_mxfp8), both modes side by side; correct first, perf targets from measurement（1.13× 相对冻结基线）· 已完成 9 个里程碑（含本提交 M10） · 最佳累计 1.199× · 下一步：M11 1x32 激活量化功能版：flydsl_gemm_a8w4_ptpc(x_quant="1x32") 与已量化入口 flydsl_gemm_a8w4_mxfp8；独立 1x32 量化核（取整同 DeepSeek-V4.1 参考 act_quant，映射到 fnuz）+ 中间档可配置核按块乘 scale，1x32 先全部 M 走这一条路径
+> 由 mf 生成（11-25 04:13）· 目标：aiter FlyDSL dense A8W4 GEMM on MI308X (gfx942): Y[M,N] = X[M,K] W^T, bf16 out; X bf16 quantized per token to FP8 E4M3FNUZ, W MXFP4 (E2M1 + one E8M0 per 32 K) converted once at load; Qwen3.8-Flash-Next dense linear layers at TP2/TP4 (6 (N,K)) x M = 1..32768: correct everywhere, small M near the HBM bound (clearly faster than aiter FP8 per-token GEMM), large M near the FP8 MFMA bound. Round 4 (user 11-25, SPEC §9): X also quantized 1x32 (FP8 E4M3FNUZ + one E8M0 per 32 K, rounding as the DeepSeek-V4.1 reference act_quant mapped to fnuz), from BF16 X or pre-quantized input (flydsl_gemm_a8w4_mxfp8), both modes side by side; correct first, perf targets from measurement（1.13× 相对冻结基线）· 已完成 10 个里程碑（含本提交 M11） · 最佳累计 1.199× · 下一步：M12 度量契约：bench 加 1x32 的 96 个 case（<形状>_m<M>_1x32，6 形状 × M 1…32768，对照仍为 aiter fp8 ptpc），重新冻结基线
 <!-- /mf:summary -->
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
      做什么 · 整体怎么做 · 为什么这样做 · 做到什么程度 · 风险与下一步。
      正文 ≤150 行；一行只说一件事（≤120 字，链接地址不计）；每节第一句是结论；只写当前设计（过程写在提交信息里）；
      接口细节、报错清单、数据格式留在代码 docstring，这里只给链接。这些注释读者看不到，也不计入篇幅。 -->
-
 ## 1. 目标与范围
-在 MI308X（gfx942）上做 dense GEMM Y = X·Wᵀ：bf16 X 按 token 动态量化成 fp8 e4m3fnuz，W 为 mxfp4，fp32 累加，输出 bf16。
+在 MI308X（gfx942）上做 dense GEMM Y = X·Wᵀ：bf16 X 动态量化成 fp8 e4m3fnuz，W 为 mxfp4，fp32 累加，输出 bf16。
 - 输入：x bf16 [M, K]（任意 M、连续）；权重为 checkpoint 的 mxfp4（fp4x2 [N, K/2] + E8M0 [N, K/32]），加载时转换一次。
+- 激活量化两种并存：按 token（默认，性能主路径）；1x32（`x_quant="1x32"`，每 token 每 32 K 一个 E8M0，取整同 DeepSeek-V4.1）。
+- 1x32 另有已量化入口 `flydsl_gemm_a8w4_mxfp8`（收 fnuz fp8 + E8M0 scale，兼容 MXFP8 激活）；1x32 现为功能版，只保正确。
 - 形状：Qwen3.8-Flash-Next dense 线性层 TP2 / TP4 的 6 个 (N, K)（N 2560–8192，K 1536–3072）× M = 1…32768。
 - 约束：K % 256 == 0、N % 64 == 0、权重 < 2 GiB，其他形状与非 gfx942 明确报错；无 host 同步，可被 CUDA graph 捕获。
-- 验收：每 case 耗时 ≤ 1.05× 同一 aiter 的 fp8 ptpc GEMM，M ≤ 32 时 ≤ 0.7×；M > 2048 达到 compute bound：≥ 453 TFLOPS 且不慢于对照（第 4 节）。
-- 精度：对照测试文件内的独立 fp32 参考，逐元素按行 1% 容差（第 4 节）。
-- 开发中（M11）：1x32 激活（每 32 K 一个 E8M0）用于接口兼容：直接收 fnuz 的 MXFP8，或 BF16 在算子内量化（取整同 DeepSeek-V4.1 参考）。
+- 验收（按 token）：每 case ≤ 1.05× 同一 aiter 的 fp8 ptpc GEMM，M ≤ 32 时 ≤ 0.7×；M > 2048 ≥ 453 TFLOPS 且不慢于对照。
+- 精度：对照测试文件内的独立 fp32 参考，逐元素按行 1% 容差（第 4 节）；1x32 量化逐位等于 DeepSeek 规则映射到 fnuz。
 - 不做：bias、fp16 输出、1x32 的每块 fp32 scale、e4m3fn 输入（调用方可无损转成 fnuz）、gfx950 / gfx1250、W4A16。
-
 ## 2. 总体设计
-权重在寄存器里按每组 LUT 解成 fp8、走 fp8 MFMA；按 (N, K) × M 档分派：小 M 一个 kernel 在 CTA 内量化 X 并算完，其余先量化再 GEMM。
+权重在寄存器里按每组 LUT 解成 fp8、走 fp8 MFMA；按 token 时按 (N, K) × M 档分派，1x32 时任意 M 都是量化 + gemm 的 1x32 变体。
 ```text
 加载时 prepare_gemm_a8w4_ptpc_weight：mxfp4 → fd2 布局（按 MFMA K 序排的 fp4 码、每 32-K 组 delta、每通道因子）
-flydsl_gemm_a8w4_ptpc(x, weight, out=None)（无 host 同步）：
+flydsl_gemm_a8w4_ptpc(x, weight, out=None, x_quant="per_token")（无 host 同步）：
   小 M（一次 launch）：dec2、decode 或 tile：x bf16 在 CTA 内按 token 量化进 LDS，乘 fd2 权重 → y bf16 [M, N]
   其余（两次 launch）：quant_x：x bf16 [M, K] → xq fp8 [M, K] + xs f32 [M]（scale = amax/240，商逐位等于 IEEE 除法）
     gemm（按表选 tile）或 gemm_large：xq、xs、fd2 权重 → y bf16 [M, N] = acc · 通道因子 · xs
+  x_quant="1x32"：quant_1x32（DeepSeek 取整）→ xq fp8 + xs E8M0 [M, K/32] → gemm 1x32 变体（即 flydsl_gemm_a8w4_mxfp8）→ y
 ```
 | 目标形状的 M | 路径 | 为什么 |
 |---|---|---|
@@ -34,9 +34,8 @@ flydsl_gemm_a8w4_ptpc(x, weight, out=None)（无 host 同步）：
 | 9–16（tp4_o 9–20） | tile（16-token 片） | M > 8 时块对映射的 MFMA 翻倍 |
 | 之上到 128 / 512 / 1024（按形状） | quant_x → gemm（按 M 档查表选 tile） | 小 tile、K 组让 CTA 铺满 CU |
 | 更大的 M | quant_x → gemm_large（持久化，按 M 选 tile 次序） | 实测 tile 够多时持久化核更快 |
-
-- gemm 档止于 M = 128（tp2_qkvz）、512（tp2_qkv）、1024（其余）；表外形状：小 M 核到 32，gemm 到 2048。
-- 核用不了就退到下一个：小 M 核要 K % 512 == 0、LDS ≤ 64 KiB（dec2 → decode → tile → gemm）；gemm_large 要 N % 256 == 0、K ≥ 512。
+| 1x32，任意 M | quant_1x32 → gemm 1x32 变体（gemm 档用表里的 tile，其余默认 64×128） | 功能版：一条路径先保正确 |
+- 表外：小 M 核到 M = 32、gemm 到 2048；核用不了依次退到下一个：小 M 核要 K % 512 == 0、LDS ≤ 64 KiB，gemm_large 要 N % 256 == 0、K ≥ 512。
 - 核心 kernel 骨架（完整的任务划分与逐拍流水线见 [kernels.md](kernels.md)）：
 ```text
 decode / dec2 / tile（小 M）：grid = 按 N 选的 CTA 数（目标形状 56–128），CTA 管连续 ≤ rb 个 16 行块；rb·ks 个 wave = 行块槽 × K 段
@@ -48,11 +47,13 @@ decode / dec2 / tile（小 M）：grid = 按 N 选的 CTA 数（目标形状 56�
 quant_x：≤ 128 行且 K % 512 == 0 时每 CTA 一行、K/8 个 lane（每 lane 一次 16 B 读；一行 3–6 个 wave 经 LDS 合并 max）
   否则每 CTA 一个 wave、每行 64 个 lane（K % 512 ≠ 0 时 32），lane 第 v 次读 / 写行内第 sub + v·L 个单元，xq 写穿 L2
   amax = bf16 位模式去符号的无符号 max（DPP + readlane 归约，NaN 照常传播）→ scale → 一次倒数 + 一步 FMA 修正
+quant_1x32：分工同 quant_x；一个 32-K 块的 4 个 lane 两次 DPP 求块 max（不计 NaN）→ 位运算得 E8M0 → x·2^−e 转 fp8
 gemm（配置 GemmConfig）：1-D grid，CTA = kg 组 × 4 wave，管 BM token × BN 通道（BM 16–64，BN 64 / 128）
   CTA 按 XCD 轮流派发：超块 = xcd_m 个 M 块 × 4/xcd_m 个 N 块；xcd_m = 4 时一个 X 块只进一个 XCD 的 L2
   K 分 kg 段；每段 xq tile 经 LDS 双缓冲（提前 XS 个 tile 进 VGPR 暂存），fd2 权重直读 VGPR（提前 P 个 tile）
   每 TK（128 / 256）K 一阶段、一次 barrier：VMEM 均匀插在本阶段全部 MFMA 之间；每 128 K 建 LUT → 解成 fp8 → MFMA
   K 组部分和经 LDS 定序相加；收尾 acc × 通道因子 × xs → bf16，经 LDS 拼成整行、每 lane 16 B 写（默认 TK128 tile 放不下，8 B 直写）
+  1x32 变体：每条 MFMA 一个 32-K 块（X 每子步两段 8 B、W 每 MFMA 一个 dword），部分和 × 2^(e−127) 用 v_pk_fma 累加；收尾只乘通道因子
 gemm_large：持久化，grid = min(tile 数, CU 数)；tile = 128 token × 256 通道，CTA 依次做 tile 列表里属于它的 tile
   tile 次序（入口按 M 选）：原次序 CTA c 做 c, c+G, …；1 / 2 / 4 个 N 面板时按面板、面板内 M 主序切 4 段，每 XCD 一段
   8 wave 分两组（每 SIMD 各一个），wave w 管 32 个通道 × 128 token；每个 128-K 步分搬运相与计算相
@@ -60,7 +61,6 @@ gemm_large：持久化，grid = min(tile 数, CU 数)；tile = 128 token × 256 
   X 经 LDS 双缓冲、提前 2 步加载；W 直读 VGPR 两槽，每半步一条 16 B；跨 tile 不排空，每相一次 barrier
   收尾放在 tile 最后一步的计算相：MFMA 按 token 块两两跑，穿插上一对块的缩放、bf16 舍入与 16 B 写（多面板时 nt）
 ```
-
 ## 3. 关键决策
 fp4 在寄存器里解成 fp8 走 fp8 MFMA；小 M 把量化融进一次 launch，中间档按形状查表选 tile，大 M 换持久化核、按 XCD 排 tile。
 | 决策 | 备选 | 为什么 | 代价 / 限制 |
@@ -71,9 +71,9 @@ fp4 在寄存器里解成 fp8 走 fp8 MFMA；小 M 把量化融进一次 launch�
 | 中间档按 (N, K) × M 档查表选 tile、K 组、XCD 超块 | 一个 64×128 tile | M 64–128 时 64×128 只有 20–64 个 CTA | 表只为目标形状实测；表外走通用回退 |
 | 大 M 持久化 128×256 核，两组 wave ping-pong | 通用 tile；单组流水线 | W 的 VMEM 条数是瓶颈；338→432 TF | 用满 256 VGPR；要 N % 256、K ≥ 512 |
 | 大 M 的 tile 次序按 XCD 分段（N 面板） | 原次序：每个 XCD 轮到全部 N 块 | W 或 X 留在一个 L2：tp2_qkv 大 M 445→457 TF | 按 4 XCD、3 MiB 定；核名不变 |
-
+| 1x32 每条 MFMA 一个 32-K 块，部分和 × 2^(e−127) 再累加 | 反量化成 bf16 走 bf16 MFMA | 无块缩放 MFMA；乘 2 的幂精确 | 每 MFMA 多 2 条 FMA |
 ## 4. 性能与精度
-现状：96 个 case 输出都正确且都 ≤ 1.05× 对照（最慢 tp2_qkv M32 1.015×）；M 16–2048 有 46/48 ≤ 1.0×；大 M 9 例 ≥ 453 TF。
+现状：96 个按 token case 都正确且 ≤ 1.05× 对照（最慢 tp2_qkv M32 1.015×）；M 16–2048 有 46/48 ≤ 1.0×；大 M 9 例 ≥ 453 TF。
 | M（6 形状） | 本实现 ÷ 对照（几何均值，范围） | 本实现（几何均值） | 对照（几何均值） | 结论 |
 |---|---|---|---|---|
 | 1–8 | 0.67×（0.54–0.89） | 0.80 TB/s（峰值 15%） | 1.01 TB/s（19%） | dec2 / decode，17 例 ≤ 0.7×；解码 VALU 限速 |
@@ -85,14 +85,12 @@ fp4 在寄存器里解成 fp8 走 fp8 MFMA；小 M 把量化融进一次 launch�
 - 对照：同一 worktree（aiter 上游 main `162173e89`）的 `per_token_quant_hip(x, fp8)` + `gemm_a8w8_bpreshuffle`（同 SGLang gfx942），
   权重为同一份 mxfp4 精确反量化（含置 0）后按通道量化的 fp8；TP2 命中调优表的 CK kernel（tp2_o M32768 除外），TP4 用默认 CK。
 - 计时：两边同进程、逐 case 交替、同协议（aiter `run_perftest`：输入深拷贝轮换，全部 kernel 时间相加，IQR 去离群取均值），先按耗时预热约 12 ms。
-- 精度参考：测试文件内独立 fp32 参考（X 同一量化点，W 精确反量化，fp32 matmul，关 TF32）；它同样把 delta ≥ 12 的组置 0，此损失不计入判据（Qwen3.8 真实权重 delta ≤ 6）。
+- 精度参考：测试文件内独立 fp32 参考（X 同一量化点，1x32 逐块乘 2^(e−127)；W 精确反量化；关 TF32）；delta ≥ 12 的组同样置 0，不计入判据。
 - 判据：逐元素 |Y−ref| ≤ 1%·|ref| + 1%·该行 max|ref|，calc_diff ≤ 1e-5，无 NaN/Inf；对照用它自己的量化操作数按同一判据校验。
 
 精度：激活按 token 量化不比 1x32 e8m0 差；对 BF16 激活 × BF16 权重的误差 11.7–12.5%，主要来自 mxfp4 权重（只量化权重已 11.5–12.2%）。
-| 激活量化误差（每 token 相对 L2 均值） | 按 token（本实现） | 1x32 e8m0（开发中，取整不影响） | 1x32 fp32 scale（参照） |
-|---|---|---|---|
-| 普通 token | 2.5–2.6% | 1.01–1.06× 按 token | 0.78–0.89× 按 token |
-| 离群 token（1–8 个通道达 50–200 倍 RMS） | 1.5–1.8% | 1.33–1.72× 按 token | 0.39–0.48× 按 token |
+- 激活量化误差（每 token 相对 L2 均值）：普通 token 按 token 2.5–2.6%，1x32 e8m0 为其 1.01–1.06×，1x32 fp32 scale（参照）0.78–0.89×。
+- 离群 token（1–8 个通道达 50–200 倍 RMS）：按 token 1.5–1.8%，1x32 e8m0 为其 1.33–1.72×，fp32 scale 0.39–0.48×；取整方式不影响。
 - 原因：E4M3 精度由 3 位尾数定，2 的幂块 scale 只平移指数，按 token 还让每行最大值精确；块 scale 只防行内动态范围 ≳3×10⁴ 时的下溢。
 - 评测：Qwen3.8-Flash-Next-FP8 第 0、3 层真实权重切成 6 形状转 mxfp4，激活按 hc_norm 增益构造；脚本不在仓库内（任务目录 tools/precision1x32/）。
 <!-- mf:perf -->
@@ -205,16 +203,16 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 
 </details>
 <!-- /mf:perf -->
-
 ## 5. 测试覆盖
-三类测试都在 [op_tests/test_gemm_a8w4_ptpc.py](../../../../../op_tests/test_gemm_a8w4_ptpc.py)，每个输出都对照独立 fp32 参考；五种 kernel 三类都覆盖到。
+三类测试都在 [op_tests/test_gemm_a8w4_ptpc.py](../../../../../op_tests/test_gemm_a8w4_ptpc.py)，每个输出都对照独立 fp32 参考；按 token 五种 kernel 三类都覆盖到，1x32 只有基本功能与其他覆盖。
 
-**基本功能测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m basic`，8 例，约 15 秒）
+**基本功能测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m basic`，10 例，约 15 秒）
 | 覆盖什么 | 用例 | 结果 |
 |---|---|---|
 | 6 个形状、五档各至少一例（M 多为非 2 的幂）；profiler 看到的 kernel = 分派结果 | `test_gemm` ×8 | 通过 |
+| 1x32 两个入口（tp2_qkv M = 100）：launch 的核 = kernel_names，对 fp32 参考，两入口逐位相同 | `test_gemm_1x32` ×2 | 通过 |
 
-**性能测试**（`python op_tests/test_gemm_a8w4_ptpc.py`，96 个 case；两边按耗时预热后计时，被计时的输出逐 case 校验）
+**性能测试**（`python op_tests/test_gemm_a8w4_ptpc.py`，96 个按 token case；两边按耗时预热后计时，被计时的输出逐 case 校验）
 | 覆盖什么（分档 / 形状） | case | 结果 |
 |---|---|---|
 | dec2 / decode：6 形状 × M = 1、2、4、8（dec2 5 例） | `<形状>_m<M>` ×24 | 校验通过；0.67× 对照，0.80 TB/s |
@@ -223,46 +221,48 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 | M = 64…2048：gemm 26 例、表交给 gemm_large 的 10 例 | ×36 | 校验通过；0.81× 对照，220 TFLOPS |
 | gemm_large：6 形状 × M = 4096…32768 | ×24 | 校验通过；0.86× 对照，440 TFLOPS |
 
-**其他覆盖测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"`，98 例，冷编译约 75 秒，峰值约 9 GB 显存）
+**其他覆盖测试**（`pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"`，140 例，暖缓存约 55 秒，峰值约 9 GB 显存）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
 | 目标形状各换核点两侧（dec2→decode、小 M→gemm、gemm→大 M） | bench 至多测一侧、不核对 kernel | `test_target_shape_dispatch` ×14 | 通过 |
 | gemm 档内换 tile：M 65 / 129 / 257 起的新 tile，末行块 1 行（129 处量化也换） | 只测其下的 2 的幂 | `test_target_shape_tile_switches` ×9 | 通过 |
 | 小 M 核上限 8/9、16/17、32/33；K%512≠0、LDS 超 64 KiB 依次回落，贴近上限仍用原核 | bench 只测一侧、形状都不触发 | `test_small_m_dispatch` ×13 | 通过 |
 | 小 M：M 不满 token 槽 / 片（含 dec2、80 CTA 的 tile 核）、out= 不越界、6 个 K 窗口 | M 恰为容量 | `test_small_m_partial_tiles` ×8 | 通过 |
-| 小 M 核内量化逐位（含 dec2）：全零、中点、极小 scale、-0、商超 240 | 少数 fp8 码翻转在 GEMM 容差内 | `test_small_m_quant_bitexact` ×5 | 通过 |
-| 小 M：NaN / ±Inf 行只让本行输出为 NaN（decode、dec2、tile） | 前两类的输入都是有限值 | `test_small_m_nonfinite_rows` ×3 | 通过 |
+| 小 M 核内量化逐位（含 dec2）；NaN / ±Inf 行只本行为 NaN | 码翻转在容差内；输入有限 | `test_small_m_quant_bitexact` ×5、`…_nonfinite_rows` ×3 | 通过 |
 | gemm 表外回退：末行块 31 / 1 行、BN64、1–3 个 K tile、超块有空 CTA | 目标形状都在表内；bench 的 M 是 2 的幂 | `test_tile_boundaries` ×3 | 通过 |
 | gemm 经 LDS 收尾时 N 末块半空（BN128、N = 320）、末行块 1 行 | 分派不选这种 tile，直接编译调用 | `test_lds_epilogue_ragged_n` | 通过 |
 | 表外 2048/2049、N%256≠0、K=256；大 M 尾块 1 / 40 行、先满后尾 | 只测 2 的幂 | `test_large_m_dispatch` ×4、`test_large_m_tiles` | 通过 |
 | 大 M 核各 tile 次序（原次序、1/2/4 面板、CTA 数非 4 倍）在 M = 1、129、3001、4097 | 入口每形状只用一种 | `test_large_m_tile_orders` ×5 | 通过 |
 | 入口选的 tile 次序：K = 2560 时 M 1152 / 1153 两侧，tp2_o、tp4_o | 各次序核名相同，profiler 分不出 | `test_large_m_panel_choice` ×10 | 通过 |
 | 两档：字节偏移过 2³¹ / 2³²（gemm 与 gemm_large） | bench 最大 M = 32768，偏移远小于 2³¹ | `test_m_past_32bit_offsets` ×2 | 通过 |
-| quant_x 逐位：全零、中点、极小 scale、-0；两种配置（一行 3 / 6 / 16 wave）及 128/129 切换 | 少数码翻转在容差内 | `test_quant_bitexact` ×6 | 通过 |
-| quant_x：商略超 240（两种除法路径）、NaN / ±Inf 行 | 随机输入不保证出现，且都是有限值 | `test_quant_max_quotient_and_nonfinite` ×2 | 通过 |
-| prepare：逐字节布局（16 个码、delta 0–15）；接受非连续切片 | 结果对时布局也可能错；前两类传整块 | `test_prepare_*` ×2 | 通过 |
-| delta 11 精确、delta 12 置 0 | 随机权重的组 delta 只有 0–3 | `test_delta_flush_boundary` | 通过 |
+| quant_x 逐位：全零、中点、极小 scale、-0、商超 240、NaN / ±Inf 行；两种配置及切换 | 码翻转在容差内 | `test_quant_bitexact` ×6、`…_nonfinite` ×2 | 通过 |
+| prepare 逐字节布局、非连续切片；delta 11 精确、12 置 0 | 布局错时结果也可能对 | `test_prepare_*` ×2、`test_delta_flush_boundary` | 通过 |
 | 报错：dtype、形状、E8M0=255、非 gfx942 | 前两类只给合法输入 | `test_rejects_bad_inputs` | 通过 |
 | `out=` 填 NaN 哨兵且不写越界；M = 0 | 前两类由算子分配输出，M ≥ 1 | `test_out_preallocated`、`test_m_zero` | 通过 |
 | CUDA graph 捕获与重放（五种 kernel，含 dec2 的 LDS 计数器等待） | 前两类都是 eager 调用 | `test_cuda_graph_replay` ×5 | 通过 |
 | 编译缓存：形状交替、回到旧形状、同名核不同 K | bench 每个形状只顺序访问一次 | `test_compile_cache` | 通过 |
+| 1x32 量化逐位等于 DeepSeek 规则（尾数 1.75、1e-4 两侧、次正规、NaN / ±Inf）；对 aiter 只差 3 类已记录块 | 差一档也在容差内 | `test_1x32_quant_*` ×4 | 通过 |
+| 1x32 GEMM 的 E8M0 两端：0 / 1（次正规 2⁻¹²⁷，核保留 denormal）与 200–226 | 算子内量化只出 106–248 | `test_1x32_extreme_scales` ×2 | 通过 |
+| 1x32 六个形状换 tile 的 M（30 处，含量化换配置的 129） | 基本功能只测一个 tile | `test_1x32_tile_switches` ×30 | 通过 |
+| 1x32 表外 N%128=64（越界存储被丢弃）、out= 不越写、e8m0fnu scale | 目标形状 N%128 == 0 | `test_1x32_off_table_ragged_n` ×2 | 通过 |
+| 1x32 报错：x_quant；mxfp8 入口 dtype、形状、对齐、设备、out；非 gfx942；M = 0 | 只给合法输入 | `test_1x32_rejects_bad_inputs`、`…_m_zero` | 通过 |
+| 1x32 两入口同一 CUDA graph 重放；与按 token 交替（编译缓存分开） | 都是 eager、单一模式 | `test_1x32_cuda_graph_replay`、`…_compile_cache` | 通过 |
 
 未覆盖 / 跳过：
 - 非 gfx942（只用替身模拟架构判断）、多 GPU、非 80 CU：测试只在一张 80 CU 的 MI308X 上跑；小 M 配置、分派表与 tile 次序按 80 CU 定。
 - 权重接近 2 GiB 上限时的正确性：目标权重最大 10.5 MB，这样的 prepare 要十几 GB 显存；只测了拒绝一侧。
 - ±Inf 行的 fp8 码：quant_x 与小 M 核都整行写 NaN 码，torch 的有限元素为 0；两边输出都是整行 NaN，用例只比 scale 与输出。
 - 其余 9 个 gemm 档内换 tile 点（M 33 五处，tp2_o 65 / 129，tp4_qkv、tp4_o 65）只由 bench 在其下的 2 的幂处校验：末行块截断机制相同。
-- gemm 分派不选的配置（BM128、BN256、TK128 + K 组）与 compile 对超 LDS 配置的报错：分派不会走到，没有用例。
-- bench 的预热是否够长：只影响离群率、不影响输出，要多次同卡 bench 统计才看得出，没有用例。
-
+- gemm 分派不选的配置（BM128、BN256、TK128 + K 组）与超 LDS 配置的报错：分派不会走到；bench 预热是否够长只影响离群率，没有用例。
+- 1x32：bench 不测（下一里程碑加）；字节偏移过 2³¹（同按 token 按首行 64 位重定基址，要 9 GB）与 E8M0 > 226 / = 255 没有用例。
 ## 6. 风险与待定
 - 小 M 17/36 例 ≤ 0.7×（M ≤ 8 有 7 例 0.72–0.89×，M 16 为 0.76–0.99×，M 32 为 0.88–1.02×）：重复量化与解码 VALU 是下界 → 再降要 X 预排布局（未排期）。
-- tp2_qkv 的 M 16 / 32 / 64 贴着对照（0.99–1.02×）→ 未排期；单次 bench 有 ±2–4% 噪声（aiter 小 M 开头慢段、profiler 偶丢事件）→ 取多次中位。
+- tp2_qkv 的 M 16 / 32 / 64 为对照的 0.99–1.02×，大 M 15 例低于 453 TF（391–451，tp4_qkv 尾轮不满）→ 接受现状；单次 bench 噪声 ±2–4% → 取多次中位。
 - 分派表与 tile 次序只为 6 个目标形状在 80 CU 的 MI308X 上实测：表外形状走通用回退（未调优），换卡要重测 → 新形状上线前补表项。
-- 大 M 15 例低于 453 TF（391–451，tp4_o 最低）：tp4_qkv 尾轮 tile 不满（全命中 L2 的上限变体也到不了 453 TF），tp4_qkvz 看卡 → 接受现状，均快于对照。
-
+- 1x32 是功能版，粗测比按 token 慢 1.5–5.3×（小 M 不走小 M 核、大 M 不走 gemm_large、无调度提示）→ 加 1x32 bench 后按实测定目标。
+- 1x32 已知差异：±Inf 块 scale 记 254（DeepSeek 为 NaN）、NaN 不进块 max，与 aiter 差 3 类块；E8M0 > 226 可能溢出、255 未定义，均不检查。
 ## 7. 进一步阅读
-- 代码入口：[gemm_a8w4_ptpc.py](../../gemm_a8w4_ptpc.py)（接口与报错见 docstring）；权重布局：[layout.py](layout.py)
+- 代码入口：[gemm_a8w4_ptpc.py](../../gemm_a8w4_ptpc.py)（接口与报错见 docstring）；权重布局：[layout.py](layout.py)；1x32 取整与差异：[quant_1x32.py](quant_1x32.py)
 - kernel 设计（任务划分与流水线）：[kernels.md](kernels.md)；region 表与不变量：[gemm.py](gemm.py)、[gemm_large.py](gemm_large.py)、[small_m.py](small_m.py) 模块 docstring
 - 里程碑（每个提交写了改了什么、为什么）：见下方生成块
 <!-- mf:roadmap -->
@@ -276,8 +276,9 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 - M7 ✅ 已推送 · 性能 · 量化核提速 + 中间档 GEMM 对齐 CK + 大 M 按 XCD 的 L2… · 1.051× 对 M3（预期 1.06×） · [提交](https://github.com/luocheng25/aiter/commit/5999a839537de9d25a5a91233fd962dcac487d28)
 - M8 ✅ 已推送 · 维护 · 用例去耦：分派用例改为经公开 kernel_names 核对实际 launch… · [提交](https://github.com/luocheng25/aiter/commit/d91b107b6cc74c6cbc0d36506444d4ed9d7f2fc5)
 - M9 ✅ 已推送 · 维护 · 代码格式与 lint：按 aiter CI 规则（black@stable、r… · 1.002× 对 M7（预期 1×） · [提交](https://github.com/luocheng25/aiter/commit/4f98da2531efc78a51583900a249536626a76eaa)
-- M10 ✅ 本提交 · 分析 · 精度评测：按 token FP8 与 1x32 e8m0 FP8（及 1x32…
-- M11 ⏳ 承诺 · 功能 · 1x32 激活量化功能版：flydsl_gemm_a8w4_ptpc(x_qu…
+- M10 ✅ 已推送 · 分析 · 精度评测：按 token FP8 与 1x32 e8m0 FP8（及 1x32… · [提交](https://github.com/luocheng25/aiter/commit/a995b318dc6027cae42d635a37a7be7bb3126d4a)
+- M11 ✅ 本提交 · 功能 · 1x32 激活量化功能版：flydsl_gemm_a8w4_ptpc(x_qu…
+- M12 ⏳ 承诺 · 维护 · 度量契约：bench 加 1x32 的 96 个 case（<形状>_m<M>… · 预期 1×
 
-下一步（本提交的承诺）：M11 1x32 激活量化功能版：flydsl_gemm_a8w4_ptpc(x_quant="1x32") 与已量化入口 flydsl_gemm_a8w4_mxfp8；独立 1x32 量化核（取整同 DeepSeek-V4.1 参考 act_quant，映射到 fnuz）+ 中间档可配置核按块乘 scale，1x32 先全部 M 走这一条路径
+下一步（本提交的承诺）：M12 度量契约：bench 加 1x32 的 96 个 case（<形状>_m<M>_1x32，6 形状 × M 1…32768，对照仍为 aiter fp8 ptpc），重新冻结基线
 <!-- /mf:roadmap -->

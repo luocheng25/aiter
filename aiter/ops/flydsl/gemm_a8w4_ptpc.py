@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 dense A8W4 GEMM (FlyDSL): per-token FP8 activations x MXFP4 weights -> BF16.
+"""gfx942 dense A8W4 GEMM (FlyDSL): FP8 activations x MXFP4 weights -> BF16.
 
 ``prepare_gemm_a8w4_ptpc_weight`` converts a checkpoint MXFP4 weight once, at load time,
 into the fd2 layout of ``kernels/gemm_a8w4_ptpc/layout.py``. ``flydsl_gemm_a8w4_ptpc``
-computes ``Y = X W^T`` from BF16 ``X``: one kernel quantizes ``X`` per token to FP8
-E4M3FNUZ (``scale = amax / 240``, ``q = RNE(x / scale)``), the GEMM kernel decodes the
-weight to FP8 in registers, accumulates in f32 and writes BF16. The call issues no host
-synchronization and can be captured in a CUDA graph.
+computes ``Y = X W^T`` from BF16 ``X``: by default one kernel quantizes ``X`` per token to
+FP8 E4M3FNUZ (``scale = amax / 240``, ``q = RNE(x / scale)``), the GEMM kernel decodes the
+weight to FP8 in registers, accumulates in f32 and writes BF16. With ``x_quant="1x32"`` the
+activation is quantized 1x32 instead (one E8M0 scale per token and 32 K, rounded as
+DeepSeek-V4.1's reference ``act_quant`` with UE8M0 scales and mapped to E4M3FNUZ; see
+``kernels/gemm_a8w4_ptpc/quant_1x32.py``) and the GEMM scales every 32-K block's MFMA sum;
+``flydsl_gemm_a8w4_mxfp8`` takes such an activation already quantized. The calls issue no
+host synchronization and can be captured in a CUDA graph.
 """
 
 from __future__ import annotations
@@ -41,6 +45,10 @@ from .kernels.gemm_a8w4_ptpc.quant import (
     quant_config,
     quant_kernel_name,
 )
+from .kernels.gemm_a8w4_ptpc.quant_1x32 import (
+    compile_quant_x_1x32,
+    quant_1x32_kernel_name,
+)
 from .kernels.gemm_a8w4_ptpc.small_m import (
     compile_small_m,
     small_m_config,
@@ -50,13 +58,21 @@ from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
 
 __all__ = [
     "GemmA8W4PtpcWeight",
+    "flydsl_gemm_a8w4_mxfp8",
     "flydsl_gemm_a8w4_ptpc",
+    "gemm_a8w4_mxfp8_kernel_names",
     "gemm_a8w4_ptpc_kernel_names",
     "gemm_a8w4_ptpc_shape_supported",
     "prepare_gemm_a8w4_ptpc_weight",
 ]
 
 SUPPORTED_GFX = ("gfx942",)
+# Activation quantization of flydsl_gemm_a8w4_ptpc: one f32 scale per token, or one E8M0
+# scale per token and 32 K (MXFP8).
+X_QUANT_PER_TOKEN = "per_token"
+X_QUANT_1X32 = "1x32"
+_X_QUANTS = (X_QUANT_PER_TOKEN, X_QUANT_1X32)
+_BLOCK_K = 32
 # Byte offsets into the prepared weight are 32-bit.
 _MAX_WEIGHT_BYTES = 1 << 31
 _E8M0_NAN = 255
@@ -174,17 +190,55 @@ def gemm_a8w4_ptpc_shape_supported(n: int, k: int) -> bool:
     )
 
 
-def gemm_a8w4_ptpc_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
-    """Kernels ``flydsl_gemm_a8w4_ptpc`` launches, in order, for ``x`` [m, k] and weight [n, k]."""
+def gemm_a8w4_ptpc_kernel_names(
+    m: int, n: int, k: int, *, x_quant: str = X_QUANT_PER_TOKEN
+) -> tuple[str, ...]:
+    """Kernels ``flydsl_gemm_a8w4_ptpc`` launches, in order, for ``x`` [m, k], weight [n, k]
+    and the same ``x_quant``."""
+    _check_x_quant(x_quant)
     if not gemm_a8w4_ptpc_shape_supported(n, k):
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
+    if x_quant == X_QUANT_1X32:
+        return (
+            quant_1x32_kernel_name(k, quant_config(m, k)),
+            gemm_kernel_name(_config_1x32(m, n, k), x_block_scale=True),
+        )
     choice = _gemm_choice(m, n, k)
     if choice == _SMALL:
         return (small_m_kernel_name_of(_small_config(m, n, k)),)
     gemm_name = LARGE_GEMM_KERNEL_NAME if choice == _LARGE else gemm_kernel_name(choice)
     return (quant_kernel_name(k, quant_config(m, k)), gemm_name)
+
+
+def gemm_a8w4_mxfp8_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
+    """Kernels ``flydsl_gemm_a8w4_mxfp8`` launches for ``xq`` [m, k] and weight [n, k]: the
+    1x32 GEMM (the second kernel of ``x_quant="1x32"``)."""
+    if not gemm_a8w4_ptpc_shape_supported(n, k):
+        raise ValueError(_shape_error(n, k))
+    if m == 0:
+        return ()
+    return (gemm_kernel_name(_config_1x32(m, n, k), x_block_scale=True),)
+
+
+def _check_x_quant(x_quant) -> None:
+    if x_quant not in _X_QUANTS:
+        raise ValueError(f"x_quant must be one of {_X_QUANTS}, got {x_quant!r}")
+
+
+def _config_1x32(m: int, n: int, k: int) -> GemmConfig:
+    """Tile of the 1x32 GEMM, which runs every M: the general kernel's GemmConfig of the
+    per-token dispatch table for (N, K) and M when it has one, else the default GemmConfig
+    (64 x 128, 128 K per stage; it fits every supported shape)."""
+    table = _MID_TABLE.get((n, k))
+    if table is not None:
+        entry = table[next((b for b in sorted(table) if m <= b), max(table))]
+        if entry not in (_SMALL, _LARGE):
+            cfg = GemmConfig(*entry)
+            if gemm_config_supported(n, k, cfg):
+                return cfg
+    return GemmConfig()
 
 
 def _gemm_choice(m: int, n: int, k: int):
@@ -308,18 +362,81 @@ def _quant_per_token(x: torch.Tensor):
     return xq, x_scale
 
 
+def _quant_1x32(x: torch.Tensor):
+    """Contiguous BF16 ``x`` [M, K] (M > 0, K % 64 == 0) -> FP8 E4M3FNUZ [M, K], uint8 E8M0
+    [M, K / 32], as ``x_quant="1x32"`` quantizes it (``kernels/gemm_a8w4_ptpc/quant_1x32.py``).
+    """
+    m, k = x.shape
+    xq = torch.empty((m, k), dtype=torch.float8_e4m3fnuz, device=x.device)
+    x_scale = torch.empty((m, k // _BLOCK_K), dtype=torch.uint8, device=x.device)
+    _run_compiled(
+        compile_quant_x_1x32(k, x.device.index, quant_config(m, k)),
+        ptr_arg(x),
+        ptr_arg(xq),
+        ptr_arg(x_scale),
+        m,
+        current_stream_arg(x.device),
+    )
+    return xq, x_scale
+
+
+def _output(out: torch.Tensor | None, m: int, n: int, device) -> torch.Tensor:
+    """``out`` checked as a contiguous BF16 [m, n] tensor on ``device``, or a new one."""
+    if out is None:
+        return torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    if out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n):
+        raise ValueError(
+            f"out must be bfloat16 {(m, n)}, got {out.dtype} {tuple(out.shape)}"
+        )
+    if out.device != device or not out.is_contiguous():
+        raise ValueError(f"out must be contiguous on {device}")
+    return out
+
+
+def _gemm_1x32_args(xq, x_scale, weight, out, m, stream):
+    """Launcher and arguments of the 1x32 GEMM for FP8 ``xq`` [m, K], E8M0 ``x_scale``."""
+    gemm = compile_gemm_a8w4_ptpc(
+        weight.n,
+        weight.k,
+        xq.device.index,
+        _config_1x32(m, weight.n, weight.k),
+        x_block_scale=True,
+    )
+    args = (
+        ptr_arg(xq),
+        ptr_arg(x_scale),
+        ptr_arg(weight.q),
+        ptr_arg(weight.d),
+        ptr_arg(weight.s),
+        ptr_arg(out),
+        m,
+        stream,
+    )
+    return gemm, args
+
+
 def flydsl_gemm_a8w4_ptpc(
     x: torch.Tensor,
     weight: GemmA8W4PtpcWeight,
     out: torch.Tensor | None = None,
+    *,
+    x_quant: str = X_QUANT_PER_TOKEN,
 ) -> torch.Tensor:
     """``Y = X W^T``: BF16 ``x`` [M, K] (contiguous) x prepared weight [N, K] -> BF16 [M, N].
 
-    ``x`` is quantized per token to FP8 E4M3FNUZ (``scale = amax / 240``, an all-zero row
-    gets scale 1); accumulation is f32. ``out`` may be a preallocated contiguous BF16
-    [M, N] tensor on ``x.device``. Any M (M = 0 returns the empty output).
+    ``x_quant="per_token"`` (default): ``x`` is quantized per token to FP8 E4M3FNUZ
+    (``scale = amax / 240``, an all-zero row gets scale 1). ``x_quant="1x32"``: ``x`` is
+    quantized 1x32 to FP8 E4M3FNUZ with one E8M0 scale per token and 32 K, rounded as
+    DeepSeek-V4.1's reference ``act_quant(block_size=32)`` with UE8M0 scales and mapped to
+    FNUZ (scale byte + 1, same FP8 codes, -0 stored as 0; ``2**ceil(log2(max(amax, 1e-4) /
+    448))``; see ``kernels/gemm_a8w4_ptpc/quant_1x32.py``, also for NaN / Inf and the
+    differences from ``aiter.ops.triton.quant.dynamic_mxfp8_quant``), and the GEMM of
+    ``flydsl_gemm_a8w4_mxfp8`` runs on it, for every M. Accumulation is f32. ``out`` may be a
+    preallocated contiguous BF16 [M, N] tensor on ``x.device``. Any M (M = 0 returns the
+    empty output).
     """
     _require_supported_gfx()
+    _check_x_quant(x_quant)
     if not isinstance(weight, GemmA8W4PtpcWeight):
         raise TypeError("weight must come from prepare_gemm_a8w4_ptpc_weight()")
     if x.dtype != torch.bfloat16:
@@ -334,16 +451,19 @@ def flydsl_gemm_a8w4_ptpc(
         raise ValueError(f"x is on {x.device} but the weight is on {weight.q.device}")
     if not x.is_contiguous():
         raise ValueError("x must be contiguous")
-    if out is None:
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    else:
-        if out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n):
-            raise ValueError(
-                f"out must be bfloat16 {(m, n)}, got {out.dtype} {tuple(out.shape)}"
-            )
-        if out.device != x.device or not out.is_contiguous():
-            raise ValueError(f"out must be contiguous on {x.device}")
+    out = _output(out, m, n, x.device)
     if m == 0:
+        return out
+
+    if x_quant == X_QUANT_1X32:
+        xq = torch.empty((m, k), dtype=torch.float8_e4m3fnuz, device=x.device)
+        x_scale = torch.empty((m, k // _BLOCK_K), dtype=torch.uint8, device=x.device)
+        quant = compile_quant_x_1x32(k, x.device.index, quant_config(m, k))
+        stream = current_stream_arg(x.device)
+        quant_args = (ptr_arg(x), ptr_arg(xq), ptr_arg(x_scale), m, stream)
+        gemm, gemm_args = _gemm_1x32_args(xq, x_scale, weight, out, m, stream)
+        _run_compiled(quant, *quant_args)
+        _run_compiled(gemm, *gemm_args)
         return out
 
     choice = _gemm_choice(m, n, k)
@@ -384,5 +504,64 @@ def flydsl_gemm_a8w4_ptpc(
     )
     # Both launches' arguments are built first, so the GPU waits less between the kernels.
     _run_compiled(quant, *quant_args)
+    _run_compiled(gemm, *gemm_args)
+    return out
+
+
+def flydsl_gemm_a8w4_mxfp8(
+    xq: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: GemmA8W4PtpcWeight,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``Y = X W^T`` from a 1x32-quantized activation -> BF16 [M, N].
+
+    ``xq`` FP8 ``torch.float8_e4m3fnuz`` [M, K] (gfx942's FP8; e4m3fn is not accepted: its
+    codes convert losslessly to FNUZ with the scale byte + 1 and -0 stored as 0) and
+    ``x_scale`` E8M0 [M, K / 32] (uint8 or ``torch.float8_e8m0fnu``, row-major, not
+    shuffled), both contiguous on the weight's GPU, e.g. from ``aiter.ops.triton.quant.
+    dynamic_mxfp8_quant(x, quant_dtype=torch.float8_e4m3fnuz)``:
+    ``X = xq * 2**(x_scale - 127)`` per token and 32-K block; ``weight`` from
+    ``prepare_gemm_a8w4_ptpc_weight``. Every block's MFMA sum is scaled exactly (byte 0 is
+    2**-127) and accumulated in f32 (bytes above 226, i.e. a block amax of 2**107 or more,
+    can overflow it). Scale byte 255 (E8M0 NaN) is not checked, as that would synchronize
+    with the host, and gives an undefined result. ``out`` may be a preallocated contiguous
+    BF16 [M, N] tensor on the weight's GPU. Any M (M = 0 returns the empty output). The GEMM
+    is the one of ``flydsl_gemm_a8w4_ptpc(..., x_quant="1x32")``: the same quantized input
+    gives a bit-identical output. No host synchronization (CUDA graph safe).
+    """
+    _require_supported_gfx()
+    if not isinstance(weight, GemmA8W4PtpcWeight):
+        raise TypeError("weight must come from prepare_gemm_a8w4_ptpc_weight()")
+    if xq.dtype != torch.float8_e4m3fnuz:
+        raise TypeError(f"xq must be float8_e4m3fnuz, got {xq.dtype}")
+    if x_scale.dtype not in _E8M0_DTYPES:
+        raise TypeError(f"x_scale must be uint8 or float8_e8m0fnu, got {x_scale.dtype}")
+    if xq.dim() != 2:
+        raise ValueError(f"xq must be 2-D [M, K], got shape {tuple(xq.shape)}")
+    m, k = xq.shape
+    if k != weight.k:
+        raise ValueError(f"xq has K={k} but the weight has K={weight.k}")
+    if tuple(x_scale.shape) != (m, k // _BLOCK_K):
+        raise ValueError(
+            f"x_scale must have shape {(m, k // _BLOCK_K)}, got {tuple(x_scale.shape)}"
+        )
+    device = weight.q.device
+    if xq.device != device or x_scale.device != device:
+        raise ValueError(
+            f"xq and x_scale must be on the weight's {device}, "
+            f"got {xq.device} and {x_scale.device}"
+        )
+    if not xq.is_contiguous() or not x_scale.is_contiguous():
+        raise ValueError("xq and x_scale must be contiguous")
+    # The GEMM loads 16 bytes of xq and 4 bytes of x_scale per access.
+    if xq.data_ptr() % 16 != 0 or x_scale.data_ptr() % 4 != 0:
+        raise ValueError("xq must be 16-byte aligned and x_scale 4-byte aligned")
+    out = _output(out, m, weight.n, device)
+    if m == 0:
+        return out
+    gemm, gemm_args = _gemm_1x32_args(
+        xq, x_scale, weight, out, m, current_stream_arg(device)
+    )
     _run_compiled(gemm, *gemm_args)
     return out
