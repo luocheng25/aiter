@@ -65,28 +65,47 @@ both halves, so one LUT per lane and step decodes its FP4: MMA-side K
 X reads the same way.
 
 Variant ``x_block_scale`` (1x32 activations: FP8 X with one E8M0 byte per token and 32 K,
-``x_scale`` uint8 [M, K / 32]): gfx942 has no block-scaled MFMA, so each MMA must cover one
-32-K block and its sum is scaled before it is accumulated. MMA ``c`` of sub-step ``ki`` covers
-32-K block ``2 ki + c`` of the tile in natural K order (lane group ``g``: K ``8g .. 8g + 7``
-of it): X is read from LDS as two 8-byte pieces per sub-step (stored K
-``v + 32c + 8g + 64h + 128 step``) and lane ``(g, r)`` loads dword ``g % 2`` of fd2 lane
-group ``2c + g // 2`` per MMA (two 4-byte loads per 64-K block instead of one 8-byte load)
-and decodes each with the LUT of its own 32-K group (delta dwords of both halves). Each MMA
-starts from zero, ``part = W_c X_c`` (f32), and the lane adds
-``part * 2**(e[token, block] - 127)`` to ``acc`` with one FMA per two values; the E8M0 byte
-becomes the f32 ``max(e << 23, 2**-127 bits)``, exact for every e < 255 (e = 0 is the
-subnormal 2**-127: the kernel keeps f32 denormals, ``.amdhsa_float_denorm_mode_32 3``;
-e = 255 gives Inf and an undefined result). ``acc`` holds these sums in decoded-weight units
-(the channel factor comes in the epilogue, ``|part| < 2**21``), so it cannot overflow while
-every E8M0 byte is at most 226 (block amax < 2**107). The scale dwords of tile ``k``
-(``tile_k / 32`` bytes per token) are loaded with W(k) into its slot and expanded at the
-start of stage ``k``. The epilogue multiplies by the channel factor only. The stage issues
-its loads and MFMAs without ``hot_loop_scheduler`` hints (functional version):
+``x_scale`` uint8 [M, K / 32]): gfx942 has no block-scaled MFMA, so each MMA covers one 32-K
+block and its sum is scaled before it is accumulated: the MMA starts from zero,
+``part = W X`` (f32), and the lane adds ``part * s`` to ``acc`` with one FMA per two values.
+``s = 2**(e[token, block] - 126)`` is twice the block scale, the f32 bits ``(e + 1) << 23``
+(normal for every e < 255; e = 255 gives -0 and an undefined result): a byte permute puts e
+alone in byte 2 and one shift-add finishes it, and the epilogue multiplies by half the
+channel factor. ``acc`` holds these sums in decoded-weight units (``|part| < 2**21``), so it
+cannot overflow while every E8M0 byte is at most 226 (block amax < 2**107). The VALU bounds
+the variant (FMA, per-block LUTs and scales on top of the decode), so its stages are emitted
+in their final order instead of with ``hot_loop_scheduler`` hints: one region per MMA,
+fenced by ``sched_barrier``s, holding the MMA, a share of the next block's VALU and LDS reads
+and of the stage's loads (spread over all regions; with ``P = 1`` one per region from the
+first, and ``n_reps`` per region from the first in 16x16x32 tiles of one 64-channel group,
+whose few MMAs leave the loads latency-bound), then the FMA of the tile completed one region
+earlier (its sum is ready by then). The E8M0 dwords of tile ``k`` (``tile_k / 32`` bytes per
+token) are loaded with W(k) into its slot. Two MMA shapes:
 
-    ki   MFMA (per wave)                         LDS -> VGPR       VMEM            VALU
-    0    part = W0c(k) X0c(k); acc += part s(k)  X0(k), 2 x 8 B    X(k+XS) W(k+P)  scales(k),
-    1    ... (c = 0, 1: blocks 2 ki + c)         X1(k)             D(k+P) S(k+P)   decode, FMA
-    end  X(k+1) VGPR -> LDS[(k+1) % 2]; s_barrier
+* 32x32x16 MMAs when ``block_m % 32 == 0`` and ``block_n % 128 == 0`` (``mma32``): wave
+  ``w`` owns channels ``128 t + 32 w .. + 31`` (``t < block_n / 128``) for all tokens, in
+  32-token tiles ``u``; ``acc`` holds 16 values per lane and tile (value ``4 q + v``: channel
+  ``8 q + 4 h + v``, token ``r`` of the tile, lane ``(h, r) = (l // 32, l % 32)``). Two MMAs
+  ``j`` cover a 32-K block: lane ``(h, r)`` feeds K ``16 h + 8 j .. + 7`` of the block to
+  MMA ``j``, so one 8-byte load of fd2 lane group ``2 c + h`` (``c``: the block's half of its
+  64-K block) holds both MMAs' weights, decoded with one LUT, and one 16-byte LDS read the X
+  of both. Block ``b`` of tile ``k`` (``2 tile_k / 64`` blocks):
+
+      b    MFMA (per wave, tile i = (t, u))        LDS -> VGPR      VMEM          VALU
+      b    part_i = A_j(b) B_j(b), j = 0, 1        B(b+1): 16 B/u   X(k+XS) W(k+P) FMA of tile i-1,
+           acc_i += part_i s_u(b)                                   D(k+P) S(k+P) decode A(b+1), s(b+1)
+      end  X(k+1) VGPR -> LDS[(k+1) % 2]; last FMA; s_barrier
+
+* 16x16x32 MMAs otherwise: MMA ``c`` of sub-step ``ki`` covers 32-K block ``2 ki + c`` in
+  natural K order (lane group ``g``: K ``8g .. 8g + 7`` of it): X is read from LDS as two
+  8-byte pieces per sub-step (stored K ``v + 32c + 8g + 64h + 128 step``) and lane ``(g, r)``
+  loads dword ``g % 2`` of fd2 lane group ``2c + g // 2`` per MMA (two 4-byte loads per 64-K
+  block instead of one 8-byte load), each decoded with the LUT of its own 32-K group:
+
+      ki   MFMA (per wave)                         LDS -> VGPR       VMEM            VALU
+      ki   part = W_c(ki) X_c(ki), c = 0, 1        X(ki+1), 2 x 8 B  X(k+XS) W(k+P)  FMA of MMA i-1,
+           acc += part s(2 ki + c)                                   D(k+P) S(k+P)   decode W(ki+1), s(ki+1)
+      end  X(k+1) VGPR -> LDS[(k+1) % 2]; last FMA; s_barrier
 
 Naming: M = tokens, N = channels, K = reduction. ``m`` indexes 64-channel groups (MMA A
 rows), ``ni`` 16-token columns (MMA B columns), ``ki`` 64-K sub-steps, ``c`` the two MMAs of
@@ -94,7 +113,10 @@ a sub-step; ``lane_group`` / ``row`` split a wave's 64 lanes; ``j`` is a stage's
 the unrolled loop body. ``w_regs`` / ``d_regs``: raw weight / delta dwords per slot;
 ``w_frag``: decoded FP8 A operand; ``a_frag``: X B operand; ``a_cp_frag``: X tiles between
 their global load and their LDS store. ``x_block_scale`` only: ``s_regs`` the E8M0 dwords of
-a slot's tile, ``part`` one MMA's unscaled sum, ``W0c`` / ``X0c`` MMA ``c`` of block 0.
+a slot's tile, ``part`` / ``parts`` one MMA tile's unscaled sum, ``s`` a block scale,
+``W_c`` / ``X_c`` MMA ``c``'s operands. ``mma32`` only: ``t`` / ``u`` index 128-channel /
+32-token tiles (``m32`` / ``n32`` of them), ``b`` 32-K blocks, ``j`` the two MMAs of a
+block, ``a_ops`` / ``b_ops`` the decoded weight / X operands by block parity.
 
 Pipeline rules, to keep when editing the kernel body:
 1. One ``s_barrier`` per stage, after its LDS store: the next stage overwrites the buffer
@@ -103,21 +125,28 @@ Pipeline rules, to keep when editing the kernel body:
    by stage k-1; it loads X(k+XS) into staging set ``k % XS``, whose tile X(k) went to LDS at
    the end of stage k-1. Slots, buffers and staging sets are static: the loop body is
    ``unroll`` stages and the tile count of the loop is a multiple of it. ``x_block_scale``:
-   the E8M0 dwords of tile k+P go into the same slot, after its deltas; stage k expands
-   slot ``k % num_slots`` once its own loads are issued.
+   the E8M0 dwords of tile k+P go into the same slot, after its deltas and weights; stage k
+   expands the scales of slot ``k % num_slots`` one block ahead of their MMAs.
 3. The sub-step that decodes a step's first half builds the LUT; the second half reuses it.
    One delta dword covers two 128-K steps (byte ``2 (step % 2) + g // 2``): the parity is
    static per stage, flipped at run time for K groups that start on an odd 128-K tile
-   (a 256-K tile is one whole delta dword). ``x_block_scale``: every MMA builds its own LUT
-   from byte ``kb % 4`` (64-K block ``kb``) of the delta dword of its half ``c``, with the
-   same static parity and run-time flip.
+   (a 256-K tile is one whole delta dword). ``x_block_scale``: every 32-K block (MMA, or
+   MMA pair with ``mma32``) builds its own LUT from byte ``kb % 4`` (64-K block ``kb``) of
+   the delta dword of its half ``c``, with the same static parity and run-time flip.
 4. The accumulators cross the runtime loop as ``init`` / ``yield`` values; the other loop
    state (weight slots, LUTs, ``w_frag``, X staging) lives in register tensors.
 5. Loads are issued in consumption order (X before W within a stage, oldest tile first in
    the prologue): ``vmcnt`` counts in order, so the waits before a decode or an LDS store
    leave every younger load in flight.
 6. ``hot_loop_scheduler`` only orders instructions; its VMEM / VALU / LDS counts must match
-   what a stage issues (per-token stages only; ``x_block_scale`` stages issue no hints).
+   what a stage issues (per-token stages only). ``x_block_scale`` stages are fenced instead:
+   a ``sched_barrier`` right after each MMA (else the FMA of the previous tile is hoisted
+   above it and waits for its sum), one after its share of work and one after the FMA (in
+   the MMA's shadow the compiler splits packed FMAs in two: tp4_qkvz M = 64, GEMM +7%). The
+   FMA of a tile comes one region after its last MMA, before the tile's part is rewritten:
+   parts are used in turn (16x16x32: per MMA tile, two when there is one; 32x32x16: two).
+   A loaded dword is an Int32 to FlyDSL (``>>`` is arithmetic): the scale bytes are taken
+   with a byte permute.
 7. Every wave of the CTA reaches every barrier: all groups run the same number of stages,
    and the K-group exchange (partials over the X buffers, after the last stage's barrier)
    and the epilogue are guarded only by wave-uniform conditions.
@@ -175,6 +204,14 @@ def gemm_kernel_name(cfg=DEFAULT_CONFIG, x_block_scale=False):
         f"_p{cfg.prefetch}_x{cfg.x_stages}_g{cfg.xcd_m}_kg{cfg.k_groups}"
         + ("_1x32" if x_block_scale else "")
     )
+
+
+def _spread(items, slots):
+    """``slots`` lists holding ``items`` in order and evenly: item i in list i * slots // len."""
+    at = [[] for _ in range(slots)]
+    for i, item in enumerate(items):
+        at[i * slots // len(items)].append(item)
+    return at
 
 
 def _lds_bytes(cfg):
@@ -266,6 +303,11 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
     shuffled = _shuffled_store(cfg)
     # x_block_scale: E8M0 dwords per token and K tile (one byte per 32 K).
     xs_tile_dwords = tile_k // 128
+    # x_block_scale with 32 x 32 MMA tiles (MFMA 32x32x16, two per 32-K block): when the
+    # tile holds whole 32 x 128 MMA rows; else 16 x 16 x 32 MMAs, one per block.
+    mma32 = block_scale and block_m % 32 == 0 and block_n % 128 == 0
+    m32 = block_n // 128
+    n32 = block_m // 32
 
     @fx.struct
     class SharedStorage:
@@ -498,13 +540,18 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                 ]
                 for _ in range(num_slots)
             ]
-            # One MMA's unscaled sum and the zero it starts from.
-            part = tiled_mma.make_fragment_C(acc_shape)
+            # One MMA's unscaled sum, in two fragments used in turn (an MMA's sum is scaled after
+            # the next MMA issues), and the zero it starts from.
+            parts = [tiled_mma.make_fragment_C(acc_shape) for _ in range(2)]
             zero_c = tiled_mma.make_fragment_C(acc_shape)
             zero_c.fill(0)
+            x_passes = block_m * tile_k // (_THREADS * 16)
 
-            def load_weights_bs(slot, k_tile):
+            def weight_loads_bs(slot, k_tile):
+                # The loads of W(k), its delta and E8M0 dwords into ``slot``: one closure per
+                # load instruction, in issue order.
                 kb0 = (k_base + k_tile) * k_iters
+                loads = []
                 for m in range_constexpr(m_reps):
                     rb = row_block16(m)
                     for ki in range_constexpr(k_iters):
@@ -514,17 +561,23 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                                 + w_lane_bs
                                 + c * 64
                             )
-                            fx.copy(
-                                d_atom,
-                                fx.slice(w_view, (None, unit)),
-                                w_regs_bs[slot][m][ki][c],
+                            loads.append(
+                                functools.partial(
+                                    fx.copy,
+                                    d_atom,
+                                    fx.slice(w_view, (None, unit)),
+                                    w_regs_bs[slot][m][ki][c],
+                                )
                             )
                     for c in range_constexpr(2):
                         unit = (rb * kq_total + kb0 // 4) * d_block_units + c * 16 + row
-                        fx.copy(
-                            d_atom,
-                            fx.slice(d_view, (None, unit)),
-                            d_regs_bs[slot][m][c],
+                        loads.append(
+                            functools.partial(
+                                fx.copy,
+                                d_atom,
+                                fx.slice(d_view, (None, unit)),
+                                d_regs_bs[slot][m][c],
+                            )
                         )
                 for ni in range_constexpr(n_reps):
                     for i in range_constexpr(xs_tile_dwords):
@@ -533,69 +586,80 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                             + (k_base + k_tile) * xs_tile_dwords
                             + i
                         )
-                        fx.copy(
-                            d_atom, fx.slice(xs_view, (None, unit)), s_regs[slot][ni][i]
+                        loads.append(
+                            functools.partial(
+                                fx.copy,
+                                d_atom,
+                                fx.slice(xs_view, (None, unit)),
+                                s_regs[slot][ni][i],
+                            )
                         )
+                return loads
+
+            def x_loads_bs(stage, k_tile):
+                # The loads of X(k) into staging set ``stage``: one closure per 16-byte load.
+                return [
+                    functools.partial(
+                        fx.copy,
+                        buf_cp_atom,
+                        a_mem_thr[None, i, None, k_base + k_tile],
+                        a_cp_frag[stage][None, i, None],
+                    )
+                    for i in range(x_passes)
+                ]
+
+            def load_weights_bs(slot, k_tile):
+                for load in weight_loads_bs(slot, k_tile):
+                    load()
+
+            def decode_bs(slot, parity, ki, m, c):
+                # Weight operand of MMA c of block ki, channel group m: its dword through the LUT
+                # of its 32-K group, byte kb % 4 of the delta dword of half c (parity = group
+                # K-tile index % 2, static).
+                lut = layout.fp8_lut(
+                    d_regs_bs[slot][m][c].load()[0], sel_bs[parity][ki]
+                )
+                raw = w_regs_bs[slot][m][ki][c].load()[0]
+                w_frag[None, m, (c, ki)].store(layout.fp4x8_to_fp8(raw, lut))
 
             def decode_weights_bs(slot, parity, ki):
-                # parity = group K-tile index % 2 (static): selects byte kb % 4.
                 for m in range_constexpr(m_reps):
                     for c in range_constexpr(2):
-                        lut = layout.fp8_lut(
-                            d_regs_bs[slot][m][c].load()[0], sel_bs[parity][ki]
-                        )
-                        raw = w_regs_bs[slot][m][ki][c].load()[0]
-                        w_frag[None, m, (c, ki)].store(layout.fp4x8_to_fp8(raw, lut))
+                        decode_bs(slot, parity, ki, m, c)
 
-            def block_scales(slot):
-                # [ni][b]: 2**(e - 127) of 32-K block b, as f32 bits max(e << 23, 2**-127):
-                # exact for every e < 255 (e = 0 is the subnormal 2**-127).
+            def block_scales_bs(slot, ki, ni):
+                # Twice 2**(e - 127) of 32-K blocks 2 ki and 2 ki + 1 of the tile for token
+                # ni * 16 + row: the f32 bits (e + 1) << 23, normal for every e < 255 (the
+                # epilogue takes the factor 1 / 2 back with the channel factor). Two VALU each:
+                # a byte permute puts e alone in byte 2, then one shift-add; a shift / mask form
+                # is canonicalized to three.
+                word = s_regs[slot][ni][ki // 2].load()[0]
                 scales = []
-                for ni in range_constexpr(n_reps):
-                    row_scales = []
-                    for b in range_constexpr(tile_k // 32):
-                        word = s_regs[slot][ni][b // 4].load()[0]
-                        shift = 23 - 8 * (b % 4)
-                        if const_expr(shift >= 0):
-                            bits = word << shift
-                        else:
-                            bits = word >> -shift
-                        bits = fx.max(
-                            bits & fx.Uint32(0x7F800000), fx.Uint32(0x00400000)
-                        )
-                        row_scales.append(bits.bitcast(fx.Float32))
-                    scales.append(row_scales)
+                for c in range_constexpr(2):
+                    sel = fx.Uint32(0x0C000C0C | (((2 * ki + c) % 4) << 16))
+                    e16 = layout.byte_perm(word, word, sel)
+                    scales.append(
+                        ((e16 << 7) + fx.Uint32(0x00800000)).bitcast(fx.Float32)
+                    )
                 return scales
 
-            def read_x_bs(buf, ki):
+            def read_x_bs(buf, ki, ni):
                 # Partitions ((8, 2), n_reps, k_iters): MMA c's 8 bytes are piece c of mode 0.
                 fx.copy(
                     rd_atom,
-                    a_lds_r[buf][None, None, ki],
-                    a_frag_retile[None, None, ki],
+                    a_lds_r[buf][None, ni, ki],
+                    a_frag_retile[None, ni, ki],
                 )
 
-            def mma_block_scaled(ki, scales):
-                # MMA c covers 32-K block 2 ki + c: part = W_c X_c from zero, then
-                # acc += part * 2**(e - 127) (one FMA per two values).
-                for c in range_constexpr(2):
-                    fx.gemm(
-                        mma_atom,
-                        part,
-                        w_frag[None, None, (c, ki)],
-                        a_frag[None, None, (c, ki)],
-                        zero_c,
+            def scale_into_acc(part, m, ni, s):
+                # acc += part * 2**(e - 127): one FMA per two values.
+                acc[None, m, ni].store(
+                    fx.fma(
+                        Vec(part[None, m, ni].load()),
+                        Vec.from_elements([s, s, s, s], fx.Float32),
+                        Vec(acc[None, m, ni].load()),
                     )
-                    for m in range_constexpr(m_reps):
-                        for ni in range_constexpr(n_reps):
-                            s = scales[ni][2 * ki + c]
-                            acc[None, m, ni].store(
-                                fx.fma(
-                                    Vec(part[None, m, ni].load()),
-                                    Vec.from_elements([s, s, s, s], fx.Float32),
-                                    Vec(acc[None, m, ni].load()),
-                                )
-                            )
+                )
 
             load_weights = load_weights_bs
             decode_weights = decode_weights_bs
@@ -654,29 +718,21 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                 load_weights(
                     (j + prefetch) % num_slots, k_tile + prefetch
                 )  # VMEM W(k+P)
-            if const_expr(block_scale):
-                scales = block_scales(j % num_slots)  # E8M0 of X(k), loaded with W(k)
             for ki in range_constexpr(k_iters):
-                if const_expr(block_scale):
-                    read_x_bs(buf, ki)  # LR X(k) half ki, two 8-byte pieces
-                else:
-                    fx.copy(
-                        uni_cp_atom,
-                        a_lds_r[buf][None, None, ki],
-                        a_frag_retile[None, None, ki],
-                    )  # LR X(k) half ki
+                fx.copy(
+                    uni_cp_atom,
+                    a_lds_r[buf][None, None, ki],
+                    a_frag_retile[None, None, ki],
+                )  # LR X(k) half ki
                 if const_expr(ki > 0):
                     decode_weights(j % num_slots, j % 2, ki)  # W(k) half ki
-                if const_expr(block_scale):
-                    mma_block_scaled(ki, scales)
-                else:
-                    fx.gemm(
-                        mma_atom,
-                        acc,
-                        w_frag[None, None, (None, ki)],
-                        a_frag[None, None, (None, ki)],
-                        acc,
-                    )
+                fx.gemm(
+                    mma_atom,
+                    acc,
+                    w_frag[None, None, (None, ki)],
+                    a_frag[None, None, (None, ki)],
+                    acc,
+                )
             if const_expr(has_next):
                 decode_weights((j + 1) % num_slots, (j + 1) % 2, 0)  # W(k+1) half 0
                 fx.copy(
@@ -684,10 +740,107 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                     a_cp_frag_retile[(j + 1) % x_stages],
                     a_lds_w[(j + 1) % 2],
                 )  # LW X(k+1)
-            if const_expr(not block_scale):
-                hot_loop_scheduler(do_x, do_w, has_next)
+            hot_loop_scheduler(do_x, do_w, has_next)
             rocdl.sched_barrier(0)
             gpu.barrier()
+
+        def pipeline_stage_bs(j, k_tile, do_x, do_w, has_next):
+            # x_block_scale stage of group K tile k (k % unroll == j), 16x16x32 MMAs. The VALU
+            # bounds it, so it is emitted in its final order, one fenced region per MMA: MMA i,
+            # a share of the VALU and LDS reads for the next block (decode, E8M0 scales, X) and
+            # of the stage's loads, then the FMA scaling MMA i - 1 (its sum is ready by then).
+            slot = j % num_slots
+            buf = j % 2
+            loads = []
+            if const_expr(do_x):
+                loads += x_loads_bs(j % x_stages, k_tile + x_stages)  # VMEM X(k+XS)
+            if const_expr(do_w):
+                loads += weight_loads_bs(
+                    (j + prefetch) % num_slots, k_tile + prefetch
+                )  # VMEM W(k+P), D(k+P), S(k+P)
+            mmas = mfma_per_ki * k_iters
+            if const_expr(prefetch > 1 and m_reps > 1):
+                load_at = _spread(loads, mmas)
+            else:
+                # W(k+1) is decoded at the end of this stage (P = 1), or one 64-channel
+                # group: few MMAs per load and latency-bound tiles (tp2_qkv M = 64, 32 x 64:
+                # GEMM -8%). The loads go out first, n_reps per MMA, the rest after the last.
+                per = 1 if prefetch == 1 else n_reps
+                load_at = [loads[per * i : per * i + per] for i in range(mmas)]
+                load_at[-1] += loads[per * mmas :]
+            for ni in range_constexpr(n_reps):
+                read_x_bs(buf, 0, ni)  # LR X(k) block 0
+            scales = [block_scales_bs(slot, 0, ni) for ni in range_constexpr(n_reps)]
+            pending = None
+            i = 0
+            for ki in range_constexpr(k_iters):
+                nxt = [None] * n_reps
+                work = []
+                if const_expr(ki + 1 < k_iters):
+                    for ni in range_constexpr(n_reps):
+                        # LR X(k) block ki + 1
+                        work.append(functools.partial(read_x_bs, buf, ki + 1, ni))
+                    for m in range_constexpr(m_reps):
+                        for c in range_constexpr(2):
+                            # W(k) block ki + 1
+                            work.append(
+                                functools.partial(decode_bs, slot, j % 2, ki + 1, m, c)
+                            )
+                    for ni in range_constexpr(n_reps):
+
+                        def scale_work(ni=ni, ki=ki, nxt=nxt):
+                            nxt[ni] = block_scales_bs(slot, ki + 1, ni)
+
+                        work.append(scale_work)
+                elif const_expr(has_next):
+                    for m in range_constexpr(m_reps):
+                        for c in range_constexpr(2):
+                            # W(k+1) block 0
+                            work.append(
+                                functools.partial(
+                                    decode_bs, (j + 1) % num_slots, (j + 1) % 2, 0, m, c
+                                )
+                            )
+                work_at = _spread(work, mfma_per_ki) if work else [[]] * mfma_per_ki
+                t = 0
+                for c in range_constexpr(2):
+                    for m in range_constexpr(m_reps):
+                        for ni in range_constexpr(n_reps):
+                            part = parts[i % 2]
+                            fx.gemm(
+                                mma_atom,
+                                part[(None, 0), m, ni],
+                                w_frag[None, m, (c, ki)],
+                                a_frag[None, ni, (c, ki)],
+                                zero_c[(None, 0), m, ni],
+                            )
+                            # Fenced: else the FMA of MMA i - 1 is hoisted above MMA i; it
+                            # comes after the other work, out of the MMA's shadow (rule 6).
+                            rocdl.sched_barrier(0)
+                            for op in work_at[t]:
+                                op()
+                            for load in load_at[i]:
+                                load()
+                            rocdl.sched_barrier(0)
+                            if pending is not None:
+                                scale_into_acc(*pending)
+                            pending = (part, m, ni, scales[ni][c])
+                            rocdl.sched_barrier(0)
+                            t += 1
+                            i += 1
+                if const_expr(ki + 1 < k_iters):
+                    scales = nxt
+            if const_expr(has_next):
+                fx.copy(
+                    uni_cp_atom,
+                    a_cp_frag_retile[(j + 1) % x_stages],
+                    a_lds_w[(j + 1) % 2],
+                )  # LW X(k+1)
+            scale_into_acc(*pending)
+            rocdl.sched_barrier(0)
+            gpu.barrier()
+
+        stage = pipeline_stage_bs if block_scale else pipeline_stage
 
         # ======== Prologue: X(0) -> LDS, X(1 .. XS-1) staged, W(0 .. P-1) in slots ========
         load_x(0, fx.Int32(0))
@@ -709,7 +862,7 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                 acc.store(state[0])
                 kt = fx.Int32(iv * unroll)
                 for j in range_constexpr(unroll):
-                    pipeline_stage(j, kt + j, True, True, True)
+                    stage(j, kt + j, True, True, True)
                 results = yield [acc.load()]
             # A loop with one carried value yields it bare, not as a one-element list.
             acc.store(results[0] if isinstance(results, (list, tuple)) else results)
@@ -717,7 +870,7 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
         # ======== Tail: the last stages stop loading past the group's last tile ========
         for j in range_constexpr(tail_stages):
             kk = loop_iters * unroll + j
-            pipeline_stage(
+            stage(
                 j % unroll,
                 fx.Int32(kk),
                 kk + x_stages < group_tiles,
@@ -763,6 +916,391 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                     gpu.barrier()
         return acc
 
+    @flyc.jit
+    def gemm_tile_bs32(x_tile, w_buf, d_buf, blk_n, lds, xs_buf):
+        # x_block_scale with MFMA 32x32x16 (see the module docstring): wave w owns channels
+        # 128 t + 32 w .. + 31 (t < m32) for all tokens (32-token tiles u < n32); lane
+        # (h, r) = (l // 32, l % 32) feeds row / token r and K 16 h .. 16 h + 15 of each 32-K
+        # block, 8 of them to each of the block's two MMAs (j = 0, 1: K 16 h + 8 j + v).
+        tid = gpu.thread_idx.x % _THREADS
+        group = gpu.thread_idx.x // _THREADS
+        mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, fp8))
+
+        # X: global -> VGPR (16 B per lane) -> swizzled LDS, as in gemm_tile.
+        a_tile = fx.flat_divide(x_tile, fx.make_tile(block_m, tile_k))[
+            None, None, 0, None
+        ]
+        buf_cp_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fp8)
+        thrs_k = tile_k // 16
+        thrs_m = _THREADS // thrs_k
+        g2r_tv_layout = fx.make_layout(
+            ((thrs_k, thrs_m), (1, 16)), ((thrs_m * 16, 1), (1, thrs_m))
+        )
+        a_g2r = fx.make_tiled_copy(
+            buf_cp_atom, g2r_tv_layout, fx.make_tile(thrs_m, tile_k)
+        )
+        a_mem_thr = a_g2r.get_slice(tid).partition_S(a_tile)
+        a_cp_frag = [
+            fx.make_fragment_like(a_mem_thr[None, None, None, 0])
+            for _ in range(x_stages)
+        ]
+        swz_bits = (tile_k // 16).bit_length() - 1
+        swz = fx.SwizzleType.get(swz_bits, 4, swz_bits)
+        lds_x = [lds.a.ptr + (group * 2 + b) * x_tile_bytes for b in range(2)]
+        uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fp8)
+        a_r2s = fx.make_tiled_copy(
+            uni_cp_atom, g2r_tv_layout, fx.make_tile(thrs_m, tile_k)
+        )
+        a_lds_w = [
+            a_r2s.get_slice(tid).partition_D(
+                fx.make_view(
+                    ptr,
+                    fx.make_composed_layout(
+                        fx.static(swz),
+                        fx.make_ordered_layout((block_m, tile_k), order=(1, 0)),
+                    ),
+                )
+            )
+            for ptr in lds_x
+        ]
+        a_cp_frag_retile = [a_r2s.get_slice(tid).retile(f) for f in a_cp_frag]
+
+        lane = tid % 64
+        half = lane // 32
+        r = lane % 32
+        wave = tid // 64
+        k_base = group * group_tiles
+        x_passes = block_m * tile_k // (_THREADS * 16)
+        blocks = tile_k // 32
+        tiles = [(t, u) for t in range(m32) for u in range(n32)]
+        n_tiles = len(tiles)
+        # A tile's two MMAs run back to back and its sum is scaled one MMA region after the
+        # second: consecutive tiles (across blocks too) use the two part buffers in turn.
+
+        # X reads: token r of tile u, 16-byte chunk 2 kb + c + h of the 64-K block kb ...
+        # swizzled by the row (32 u + r has the same low bits as r): dword offsets.
+        chunk_mask = tile_k // 16 - 1
+        x_rd = [
+            r * (tile_k // 4) + ((fx.Int32(2 * b) | half) ^ (r & chunk_mask)) * 4
+            for b in range(blocks)
+        ]
+        lds_u32 = fx.recast_iter(fx.Uint32, lds.a.ptr)
+        lds_x32 = [lds_u32 + (group * 2 + b) * (x_tile_bytes // 4) for b in range(2)]
+        vec4u = fx.Vector.make_type(4, fx.Uint32)
+        # Weights: 8-byte units; lane (h, r) of channel tile t reads fd2 lane group 2 c + h
+        # of row r % 16 of 16-row block 8 t + 2 w + r // 16.
+        w_lane = (2 * wave + r // 16) * kb_total * 64 + half * 16 + r % 16
+        d_lane = (2 * wave + r // 16) * kq_total * d_block_units + r % 16
+        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Uint32)
+        d_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Uint32)
+        d_view = fx.logical_divide(d_buf, fx.make_layout(1, 1))
+        xs_view = fx.logical_divide(xs_buf, fx.make_layout(1, 1))
+        # Delta byte kb % 4 of the group's tile (parity p = tile index % 2 with 128-K tiles).
+        sel = [
+            [fx.Uint32(((p * k_iters + kb) % 4) * 0x01010101) for kb in range(k_iters)]
+            for p in range(2)
+        ]
+        if const_expr(group_tiles % 2 == 1 and tile_k == 128):
+            odd = (group % 2) == 1
+            sel = [
+                [odd.select(sel[1 - p][kb], sel[p][kb]) for kb in range(k_iters)]
+                for p in range(2)
+            ]
+        # [slot][t][block] weight dword pairs, [slot][t][c] delta dwords, [slot][u][i] E8M0
+        # dwords of token 32 u + r (byte b: block 4 i + b of the tile).
+        w_regs = [
+            [
+                [fx.make_rmem_tensor(2, fx.Uint32) for _ in range(blocks)]
+                for _ in range(m32)
+            ]
+            for _ in range(num_slots)
+        ]
+        d_regs = [
+            [[fx.make_rmem_tensor(1, fx.Uint32) for _ in range(2)] for _ in range(m32)]
+            for _ in range(num_slots)
+        ]
+        s_regs = [
+            [
+                [fx.make_rmem_tensor(1, fx.Uint32) for _ in range(xs_tile_dwords)]
+                for _ in range(n32)
+            ]
+            for _ in range(num_slots)
+        ]
+        # Operands by block parity: A (decoded weights) [8 v, 2 j, t, parity], B (X) the
+        # same with u; C: the accumulators, one 16-value column per tile, and the parts.
+        a_ops = fx.make_rmem_tensor((8, 2, m32, 2), fp8)
+        b_ops = fx.make_rmem_tensor((8, 2, n32, 2), fp8)
+        acc = fx.make_rmem_tensor((16, n_tiles), fx.Float32)
+        acc.fill(0)
+        parts = fx.make_rmem_tensor((16, 2), fx.Float32)
+        zero = fx.make_rmem_tensor(16, fx.Float32)
+        zero.fill(0)
+
+        def weight_loads(slot, k_tile):
+            # W(k), its deltas and E8M0 dwords into ``slot``: one closure per load.
+            kb0 = (k_base + k_tile) * k_iters
+            base = blk_n * (block_n // 16)
+            loads = []
+            for t in range_constexpr(m32):
+                for b in range_constexpr(blocks):
+                    unit = (
+                        (base + 8 * t) * kb_total * 64
+                        + (kb0 + b // 2) * 64
+                        + (b % 2) * 32
+                        + w_lane
+                    )
+                    loads.append(
+                        functools.partial(
+                            fx.copy,
+                            w_atom,
+                            fx.slice(w_buf, (unit, None)),
+                            w_regs[slot][t][b],
+                        )
+                    )
+                for c in range_constexpr(2):
+                    unit = (
+                        (base + 8 * t) * kq_total * d_block_units
+                        + (kb0 // 4) * d_block_units
+                        + c * 16
+                        + d_lane
+                    )
+                    loads.append(
+                        functools.partial(
+                            fx.copy,
+                            d_atom,
+                            fx.slice(d_view, (None, unit)),
+                            d_regs[slot][t][c],
+                        )
+                    )
+            for u in range_constexpr(n32):
+                for i in range_constexpr(xs_tile_dwords):
+                    unit = (
+                        (32 * u + r) * (k // 128)
+                        + (k_base + k_tile) * xs_tile_dwords
+                        + i
+                    )
+                    loads.append(
+                        functools.partial(
+                            fx.copy,
+                            d_atom,
+                            fx.slice(xs_view, (None, unit)),
+                            s_regs[slot][u][i],
+                        )
+                    )
+            return loads
+
+        def x_loads(stage, k_tile):
+            return [
+                functools.partial(
+                    fx.copy,
+                    buf_cp_atom,
+                    a_mem_thr[None, i, None, k_base + k_tile],
+                    a_cp_frag[stage][None, i, None],
+                )
+                for i in range(x_passes)
+            ]
+
+        def decode(slot, parity, b, t):
+            # Block b of the tile for channel tile t: both dwords through the LUT of the
+            # lane's 32-K group (delta byte kb % 4 of half b % 2).
+            lut = layout.fp8_lut(d_regs[slot][t][b % 2].load()[0], sel[parity][b // 2])
+            raw = w_regs[slot][t][b].load()
+            for j in range_constexpr(2):
+                a_ops[None, j, t, b % 2].store(layout.fp4x8_to_fp8(raw[j], lut))
+
+        def read_x(buf, b, u):
+            # LR X block b, token tile u: 16 bytes, K 16 h .. 16 h + 15 of the block.
+            vals = fx.ptr_load(
+                lds_x32[buf] + (x_rd[b] + u * 32 * (tile_k // 4)), result_type=vec4u
+            )
+            b_ops[None, None, u, b % 2].store(Vec(vals).bitcast(fp8))
+
+        def block_scale_of(slot, b, u):
+            # Twice 2**(e - 127) for block b of token 32 u + r: the f32 bits (e + 1) << 23
+            # (normal for every e < 255; the epilogue takes the 1 / 2 back), two VALU.
+            word = s_regs[slot][u][b // 4].load()[0]
+            e16 = layout.byte_perm(word, word, fx.Uint32(0x0C000C0C | ((b % 4) << 16)))
+            return ((e16 << 7) + fx.Uint32(0x00800000)).bitcast(fx.Float32)
+
+        def scale_into_acc(i, part, s):
+            acc[None, i].store(
+                fx.fma(
+                    Vec(part.load()),
+                    Vec.from_elements([s] * 16, fx.Float32),
+                    Vec(acc[None, i].load()),
+                )
+            )
+
+        regions_per_block = 2 * n_tiles
+
+        def pipeline_stage(j, k_tile, do_x, do_w, has_next):
+            # Stage of group K tile k (k % unroll == j). One fenced region per MMA: the MMA, a
+            # share of the next block's VALU and LDS reads (decode, E8M0 scales, X) and of the
+            # stage's loads, then the FMA scaling the tile completed one region earlier.
+            slot = j % num_slots
+            buf = j % 2
+            loads = []
+            if const_expr(do_x):
+                loads += x_loads(j % x_stages, k_tile + x_stages)  # VMEM X(k+XS)
+            if const_expr(do_w):
+                loads += weight_loads(
+                    (j + prefetch) % num_slots, k_tile + prefetch
+                )  # VMEM W(k+P), D(k+P), S(k+P)
+            regions = regions_per_block * blocks
+            if const_expr(prefetch > 1):
+                load_at = _spread(loads, regions)
+            else:
+                # W(k+1) is decoded at the end of this stage: its loads go out first.
+                load_at = [loads[i : i + 1] for i in range(regions)]
+                load_at[-1] += loads[regions:]
+            for u in range_constexpr(n32):
+                read_x(buf, 0, u)  # LR X(k) block 0
+            scales = [block_scale_of(slot, 0, u) for u in range_constexpr(n32)]
+            pending = []
+            reg = 0
+            for b in range_constexpr(blocks):
+                nxt = [None] * n32
+                work = []
+                if const_expr(b + 1 < blocks):
+                    for u in range_constexpr(n32):
+                        work.append(functools.partial(read_x, buf, b + 1, u))
+                    for t in range_constexpr(m32):
+                        work.append(functools.partial(decode, slot, j % 2, b + 1, t))
+                    for u in range_constexpr(n32):
+
+                        def scale_work(u=u, b=b, nxt=nxt):
+                            nxt[u] = block_scale_of(slot, b + 1, u)
+
+                        work.append(scale_work)
+                elif const_expr(has_next):
+                    for t in range_constexpr(m32):
+                        work.append(
+                            functools.partial(
+                                decode, (j + 1) % num_slots, (j + 1) % 2, 0, t
+                            )
+                        )
+                work_at = (
+                    _spread(work, regions_per_block)
+                    if work
+                    else [[]] * regions_per_block
+                )
+                q = 0
+                for i in range_constexpr(n_tiles):
+                    t, u = tiles[i]
+                    part = parts[None, (b * n_tiles + i) % 2]
+                    for jj in range_constexpr(2):
+                        fx.gemm(
+                            mma_atom,
+                            part,
+                            a_ops[None, jj, t, b % 2],
+                            b_ops[None, jj, u, b % 2],
+                            zero if jj == 0 else part,
+                        )
+                        # Fenced: else the FMA is hoisted above the MMA. The FMA comes after
+                        # the region's other work, out of the MMA's shadow (else the compiler
+                        # splits packed FMAs there; tp4_qkvz M = 64: GEMM -7%).
+                        rocdl.sched_barrier(0)
+                        for op in work_at[q]:
+                            op()
+                        for load in load_at[reg]:
+                            load()
+                        rocdl.sched_barrier(0)
+                        if pending:
+                            scale_into_acc(*pending.pop(0))
+                        if jj == 1:
+                            pending.append((i, part, scales[u]))
+                        rocdl.sched_barrier(0)
+                        q += 1
+                        reg += 1
+                if const_expr(b + 1 < blocks):
+                    scales = nxt
+            if const_expr(has_next):
+                fx.copy(
+                    uni_cp_atom,
+                    a_cp_frag_retile[(j + 1) % x_stages],
+                    a_lds_w[(j + 1) % 2],
+                )  # LW X(k+1)
+            for item in pending:
+                scale_into_acc(*item)
+            rocdl.sched_barrier(0)
+            gpu.barrier()
+
+        # ======== Prologue: X(0) -> LDS, X(1 .. XS-1) staged, W(0 .. P-1) in slots ========
+        for load in x_loads(0, fx.Int32(0)) + weight_loads(0, fx.Int32(0)):
+            load()
+        for i in range_constexpr(1, max(x_stages, prefetch)):
+            if const_expr(i < x_stages and i < group_tiles):
+                for load in x_loads(i, fx.Int32(i)):
+                    load()
+            if const_expr(i < prefetch and i < group_tiles):
+                for load in weight_loads(i, fx.Int32(i)):
+                    load()
+        fx.copy(uni_cp_atom, a_cp_frag_retile[0], a_lds_w[0])
+        for t in range_constexpr(m32):
+            decode(0, 0, 0, t)
+        gpu.barrier()
+
+        # ======== Main loop and tail, as in gemm_tile ========
+        if const_expr(loop_iters > 0):
+            acc_init = [acc.load()]
+            results = acc_init
+            for iv, state in range(0, loop_iters, 1, init=acc_init):
+                acc.store(state[0])
+                kt = fx.Int32(iv * unroll)
+                for j in range_constexpr(unroll):
+                    pipeline_stage(j, kt + j, True, True, True)
+                results = yield [acc.load()]
+            acc.store(results[0] if isinstance(results, (list, tuple)) else results)
+        for j in range_constexpr(tail_stages):
+            kk = loop_iters * unroll + j
+            pipeline_stage(
+                j % unroll,
+                fx.Int32(kk),
+                kk + x_stages < group_tiles,
+                kk + prefetch < group_tiles,
+                kk + 1 < group_tiles,
+            )
+
+        # ======== K groups: pairwise tree through LDS, group 0 ends with the sum ========
+        if const_expr(k_groups > 1):
+            # 16-byte units, lane-contiguous: tile i, quarter q is unit 4 i + q.
+            units = 4 * n_tiles
+            part_lds = fx.recast_iter(fx.Float32, lds.a.ptr)
+
+            def part_ptr(slot, unit):
+                return part_lds + ((slot * 4 + wave) * units + unit) * 256 + lane * 4
+
+            vec4 = fx.Vector.make_type(4, fx.Float32)
+            for rnd in range_constexpr(k_groups.bit_length() - 1):
+                active = k_groups >> rnd
+                half_g = active // 2
+                if (group >= half_g) & (group < active):
+                    for i in range_constexpr(n_tiles):
+                        vals = Vec(acc[None, i].load())
+                        for q in range_constexpr(4):
+                            fx.ptr_store(
+                                vals[4 * q : 4 * q + 4],
+                                part_ptr(group - half_g, 4 * i + q),
+                            )
+                gpu.barrier()
+                slot = group % half_g
+                for i in range_constexpr(n_tiles):
+                    vals = Vec(acc[None, i].load())
+                    sums = []
+                    for q in range_constexpr(4):
+                        sums.append(
+                            vals[4 * q : 4 * q + 4]
+                            + Vec(
+                                fx.ptr_load(part_ptr(slot, 4 * i + q), result_type=vec4)
+                            )
+                        )
+                    acc[None, i].store(
+                        Vec.from_elements([x for s4 in sums for x in s4], fx.Float32)
+                    )
+                if const_expr(half_g > 1):
+                    gpu.barrier()
+        return acc
+
     out_pitch = _out_row_bytes(cfg) // 4
     out_units = block_m * (block_n // 8)
 
@@ -796,7 +1334,8 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
         # One MMA tile's 4 sums -> BF16: times the channel factors and, per token, the
         # token scale (x_block_scale applied its block scales in the K loop).
         if block_scale:
-            vals = [(c[v] * w_scale[v]).to(fx.BFloat16) for v in range(4)]
+            # The K loop's block scales are twice 2**(e - 127).
+            vals = [(c[v] * (w_scale[v] * 0.5)).to(fx.BFloat16) for v in range(4)]
         else:
             vals = [
                 (c[v] * w_scale[v] * x_scales[ni]).to(fx.BFloat16) for v in range(4)
@@ -870,6 +1409,78 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                 else:
                     buf_copy_store(y_buf, unit, out, elem=fx.BFloat16, unit_elems=4)
 
+    tiles32 = [(t, u) for t in range(m32) for u in range(n32)]
+
+    def bf16_out32(blk_n, s_buf):
+        # MMA32 epilogue values of lane (h, r): value 4 q + v of a tile is channel
+        # 8 q + 4 h + v of the wave's 32-channel group (token r of the tile), times its
+        # channel factor and 1 / 2 (the K loop's block scales are twice 2**(e - 127)).
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = tid // 64
+        w_scales = [
+            [
+                buf_copy_load(
+                    s_buf,
+                    blk_n * (block_n // 4) + 32 * t + 8 * wave + 2 * q + lane // 32,
+                    elem=fx.Float32,
+                    unit_elems=4,
+                )
+                for q in range_constexpr(4)
+            ]
+            for t in range_constexpr(m32)
+        ]
+
+        def convert(vals, t):
+            return [
+                Vec.from_elements(
+                    [
+                        (vals[4 * q + v] * (w_scales[t][q][v] * 0.5)).to(fx.BFloat16)
+                        for v in range(4)
+                    ],
+                    fx.BFloat16,
+                )
+                for q in range(4)
+            ]
+
+        return convert
+
+    @flyc.jit
+    def stage_out_tile32(acc, blk_n, s_buf, lds):
+        # The scaled BF16 tile to LDS, token-major (pitch out_pitch dwords): 8 bytes per
+        # lane, tile and q.
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = tid // 64
+        convert = bf16_out32(blk_n, s_buf)
+        out_lds = fx.recast_iter(fx.Uint32, lds.a.ptr)
+        for i in range_constexpr(len(tiles32)):
+            t, u = tiles32[i]
+            outs = convert(Vec(acc[None, i].load()), t)
+            for q in range_constexpr(4):
+                col = 64 * t + 16 * wave + 4 * q + 2 * (lane // 32)
+                fx.ptr_store(
+                    Vec(outs[q]).bitcast(fx.Uint32),
+                    out_lds + (32 * u + lane % 32) * out_pitch + col,
+                )
+
+    @flyc.jit
+    def store_tile32(acc, blk_n, s_buf, y_buf):
+        # Direct 8-byte stores; channels past N store past the buffer (pipeline rule 8).
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = tid // 64
+        convert = bf16_out32(blk_n, s_buf)
+        for i in range_constexpr(len(tiles32)):
+            t, u = tiles32[i]
+            outs = convert(Vec(acc[None, i].load()), t)
+            for q in range_constexpr(4):
+                ch4 = blk_n * (block_n // 4) + 32 * t + 8 * wave + 2 * q + lane // 32
+                unit = (32 * u + lane % 32) * (n // 4) + ch4
+                if const_expr(ragged_n):
+                    unit = (ch4 < n // 4).select(unit, fx.Int32(block_m * (n // 4)))
+                buf_copy_store(y_buf, unit, outs[q], elem=fx.BFloat16, unit_elems=4)
+
     @flyc.kernel(
         name=gemm_kernel_name(cfg, block_scale), known_block_size=[threads, 1, 1]
     )
@@ -906,7 +1517,7 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                     ),
                     num_records_bytes=nrows * k,
                 )
-                if const_expr(block_scale):
+                if const_expr(block_scale and not mma32):
                     # 4-byte weight units (one dword per MMA) and the E8M0 rows of the tile.
                     w_buf = ptr_buf_tensor(
                         p_wq, elem=fx.Uint32, num_records_bytes=w_bytes
@@ -931,7 +1542,10 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                         elem=fx.Float32,
                         num_records_bytes=nrows * 4,
                     )
-                acc = gemm_tile(x_tile, w_buf, d_buf, blk_n, lds, xs_buf)
+                if const_expr(mma32):
+                    acc = gemm_tile_bs32(x_tile, w_buf, d_buf, blk_n, lds, xs_buf)
+                else:
+                    acc = gemm_tile(x_tile, w_buf, d_buf, blk_n, lds, xs_buf)
 
                 if const_expr(shuffled):
                     # Whole 128-byte lines per store instead of 32-byte pieces of 16 rows
@@ -945,7 +1559,12 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                     )
                     if const_expr(k_groups > 1):
                         gpu.barrier()
-                    if const_expr(unguarded):
+                    if const_expr(mma32 and unguarded):
+                        stage_out_tile32(acc, blk_n, s_buf, lds)
+                    elif const_expr(mma32):
+                        if gpu.thread_idx.x < _THREADS:
+                            stage_out_tile32(acc, blk_n, s_buf, lds)
+                    elif const_expr(unguarded):
                         stage_out_tile(acc, blk_n, s_buf, xs_buf, lds)
                     else:
                         if gpu.thread_idx.x < _THREADS:
@@ -960,7 +1579,12 @@ def compile_gemm_a8w4_ptpc(n, k, device_index, cfg=DEFAULT_CONFIG, x_block_scale
                         unit_elems=4,
                         num_records_bytes=nrows * (n * 2),
                     )
-                    if const_expr(unguarded):
+                    if const_expr(mma32 and unguarded):
+                        store_tile32(acc, blk_n, s_buf, y_buf)
+                    elif const_expr(mma32):
+                        if gpu.thread_idx.x < _THREADS:
+                            store_tile32(acc, blk_n, s_buf, y_buf)
+                    elif const_expr(unguarded):
                         store_tile(acc, blk_n, s_buf, xs_buf, y_buf)
                     else:
                         if gpu.thread_idx.x < _THREADS:

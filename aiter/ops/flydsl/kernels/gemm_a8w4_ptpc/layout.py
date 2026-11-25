@@ -51,6 +51,11 @@ def _perm(hi, lo, sel):
     return fx.Uint32(fx.rocdl.perm_b32(fx.Uint32(hi), fx.Uint32(lo), fx.Uint32(sel)))
 
 
+def byte_perm(hi, lo, sel):
+    """Byte ``j`` of the result is byte ``sel[j]`` of the 8-byte table ``hi:lo`` (0 for 12)."""
+    return _perm(hi, lo, sel)
+
+
 def fp8_lut(deltas, selector):
     """|E2M1| -> FP8 byte table for the delta in byte ``j`` of ``deltas``.
 

@@ -29,6 +29,7 @@ from .kernels.gemm_a8w4_ptpc import layout
 from .kernels.gemm_a8w4_ptpc.gemm import (
     K_ALIGN,
     N_ALIGN,
+    TILE_K,
     GemmConfig,
     compile_gemm_a8w4_ptpc,
     gemm_config_supported,
@@ -139,6 +140,78 @@ _MID_TABLE = {
     },
 }
 
+# The 1x32 GEMM's path per weight shape (N, K) and token bucket (M up to the bucket): the
+# general kernel's GemmConfig fields, None for the default GemmConfig (M below the middle
+# range, where the per-token dispatch runs the small-M kernel) or "large" for the 1x32 variant
+# of the persistent large-M kernel; past the last bucket, the large-M kernel where the
+# per-token dispatch takes it. Measured on MI308X on the benchmark's inputs: the general tiles
+# up to M = 128 (tp2_qkvz), 512 (tp2_qkv) or 1024 with the GEMM alone, the rest with the full
+# call against the large-M kernel. Tiles of 32 x 128 and up run 32x32x16 MMAs. Up to M = 1024
+# (tp2_qkvz), 1920 (tp2_o, tp4_qkv) or 2048 the large-M kernel's 128 x 256 tiles are up to
+# 1.5x slower, except where they fill whole waves of the CUs: up to 18% faster there, taken
+# when over 10% (tp4_qkvz M = 513..640). At M = 65..112 tp2_qkv keeps the per-token tile
+# (48 x 128), which op_tests/test_gemm_a8w4_ptpc.py expects at M = 100 (32 x 128 is 14%
+# faster there).
+_MID_TABLE_1X32 = {
+    (8192, 2560): {
+        16: None,
+        32: (32, 128, 2, 2, 1, 2, TILE_K),
+        64: (64, 128, 2, 2, 1, 1, _TK256),
+        128: (64, 128, 2, 2, 2, 1, _TK256),
+        192: (64, 128, 1, 1, 1, 1, TILE_K),
+        1024: (64, 128, 2, 2, 2, 1, _TK256),
+        2048: _LARGE,
+    },
+    (6656, 2560): {
+        16: None,
+        32: (32, 128, 2, 2, 1, 2, TILE_K),
+        64: (64, 128, 2, 2, 1, 1, _TK256),
+        112: (48, 128, 2, 2, 1, 1, _TK256),
+        128: (32, 128, 2, 2, 2, 1, _TK256),
+        512: (64, 128, 2, 2, 2, 1, _TK256),
+        576: (64, 128, 2, 2, 1, 1, _TK256),
+        2048: (64, 128, 2, 2, 2, 1, _TK256),
+    },
+    (2560, 3072): {
+        16: None,
+        32: (16, 64, 2, 2, 2, 2, _TK256),
+        64: (32, 64, 2, 2, 2, 2, _TK256),
+        128: (32, 128, 2, 2, 2, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        1920: (64, 128, 1, 1, 4, 1, _TK256),
+        2048: _LARGE,
+    },
+    (4096, 2560): {
+        16: None,
+        32: (32, 64, 2, 2, 1, 2, _TK256),
+        64: (32, 128, 2, 2, 1, 2, TILE_K),
+        128: (64, 128, 2, 2, 2, 1, _TK256),
+        512: (64, 128, 2, 2, 4, 1, _TK256),
+        640: _LARGE,
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        2048: (64, 128, 2, 2, 2, 1, _TK256),
+    },
+    (3584, 2560): {
+        16: None,
+        32: (32, 64, 2, 2, 1, 2, _TK256),
+        64: (32, 128, 2, 2, 1, 2, TILE_K),
+        128: (64, 128, 2, 2, 2, 1, _TK256),
+        256: (32, 128, 2, 2, 4, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        1920: (64, 128, 2, 2, 2, 1, _TK256),
+        2048: _LARGE,
+    },
+    (2560, 1536): {
+        20: None,
+        32: (16, 64, 2, 2, 2, 2, _TK256),
+        64: (32, 64, 2, 2, 1, 1, _TK256),
+        128: (32, 128, 2, 2, 4, 1, _TK256),
+        256: (64, 128, 1, 1, 4, 1, _TK256),
+        1024: (64, 128, 2, 2, 4, 1, _TK256),
+        2048: (64, 128, 1, 1, 4, 1, _TK256),
+    },
+}
+
 # Small-M tile kernels (9 <= M <= 16) on fewer row blocks per CTA than small_m_config picks,
 # so all CUs get one: (N, K) -> (row blocks, CTAs); its LDS use only shrinks.
 _SMALL_TILE_SPREAD = {(6656, 2560): (6, 80)}
@@ -229,12 +302,17 @@ def _check_x_quant(x_quant) -> None:
 
 
 def _gemm_choice_1x32(m: int, n: int, k: int):
-    """Path of the 1x32 GEMM: ``_LARGE`` (the persistent large-M kernel's 1x32 variant)
-    where the per-token dispatch takes the large-M kernel, else the general kernel's
+    """Path of the 1x32 GEMM: ``_LARGE`` (the persistent large-M kernel's 1x32 variant) in
+    the "large" buckets of ``_MID_TABLE_1X32`` and, past its last bucket or off the table,
+    where the per-token dispatch takes the large-M kernel; else the general kernel's
     ``_config_1x32``."""
-    if _gemm_choice(m, n, k) == _LARGE:
-        return _LARGE
-    return _config_1x32(m, n, k)
+    table = _MID_TABLE_1X32.get((n, k))
+    bucket = None if table is None else next((b for b in sorted(table) if m <= b), None)
+    if bucket is None:
+        large = _gemm_choice(m, n, k) == _LARGE
+    else:
+        large = table[bucket] == _LARGE and large_m_supported(n, k)
+    return _LARGE if large else _config_1x32(m, n, k)
 
 
 def _gemm_1x32_kernel_name(m: int, n: int, k: int) -> str:
@@ -246,14 +324,14 @@ def _gemm_1x32_kernel_name(m: int, n: int, k: int) -> str:
 
 def _config_1x32(m: int, n: int, k: int) -> GemmConfig:
     """General-kernel tile of the 1x32 GEMM where ``_gemm_choice_1x32`` does not take the
-    large-M kernel: the GemmConfig of the per-token dispatch table for (N, K) and M when it
-    has one, else the default GemmConfig (64 x 128, 128 K per stage; it fits every
-    supported shape)."""
-    table = _MID_TABLE.get((n, k))
+    large-M kernel: ``_MID_TABLE_1X32``'s GemmConfig for (N, K) and M when it has one, else
+    the default GemmConfig (64 x 128, 128 K per stage; it fits every supported
+    shape)."""
+    table = _MID_TABLE_1X32.get((n, k))
     if table is not None:
-        entry = table[next((b for b in sorted(table) if m <= b), max(table))]
-        if entry not in (_SMALL, _LARGE):
-            cfg = GemmConfig(*entry)
+        bucket = next((b for b in sorted(table) if m <= b), None)
+        if bucket is not None and table[bucket] not in (None, _LARGE):
+            cfg = GemmConfig(*table[bucket])
             if gemm_config_supported(n, k, cfg):
                 return cfg
     return GemmConfig()
