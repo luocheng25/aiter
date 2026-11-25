@@ -50,8 +50,9 @@
 #     表外：M > 2048 且 N % 256 == 0、K ≥ 512 走 gemm_large；否则 gemm：M ≤ 128 用 32×64，到 2048 用 64×128
 #     （N % 128 == 64 时 64×64），更大用默认 64×128·TK128
 # flydsl_gemm_a8w4_ptpc(x, w, x_quant="1x32")（任意 M，两次 launch）：quant_1x32(x)（配置同 quant_x）→ xq, xs（E8M0）
-#   → gemm(cfg, x_block_scale)(xq, xs, wq, wd, ws) → y；cfg = 中间档表在该 M 档的 GemmConfig，小 M / 大 M 档与表外用默认
-# flydsl_gemm_a8w4_mxfp8(xq, xs, w)：只 launch 上面的 gemm(cfg, x_block_scale)
+#   → 按 token 走 gemm_large 的 M：gemm_large(panels, x_block_scale)(xq, xs, wq, wd, ws) → y；
+#     其余 gemm(cfg, x_block_scale)(…) → y，cfg = 中间档表在该 M 档的 GemmConfig，小 M 档与表外用默认
+# flydsl_gemm_a8w4_mxfp8(xq, xs, w)：只 launch 上面的 1x32 GEMM（gemm_large 或 gemm 的 x_block_scale 变体）
 ```
 
 ## gemm_a8w4_ptpc_quant_k{K}_l{L}_r{R}（[代码](quant.py)）
@@ -250,9 +251,11 @@ K 组（kg > 1）：组 [h, 2h) 写部分和 → barrier → 全部 wave 加 →
 **资源**：LDS = max(kg·2·BM·TK, kg/2·BM·BN·4) B（X 区与 K 组部分和共用）：目标形状的配置 16–32 KB，默认 64×128·TK128 为 16 KB；
 收尾的输出 tile（BM·(2·BN+16) B）放得下时复用这块，不另占 LDS。1x32 变体的 LDS 相同，VGPR 见上。
 
-## gemm_a8w4_ptpc_pp_bm128_bn256_tk128（[代码](gemm_large.py)）
+## gemm_a8w4_ptpc_pp_bm128_bn256_tk128[_1x32]（[代码](gemm_large.py)）
 表交给它的 M（目标形状从 129 / 513 / 1025 起）与表外 M > 2048 的 GEMM，要 N % 256 == 0、K ≥ 512：运算与 gemm 相同
 （同一 fd2 解码、同一 K 序），换成持久化的 128 token × 256 通道 tile、两组 wave ping-pong，收尾写在 tile 最后一个 K 步里。
+编译期开关 `x_block_scale`（核名加 `_1x32`）给 1x32 激活，在同样的 M 上运行：tile、grid、tile 次序与相位骨架不变，
+换成 32x32x16 MMA、块 scale 经 LDS、每块乘 scale 再累加（见下文“1x32 变体”）。
 
 **Gluon 风格**
 ```python
@@ -324,7 +327,7 @@ tile 次序（CTA 按线性号轮流派到 4 个 XCD，各有 4 MiB L2）：原�
 W 超 3 MiB 用 4 面板（tp2_qkv），W 加一轮 X 超 3 MiB 且 gcd(NB, 4) = 2 用 2 面板（tp4_qkv、tp2_o），每个 XCD 约留一个
 面板的 W；其余（tp2_qkvz、tp4_qkvz 的大 M）原次序。CU 数不是 4 的倍数时一律原次序。
 
-**流水线**（相位表与 tile 交界见 [gemm_large.py 模块 docstring](gemm_large.py#L35-L61)）
+**流水线**（相位表与 tile 交界见 [gemm_large.py 模块 docstring](gemm_large.py#L39-L65)）
 ```text
 序言（每 CTA 一次）：VMEM X(0)、W0(0)+D(0)、W1(0)、W0(1)+D(1) → vmcnt(0) → X(0) 写 L[0]、VMEM X(1) → LUT、解码 W0(0) → barrier
 组 1 再等一个 barrier；之后每个 wave 依次 M(0) C(0) M(1) C(1) … C(T−1) M(0′) …，每相以一次 CTA barrier 结束
@@ -340,9 +343,53 @@ tile 交界：M(T−2) 起换读下一 tile 的 X(0)、W0(0)、D(0)，并读本 
 | C(j) 后半 | 32：W1(j)·X1(j) | — | — | — | 建 LUT(j+1)、解码 W0(j+1) |
 | C(T−1) 后半 | 4 对 token 块 × 8 条 | — | 写 y：上一对块各 16 B | — | 第一对建 LUT、解码 W0(0′)；其余缩放、bf16 RNE |
 
-**命名**与**流水线不变量**：见 [gemm_large.py 模块 docstring](gemm_large.py#L63-L85)（Naming、Pipeline rules 1–7）。
+**1x32 变体（`x_block_scale`）**：gfx942 没有块缩放 MFMA，所以每个 32-K 块单独算出部分和 part，乘该块的 2^(e−127)
+再累加；乘 2 的幂是精确的，结果与 fp32 参考只差累加顺序。与上面不同的只有下面几处：
+```python
+# MMA 换成 fp8 32x32x16（mfma32）：lane (g, r)，g = lane // 32；块 b 的第 i 条 MMA 里 lane 持块内 K 16g+8i … +7，
+#   两条链成 part → X 每块每 token 块一次 16 B LDS 读，W 每块一次 8 B 读（fd2 lane 组 2(b%2)+g）
+# wave w 的 32 个通道是一个 32 行 tile：行 r = 通道 pi(r) = 16((r//4)%2) + 4(r//8) + r%4，输出 lane (g, r) 持
+#   token 32ni+r 的通道 16g … 16g+15；acc = 4 个 32-token 块 × 16 f32 / lane
+# 放置：块 scale S(j) 由每个 wave 组各自展开成 f32 写进自己的 LDS 双缓冲 Ls[grp][j % 2]（[块][token % 32][token // 32]，
+#   2 KiB）；与 X 同节奏：E8M0 dword 提前 2 步进 VGPR（s_stage）、提前 1 步写 LDS；两组错开一相，各用各的缓冲，无跨组 barrier
+def mem_phase(j):                                      # 上面的 M(j)，另加：
+    s_hold = Ls[grp][j % 2].load(块 0, token 32ni + r，ni = 0…3)        # 一次 16 B
+    Ls[grp][(j+1) % 2].store(位 max(e << 23, 2^−127))  # S(j+1)：组内线程 t 管 token t // 2 的 2 个块
+    s_stage = cdna3.buffer_load(xs[tile 行, K 步 j+2])  # 每 token 一个 dword（4 个块）；≥ M 的行读 0
+    d_hand = dr[j % 2]                                 # D(j)：C(j) 解码 W1(j) 还要用，槽随即装 D(j+2)
+    # W1(j+1)、W0(j+2) 各两块、每块 8 B，D(j+2) 两个 dword；j == T−1 时读本 tile 的通道因子 ws_r（不读 xs）
+
+def compute_phase(j, store):                           # C(j)：32 个 sched 区，每区一条 MMA，块主序
+    for b in range(4):                                 # 32-K 块
+        s_b = s_hold if b == 0 else Ls[grp][j % 2].load(块 b, …)    # 块 b 的 scale 在块 b−1 的区里读
+        for ni in range(4):                            # 32-token 块
+            part = mfma32(wf[b, 1], xb[ni, b, 1], mfma32(wf[b, 0], xb[ni, b, 0], 0))
+            acc[ni] = part * s_b[ni] + acc[ni]         # 新 tile 的块 0：acc = part · s；16 条乘加 = 4 个 4-VALU 单元
+            if store and b == 3:                       # C(T−1)：该 token 块最后一次 FMA 之后写出
+                cdna3.buffer_store((acc[ni] * ws_r).to(bf16), y[token 32ni + r, 通道 16g …])   # 2 × 16 B / lane
+    # 解码：块 0、1 的区解出 W1(j) 的块 2、3（用 d_hand），块 2、3 的区解出 W0(j+1) 的块 0、1；每块一个 LUT
+```
+- 为什么 32x32x16：16x16x32 时一条 MMA 就是一个块，每 lane 每块只取 8 个码，W 只能按 4 B 读（读数翻倍），实测慢约 20%；
+  32x32x16 让一个块的两条 MMA 共用一次 8 B W 读与一次 16 B X 读，LUT 与 scale 的读也减半。
+- 区内排布（[单元调度器 `_take_units`](gemm_large.py#L224-L233)，trace 时决定）：每区一条 MMA 后按额度（每区 7 条、上限 12）发 4-VALU 单元，
+  先发已就绪的标量 FMA 单元（偶数 ni，`v_fmac`），再发解码单元（带截止区，晚了即断言）；然后单独一个 sched 区发至多一个
+  `v_pk_fma` 单元（奇数 ni）。FMA 单元从其 MMA 对的下一区起发。
+- 一半标量一半打包：`v_fmac` 能在 MMA 执行时并发，`v_pk_fma_f32` 不能（紧跟 MMA 时 LLVM 还会拆成标量），所以打包的只在
+  影子填满后单独发；本核关 SLP 向量化，标量单元才保持 `v_fmac`。每 K 步每 wave 256 条乘加，几乎不被 MFMA 掩盖，是现在的瓶颈。
+- E8M0 → f32 同 gemm 变体：`max(e << 23, 2^−127 的位)`，e = 0 为次正规 2^−127（核保留 f32 denormal），e < 255 都精确。
+
+| 相 | MMA（32x32x16） | LDS → VGPR | VMEM（每 lane） | VGPR → LDS | VALU |
+|---|---|---|---|---|---|
+| M(j) | — | X(j)、S(j) 块 0 | X(j+2) 2×16 B、S(j+2) 4 B、W1(j+1)、W0(j+2) 各 2×8 B、D(j+2) 2×4 B | X(j+1)、S(j+1) 本组 | 展开 S(j+1) |
+| C(j) 块 b | 8：4 个 token 块 × 2 | S(j) 块 b+1 | — | — | FMA；b < 2 解码 W1(j) 块 b+2，否则 W0(j+1) 块 b−2 |
+| C(T−1) | 同 C(j) | 同 C(j) | 写 y：每个 token 块 2×16 B，在它最后一次 FMA 后 | — | 另加 × 通道因子、bf16 RNE |
+
+region 表与规则见 [gemm_large.py 模块 docstring](gemm_large.py#L67-L93)；通道因子在 M(T−1) 才读（C(T−2) 少占 VGPR）。
+
+**命名**与**流水线不变量**：见 [gemm_large.py 模块 docstring](gemm_large.py#L95-L128)（Naming、Pipeline rules 1–9，规则 8、9 只管 1x32 变体）。
 
 **资源**：LDS 32 KB（2 × 128 × 128 B）；256 VGPR（无 AGPR）、58 SGPR、无 spill；`waves_per_eu = 2`，每 CU 1 个 CTA。
+1x32 变体：LDS 40 KB（另加块 scale 2 组 × 2 缓冲 × 2 KB）；256 VGPR，C(T−1) 尾部 88 B scratch（主循环没有）。
 
 ## gemm_a8w4_ptpc_decode_rb{rb}_ks{ks}_m{mcap}_g{G}（[代码](small_m.py#L304-L631)）
 M ≤ 8 时的整个调用（最宽两形状的 M ≤ 2 / 4 换 dec2）：一次 launch 里把 x 按 token 量化进 LDS 并算完 y；块对映射让 ≤ 8 个 token 也不空转 MFMA 的半边。

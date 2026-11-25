@@ -37,6 +37,7 @@ from .kernels.gemm_a8w4_ptpc.gemm import (
 from .kernels.gemm_a8w4_ptpc.gemm_large import KERNEL_NAME as LARGE_GEMM_KERNEL_NAME
 from .kernels.gemm_a8w4_ptpc.gemm_large import (
     compile_gemm_a8w4_ptpc_large,
+    large_kernel_name,
     large_m_supported,
     xcd_panels,
 )
@@ -203,7 +204,7 @@ def gemm_a8w4_ptpc_kernel_names(
     if x_quant == X_QUANT_1X32:
         return (
             quant_1x32_kernel_name(k, quant_config(m, k)),
-            gemm_kernel_name(_config_1x32(m, n, k), x_block_scale=True),
+            _gemm_1x32_kernel_name(m, n, k),
         )
     choice = _gemm_choice(m, n, k)
     if choice == _SMALL:
@@ -219,7 +220,7 @@ def gemm_a8w4_mxfp8_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
-    return (gemm_kernel_name(_config_1x32(m, n, k), x_block_scale=True),)
+    return (_gemm_1x32_kernel_name(m, n, k),)
 
 
 def _check_x_quant(x_quant) -> None:
@@ -227,10 +228,27 @@ def _check_x_quant(x_quant) -> None:
         raise ValueError(f"x_quant must be one of {_X_QUANTS}, got {x_quant!r}")
 
 
+def _gemm_choice_1x32(m: int, n: int, k: int):
+    """Path of the 1x32 GEMM: ``_LARGE`` (the persistent large-M kernel's 1x32 variant)
+    where the per-token dispatch takes the large-M kernel, else the general kernel's
+    ``_config_1x32``."""
+    if _gemm_choice(m, n, k) == _LARGE:
+        return _LARGE
+    return _config_1x32(m, n, k)
+
+
+def _gemm_1x32_kernel_name(m: int, n: int, k: int) -> str:
+    choice = _gemm_choice_1x32(m, n, k)
+    if choice == _LARGE:
+        return large_kernel_name(x_block_scale=True)
+    return gemm_kernel_name(choice, x_block_scale=True)
+
+
 def _config_1x32(m: int, n: int, k: int) -> GemmConfig:
-    """Tile of the 1x32 GEMM, which runs every M: the general kernel's GemmConfig of the
-    per-token dispatch table for (N, K) and M when it has one, else the default GemmConfig
-    (64 x 128, 128 K per stage; it fits every supported shape)."""
+    """General-kernel tile of the 1x32 GEMM where ``_gemm_choice_1x32`` does not take the
+    large-M kernel: the GemmConfig of the per-token dispatch table for (N, K) and M when it
+    has one, else the default GemmConfig (64 x 128, 128 K per stage; it fits every
+    supported shape)."""
     table = _MID_TABLE.get((n, k))
     if table is not None:
         entry = table[next((b for b in sorted(table) if m <= b), max(table))]
@@ -395,13 +413,20 @@ def _output(out: torch.Tensor | None, m: int, n: int, device) -> torch.Tensor:
 
 def _gemm_1x32_args(xq, x_scale, weight, out, m, stream):
     """Launcher and arguments of the 1x32 GEMM for FP8 ``xq`` [m, K], E8M0 ``x_scale``."""
-    gemm = compile_gemm_a8w4_ptpc(
-        weight.n,
-        weight.k,
-        xq.device.index,
-        _config_1x32(m, weight.n, weight.k),
-        x_block_scale=True,
-    )
+    n, k = weight.n, weight.k
+    choice = _gemm_choice_1x32(m, n, k)
+    if choice == _LARGE:
+        num_cus = _num_cus(xq.device.index)
+        gemm = compile_gemm_a8w4_ptpc_large(
+            n,
+            k,
+            num_cus,
+            xq.device.index,
+            xcd_panels(m, n, k, num_cus),
+            x_block_scale=True,
+        )
+    else:
+        gemm = compile_gemm_a8w4_ptpc(n, k, xq.device.index, choice, x_block_scale=True)
     args = (
         ptr_arg(xq),
         ptr_arg(x_scale),

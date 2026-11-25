@@ -75,3 +75,15 @@ def fp4x8_to_fp8(raw, lut):
     even = ((raw << 4) & sign) | _perm(hi, lo, raw & mag)
     odd = (raw & sign) | _perm(hi, lo, (raw >> 4) & mag)
     return Vec.from_elements([even, odd], fx.Uint32).bitcast(fx.Float8E4M3FNUZ)
+
+
+def fp4x4_to_fp8(raw, lut, odd):
+    """Half of ``fp4x8_to_fp8``: the even (``odd=False``) or odd nibbles of a ``q`` dword ->
+    one dword of 4 FP8 E4M3FNUZ bytes (the first / second dword of ``fp4x8_to_fp8``)."""
+    lo, hi = lut
+    raw = fx.Uint32(raw)
+    sign = fx.Uint32(0x80808080)
+    mag = fx.Uint32(0x07070707)
+    if odd:
+        return (raw & sign) | _perm(hi, lo, (raw >> 4) & mag)
+    return ((raw << 4) & sign) | _perm(hi, lo, raw & mag)
