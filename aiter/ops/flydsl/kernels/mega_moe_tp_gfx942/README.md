@@ -1,7 +1,7 @@
 # mega_moe_tp_gfx942（gfx942 TP MoE 层：fp8 激活（按 token）× mxfp4 权重，all-reduce 模式）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-25 12:24）· 目标：让 aiter 的 MegaMoE TP 在 gfx942（MI308X）上跑 A8W4：激活按 token 量化成 FP8 × MXFP4 权重，experts 复制、inter_dim 按 TP 切，MoE 计算与 TP 通信融合；Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash TP4，M=1…32768 的 2 的幂及 48，一次完整 MoE 层（含通信）的耗时逐 case 不慢于两个对照（aiter fp8 ptpc fused_moe + 单独 all-reduce；pyhip 2stage A8W4 + 单独 all-reduce）中较快的；主流程框架（MegaMoE TP / 2stage+融合通信 / #8530 改 TP）由实验决定（1.2× 相对冻结基线）· 已完成 1 个里程碑（含本提交 M0） · 最佳累计 — · 下一步：M1 融合通信第一版：M≥48 把 RS+AG 并进最后一个 kernel（L1：部分和写到 owner 卡、owner 按 rank 顺序求和后写回各卡），M≤16 用 decode TP 尾部（f32 部分和写进各卡收件箱、按 rank 顺序求和），M=32 保留 AR
+> 由 mf 生成（11-25 13:07）· 目标：让 aiter 的 MegaMoE TP 在 gfx942（MI308X）上跑 A8W4：激活按 token 量化成 FP8 × MXFP4 权重，experts 复制、inter_dim 按 TP 切，MoE 计算与 TP 通信融合；Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash TP4，M=1…32768 的 2 的幂及 48，一次完整 MoE 层（含通信）的耗时逐 case 不慢于两个对照（aiter fp8 ptpc fused_moe + 单独 all-reduce；pyhip 2stage A8W4 + 单独 all-reduce）中较快的；主流程框架（MegaMoE TP / 2stage+融合通信 / #8530 改 TP）由实验决定（1.08× 相对冻结基线）· 已完成 2 个里程碑（含本提交 M1a） · 最佳累计 — · 下一步：M1 融合通信第一版：M≥48 把 RS+AG 并进最后一个 kernel（L1：部分和写到 owner 卡、owner 按 rank 顺序求和后写回各卡），M≤16 用 decode TP 尾部（f32 部分和写进各卡收件箱、按 rank 顺序求和），M=32 保留 AR
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -16,7 +16,7 @@
 - 计算：x 按 token 量化成 fp8（amax/240）→ Gate/Up（mxfp4 在寄存器里解成 fp8 走 fp8 MFMA）→ SiLU / SwiGLU → 中间激活按行量化 → Down。
 - 形状：Qwen3.8-Flash-Next TP2 / TP4（H2560、E513 含 1 个融合 shared、topk11、每卡 I 320 / 160）。
 - 形状：DeepSeek-V4.1-Flash TP4（H5120、E384、topk6、I576、swiglu_limit 10）；M = 1…32768 的 2 的幂及 48，共 51 case。
-- 验收：逐 case 耗时不慢于对照 1、2（第 4 节）中较快者，目标相对冻结基线 1.2×；精度过 fp32 参考判据，各卡输出逐位相同。
+- 验收：逐 case 耗时不慢于对照 1、2（第 4 节）中较快者，目标相对冻结基线几何均值 1.08×；精度过 fp32 参考判据，各卡输出逐位相同。
 - 只做 `comm_mode="ar"`；不做 ag_rs、fused tail、TP8、gfx950 / gfx1250、已量化输入、跨次运行逐位确定，这些与其他架构都明确报错。
 
 ## 2. 总体设计
@@ -82,13 +82,17 @@ prefill Down：64 行 mq 经 LDS（I576 分两段）装入后驻留 VGPR；逐�
 - 目标按较快的对照 2 定（bench 的第一个 MF_REF）；冻结基线（mf 在 GPU 空闲时测）与逐 case 数据见下方生成块。
 
 <!-- mf:perf -->
+基线来源（mf 记录）：11-25 12:47 冻结于提交 `e19c1fc3a6`（里程碑 M0，tag `mega-tp-a8w4-M0`），bench 跑 3 次取中位数，GPU0,1,2,3，噪声 ±0.18%；bench 命令 `/root/.myflow-r2/tasks/mega-tp-a8w4/venv/bin/python op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py`。对照实现与精度参考的来源见本节手写部分。
+
 （尚无复核数据）
 <!-- /mf:perf -->
 
 ## 5. 测试覆盖
 三类用例都在 [test_mega_moe_tp_gfx942.py](../../../../../op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py)，全部通过；多卡用例共用一个 4 进程常驻池，有输出的用例都按 fp32 参考判据校验并查各卡逐位相同。
+- 路径断言只固定档位与通信段：档位 = 首个 GateUp kernel；通信段恰好一个（末尾一个 CA / RCCL，或名字含 `tp` 词的融合 kernel 且无 AR）。
+- GateUp 之后的 kernel 不固定（通信融合会改它们）；AR 种类只在不融合时由 `out=` 与默认通信组两例检查。
 
-**基本功能测试**（每次改动先跑：`commands.correctness` = `pytest <文件> -m basic`，13 例，约 72 秒；每例另断言 kernel 序列与 AR 种类，防止静默换路径）
+**基本功能测试**（每次改动先跑：`commands.correctness` = `pytest <文件> -m basic`，13 例，约 72 秒；每例另断言档位与通信段，防止静默换档）
 | 覆盖什么 | 用例 | 结果 |
 |---|---|---|
 | decode 两次 launch（WG 内量化） | tp2_m1、ds_tp4_m2 | 过 |
@@ -106,7 +110,7 @@ prefill Down：64 行 mq 经 LDS（I576 分两段）装入后驻留 VGPR；逐�
 | prefill × 三形状（CA 与 RCCL） | M ≥ 2048（tp4 ≥ 4096），14 个 | ÷对照 2 0.992–1.002，≤ 223 TFLOPS |
 - 被计时的输出都查各卡逐位相同，A8W4 两者另按 fp32 参考校验（对照 1 只查有限值）；不过则记失败、退出码非 0。
 
-**其他覆盖测试**（只测前两类覆盖不了的；`commands.verify_extra` = `pytest <文件> -m "not basic"`，14 例，约 70 秒）
+**其他覆盖测试**（只测前两类覆盖不了的；`commands.verify_extra` = `pytest <文件> -m "not basic"`，15 例，约 100 秒）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
 | 每个分档门槛两侧与奇数 M | 前两类只取 2 的幂与 48，只在门槛一侧 | test_dispatch_boundaries（3 例） | 过 |
@@ -117,9 +121,11 @@ prefill Down：64 行 mq 经 LDS（I576 分两段）装入后驻留 VGPR；逐�
 | CUDA graph 捕获与重放（CA 与 RCCL） | 前两类都是 eager 调用 | test_cuda_graph（5 例） | 过 |
 | 不传 group / cpu_group 时自建通信组 | 前两类都显式传组 | test_default_communicators | 过 |
 | 非法参数 / 形状、非 gfx942、NaN scale | 前两类只走合法输入 | test_rejected_arguments（20 种） | 过 |
+| 路径判定本身：融合、不融合、两者都有 / 都没有 | 前两类只见不融合路径；判定放行一切也照过 | test_path_checks（纯 CPU） | 过 |
 
 未覆盖 / 跳过：
-- 少于 4 张 gfx942 时整套跳过（常驻池拉不起）。
+- 少于 4 张 gfx942 时多卡用例跳过（常驻池拉不起），只剩 test_path_checks。
+- 同一 GateUp 档内的子路径（decode 是否预量化 mid、是否 route_sum、prefill 的排序方式）不固定：换了不报，只查结果。
 - 3 个目标形状以外的形状：没有用例（接口按 H % 512、I % 32 放行，见第 6 节）。
 - 跨次运行逐位相同：不要求（第 1 节），不测；Qwen 流式的 bf16 原子加顺序不定。
 
@@ -136,8 +142,9 @@ prefill Down：64 行 mq 经 LDS（I576 分两段）装入后驻留 VGPR；逐�
 - 里程碑（每个提交写了改了什么、为什么）：本分支提交历史。
 
 <!-- mf:roadmap -->
-- M0 ✅ 本提交 · 功能 · 功能版（框架 B）：pyhip 2stage A8W4 移植到 aiter（k…
+- M0 ✅ 已推送 · 功能 · 功能版（框架 B）：pyhip 2stage A8W4 移植到 aiter（k… · [提交](https://github.com/luocheng25/aiter/commit/e19c1fc3a6675ba05ee9035ca31a1ff660d930a5)
 - M1 ⏳ 承诺 · 性能 · 融合通信第一版：M≥48 把 RS+AG 并进最后一个 kernel（L1：部… · 预期 1.046×
+- M1a ✅ 本提交 · 维护 · 用例：kernel 路径断言放开通信段（为 M1 融合通信让路）
 
 下一步（本提交的承诺）：M1 融合通信第一版：M≥48 把 RS+AG 并进最后一个 kernel（L1：部分和写到 owner 卡、owner 按 rank 顺序求和后写回各卡），M≤16 用 decode TP 尾部（f32 部分和写进各卡收件箱、按 rank 顺序求和），M=32 保留 AR
 <!-- /mf:roadmap -->

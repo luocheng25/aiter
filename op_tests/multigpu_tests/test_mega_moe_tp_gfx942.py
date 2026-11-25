@@ -96,7 +96,7 @@ _E2M1 = (
     -6.0,
 )
 
-# Kernel sequences of moe_a8w4.fused_moe_a8w4 (layer.last_path without the all-reduce).
+# Kernel sequences of moe_a8w4.fused_moe_a8w4 (layer.last_path without the all-reduce) on the unfused paths.
 DEC = "a8w4_gateup_decode>a8w4_down_decode"
 DPQ = "a8w4_gateup_decode>a8w4_row_quant_decode>a8w4_down_decode_pq"
 PQ = "a8w4_row_quant_decode>a8w4_gateup_decode_pq>a8w4_row_quant_decode>a8w4_down_decode_pq"
@@ -149,10 +149,36 @@ def input_seed(shape, M, g):
     return SEED * 1000 + 500 + 37 * SHAPE_INDEX[shape] + 4 * M + g
 
 
+# Path checks. The tests pin a forward's dispatch tier -- its Gate/Up kernel, the first one named a8w4_gateup* -- and
+# require exactly one communication segment: one all-reduce at the end (CA / RCCL: unfused), or at least one fused
+# communication kernel and no all-reduce (fused). A fused communication kernel has the word "tp" in its
+# "_"-separated name (a8w4_down_decode_tp, a8w4_tp_reduce, sorted_sum_tp). The kernels after Gate/Up are not
+# pinned: fusing the TP reduction changes them.
+GATEUP_PREFIX, TP_WORD, FUSED_COMM = "a8w4_gateup", "tp", "fused"
+
+
+def gateup_tier(path):
+    """The dispatch tier of a path: its first Gate/Up kernel (None without one)."""
+    return next((k for k in path.split(">") if k.startswith(GATEUP_PREFIX)), None)
+
+
+def comm_kind(path):
+    """The communication segment of a path: CA / RCCL (one all-reduce, last, and no fused communication kernel),
+    FUSED_COMM (fused communication kernels and no all-reduce), None otherwise (none, both, several,
+    misplaced)."""
+    kernels = path.split(">")
+    ars = [k for k in kernels if k in (CA, RCCL)]
+    if any(TP_WORD in k.split("_") for k in kernels):
+        return None if ars else FUSED_COMM
+    return ars[0] if ars == kernels[-1:] else None
+
+
+GATEUP_KERNELS = frozenset(map(gateup_tier, COMPUTE_PATHS))
+
+
 def _known_path(path):
-    """A path of this implementation: one of the A8W4 kernel sequences, then one all-reduce."""
-    compute, _, ar = path.rpartition(">")
-    return compute in COMPUTE_PATHS and ar in (CA, RCCL)
+    """A path of this implementation: a known Gate/Up kernel (tier) and exactly one communication segment."""
+    return gateup_tier(path) in GATEUP_KERNELS and comm_kind(path) is not None
 
 
 # =====================================================================================================================
@@ -678,7 +704,8 @@ def pool():
 
 
 # =====================================================================================================================
-# Region 1: basic tests (-m basic): one case per dispatch tier x shape, with the exact kernel sequence
+# Region 1: basic tests (-m basic): one case per dispatch tier x shape. Each pins the tier -- the Gate/Up kernel of
+# the unfused kernel sequence listed -- and one communication segment, not the kernels after Gate/Up or the AR kind.
 # =====================================================================================================================
 BASIC = [
     # decode: one workgroup per route / token
@@ -703,12 +730,13 @@ BASIC = [
 @pytest.mark.basic
 @pytest.mark.parametrize("shape,M,path", BASIC, ids=[f"{s}_m{m}" for s, m, _ in BASIC])
 def test_basic(pool, shape, M, path):
+    tier = gateup_tier(path)
     rows = _member_rows(pool.run("check", shape=shape, tokens=[M]), shape)
     _assert_verified(rows)
     for r in rows:
         assert (
-            r["path"] == f"{path}>{CA}"
-        ), f"rank {r['rank']}: unexpected path {r['path']}"
+            gateup_tier(r["path"]) == tier and comm_kind(r["path"]) is not None
+        ), f"rank {r['rank']}: expected Gate/Up {tier} and one communication segment, path {r['path']}"
 
 
 # =====================================================================================================================
@@ -749,7 +777,7 @@ def _job_out_arg(state):
     for M in (
         8,
         16384,
-    ):  # 8: custom all-reduce, copied back into out; 16384 (84 MB > 64 MiB): RCCL in place
+    ):  # unfused, 8: custom all-reduce, copied back into out; 16384 (84 MB > 64 MiB): RCCL in place
         inputs = state.inputs(shape, M, 1)
         out = torch.full(
             (M, s["H"]), float("nan"), dtype=torch.bfloat16, device=state.device
@@ -784,9 +812,10 @@ def test_out_argument_and_empty_batch(pool):
                 "returned_out"
             ], f"rank {rank} M={r['M']}: forward(out=...) did not return out"
             ar = CA if r["M"] == 8 else RCCL
-            assert r["path"].endswith(
-                f">{ar}"
-            ), f"rank {rank} M={r['M']}: expected {ar}, path {r['path']}"
+            assert comm_kind(r["path"]) in (
+                ar,
+                FUSED_COMM,
+            ), f"rank {rank} M={r['M']}: expected {ar} or a fused reduction, path {r['path']}"
         assert (
             res["empty_shape"] == (0, SHAPES["tp4"]["H"]) and res["empty_path"] == ()
         ), res
@@ -1002,7 +1031,12 @@ def _job_default_comm(state):
 def test_default_communicators(pool):
     for rows in pool.run("default_comm"):
         _assert_verified(rows)
-        assert rows[0]["path"] == f"{DPQ}>{CA}", rows
+        # Unfused, the custom all-reduce must run over the gloo group the layer made (not the RCCL fallback).
+        path = rows[0]["path"]
+        assert gateup_tier(path) == gateup_tier(DPQ) and comm_kind(path) in (
+            CA,
+            FUSED_COMM,
+        ), rows
 
 
 # --- 2.8 rejected configurations and arguments ------------------------------------------------------------------
@@ -1156,6 +1190,38 @@ def _job_errors(state):
 def test_rejected_arguments(pool):
     failures = pool.run("errors")[0]
     assert not failures, "\n".join(failures)
+
+
+# --- 2.9 the path checks themselves (CPU only) ------------------------------------------------------------------
+# Why: the benchmark does not check paths, and the tests above only see the paths this code takes (a known Gate/Up
+# kernel, one all-reduce at the end); a check that accepted anything would pass them all. Its verdicts on fused
+# reductions and on broken paths (no / several / misplaced all-reduces, no / an unknown Gate/Up) are pinned here.
+def test_path_checks():
+    fused = "a8w4_gateup_decode>a8w4_down_decode_tp"
+    cases = [  # path, comm_kind, _known_path
+        (f"{DPQ}>{CA}", CA, True),
+        (f"{PF_SORT}>{RCCL}", RCCL, True),
+        (fused, FUSED_COMM, True),
+        (f"{ST16}>a8w4_tp_reduce", FUSED_COMM, True),
+        (f"{PF_PREP}_tp", FUSED_COMM, True),  # sorted_sum_tp
+        (DEC, None, False),  # no communication
+        (f"{fused}>{CA}", None, False),  # fused and an all-reduce
+        (f"{DEC}>{RCCL}>{RCCL}", None, False),
+        (f"a8w4_gateup_decode>{CA}>a8w4_down_decode", None, False),  # not last
+        ("a8w4_gateup_decode>a8w4_down_decode_stp", None, False),  # no word "tp"
+        (f"a8w4_down_decode>{CA}", CA, False),  # no Gate/Up kernel
+        (f"a8w4_gateup_decode_v2>a8w4_down_decode>{CA}", CA, False),  # unknown one
+    ]
+    wrong = [
+        (p, comm_kind(p), _known_path(p))
+        for p, kind, known in cases
+        if (comm_kind(p), _known_path(p)) != (kind, known)
+    ]
+    assert not wrong, wrong
+    # the first Gate/Up kernel, also behind sorting / quantization; every unfused sequence has one
+    assert gateup_tier(PF_SORT) == "a8w4_gateup_prefill_bm64_bn128_tk128"
+    assert gateup_tier(fused) == gateup_tier(DEC) == "a8w4_gateup_decode"
+    assert None not in GATEUP_KERNELS
 
 
 # =====================================================================================================================
