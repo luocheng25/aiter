@@ -266,7 +266,8 @@ def compile_a8w4_gateup_decode(
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     if PLAN is not None:
-        from .decode_dedup_a8w4 import _address, _plan_route, _rsrc
+        from .decode_dedup_a8w4 import _plan_route
+        from .stream_a8w4 import _address, _rsrc
 
         GROUP, MAX_M, ZERO_COLS = PLAN
         SEGS = (MAX_M * TOPK + 63) // 64

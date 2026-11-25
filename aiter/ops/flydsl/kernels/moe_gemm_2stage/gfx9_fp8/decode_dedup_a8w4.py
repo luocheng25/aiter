@@ -37,9 +37,9 @@ rounding of the partial sums) is not deterministic.
 The leader check depends on scalar loads (plan entry, expert id, kernel arguments); ``_pin`` makes them issue
 together before the branch instead of one round trip after another.
 
-Global memory of the plan and the leaders' gathers goes through raw buffer descriptors built from a 64-bit address
-(``_rsrc`` / ``_load`` / ``_store``): per-lane byte offsets, and an offset of ``_DROP`` (past every buffer) loads 0
-or drops the store, so lanes outside the group need no branch.
+Global memory of the plan and the leaders' gathers goes through the raw buffer descriptors of ``stream_a8w4``
+(``_rsrc`` / ``_load`` / ``_store``, built from a 64-bit address): per-lane byte offsets, and an offset of ``_DROP``
+(past every buffer) loads 0 or drops the store, so lanes outside the group need no branch.
 """
 
 import flydsl.compiler as flyc
@@ -72,73 +72,7 @@ from .decode_a8w4 import (
     _wave_index,
     _wave_max,
 )
-
-# Byte offset past every buffer used here: loads return 0, stores are dropped.
-_DROP = 0x7FFFFF00
-
-
-def _address(p):
-    return fx.Int64(fx.ptrtoint(p))
-
-
-def _rsrc(address, nbytes):
-    # Raw descriptor (llvm.inttoptr + rocdl.make_buffer_rsrc) for the raw loads / stores of _load / _store, which
-    # have no typed form (see there). The flags 0x27000 are those of the typed fx.rocdl.make_buffer_ptr on CDNA;
-    # the base is a 64-bit address computed in the kernel (an expert's channel factors, the plan, token rows) and
-    # the byte count depends on the runtime token count.
-    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr"), fx.Int64(address).ir_value())
-    return rocdl.make_buffer_rsrc(
-        ir.Type.parse("!llvm.ptr<8>"),
-        pointer,
-        fx.Int16(0).ir_value(),
-        fx.Int64(nbytes).ir_value(),
-        fx.Int32(0x27000).ir_value(),
-    )
-
-
-def _load(rsrc, voffset, soffset, dwords, aux=0):
-    """Raw buffer load of ``dwords`` dwords -> list of Uint32 (``aux``: cache policy bits, 2 = non-temporal)."""
-    # Raw buffer load: the typed fx.copy with a BufferCopy atom addresses through a view layout and fills a vector
-    # fragment, while these loads take a per-lane VGPR byte offset (_DROP for lanes outside the group: the range
-    # check returns 0, no branch) plus an SGPR one and return the dwords as scalars.
-    if dwords == 1:
-        value = rocdl.raw_ptr_buffer_load(
-            fx.Int32.ir_type,
-            rsrc,
-            fx.Int32(voffset).ir_value(),
-            fx.Int32(soffset).ir_value(),
-            aux=aux,
-        )
-        return [fx.Uint32(value)]
-    value = rocdl.raw_ptr_buffer_load(
-        ir.VectorType.get([dwords], fx.Int32.ir_type),
-        rsrc,
-        fx.Int32(voffset).ir_value(),
-        fx.Int32(soffset).ir_value(),
-        aux=aux,
-    )
-    vec = Vec(value).bitcast(fx.Uint32)
-    return [vec[i] for i in range(dwords)]
-
-
-def _store(rsrc, words, voffset):
-    # Raw buffer store: the typed fx.copy store takes its offset from a view layout; here a per-lane byte offset,
-    # _DROP drops the store in the hardware range check (no branch).
-    words = list(words)
-    # A one-element vector store cannot be scalarized by the backend: store a plain i32.
-    value = (
-        fx.Int32(words[0])
-        if len(words) == 1
-        else Vec.from_elements(words, fx.Uint32).bitcast(fx.Int32)
-    )
-    rocdl.raw_ptr_buffer_store(
-        value.ir_value(),
-        rsrc,
-        fx.Int32(voffset).ir_value(),
-        fx.Int32(0).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
-    )
-
+from .stream_a8w4 import _DROP, _address, _load, _rsrc, _store
 
 _NONE = 0x7FFFFFFF  # "no further route" in a plan entry
 
