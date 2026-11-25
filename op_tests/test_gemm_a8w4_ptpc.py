@@ -20,8 +20,8 @@ One file, three regions:
      input errors, M = 0, CUDA graph, compile cache):
      ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
-     M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, per-token quantization,
-     every timed output checked: ``python op_tests/test_gemm_a8w4_ptpc.py``.
+     M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, per-token quantization and
+     then 1x32, every timed output checked: ``python op_tests/test_gemm_a8w4_ptpc.py``.
 Every output is graded against an independent fp32 torch reference (``run_torch``,
 ``run_torch_1x32``); ``MF_SEED`` seeds all inputs.
 """
@@ -1893,6 +1893,12 @@ def test_1x32_compile_cache():
 # rule included) and quantized per channel to FP8. Both use run_perftest (inputs deep-copied
 # and rotated, >= ~12 ms of warm-up calls, all kernels of a call summed) and grade the timed
 # output with checkAllclose against an fp32 reference of their own quantized operands.
+# After all of them, the 1x32 cases (``<shape>_m<M>_1x32``, the same shapes and M) time this
+# op's full call with x_quant="1x32" (1x32 quantization included) on the per-token case's X
+# and weight the same way, graded against the fp32 reference on the 1x32 quantization of X.
+# Their MF_REF is aiter's time from the per-token case of the same (shape, M), not timed again
+# (that would double the bench's time); running them last leaves the per-token cases timed as
+# before.
 # =============================================================================================
 
 BENCH_M = [1 << i for i in range(16)]
@@ -2015,6 +2021,88 @@ def bench_gemm_a8w4_ptpc(shape, m):
     return ret
 
 
+# -- x_quant="1x32" cases ----------------------------------------------------------------------
+# The bench keeps its own 1x32 reference: it uses none of the test regions' 1x32 helpers, so
+# those can change without changing what the bench runs.
+
+
+def _bench_quant_1x32(x):
+    """1x32 FP8 E4M3FNUZ [m, k] and E8M0 bytes [m, k / 32] of finite BF16 ``x`` as
+    x_quant="1x32" quantizes it: DeepSeek-V4.1's act_quant(x, block_size=32) with UE8M0
+    scales, mapped to FNUZ (quant_1x32_ref of the tests without its NaN / Inf rules).
+
+    e = ceil(log2(max(amax, 1e-4) * f32(1 / 448))) from the f32 bits, q = RNE_e4m3fn(x / 2**e);
+    an FNUZ code is worth half its E4M3FN value, so the byte is e + 128 with the same codes,
+    -0 (0x80, FNUZ's NaN) stored as 0x00.
+    """
+    m, k = x.shape
+    xf = x.float().view(m, k // 32, 32)
+    amax = xf.abs().amax(dim=-1)
+    amax = torch.maximum(amax, torch.full_like(amax, 1e-4))
+    inv_max = torch.ones_like(amax) / torch.full_like(amax, 448.0)
+    bits = (amax * inv_max).view(torch.int32)
+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    scale_fn = ((e + 127) << 23).view(torch.float32).unsqueeze(-1)
+    q = (xf / scale_fn).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+    q = torch.where(q == 0x80, torch.zeros_like(q), q)
+    return q.view(m, k).view(torch.float8_e4m3fnuz), (e + 128).to(torch.uint8)
+
+
+def _bench_ref_1x32(x, w_exact):
+    """fp32 reference of flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32"), ``w_exact`` the
+    exact weight (prepare flush rule included): the sum over 32-K blocks of 2**(e - 127) x
+    sum(q x w) on the 1x32 quantization of ``x``; each q x 2**(e - 127) is exact in f32.
+    """
+    xq, e = _bench_quant_1x32(x)
+    m, k = xq.shape
+    scale = torch.exp2(e.double() - 127).float().unsqueeze(-1)
+    x_exact = (xq.float().view(m, k // 32, 32) * scale).view(m, k)
+    return fp32_matmul(x_exact, w_exact)
+
+
+@benchmark()
+def bench_gemm_a8w4_1x32(shape, m, per_token_us, aiter_us):
+    """Case ``<shape>_m<M>_1x32``: flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32") on the X
+    and weight of the per-token case ``<shape>_m<M>``, timed and graded as that case does the
+    per-token call. ``per_token_us``, ``aiter_us``: that case's times of this op and of aiter's
+    FP8 per-token GEMM; aiter is not timed again, so MF_REF repeats its time."""
+    n, k = SHAPES[shape]
+    case = f"{shape}_m{m}_1x32"
+    weight, w_exact = _bench_weight(shape)[:2]
+    x = make_x(m, k, case_seed("bench_x", shape, m))
+    fn = functools.partial(flydsl_gemm_a8w4_ptpc, x_quant="1x32")
+    args = (x, weight)
+    out, us = run_perftest(fn, *args, num_warmup=_warmup_calls(fn, args))
+    err = check_output(out, _bench_ref_1x32(x, w_exact), msg=f"{case} a8w4")
+    flops = 2 * m * n * k
+    # The per-token case's bytes (BF16 X and the prepared weight read, BF16 Y written): the
+    # 1x32 FP8 X and its M * K / 32 E8M0 scales are not counted, as the per-token FP8 X and
+    # scales are not: the call writes and reads them back itself.
+    nbytes = m * k * 2 + n * k // 2 + n * k // 32 + 4 * n + m * n * 2
+    aiter_bytes = m * k * 2 + n * k + 4 * n + m * n * 2
+    print(
+        f"MF_METRIC case={case} value={us:.3f} unit=us flops={flops} bytes={nbytes}",
+        flush=True,
+    )
+    print(
+        f"MF_REF case={case} impl=aiter_fp8_ptpc value={aiter_us:.3f} unit=us "
+        f"flops={flops} bytes={aiter_bytes}",
+        flush=True,
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "N": n,
+        "K": k,
+        "a8w4_1x32 us": us,
+        "a8w4_1x32 TFLOPS": flops / us / 1e6,
+        "a8w4_1x32 TB/s": nbytes / us / 1e6,
+        "a8w4_1x32 err": err,
+        "1x32 / per_token": us / per_token_us,
+        "1x32 / aiter": us / aiter_us,
+        "a8w4_1x32 kernel": gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")[-1],
+    }
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -2023,7 +2111,8 @@ def main():
         return
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark the FlyDSL A8W4 GEMM against aiter's FP8 per-token GEMM.",
+        description="Benchmark the FlyDSL A8W4 GEMM (per-token, then 1x32 activations) "
+        "against aiter's FP8 per-token GEMM.",
     )
     parser.add_argument(
         "-s",
@@ -2049,6 +2138,18 @@ def main():
     df = pd.DataFrame(rows)
     aiter.logger.info(
         "gemm_a8w4_ptpc summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    # The 1x32 cases after every per-token case, in the same order, each given the per-token
+    # case's times of this op and aiter.
+    rows_1x32 = [
+        bench_gemm_a8w4_1x32(
+            row["shape"], row["m"], row["a8w4 us"], row["aiter_fp8_ptpc us"]
+        )
+        for row in rows
+    ]
+    aiter.logger.info(
+        "gemm_a8w4_ptpc x_quant=1x32 summary (markdown):\n%s",
+        pd.DataFrame(rows_1x32).to_markdown(index=False),
     )
 
 
