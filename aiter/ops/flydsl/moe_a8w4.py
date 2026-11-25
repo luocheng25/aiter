@@ -312,6 +312,14 @@ def _decode_fits(H, I, topk, paired):
     )
 
 
+def _down_pq_fits(H, weights, topk):
+    """Whether the slot-pair Down decode kernel (pre-quantized rows) takes this shape: it addresses all experts'
+    weights with 32-bit byte offsets; larger weights or shapes it does not support take the single-slot Down.
+    """
+    small_w2 = weights.w2.numel() * weights.w2.element_size() < 2**32
+    return small_w2 and _decode_fits(H, weights.inter_padded, topk, True)
+
+
 @functools.cache
 def _gateup_decode_kernel(N1, H, topk, prequant, limit):
     return a8w4_decode.compile_a8w4_gateup_decode(
@@ -361,7 +369,7 @@ def _quantize_decode(x, rows, cols, bf16):
 
 
 def _fused_moe_decode_wide_dd(
-    hidden_states, weights, topk_weight, topk_ids, output, limit
+    hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
 ):
     """Decode of the DECODE_WIDE_HIDDEN sizes from DECODE_WIDE_DEDUP_MIN_M tokens: one kernel quantizes x and writes
     the dedup plan, Gate/Up is deduplicated by expert (``decode_dedup``), the row kernel quantizes the intermediate
@@ -401,6 +409,9 @@ def _fused_moe_decode_wide_dd(
         M,
     )
     mq, ms = _quantize_decode(mid, M * topk, I, False)
+    if decode_down is not None:
+        decode_down(True, mq, ms, topk_ids, topk_weight, weights, output)
+        return output
     _launch(
         "a8w4_down_decode_pq",
         _down_decode_kernel(H, I, topk, True),
@@ -417,25 +428,20 @@ def _fused_moe_decode_wide_dd(
     return output
 
 
-def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output, limit):
+def _fused_moe_decode(
+    hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
+):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     I = weights.inter_padded
-    # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets; larger weights or
-    # shapes the slot-pair kernel does not support take the single-slot Down.
-    small_w2 = weights.w2.numel() * weights.w2.element_size() < 2**32
-    if (
-        H in DECODE_WIDE_HIDDEN
-        and M >= DECODE_WIDE_DEDUP_MIN_M
-        and small_w2
-        and _decode_fits(H, I, topk, True)
-    ):
+    pq_fits = _down_pq_fits(H, weights, topk)
+    if H in DECODE_WIDE_HIDDEN and M >= DECODE_WIDE_DEDUP_MIN_M and pq_fits:
         return _fused_moe_decode_wide_dd(
-            hidden_states, weights, topk_weight, topk_ids, output, limit
+            hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
         )
     # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
     gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
-    down_pq = M >= DECODE_PREQUANT_MIN_M and small_w2 and _decode_fits(H, I, topk, True)
+    down_pq = M >= DECODE_PREQUANT_MIN_M and pq_fits
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
     if gateup_pq:
         xq, xs = _quantize_decode(hidden_states, M, H, True)
@@ -460,6 +466,9 @@ def _fused_moe_decode(hidden_states, weights, topk_weight, topk_ids, output, lim
         mq, ms = _quantize_decode(mid, M * topk, I, False)
     else:
         mq, ms = mid, topk_weight
+    if decode_down is not None:
+        decode_down(down_pq, mq, ms, topk_ids, topk_weight, weights, output)
+        return output
     _launch(
         "a8w4_down_decode" + ("_pq" if down_pq else ""),
         _down_decode_kernel(H, I, topk, down_pq),
@@ -641,7 +650,9 @@ def _quantize(x, rows, cols, dtype, fill=None):
     return q, scale
 
 
-def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output, limit):
+def _fused_moe_stream(
+    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     E, I = weights.experts, weights.inter_padded
@@ -710,6 +721,8 @@ def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output, lim
             output,
             *down_args,
         )
+        if reduce is not None:
+            reduce(output, None, None)
         return output
     routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=device)
     _launch(
@@ -721,6 +734,9 @@ def _fused_moe_stream(hidden_states, weights, topk_weight, topk_ids, output, lim
         routes,
         *down_args,
     )
+    if reduce is not None:
+        reduce(output, loc_ids, routes)
+        return output
     _launch(
         "a8w4_route_sum",
         _route_sum_kernel(topk, H),
@@ -784,7 +800,9 @@ def _down_prefill_kernel(N, K, topk, experts, nsplit, xcd_chunk):
     )
 
 
-def _fused_moe_prefill(hidden_states, weights, topk_weight, topk_ids, output, limit):
+def _fused_moe_prefill(
+    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     E, I = weights.experts, weights.inter_padded
@@ -851,6 +869,9 @@ def _fused_moe_prefill(hidden_states, weights, topk_weight, topk_ids, output, li
         M,
         grid,
     )
+    if reduce is not None:
+        reduce(output, loc_ids, routes)
+        return output
     sorted_sum(topk, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
     return output
@@ -873,7 +894,15 @@ def _swiglu_limit(value):
 
 
 def fused_moe_a8w4(
-    hidden_states, weights, topk_weight, topk_ids, *, output=None, swiglu_limit=0.0
+    hidden_states,
+    weights,
+    topk_weight,
+    topk_ids,
+    *,
+    output=None,
+    swiglu_limit=0.0,
+    reduce=None,
+    decode_down=None,
 ):
     """A8W4 MoE forward of one rank: BF16 ``hidden_states`` [M, H] -> BF16 [M, H] (``output`` if given).
 
@@ -889,6 +918,19 @@ def fused_moe_a8w4(
     weight and activation scales); the limit is a compile-time constant (the Gate/Up kernel symbols end in
     ``_swiglu``; the ``last_path`` names do not change).
     0 (default) runs the kernels without it. Must be finite and >= 0 (``ValueError``).
+
+    ``reduce`` (default None) replaces the last step of the stream and prefill paths, for a caller that fuses
+    more work into it (``MegaMoeTPGfx942``: the cross-rank sum): instead of the route sum it is called as
+    ``reduce(output, loc_ids, routes)`` -- ``routes`` BF16 [rows, H] by sorted row, ``loc_ids`` int32 [M, topk]
+    the sorted row of each route (negative: none), summed in slot order -- and after the atomic streaming Down
+    (which leaves the route sum in ``output``) as ``reduce(output, None, None)``; it must launch on the current
+    stream and leave the result in ``output``. The decode path never calls it.
+
+    ``decode_down`` (default None) likewise replaces the Down kernel of the decode path: it is called with that
+    kernel's inputs as ``decode_down(paired, mid, mid_scale, topk_ids, topk_weight, weights, output)`` --
+    ``paired``: the slot-pair kernel, ``mid`` FP8 [M * topk, I] with its row scales ``mid_scale``; else the
+    single-slot kernel, ``mid`` f32 [M, topk, I] and ``mid_scale`` the (unused) ``topk_weight`` -- and must launch on
+    the current stream and leave the route sum in ``output``. The other paths never call it.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
         raise TypeError("hidden_states must be a 2-D bfloat16 tensor")
@@ -925,12 +967,12 @@ def fused_moe_a8w4(
     E, I = weights.experts, weights.inter_padded
     if M <= DECODE_MAX_M and _decode_fits(H, I, topk, False):
         return _fused_moe_decode(
-            hidden_states, weights, topk_weight, topk_ids, output, limit
+            hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
         )
     if M > DECODE_MAX_M and M * topk <= _stream_max_rows(H, I, M * topk) * E:
         return _fused_moe_stream(
-            hidden_states, weights, topk_weight, topk_ids, output, limit
+            hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
         )
     return _fused_moe_prefill(
-        hidden_states, weights, topk_weight, topk_ids, output, limit
+        hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
     )

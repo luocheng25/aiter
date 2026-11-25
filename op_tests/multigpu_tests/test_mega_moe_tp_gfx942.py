@@ -705,38 +705,42 @@ def pool():
 
 # =====================================================================================================================
 # Region 1: basic tests (-m basic): one case per dispatch tier x shape. Each pins the tier -- the Gate/Up kernel of
-# the unfused kernel sequence listed -- and one communication segment, not the kernels after Gate/Up or the AR kind.
+# the unfused kernel sequence listed -- and the communication segment: FUSED_COMM (the cross-rank sum fused into the
+# Down decode kernel up to 16 rows, into tp_reduce from 2 MiB (TP2) / 1 MiB (TP4) of BF16 output) or CA (the custom
+# all-reduce in between). Not pinned: the kernels after Gate/Up.
 # =====================================================================================================================
 BASIC = [
     # decode: one workgroup per route / token
-    ("tp2", 1, DEC),
-    ("ds_tp4", 2, DEC),
-    ("tp4", 8, DPQ),  # Down on pre-quantized rows
-    ("tp2", 32, PQ),  # both GEMMs on pre-quantized rows
-    ("ds_tp4", 16, DD),  # H5120: Gate/Up deduplicated by expert
+    ("tp2", 1, DEC, FUSED_COMM),
+    ("ds_tp4", 2, DEC, FUSED_COMM),
+    ("tp4", 8, DPQ, FUSED_COMM),  # Down on pre-quantized rows
+    ("tp2", 32, PQ, CA),  # both GEMMs on pre-quantized rows
+    ("ds_tp4", 16, DD, FUSED_COMM),  # H5120: Gate/Up deduplicated by expert
     # streaming (weights streamed once per expert block)
-    ("tp2", 256, ST16),
-    ("ds_tp4", 512, ST16_RS),  # Down writes routes, route_sum adds them
-    ("tp4", 48, ST32Q),  # Gate/Up quantizes the intermediate itself
-    ("ds_tp4", 1024, ST32_RS),
-    ("tp4", 2048, ST64Q),
+    ("tp2", 256, ST16, CA),
+    ("ds_tp4", 512, ST16_RS, FUSED_COMM),  # Down writes routes, tp_reduce sums them
+    ("tp4", 48, ST32Q, CA),  # Gate/Up quantizes the intermediate itself
+    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),
+    ("tp4", 2048, ST64Q, FUSED_COMM),  # atomic Down, tp_reduce sums the ranks' outputs
     # prefill: sorted 64-row blocks
-    ("tp2", 2048, PF_PREP),  # sorting by the streaming prep
-    ("tp4", 4096, PF_SORT),  # Opus moe_sorting
-    ("ds_tp4", 4096, PF_SORT),
+    ("tp2", 2048, PF_PREP, FUSED_COMM),  # sorting by the streaming prep
+    ("tp4", 4096, PF_SORT, FUSED_COMM),  # Opus moe_sorting
+    ("ds_tp4", 4096, PF_SORT, FUSED_COMM),
 ]
 
 
 @pytest.mark.basic
-@pytest.mark.parametrize("shape,M,path", BASIC, ids=[f"{s}_m{m}" for s, m, _ in BASIC])
-def test_basic(pool, shape, M, path):
+@pytest.mark.parametrize(
+    "shape,M,path,comm", BASIC, ids=[f"{s}_m{m}" for s, m, _, _ in BASIC]
+)
+def test_basic(pool, shape, M, path, comm):
     tier = gateup_tier(path)
     rows = _member_rows(pool.run("check", shape=shape, tokens=[M]), shape)
     _assert_verified(rows)
     for r in rows:
         assert (
-            gateup_tier(r["path"]) == tier and comm_kind(r["path"]) is not None
-        ), f"rank {r['rank']}: expected Gate/Up {tier} and one communication segment, path {r['path']}"
+            gateup_tier(r["path"]) == tier and comm_kind(r["path"]) == comm
+        ), f"rank {r['rank']}: expected Gate/Up {tier} and communication {comm}, path {r['path']}"
 
 
 # =====================================================================================================================
@@ -746,12 +750,28 @@ def test_basic(pool, shape, M, path):
 # --- 2.1 both sides of every dispatch boundary --------------------------------------------------------------------
 # Why: the benchmark and the basic tests only take powers of two (+48), on one side of each M threshold of the
 # dispatch (decode pre-quantization, decode / streaming / prefill, block 16 / 32 / 64, prep / Opus sorting,
-# DeepSeek's XCD chunking); these are the M on the other side, and odd M (partial blocks / tiles).
+# DeepSeek's XCD chunking, the fused communication below); these are the M on the other side, and odd M (partial
+# blocks / tiles). The benchmark does not check paths and the basic tests do not pin the fused kernel, so the
+# communication kernel of every M is pinned here: decode_tp single-slot at 1 row / slot pairs at 2-16 rows, the
+# custom all-reduce from 17 rows, tp_reduce from the byte threshold (1023 / 1024: its 1- / 2-token tiles at H2560).
 BOUNDARY_TOKENS = {
-    "tp2": (3, 11, 12, 33, 62, 63, 559, 560, 1026, 1027, 2234, 2235),
-    "tp4": (3, 19, 20, 33, 62, 63, 559, 560, 1305, 1306, 2611, 2612),
-    "ds_tp4": (3, 7, 17, 33, 768, 769, 1025, 2049, 2730, 2731),
+    "tp2": (1, 2, 3, 11, 12, 16, 17, 33, 62, 63, 409, 410, 559, 560, 1023, 1024)
+    + (1026, 1027, 2234, 2235),
+    "tp4": (1, 2, 3, 16, 17, 19, 20, 33, 62, 63, 204, 205, 559, 560, 1023, 1024)
+    + (1305, 1306, 2611, 2612),
+    "ds_tp4": (1, 2, 3, 7, 16, 17, 33, 102, 103, 768, 769, 1025, 2049, 2730, 2731),
 }
+# First M whose cross-rank sum is fused into tp_reduce: FUSED_MIN_BYTES of BF16 output (TP2 2 MiB, TP4 1 MiB).
+FUSED_FROM_M = {"tp2": 410, "tp4": 205, "ds_tp4": 103}
+
+
+def expected_comm_kernel(shape, M):
+    """The last kernel of an M-row forward of shape: its fused communication kernel or the custom all-reduce."""
+    if M == 1:
+        return "a8w4_down_decode_tp"
+    if M <= 16:
+        return "a8w4_down_decode_pq_tp"
+    return "a8w4_tp_reduce" if M >= FUSED_FROM_M[shape] else CA
 
 
 @pytest.mark.parametrize("shape", list(BOUNDARY_TOKENS))
@@ -761,23 +781,25 @@ def test_dispatch_boundaries(pool, shape):
     )
     _assert_verified(rows)
     for r in rows:
-        assert _known_path(
-            r["path"]
-        ), f"M={r['M']} rank {r['rank']}: unknown path {r['path']}"
+        last = expected_comm_kernel(shape, r["M"])
+        assert (
+            _known_path(r["path"]) and r["path"].split(">")[-1] == last
+        ), f"M={r['M']} rank {r['rank']}: expected a known path ending in {last}, path {r['path']}"
 
 
-# --- 2.2 out=, the RCCL fallback, M = 0 -------------------------------------------------------------------------
-# Why: the benchmark and the basic tests never pass ``out`` and never send M = 0; their sizes up to 8192 rows reach
-# the RCCL fallback only in the benchmark, where it is timed but its in-place / copy-back into ``out`` is not.
+# --- 2.2 out=, M = 0 ----------------------------------------------------------------------------------------------
+# Why: the benchmark and the basic tests never pass ``out`` and never send M = 0. ``out`` (NaN-filled) is written
+# by the fused decode Down (8 rows), copied back from the custom all-reduce (48) and written by tp_reduce after the
+# atomic streaming Down accumulated into it (2048).
+OUT_ARG_TOKENS = (8, 48, 2048)
+
+
 def _job_out_arg(state):
     shape = "tp4"
     layer, raw = state.get(shape)
     s = SHAPES[shape]
     rows = []
-    for M in (
-        8,
-        16384,
-    ):  # unfused, 8: custom all-reduce, copied back into out; 16384 (84 MB > 64 MiB): RCCL in place
+    for M in OUT_ARG_TOKENS:
         inputs = state.inputs(shape, M, 1)
         out = torch.full(
             (M, s["H"]), float("nan"), dtype=torch.bfloat16, device=state.device
@@ -807,15 +829,15 @@ def test_out_argument_and_empty_batch(pool):
     results = pool.run("out_arg")
     for rank, res in enumerate(results):
         _assert_verified(res["rows"])
+        assert [r["M"] for r in res["rows"]] == list(OUT_ARG_TOKENS), res["rows"]
         for r in res["rows"]:
             assert r[
                 "returned_out"
             ], f"rank {rank} M={r['M']}: forward(out=...) did not return out"
-            ar = CA if r["M"] == 8 else RCCL
-            assert comm_kind(r["path"]) in (
-                ar,
-                FUSED_COMM,
-            ), f"rank {rank} M={r['M']}: expected {ar} or a fused reduction, path {r['path']}"
+            last = expected_comm_kernel("tp4", r["M"])
+            assert (
+                r["path"].split(">")[-1] == last
+            ), f"rank {rank} M={r['M']}: expected {last} last, path {r['path']}"
         assert (
             res["empty_shape"] == (0, SHAPES["tp4"]["H"]) and res["empty_path"] == ()
         ), res
@@ -1005,7 +1027,11 @@ def test_cuda_graph(pool, shape, M):
 
 # --- 2.7 default communicators ----------------------------------------------------------------------------------
 # Why: the benchmark and the other tests pass explicit TP / gloo groups; with group=None and cpu_group=None the
-# layer uses the default group and creates its gloo group itself (collective), and close() releases it.
+# layer uses the default group and creates its gloo group itself (collective) -- the fused sum's workspace (8 rows)
+# and the custom all-reduce (48 rows) run over it -- and close() releases both.
+DEFAULT_COMM_TOKENS = (8, 48)
+
+
 def _job_default_comm(state):
     from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
 
@@ -1015,15 +1041,18 @@ def _job_default_comm(state):
         make_config(shape, state.rank), **to_megamoe_layout(raw), device=state.device
     )
     try:
-        inputs = state.inputs(shape, 8, 0)
-        y = layer.forward(*inputs)
-        return [
-            dict(
-                M=8,
-                path=">".join(layer.last_path),
-                **_verify(state, shape, raw, inputs, y),
+        rows = []
+        for M in DEFAULT_COMM_TOKENS:
+            inputs = state.inputs(shape, M, 0)
+            y = layer.forward(*inputs)
+            rows.append(
+                dict(
+                    M=M,
+                    path=">".join(layer.last_path),
+                    **_verify(state, shape, raw, inputs, y),
+                )
             )
-        ]
+        return rows
     finally:
         layer.close()
 
@@ -1031,12 +1060,11 @@ def _job_default_comm(state):
 def test_default_communicators(pool):
     for rows in pool.run("default_comm"):
         _assert_verified(rows)
-        # Unfused, the custom all-reduce must run over the gloo group the layer made (not the RCCL fallback).
-        path = rows[0]["path"]
-        assert gateup_tier(path) == gateup_tier(DPQ) and comm_kind(path) in (
-            CA,
-            FUSED_COMM,
-        ), rows
+        assert [r["M"] for r in rows] == list(DEFAULT_COMM_TOKENS), rows
+        # the fused sum over the layer's own groups, and the custom all-reduce (not the RCCL fallback)
+        for r in rows:
+            last = expected_comm_kernel("tp4", r["M"])
+            assert _known_path(r["path"]) and r["path"].split(">")[-1] == last, rows
 
 
 # --- 2.8 rejected configurations and arguments ------------------------------------------------------------------
@@ -1222,6 +1250,272 @@ def test_path_checks():
     assert gateup_tier(PF_SORT) == "a8w4_gateup_prefill_bm64_bn128_tk128"
     assert gateup_tier(fused) == gateup_tier(DEC) == "a8w4_gateup_decode"
     assert None not in GATEUP_KERNELS
+
+
+# --- 2.10 waits on peers: a late rank, a rank that skips a call, reset(), prepare()'s retry ----------------------
+# Why: the benchmark and the basic tests start every rank's fused kernel together and never time out. Here the fused
+# decode Down (8 rows) and tp_reduce (256 rows) wait for a rank that starts 0.5 s late (right sums, no error bits);
+# with the wait bound cut to 50 ms, for a rank that skips the call: the others give up within the bound with their
+# kernel's error bit, check_errors() raises once and clears it, the skipping rank's call after that is right or has
+# its error bit too, and reset() restores right sums. prepare() resets every rank and warms up again when one rank's
+# watchdog reports an error, and raises on every rank when it reports one again.
+PEER_WAIT_CASES = (("tp4", 8), ("tp4", 256))
+# error_flag() bit of a wait that gave up, by fused kernel (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT)
+TIMEOUT_BIT = {
+    "a8w4_tp_reduce": 1,
+    "a8w4_down_decode_tp": 2,
+    "a8w4_down_decode_pq_tp": 2,
+}
+
+
+def _job_peer_wait(state, shape, M):
+    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
+
+    if not state.member(shape):
+        return None
+    layer, raw = state.get(shape)
+    s = SHAPES[shape]
+    W, dev = s["world"], state.device
+    group, cpu = state.tp[W]
+    laggard = state.rank == W - 1
+
+    def verified(step, g):
+        inputs = state.inputs(shape, M, g)
+        y = layer.forward(*inputs)
+        path = ">".join(layer.last_path)
+        return dict(step=step, path=path, **_verify(state, shape, raw, inputs, y))
+
+    def raised(fn):
+        try:
+            fn()
+        except RuntimeError as e:
+            return str(e)
+        return None
+
+    rows = [verified("warm", 0)]
+    res = {}
+    # a rank 0.5 s late, within the wait bound
+    inputs = state.inputs(shape, M, 1)
+    torch.cuda.synchronize(dev)
+    dist.barrier(group=cpu)
+    if laggard:
+        time.sleep(0.5)
+    y = layer.forward(*inputs)
+    path = ">".join(layer.last_path)
+    rows.append(dict(step="late", path=path, **_verify(state, shape, raw, inputs, y)))
+    res["late_bits"] = layer.poll_errors()
+    # a rank that skips the call (wait bound 50 ms), then calls after the others gave up
+    x, tw, ids = inputs = state.inputs(shape, M, 2)
+    ref = reference(
+        x,
+        raw["w1"],
+        raw["w1_scale"],
+        raw["w2"],
+        raw["w2_scale"],
+        tw,
+        ids,
+        swiglu_limit=s["limit"] or 0.0,
+    )
+    dist.all_reduce(ref, group=group)
+    torch.cuda.synchronize(dev)
+    dist.barrier(group=cpu)
+    saved = mod.WAIT_S, mod.FIRST_WAIT_S
+    mod.WAIT_S = mod.FIRST_WAIT_S = 0.05
+    try:
+        began = time.perf_counter()
+        if not laggard:
+            layer.forward(*inputs)
+        torch.cuda.synchronize(dev)
+        res["took"] = time.perf_counter() - began
+        res["bits"] = layer.poll_errors()
+        res["raised"] = raised(layer.check_errors)
+        res["cleared"] = layer.poll_errors()
+        dist.barrier(group=cpu)
+        if laggard:
+            y = layer.forward(*inputs)
+            res["skip_ok"] = check(y, ref)["ok"]
+            res["skip_bits"] = layer.poll_errors()
+            res["skip_raised"] = raised(layer.check_errors)
+    finally:
+        mod.WAIT_S, mod.FIRST_WAIT_S = saved
+    layer.reset()
+    rows += [verified("reset", g) for g in (0, 3)]
+    res["reset_bits"] = layer.poll_errors()
+    # prepare(): one rank's watchdog reports an error (the warmup itself runs clean: a real sticky bit would make that
+    # rank's waits give up early) once -> every rank resets and warms up again; twice -> RuntimeError on every rank
+    local = -(-M // W)
+
+    def failing(times):
+        left = [times]
+
+        def poll():
+            left[0] -= 1
+            return 1 if left[0] >= 0 else type(layer).poll_errors(layer)
+
+        return poll
+
+    for name, times in (("retry", 1), ("stuck", 2)):
+        if laggard:
+            layer.poll_errors = failing(times)
+        try:
+            res[name] = raised(lambda: layer.prepare([local]))
+        finally:
+            if laggard:
+                del layer.poll_errors
+        res[f"{name}_bits"] = layer.poll_errors()
+    layer.reset()
+    rows.append(verified("after prepare", 1))
+    res["final_bits"] = layer.poll_errors()
+    return dict(res, rows=rows)
+
+
+@pytest.mark.parametrize(
+    "shape,M", PEER_WAIT_CASES, ids=[f"{s}_m{m}" for s, m in PEER_WAIT_CASES]
+)
+def test_peer_waits_and_timeouts(pool, shape, M):
+    last = expected_comm_kernel(shape, M)
+    W = SHAPES[shape]["world"]
+    for rank, res in enumerate(pool.run("peer_wait", shape=shape, M=M)):
+        if rank >= W:
+            assert res is None
+            continue
+        _assert_verified(res["rows"])
+        assert all(r["path"].split(">")[-1] == last for r in res["rows"]), res["rows"]
+        assert res["late_bits"] == 0, f"rank {rank}: error bits after a late peer {res}"
+        if rank == W - 1:  # skipped; its late call is right or flagged
+            assert res["bits"] == 0 and res["raised"] is None, res
+            assert res["skip_ok"] or res["skip_bits"], res
+            assert (res["skip_raised"] is not None) == bool(res["skip_bits"]), res
+        else:
+            assert res["bits"] == TIMEOUT_BIT[last] and res["took"] < 5.0, res
+            assert res["raised"] and "gave up" in res["raised"], res
+        assert res["cleared"] == res["reset_bits"] == 0, res
+        assert res["retry"] is None and res["retry_bits"] == res["stuck_bits"] == 0, res
+        assert res["stuck"] and "timed out" in res["stuck"], res
+        assert res["final_bits"] == 0, res
+
+
+# --- 2.11 CUDA graph replays between eager calls, two instances on one workspace --------------------------------
+# Why: the benchmark and the basic tests run one instance eagerly, and 2.6 replays one graph by itself; serving
+# replays decode graphs between eager calls of other sizes, and the instances of one communicator, hidden size and
+# batch bound (layers of a model) share the fused sums' buffers and their epochs / parities (advanced by the kernels).
+# Two TP4 instances with different weights run in graphs of 8 / 256 / 1024 rows (decode_tp, tp_reduce with 1- / 2-
+# token tiles) replayed between eager calls of both (fused sizes and the custom all-reduce).
+GRAPH_EAGER_TOKENS = (8, 256, 1024)
+GRAPH_EAGER_STEPS = (
+    ("replay", 256),
+    ("eager", 4096),
+    ("replay", 8),
+    ("eager", 256),
+    ("replay", 1024),
+    ("eager", 8),
+    ("replay", 256),
+    ("eager", 1023),
+    ("eager", 1),
+    ("replay", 8),
+    ("eager", 48),
+    ("replay", 1024),
+    ("eager", 2),
+    ("replay", 8),
+)
+
+
+def _job_graph_shared(state):
+    shape = "tp4"
+    dev = state.device
+    layer, raw = state.get(shape)
+    other, raw2, _ = state.build(shape, variant=1)
+    pairs = ((layer, raw), (other, raw2))
+    graphs = {}
+    try:
+        for M in GRAPH_EAGER_TOKENS:
+            statics = [t.clone() for t in state.inputs(shape, M, 0)]
+            outs = [torch.empty_like(statics[0]) for _ in pairs]
+            side = torch.cuda.Stream(device=dev)
+            side.wait_stream(torch.cuda.current_stream(dev))
+            with torch.cuda.stream(side):
+                for (lay, _), y in zip(pairs, outs):
+                    lay.forward(*statics, out=y)
+            torch.cuda.current_stream(dev).wait_stream(side)
+            torch.cuda.synchronize(dev)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for (lay, _), y in zip(pairs, outs):
+                    lay.forward(*statics, out=y)
+            paths = [">".join(lay.last_path) for lay, _ in pairs]
+            graphs[M] = (graph, statics, outs, paths)
+        rows = []
+        for i, (kind, M) in enumerate(GRAPH_EAGER_STEPS):
+            inputs = state.inputs(shape, M, i % 4)
+            if kind == "replay":
+                graph, statics, ys, paths = graphs[M]
+                for static, t in zip(statics, inputs):
+                    static.copy_(t)
+                graph.replay()
+            else:
+                ys, paths = [], []
+                for lay, _ in pairs:
+                    ys.append(lay.forward(*inputs))
+                    paths.append(">".join(lay.last_path))
+            for j, ((lay, w), y, path) in enumerate(zip(pairs, ys, paths)):
+                res = _verify(state, shape, w, inputs, y)
+                res.update(step=(i, kind), M=M, layer=j, path=path)
+                rows.append(dict(res, bits=lay.poll_errors()))
+        return {"shared": other._ws is layer._ws, "rows": rows}
+    finally:
+        for graph, *_ in graphs.values():
+            graph.reset()
+        other.close()
+
+
+def test_graph_eager_shared_workspace(pool):
+    for rank, res in enumerate(pool.run("graph_shared")):
+        assert res["shared"], f"rank {rank}: the instances do not share the workspace"
+        rows = res["rows"]
+        _assert_verified(rows)
+        assert len(rows) == 2 * len(GRAPH_EAGER_STEPS), rows
+        for r in rows:
+            last = expected_comm_kernel("tp4", r["M"])
+            assert r["path"].split(">")[-1] == last and r["bits"] == 0, (rank, r)
+
+
+# --- 2.12 the single-slot fused decode Down above 1 row -----------------------------------------------------------
+# Why: every weight of the benchmark and the tests fits the slot-pair Down (moe_a8w4._down_pq_fits), so their fused
+# decode sums 2-16 rows with the slot-pair kernel only; a w2 of 4 GiB or more (32-bit offsets) does not fit, too
+# large to allocate here: with the check patched, the single-slot decode_tp kernel sums the unquantized rows.
+SINGLE_SLOT_CASES = (("tp4", 2), ("tp4", 16), ("ds_tp4", 2), ("ds_tp4", 16))
+
+
+def _job_single_slot(state):
+    from aiter.ops.flydsl import moe_a8w4
+
+    real = moe_a8w4._down_pq_fits
+    moe_a8w4._down_pq_fits = lambda *args: False
+    try:
+        rows = []
+        for shape, M in SINGLE_SLOT_CASES:
+            layer, raw = state.get(shape)
+            inputs = state.inputs(shape, M, 1)
+            y = layer.forward(*inputs)
+            res = _verify(state, shape, raw, inputs, y)
+            rows.append(dict(res, shape=shape, M=M, path=">".join(layer.last_path)))
+        return rows
+    finally:
+        moe_a8w4._down_pq_fits = real
+
+
+def test_single_slot_decode_fallback(pool):
+    for rows in pool.run("single_slot"):
+        _assert_verified(rows)
+        assert [(r["shape"], r["M"]) for r in rows] == list(SINGLE_SLOT_CASES), rows
+        for r in rows:
+            kernels = r["path"].split(">")
+            # straight from Gate/Up: no row quantization in between
+            assert (
+                _known_path(r["path"])
+                and kernels[-1] == "a8w4_down_decode_tp"
+                and kernels[-2].startswith(GATEUP_PREFIX)
+            ), r
 
 
 # =====================================================================================================================

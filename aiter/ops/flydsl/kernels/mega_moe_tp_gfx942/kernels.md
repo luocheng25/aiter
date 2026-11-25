@@ -4,7 +4,10 @@
      只写当前实现，不写过程（哪个里程碑、谁定的、试过什么）；关键行链接到代码；与代码对不上就改这里。 -->
 
 `MegaMoeTPGfx942.forward` = 本卡的 A8W4 两阶段 MoE（下面各 kernel，源码在 [kernels/moe_a8w4/](../moe_a8w4/)，host 分派在
-[moe_a8w4.py](../../moe_a8w4.py)）+ 一次 all-reduce（aiter `CustomAllreduce` 或 RCCL，没有自己的通信 kernel）。
+[moe_a8w4.py](../../moe_a8w4.py)）+ 跨卡求和。跨卡求和有两个自己的 kernel（本目录，host 分派在
+[mega_moe_tp_gfx942.py](../../mega_moe_tp_gfx942.py)）：M ≤ 16 时「A8W4 Down decode 跨卡版」换掉 Down decode，
+M > 32 且每卡输出够大时「跨卡求和 a8w4_tp_reduce」换掉末步（两节都在下文）；其余 M 在本卡算完后
+跑一次 all-reduce（aiter `CustomAllreduce`，超过其上限用 RCCL）。
 流式与 prefill 用到的 `sorted_sum` 与公共工具取自 aiter 的 [gfx9_fp8](../moe_gemm_2stage/gfx9_fp8/) 两阶段 MoE。
 
 A8W4 的 GEMM kernel（prefill 两个、decode 四个（三个逐路由 / token、一个按 expert 去重的 Gate/Up）、流式两个）共用 [common.py](../moe_a8w4/common.py) 的私有权重布局与解码（字节级定义见该文件 docstring）：
@@ -81,6 +84,17 @@ global → VGPR 直读，还是经 LDS 共享 / 双缓冲）与**预取距离**�
 #     stream_prep(排序 + 量化 x，不清零 out)，否则 moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1)；之后都是
 #     gateup_prefill（BM64·BN128·TK128）→ row_quant_fp8(mid) → down_prefill（并写有效路由的 loc_ids）→ sorted_sum → out；
 #     H5120 且 M·TOPK ≥ 16384 时两个 GEMM 按 XCD 分块排布（XCD_CHUNK）；I > 512 且 BM·I > 32 KiB 时 down_prefill 的激活分两段
+# 跨卡求和（host 见 mega_moe_tp_gfx942.py 的 forward；上面各 kernel 原样不变，只换掉最后一步）：
+#   M ≤ 16：down_decode(_pq) → down_decode(_pq)_tp，块末各卡交换 f32 部分和、按 rank 顺序相加后写 out；
+#     跨卡版从 M ≥ 2 起（槽对版放得下且 w2 < 4 GiB 时）先 row_quant_decode(mid) 走槽对版
+#   M > 32 且每卡输出 M·H·2 B ≥ 2 MiB（TP2）/ 1 MiB（TP4）：route_sum / sorted_sum → tp_reduce（求和模式）；
+#     原子累加的流式 Down 之后接 tp_reduce（拷贝模式）
+#   其余：上面的路径写出本卡部分和 → all-reduce
+# 跨卡伪操作：sys_load / sys_store(t[下标], v)：系统范围的 global 读 / 写，读绕过缓存、写直达目标卡显存
+#   （tp_reduce：buffer 读写带 sc0 sc1；decode_tp：one-as monotonic 原子读写）；
+#   s_load(t[下标])：标量（SMEM）读；shuffle(v, l)：取 lane l 的 v；
+#   late, v = wait_until(读, 到齐)：限时轮询：反复「读」直到「到齐」（轮间 s_sleep 2），超过 limit·1024 个 100 MHz tick
+#   （err 已置位时只读一次）就放弃；返回是否放弃与最后读到的值。放弃后照常往下走并在 err 置错误位（输出作废，不挂死）
 ```
 
 ## A8W4 Gate/Up prefill（[gemm1.py](../moe_a8w4/gemm1.py#L624)）
@@ -411,9 +425,10 @@ x 行 → LDS xq
 **资源**：LDS 约 3.2 KiB（xq H B、part 512 B、red 16 B、LUT 96 B；H5120 多 2.5 KiB）；本 wave 的权重全部同时在途
 （H2560 每 lane 10 条 16 B，H5120 为 20 条）。
 
-## A8W4 Down decode（核内量化，[decode.py](../moe_a8w4/decode.py#L477)）
-M ≤ 3、w2 ≥ 4 GiB 或槽对版放不下时用：每个 WG 算一个 token 的 16 个输出通道，在 LDS 里把 topk 个 expert 相加后直接写 bf16 out。
+## A8W4 Down decode（核内量化，[decode.py](../moe_a8w4/decode.py#L639)）
+M ≤ 3（跨卡版只在 M = 1）、w2 ≥ 4 GiB 或槽对版放不下时用：每个 WG 算一个 token 的 16 个输出通道，在 LDS 里把 topk 个 expert 相加后直接写 bf16 out。
 它的 LDS 放不下时（[down_decode_fits](../moe_a8w4/decode.py#L62)）decode 整体不用，M ≤ 32 走 prefill。
+到 LDS 部分和为止的主体是 [down_decode_partials](../moe_a8w4/decode.py#L491)，与跨卡版共用。
 
 **Gluon 风格**
 ```python
@@ -447,7 +462,7 @@ def a8w4_down_decode(mid, topk_ids, topk_weight, w2, w2_delta, w2_scale, out):
             acc = cdna3.mfma(a, decode(wr[r], kb, lut), acc)
         total += gl.where(w + W * r < TOPK, acc[0] * cs[r] * sa[r] * tw[r], 0)
     part = gl.allocate_shared_memory(f32, [W, 16], …)
-    part.index(w).store(total); gl.barrier()
+    part.index(w).store(total); gl.barrier()         # 以上 = down_decode_partials（跨卡版共用），以下 = down_decode_sum
     out[token, n] = tree_sum(part.load(…), axis=0).to(bf16)   # RTE；直接写 out，不需清零，也没有 sorted_sum
 ```
 
@@ -477,15 +492,16 @@ wave 内量化本槽 mid 行
   lane < 16：total → LDS part[w]；barrier
   tid < 16：W 个 wave 的部分和树形相加 → bf16（RTE）→ out[token, j·16 + tid]（不需清零与 sorted_sum）
 ```
-关键代码：[槽与 expert](../moe_a8w4/decode.py#L532)、[加载](../moe_a8w4/decode.py#L542)、[wave 内量化](../moe_a8w4/decode.py#L578)、
-[主循环](../moe_a8w4/decode.py#L603)、[收尾](../moe_a8w4/decode.py#L617)。
+关键代码：[槽与 expert](../moe_a8w4/decode.py#L534)、[加载](../moe_a8w4/decode.py#L544)、[wave 内量化](../moe_a8w4/decode.py#L580)、
+[主循环](../moe_a8w4/decode.py#L605)、[收尾](../moe_a8w4/decode.py#L619)。
 
 **资源**：LDS = W·⌈topk/W⌉·I B（mq）+ 64·W B（part）+ 96 B，TP2 topk11 约 4.2 KiB。
 
-## A8W4 Down decode 槽对（预量化，[decode.py](../moe_a8w4/decode.py#L667)）
-M ≥ 4、w2 < 4 GiB 且放得下（每行 I/16 个 16 B 片 ≤ 64·W 个线程，全零行由每线程写一片；LDS 够）时用（H5120 只去重 Gate/Up 的
+## A8W4 Down decode 槽对（预量化，[decode.py](../moe_a8w4/decode.py#L914)）
+M ≥ 4（跨卡版 M ≥ 2）、w2 < 4 GiB 且放得下（每行 I/16 个 16 B 片 ≤ 64·W 个线程，全零行由每线程写一片；LDS 够）时用（H5120 只去重 Gate/Up 的
 路径也用它）：读预量化的 mq fp8 与 ms；
 一条 16 B 加载覆盖两个路由槽的同一 64-K 块，其余同核内量化版。
+主体 [down_decode_pq_partials](../moe_a8w4/decode.py#L731) 与跨卡版共用，收尾 [down_decode_pq_sum](../moe_a8w4/decode.py#L902)。
 
 **Gluon 风格**
 ```python
@@ -560,13 +576,78 @@ mq 片 → LDS 行 [w, r, 半]（只写有效片）；barrier
   lane 0–7、40–47：vals[h] → LDS part[w, h]；barrier
   tid < 16（通道 2m+h）：各 wave 取列 m + 列 m+8 → 树形相加 → bf16（RTE）→ out[token, j·16 + tid]
 ```
-关键代码：[零行](../moe_a8w4/decode.py#L717)、[槽对](../moe_a8w4/decode.py#L728)、[mq 片](../moe_a8w4/decode.py#L741)、
-[整张量寻址](../moe_a8w4/decode.py#L761)、[屏蔽 A 操作数](../moe_a8w4/decode.py#L816)、[主循环](../moe_a8w4/decode.py#L818)、[收尾](../moe_a8w4/decode.py#L845)。
+关键代码：[零行](../moe_a8w4/decode.py#L768)、[槽对](../moe_a8w4/decode.py#L777)、[mq 片](../moe_a8w4/decode.py#L790)、
+[整张量寻址](../moe_a8w4/decode.py#L810)、[屏蔽 A 操作数](../moe_a8w4/decode.py#L861)、[主循环](../moe_a8w4/decode.py#L863)、[收尾](../moe_a8w4/decode.py#L890)。
 
 **资源**：LDS = (2·W·轮数 + 1)·I B + 128·W B + 96 B，TP2 topk11 约 4.5 KiB；
 每 lane 偏移是 32 位，w2 总字节数须 < 4 GiB（否则 host 改用核内量化版）。
 
-## 行量化 decode（[decode.py](../moe_a8w4/decode.py#L899)）
+## A8W4 Down decode 跨卡版（[decode_tp.py](decode_tp.py#L229)）
+M ≤ 16 时代替 Down decode 与其后的 all-reduce：`a8w4_down_decode_tp` / `a8w4_down_decode_pq_tp` 的主体就是上两节的
+`down_decode_partials` / `down_decode_pq_partials`；各 wave 的部分和进 LDS 后，wave 0 与各卡交换本块 16 个通道的 f32 部分和，
+按 rank 顺序相加后写 bf16 out。收件箱布局、命名与编号的不变量（防死锁、双缓冲、限时等待、逐位相同）见
+[decode_tp.py 的 docstring](decode_tp.py#L4)，这里不重复。
+
+**Gluon 风格**（槽对版；单槽版只换主体与 sum）
+```python
+# grid = (H/16, M)，64·W 线程（W 同不融合版）；块 blk = token·NB + j（NB = H/16）是交换单位
+# 放置：主体同上两节（激活经 LDS，权重直进 VGPR，各 wave 部分和经 LDS 相加）。交换只用 wave 0：交换状态（parity[blk]、err、
+#       各卡收件箱地址）一批标量读，压在读 LDS 部分和的下面；收件箱是各卡同布局、不缓存的 int32 [2][WORLD][16·NB][16]，
+#       每个字平时是哨兵 0xFFFFFFFF（kernel 从不写的 f32 NaN），数据本身就是标志，没有单独的标志与 fence；无循环、无预取
+@gluon.jit
+def a8w4_down_decode_pq_tp(mq, ms, topk_ids, topk_weight, w2, w2_delta, w2_scale, out, M,
+                           tab, parity, err, rank, limit):
+    j, token = gl.program_id(0), gl.program_id(1)
+    part = down_decode_pq_partials(…)                # = 槽对版到 part.store 为止
+    gl.barrier()                                     # 保护：W 个 wave 的部分和都已在 LDS
+    if wave_id() != 0: return
+    blk = token * NB + j
+    b, e, base = s_load(parity[blk]), s_load(err[0]), s_load(tab[0:WORLD])   # 先发，空 asm 钉在 LDS 读之后
+    s, c = lane_id() // 16, lane_id() % 16           # lane 16s + c：与 rank s 交换通道 c（s ≥ WORLD 的 lane 闲置）
+    y = down_decode_pq_sum(part, c)                  # 本卡通道 c 的 f32 部分和（不融合版写 out 的同一个值）
+    bits = 0x7FFFFFFF if y.bitcast(i32) == 0xFFFFFFFF else y.bitcast(i32)   # 不发哨兵
+    peer = s < WORLD and s != rank
+    if peer:                                         # 1. 发：每个同伴 16 lane × 4 B = 一次 64 B 直写
+        sys_store(inbox@base[s][b, rank, blk, c], bits)
+    own = inbox@base[rank][b, s, blk, c]
+    late, seen = wait_until(sys_load(own), 到齐=没有 peer lane 读到哨兵)   # 2. 等（e ≠ 0 时只读一次）
+    if peer: sys_store(own, 0xFFFFFFFF)              # 3. 复位哨兵：两次调用后同伴才会再写这一半
+    v = [y if r == rank else shuffle(seen, 16 * r + c).bitcast(f32) for r in range(WORLD)]
+    total = v[0] + v[1] + …                          # 各卡都按 rank 0…WORLD−1 的顺序 f32 相加，本卡用 y
+    if lane_id() < 16: out[token, 16 * j + c] = total.to(bf16)   # RTE，舍入一次
+    if lane_id() == 0: parity[blk] = b ^ 1          # 本块下次用另一半收件箱（graph 重放也会翻）
+    if late and lane_id() == 0: atomic_or(err, 2)   # decode_tp 的错误位（tp_reduce 为 1）
+```
+
+**任务划分**
+| 层级 | 形状 / 数量 | 负责的数据 |
+|---|---|---|
+| grid | (H/16, M)，M ≤ 16 | 同不融合版；块 blk = token·NB + j 是交换单位 |
+| CTA（64·W 线程） | 同不融合版 | 主体同不融合版；交换只用 wave 0 |
+| wave 0 的 lane | l = 16s + c | 通道 c 发给 / 收自 rank s（s ≥ WORLD 闲置）；lane < 16 写 out |
+| 收件箱字 [b][s][blk][c] | 每卡 2·WORLD·16·NB·16 个 int32 | rank s 在第 b 半写来的块 blk 通道 c |
+
+**流水线**
+```text
+主体：同「A8W4 Down decode（核内量化）」或「槽对（预量化）」一节的序言与主循环；各 wave 的部分和写 LDS part；barrier
+wave 0（其余 wave 结束）：
+  s_buffer_load：parity[blk]、err、tab（2·WORLD 个字，每条 4 个）一批发出
+  LDS 读 part 的通道 c → 各 wave 树形相加 → y；空 asm 钉住上面的标量读（否则各自下沉到分支后的首次使用处，
+    一次等待变多次）
+  y 的位型等于哨兵时改成 0x7FFFFFFF；peer lane：sys_store → rank s 收件箱 [b][rank][blk][c]
+  轮询：sys_load 本卡 [b][s][blk][c] → ballot（peer lane 仍见哨兵？）→ s_sleep 2 → 再读；
+    超过 limit·1024 tick（err 已置位：读一次）放弃
+  peer lane：本卡 [b][s][blk][c] 写回哨兵（sys_store）
+  shuffle 取 lane 16r + c（r = 0…WORLD−1，本卡用 y）→ f32 依次相加 → bf16
+  lane < 16：写 out[token, 16j + c]；lane 0：parity[blk] = b ^ 1；放弃过：lane 0 原子 OR err |= 2
+```
+关键代码：[交换状态](decode_tp.py#L89)、[钉住标量读](decode_tp.py#L99)、[发](decode_tp.py#L188)、[轮询](decode_tp.py#L199)、
+[按 rank 相加与写出](decode_tp.py#L206)、[kernel](decode_tp.py#L247)；host：`MegaMoeTPGfx942._decode_down`。
+
+**资源**：LDS 同不融合版（交换不用 LDS）；收件箱每卡 2·WORLD·16·H·4 B（TP2 H2560 0.625 MiB，TP4 H5120 2.5 MiB），
+parity 每卡 16·NB（= H）个 int32。
+
+## 行量化 decode（[decode.py](../moe_a8w4/decode.py#L991)）
 槽对 Down 之前量化 mid（f32 [M·topk, I]），M·topk·I/16 ≥ 2560 时量化 x（bf16 [M, H]）；逐元素 IEEE 除法，
 结果与 [quant.py](../moe_a8w4/quant.py) 逐位一致。
 
@@ -598,7 +679,7 @@ lane 内 max|x| → DPP 4 步 + readlane 4 行得整行 amax；scale = amax / 24
 q = clamp(x / scale, ±240)（IEEE）→ cvt_pk_fp8（RNE）→ -0 改 +0 → 每 4 个打包成 32 位字
 有效片写回：bf16 每片 8 B、f32 每片 4 B；lane 0 写 scale
 ```
-关键代码：[读片](../moe_a8w4/decode.py#L921)、[scale](../moe_a8w4/decode.py#L945)、[写回](../moe_a8w4/decode.py#L949)、[-0 处理](../moe_a8w4/decode.py#L148)。
+关键代码：[读片](../moe_a8w4/decode.py#L1013)、[scale](../moe_a8w4/decode.py#L1037)、[写回](../moe_a8w4/decode.py#L1041)、[-0 处理](../moe_a8w4/decode.py#L148)。
 
 **资源**：不用 LDS。
 
@@ -715,7 +796,7 @@ x 片 → LDS [组员, H+16]；barrier
 ```
 
 关键代码：[组首判断](../moe_a8w4/decode_dedup.py#L495)、[x 行与权重](../moe_a8w4/decode_dedup.py#L269)、[主循环](../moe_a8w4/decode_dedup.py#L366)、
-[收尾](../moe_a8w4/decode_dedup.py#L380)、[pin](../moe_a8w4/decode_dedup.py#L61)、[host 分派](../../moe_a8w4.py#L363)。
+[收尾](../moe_a8w4/decode_dedup.py#L380)、[pin](../moe_a8w4/decode_dedup.py#L61)、[host 分派](../../moe_a8w4.py#L371)。
 **资源**：LDS = GROUP·(H+16) B + 128·WAVES·GROUP B + 96 B LUT（H5120、4 wave：GROUP2 约 11.1 KiB，GROUP3 约 16.6 KiB）；
 每 lane PAIRS 条 16 B 权重加载同时在途（H5120 为 20 条）。
 
@@ -817,7 +898,7 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并
 ```
 关键代码：[前导](../moe_a8w4/stream.py#L330)、[按 S 特化](../moe_a8w4/stream.py#L742)、[共享激活](../moe_a8w4/stream.py#L605)、[ACT_STEPS 取址](../moe_a8w4/stream.py#L568)、[分组发与写](../moe_a8w4/stream.py#L656)、
 [预取](../moe_a8w4/stream.py#L655)、[主循环](../moe_a8w4/stream.py#L670)、[SiLU 与截断](../moe_a8w4/stream.py#L434)、[尾部量化](../moe_a8w4/stream.py#L471)、
-[夹逼与回退](../moe_a8w4/stream.py#L215)、[分派的 tile](../../moe_a8w4.py#L490)。
+[夹逼与回退](../moe_a8w4/stream.py#L215)、[分派的 tile](../../moe_a8w4.py#L499)。
 
 **资源**：LDS = 共享时 2·SYNC·BM·64 B 激活环（SYNC1：BM16 2 KiB、BM64 8 KiB，轻 wave 的 SYNC2 翻倍，ACT_STEPS 时 SYNC = A，BM16 / 32 都是 8 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时
 BM·W·4 B amax；累加器 8·G·S 个 VGPR，分派只在它 ≤ 96 时让一个 WG 管全部 I 并尾部量化（TP2 BM32 为 80，BM64 为 160 故不量化）。
@@ -904,7 +985,7 @@ for r in 0 … R−1：
 ```
 关键代码：[共享激活](../moe_a8w4/stream.py#L1331)、[通道因子](../moe_a8w4/stream.py#L1361)、[权重与 delta](../moe_a8w4/stream.py#L1294)、
 [delta 交换](../moe_a8w4/stream.py#L1312)、[主循环](../moe_a8w4/stream.py#L1424)、[写 routes](../moe_a8w4/stream.py#L1496)、[原子累加](../moe_a8w4/stream.py#L1445)、
-[bf16x2 原子加](../moe_a8w4/stream.py#L107)、[LDS 预算](../moe_a8w4/stream.py#L1192)、[H5120 的权重缓存位](../../moe_a8w4.py#L588)。
+[bf16x2 原子加](../moe_a8w4/stream.py#L107)、[LDS 预算](../moe_a8w4/stream.py#L1192)、[H5120 的权重缓存位](../../moe_a8w4.py#L597)。
 
 **资源**：LDS = W·1 KiB 通道因子 + 共享时 BM·(I+16) B 激活 + W·1 KiB 越界片槽（构建时断言 ≤ 64 KiB；TP2 BM32 为 18.5 KiB，
 I1024 BM64 要 73 KiB 所以不共享）；激活占 S·I/64·4 个 VGPR（BM64、I320 为 80）；ATOMIC 另占 8·S 个（行 token 与行 scale），
@@ -914,7 +995,7 @@ I = 512 时加上 K512 的激活反而更慢，所以分派只在 I < 512 时用
 流式档（以及 H ≥ 2560、M·topk ≤ 24576（H5120 为 12288）的 prefill 档）用一次 launch 的 prep 代替 aiter moe_sorting 与输入量化：排序结果格式相同
 （但同一 token 重复的 expert 每条路由都保留），
 量化与 quant_row 逐位一致；Down 原子累加时同一次 launch 顺带把 out 清零。I ≥ 512 时 Down 写 routes，route_sum 代替 aiter gfx9_fp8 的
-sorted_sum（同顺序同舍入）。
+sorted_sum（同顺序同舍入）；融合跨卡求和时 route_sum 换成 tp_reduce 的求和模式（同顺序同舍入，见最后一节）。
 
 **Gluon 风格**
 ```python
@@ -968,7 +1049,7 @@ def a8w4_route_sum(loc_ids, routes, out, M):
 | `a8w4_stream_prep` 量化 | QW=4：M；QW=1：⌈M/4⌉（× 256 线程） | QW=4：wave 管列块 w, w+4…；QW=1：wave 一行；lane 每块 16 B |
 | `a8w4_route_sum` | ⌈M·H/512 / 4⌉ × 256 线程 | wave 管一个 token 的 512 列；lane 16 B |
 
-QW 由 host 选：H%2048 = 0 或 M ≤ 256 时 4（列块均分或行少），否则 1（行多时 CTA 少）。排序块 BM 也由 host 选（[_stream_block_m](../../moe_a8w4.py#L621)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
+QW 由 host 选：H%2048 = 0 或 M ≤ 256 时 4（列块均分或行少），否则 1（行多时 CTA 少）。排序块 BM 也由 host 选（[_stream_block_m](../../moe_a8w4.py#L630)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
 
 **流水线**
 ```text
@@ -988,3 +1069,86 @@ route_sum：lane < topk 读 loc_ids[token] → readlane 逐槽广播 → topk �
 
 **资源**：prep 的 LDS 约 3·(256·⌈E/256⌉ + 64) 个字（E384 约 6.8 KiB、E513 约 9.8 KiB）；route_sum 不用 LDS。
 排序容量按每个 expert 至多多出 BM−1 个填充行估上界（[stream_prep_sizes](../moe_a8w4/stream.py#L893)），grid 按它发射，多出的块 CTA 退出。
+
+## 跨卡求和 a8w4_tp_reduce（[tp_reduce.py](tp_reduce.py#L198)）
+M > 32 且每卡输出够大时代替本卡的末步与 all-reduce：token tile i 归 rank i % WORLD（owner）；非 owner 把 tile 的部分和写进
+owner 的收件箱（RS），owner 按 rank 顺序求和后写本卡 out 与各卡 landing（AG），各卡再把 landing 拷进 out。部分和有两种来源：
+求和模式（TOPK > 0）按 loc_ids 把 routes 按槽相加（与 route_sum / sorted_sum 同序同舍入），拷贝模式（TOPK = 0）直接读原子 Down
+写好的 out。命名、调度与编号的不变量（发布 / 获取、跨调用复用、防死锁、限时与毒值、逐位相同）见
+[tp_reduce.py 的 docstring](tp_reduce.py#L4)，这里不重复。
+
+**Gluon 风格**
+```python
+# grid = nwg 个 CTA（host 取 tile 数 ⌈M/TT⌉：每 CTA 一个 tile；kernel 也支持 CTA 轮取），256 线程（4 wave）
+# tile = TT 个 token（M < 1024 为 1；否则 H ≤ 1280 为 4、H ≤ 2560 为 2、更大为 1）；项 = (token, 512 列块)，lane 管 8 列
+# 放置：不用 LDS（barrier 只用来给跨卡写与标志排序）；部分和 global → VGPR：求和模式一项的 TOPK 行（每行 16 B）同时在途，
+#       f32 按槽相加后转 bf16；收件箱 / landing / 标志的跨卡读写都是 sys_load / sys_store；
+#       一个 tile 的全部项先发完再等 / 写（项之间 sched_barrier），tile 之间无预取
+@gluon.jit
+def a8w4_tp_reduce(loc, src, out, tab, epoch, err, M, rank, slots, limit, nwg):
+    landing, inbox, flags = tab[0], tab[1], tab[2]   # 各卡地址，readfirstlane 成标量
+    for i in range(gl.program_id(0), tiles, nwg):    # 第一遍：部分和 → RS → 求和 → AG
+        ep, owner = epoch[i] + 1, i % WORLD          # epoch 在设备上：各卡做同样的调用，所以一致
+        items = [(t, cols) for 本 wave 的项 wave_id(), wave_id() + 4, …]
+        part = [(Σ_k routes[loc[t, k], cols]).to(bf16) if TOPK else src[t, cols] for t, cols in items]
+        #       ↑ f32 按槽相加（缺的路由加 +0）、舍入一次 = route_sum / sorted_sum 的算术；部分和以 bf16 交换
+        if owner == rank:
+            late, _ = wait_until(sys_load(flags[rank].RS[i][s]) for s != rank, 到齐=全等于 ep)   # 只有 wave 0 轮询
+            if late: atomic_or(err, 1)
+            gl.barrier()                             # 获取：wave 0 见到 RS 后全 CTA 才读收件箱
+            for (t, cols), p in zip(items, part):
+                got = [sys_load(inbox[rank][(s - rank - 1) % WORLD, row(t), cols]) for s != rank]
+                total = sum(p if s == rank else got[s] for s in range(WORLD)).to(bf16)   # f32，rank 顺序，舍入一次
+                out[t, cols] = total
+                for q != rank: sys_store(landing[q][t, cols], total)
+            s_waitcnt(vmcnt=0); gl.barrier()         # 发布：本 tile 写进各卡 landing 的数据都已完成，才发 AG
+            if tid == 0:
+                for q != rank: sys_store(flags[q].AG[i], (ep & 低 30 位) | (POISON if late else 0))   # 毒值：缺部分和
+                epoch[i] = ep
+        else:
+            for (t, cols), p in zip(items, part):
+                sys_store(inbox[owner][(rank - owner - 1) % WORLD, row(t), cols], p)
+            s_waitcnt(vmcnt=0); gl.barrier()         # 发布：写进 owner 收件箱的数据都已完成，才发 RS
+            if tid == 0: sys_store(flags[owner].RS[i][rank], ep)
+    for i in range(gl.program_id(0), tiles, nwg):    # 第二遍：别的卡 own 的 tile，等 AG 后拷贝
+        if i % WORLD == rank: continue
+        ep = epoch[i] + 1
+        late, ag = wait_until(sys_load(flags[rank].AG[i]), 到齐=低 30 位等于 ep)
+        if late or ag 带 POISON: atomic_or(err, 1)   # 迟到的卡也不会静默拿到不完整的和
+        gl.barrier()                                 # 获取：见到 AG 后全 CTA 才读 landing
+        rows = [sys_load(landing[rank][t, cols]) for t, cols in items]   # 全部先发
+        for (t, cols), r in zip(items, rows): out[t, cols] = r
+        if tid == 0: epoch[i] = ep
+```
+
+**任务划分**
+| 层级 | 形状 / 数量 | 负责的数据 |
+|---|---|---|
+| grid | nwg = ⌈M/TT⌉ 个 CTA | CTA w 管 tile w, w+nwg, …（host 下每 CTA 一个）；tile i 的 owner 是 rank i % WORLD |
+| CTA（256 线程） | 4 wave | 一个 tile 的 TT·H/512 项（H2560·TT2 与 H5120·TT1 都是 10 项） |
+| wave | 项 wave, wave+4, … | 每项一个 token 的 512 列；每 wave 至多 ⌈项数/4⌉ 项 |
+| lane | 8 列（16 B） | 求和模式：lane < TOPK 先读 loc[t, lane]，再 readlane 逐槽广播 |
+| 遍 | 第一遍全部 tile；第二遍别的卡 own 的 tile | RS、求和、AG；等 AG 后拷贝 landing |
+
+**流水线**
+```text
+序言：读 tab（3·WORLD 个 int64，readfirstlane）→ 各卡 landing / flags 与本卡 inbox 的 buffer 描述符（同伴 inbox 只留地址，
+  发 RS 时按 owner 选出再建描述符）；tiles、rps
+第一遍，每个 tile i（ep = epoch[i] + 1，owner = i % WORLD）
+  每项（项间 sched_barrier）：
+    求和：lane < TOPK 读 loc[t, lane] → readlane 逐槽 → TOPK 条 16 B 行加载同时在途（每行一个 64 位基址的描述符，
+      loc < 0 不读、加 +0）→ f32 按槽相加 → RNE bf16；拷贝：1 条 16 B 加载 src[t, 列]
+  owner：wave 0 读 err（sc0 sc1），轮询本卡 RS[i][s]（lane s < WORLD、s ≠ rank 各读一个）→ ballot；超时 OR err |= 1；barrier
+    每项：WORLD−1 条收件箱 16 B 加载（sc0 sc1）→ 按 s = 0…WORLD−1 f32 相加 → RNE bf16 → 写本卡 out（缓存）
+      + 写 WORLD−1 个同伴 landing（sc0 sc1）；项间 sched_barrier
+    s_waitcnt vmcnt(0)；barrier；tid 0：写各同伴 AG[i] = ep 低 30 位 | 毒值（sc0 sc1）；epoch[i] = ep
+  非 owner：每项 16 B 写 owner 收件箱（sc0 sc1）；s_waitcnt vmcnt(0)；barrier；tid 0：写 owner 的 RS[i][rank] = ep（sc0 sc1）
+第二遍，每个 i % WORLD ≠ rank 的 tile（ep = epoch[i] + 1）
+  wave 0 读 err，轮询本卡 AG[i]（sc0 sc1）：低 30 位 = ep 即到，带毒值则 lane 0 OR err |= 1；超时同上；barrier
+  全部项的 landing 16 B 加载（sc0 sc1）先全发 → 再全部写 out；tid 0：epoch[i] = ep
+```
+关键代码：[描述符](tp_reduce.py#L233)、[项](tp_reduce.py#L248)、[等待](tp_reduce.py#L258)、[部分和](tp_reduce.py#L277)、
+[owner](tp_reduce.py#L321)、[非 owner](tp_reduce.py#L383)、[拷贝](tp_reduce.py#L412)；host：`MegaMoeTPGfx942._reducer`、`_tile_tokens`。
+
+**资源**：不用 LDS；有 SGPR 溢出（≤ 165 条，溢到 VGPR lane，无 scratch）。工作区（`_Workspace`，同组同 H 同 M 上限的实例共享）：
+landing [M 上限, H] 与收件箱 [(WORLD−1)·rps, H] 都是 bf16，标志 slots·(WORLD+1) 个 int32，均为对称、不缓存的 hipIpc 显存。

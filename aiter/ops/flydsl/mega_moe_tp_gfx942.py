@@ -4,9 +4,21 @@
 
 Experts are replicated over the TP group and ``inter_dim`` is sharded. Every rank gets the same input rows and
 routing; ``forward`` runs this rank's slice with the A8W4 two-stage kernels (``moe_a8w4.fused_moe_a8w4``: FP8
-per-token activations, MXFP4 weights) and all-reduces the BF16 partial sums: aiter ``CustomAllreduce`` when its
-``should_custom_ar`` accepts the tensor, RCCL (``torch.distributed.all_reduce`` on ``group``) otherwise. The
-outputs of all ranks are bitwise identical.
+per-token activations, MXFP4 weights) and sums the partial outputs over the ranks:
+
+* TP2 / TP4 batches of at most ``DECODE_TP_MAX_M`` rows (the decode path): the sum is fused into the Down decode
+  kernel (``kernels/mega_moe_tp_gfx942/decode_tp.py``, ``a8w4_down_decode[_pq]_tp``: each workgroup sends its f32
+  partials of 16 channels to the other ranks' inboxes over hipIpc symmetric memory and adds the ranks' partials in
+  rank order; the slot-pair ``_pq`` kernel from ``DECODE_TP_PREQUANT_MIN_M`` rows on);
+* TP2 / TP4 batches of more than ``FUSED_MIN_M - 1`` rows (the streaming and prefill paths) whose BF16 output
+  has at least ``FUSED_MIN_BYTES[world_size]`` bytes: the sum is fused into the last kernel
+  (``kernels/mega_moe_tp_gfx942/tp_reduce.py``, ``a8w4_tp_reduce``: route sum, reduce-scatter of token tiles to
+  their owner rank over hipIpc symmetric memory, f32 sum in rank order, all-gather of the BF16 rows);
+* otherwise: the BF16 partials are all-reduced: aiter ``CustomAllreduce`` when its ``should_custom_ar`` accepts
+  the tensor, RCCL (``torch.distributed.all_reduce`` on ``group``) otherwise.
+
+The buffers of the fused sums (``_Workspace``) are allocated once per (communicator, ``model_dim``,
+``max_local_tokens``) and shared by those instances. The outputs of all ranks are bitwise identical.
 
 Weights come in the ``MegaMoeTP`` layout (MXFP4, ``shuffle_weight(16, 16)`` + ``e8m0_shuffle``) and are converted
 once (constructor / ``set_weights``) to the A8W4 layout; ``inter_dim`` is zero-padded to a multiple of 64.
@@ -15,8 +27,14 @@ Contract (as ``MegaMoeTP``):
 
 * ``forward`` is a collective: every rank calls it the same number of times, in the same order, with the same
   input and routing.
-* ``prepare(local_tokens)`` before CUDA graph capture: it compiles and runs every kernel these batches launch.
-* No kernel waits on a peer: ``error_flag()`` is always zero, ``reset()`` has no cross-rank state to restart.
+* ``prepare(local_tokens)`` before CUDA graph capture: it compiles and runs every kernel these batches launch,
+  then checks every rank's watchdog (``reset()`` and retry once on a timeout, else raise).
+* A wait of a fused kernel on a peer gives up after ``WAIT_S`` seconds (``FIRST_WAIT_S`` on an instance's first
+  forward of a batch size, which may still be compiling on a peer), sets a sticky bit and goes on: that launch's
+  output is invalid, never a hang. ``error_flag()`` is that bit as a device tensor (no sync);
+  ``check_errors()`` synchronizes and raises; ``reset()`` (collective) restarts the cross-rank state (device-side
+  epochs, flags, inboxes and parities shared by the instances of the workspace), which a timed-out launch leaves
+  inconsistent.
 * ``activation`` must be ``Silu``; a finite ``swiglu_limit`` L > 0 computes
   ``SiLU(gate.clamp(max=L)) * up.clamp(-L, L)`` (DeepSeek-V4.1). The all-reduce is BF16 whatever
   ``comm_dtype`` says; the gfx950 fields (``schedule``, ``act_dtype``, ``lb_*``, ``bigm_min_tokens``, Situ betas,
@@ -34,6 +52,7 @@ from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import moe_a8w4
+from .kernels.mega_moe_tp_gfx942 import decode_tp, tp_reduce
 from .mega_moe_tp import MegaMoeTPConfig
 
 __all__ = ["MegaMoeTPConfig", "MegaMoeTPGfx942", "mega_moe_tp_gfx942_supported"]
@@ -167,6 +186,136 @@ def _release_comm(key):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# fused cross-rank sum: symmetric buffers shared by the instances of one communicator, hidden size and batch bound
+# ---------------------------------------------------------------------------------------------------------------
+# TP sizes whose batches of at least FUSED_MIN_M rows and FUSED_MIN_BYTES[world] bytes of BF16 output fuse the
+# cross-rank sum into the last kernel (tp_reduce). Smaller outputs keep the all-reduce: the reduce-scatter and the
+# all-gather are two dependent cross-GPU trips, the custom all-reduce one (paired timing on MI308X: TP2 fused from
+# 2.6 MB, all-reduce up to 1.3 MB; TP4 fused from 1.3 MB, all-reduce up to 0.66 MB).
+FUSED_WORLDS = (2, 4)
+FUSED_MIN_M = moe_a8w4.DECODE_MAX_M + 1
+FUSED_MIN_BYTES = {2: 2 << 20, 4: 1 << 20}
+# Decode batches of at most DECODE_TP_MAX_M rows (of the same TP sizes) sum across the ranks in the Down decode
+# kernel (decode_tp); the batches up to moe_a8w4.DECODE_MAX_M above keep the all-reduce (S2 prototype: fused
+# 2-4 % slower at 32 rows).
+DECODE_TP_MAX_M = 16
+# From DECODE_TP_PREQUANT_MIN_M rows on (below moe_a8w4.DECODE_PREQUANT_MIN_M) the fused Down is the slot-pair kernel
+# on pre-quantized rows (paired timing on MI308X, slot-pair / single-slot fused at 2 / 3 rows: TP2 0.94 / 0.88,
+# TP4 0.96 / 0.87, DeepSeek-V4.1 TP4 0.97 / 0.98; 1 row: 1.06-1.14).
+DECODE_TP_PREQUANT_MIN_M = 2
+# Wait bounds of the fused kernels in seconds: every forward, and an instance's first forward of a batch size.
+WAIT_S = 10.0
+FIRST_WAIT_S = 300.0
+# s_memrealtime frequency on gfx942.
+_TIMER_HZ = 100e6
+
+
+def _tile_tokens(m, H):
+    """Tokens per tile of tp_reduce for an m-row batch of hidden size H: one below 1024 rows, else about 10 KB
+    of BF16 per tile (one tile per workgroup: larger tiles hold more VGPRs, fewer workgroups in flight; paired
+    timing on MI308X at 4096-32768 rows, against 4-token tiles: TP4 1.1-1.9 %, DeepSeek-V4.1 TP4 1.5-1.9 % faster,
+    TP2 within 0.3 %)."""
+    if m < 1024:
+        return 1
+    return 4 if H <= 1280 else 2 if H <= 2560 else 1
+
+
+def _wait_limit(seconds):
+    """The ``limit`` launch argument of tp_reduce for a wait bound in seconds."""
+    return max(1, math.ceil(seconds * _TIMER_HZ / tp_reduce.LIMIT_TICKS))
+
+
+class _Workspace:
+    """Buffers of the fused sums (their module docstrings) of one communicator, hidden size and batch bound
+    ``m_max``. tp_reduce: symmetric ``landing`` / ``inbox`` / ``flags`` (hipIpc, uncached, zeroed), their address
+    table ``tab`` and this rank's ``epoch``; decode_tp: the symmetric ``dinbox`` (uncached, 0xFF), its address table
+    ``dtab`` and this rank's ``parity``. Creation and ``close`` are collective over the communicator's gloo group.
+    """
+
+    def __init__(self, comm, rank, world, H, m_max):
+        from .communication_ops_host_utils import IpcSymmetricHeap
+
+        # The largest batch of each tile size bounds the tiles and the inbox rows of that size.
+        tiers = [(m, _tile_tokens(m, H)) for m in {min(m_max, 1023), m_max}]
+        self.slots = max(-(-m // tt) for m, tt in tiers)
+        # Rows per owner rank: an owner's share of the tiles (tile i -> rank i % world), in tokens.
+        rps = max((-(-m // tt) + world - 1) // world * tt for m, tt in tiers)
+        self.comm, self.refs = comm, 0
+        self.heap = IpcSymmetricHeap(
+            rank=rank,
+            world_size=world,
+            device=comm.device,
+            group=comm.cpu_group,
+            memory="uncached",
+        )
+        error = None
+        try:
+            self.landing = self.heap.create_tensor((m_max, H), torch.bfloat16)
+            self.inbox = self.heap.create_tensor(((world - 1) * rps, H), torch.bfloat16)
+            self.flags = self.heap.create_tensor(
+                (self.slots * (world + 1),), torch.int32
+            )
+            self.dinbox = self.heap.create_tensor(
+                (decode_tp.inbox_words(H, world, DECODE_TP_MAX_M),), torch.int32
+            )
+            # Filled before the handles are published: from then on a peer may write into it.
+            self.dinbox.fill_(decode_tp.SENTINEL)
+            torch.cuda.synchronize(comm.device)
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        # Raises on every rank if one failed (and closes the heap collectively).
+        self.heap.publish(error)
+        self.tab = torch.stack(
+            [self.heap.p2p_table(t) for t in (self.landing, self.inbox, self.flags)]
+        ).view(torch.int32)
+        self.epoch = torch.zeros(self.slots, dtype=torch.int32, device=comm.device)
+        self.dtab = self.heap.p2p_table(self.dinbox).view(torch.int32)
+        self.parity = torch.zeros(
+            DECODE_TP_MAX_M * (H // 16), dtype=torch.int32, device=comm.device
+        )
+
+    def reset(self):
+        """Collective: zero the flags, epochs and parities and refill the decode inbox once no kernel of any rank
+        runs, before any rank launches again."""
+        torch.cuda.synchronize(self.comm.device)
+        dist.barrier(group=self.comm.cpu_group)
+        self.flags.zero_()
+        self.epoch.zero_()
+        self.dinbox.fill_(decode_tp.SENTINEL)
+        self.parity.zero_()
+        torch.cuda.synchronize(self.comm.device)
+        dist.barrier(group=self.comm.cpu_group)
+
+    def close(self):
+        """Collective (``IpcSymmetricHeap.close``)."""
+        self.heap.close()
+        self.landing = self.inbox = self.flags = self.tab = self.epoch = None
+        self.dinbox = self.dtab = self.parity = None
+
+
+_WORKSPACES: dict = {}
+
+
+def _acquire_workspace(comm_key, comm, rank, world, H, m_max):
+    key = (comm_key, H, m_max)
+    ws = _WORKSPACES.get(key)
+    if ws is None:
+        ws = _WORKSPACES[key] = _Workspace(comm, rank, world, H, m_max)
+    ws.refs += 1
+    return key, ws
+
+
+def _release_workspace(key):
+    ws = _WORKSPACES.get(key)
+    if ws is None:
+        return
+    ws.refs -= 1
+    if ws.refs <= 0:
+        del _WORKSPACES[key]
+        ws.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # the layer
 # ---------------------------------------------------------------------------------------------------------------
 def _check_config(cfg: MegaMoeTPConfig) -> float:
@@ -245,7 +394,9 @@ class MegaMoeTPGfx942:
         """``group``: the TP process group (RCCL; None: the default group). ``cpu_group``: a gloo group of the same
         ranks for the custom all-reduce; None: created with ``torch.distributed.new_group``, so every rank of the
         job must construct its layer at the same point (pass it when only the TP group's ranks construct). The
-        instances of one (group, cpu_group, device) share one communicator."""
+        instances of one (group, cpu_group, device) share one communicator, and those of one communicator,
+        ``model_dim`` and ``max_local_tokens`` the fused sum's buffers (collective when first allocated).
+        """
         if not mega_moe_tp_gfx942_supported():
             raise ValueError("MegaMoeTPGfx942: needs gfx942")
         self._limit = _check_config(cfg)
@@ -261,12 +412,31 @@ class MegaMoeTPGfx942:
         self.cfg, self.device = cfg, device
         self._group = group
         self._weights = None
-        # Kernels of the most recent forward in launch order, then its all-reduce ("custom_all_reduce" /
-        # "rccl_all_reduce"); tests check the dispatch with it.
+        # Kernels of the most recent forward in launch order (fused: ending with "a8w4_tp_reduce" or
+        # "a8w4_down_decode[_pq]_tp"), else then its all-reduce ("custom_all_reduce" / "rccl_all_reduce"); tests
+        # check the dispatch with it.
         self.last_path: tuple[str, ...] = ()
         self.set_weights(w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale)
         self._comm_key, self._comm = _acquire_comm(group, cpu_group, device)
+        self._ws_key, self._ws = None, None
+        if world in FUSED_WORLDS:
+            try:
+                self._ws_key, self._ws = _acquire_workspace(
+                    self._comm_key,
+                    self._comm,
+                    rank,
+                    world,
+                    cfg.model_dim,
+                    cfg.max_local_tokens * world,
+                )
+            except Exception:
+                _release_comm(self._comm_key)
+                self._comm = None
+                raise
+        # Sticky watchdog bits of this instance's fused launches (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT).
         self._err = torch.zeros(1, dtype=torch.int32, device=device)
+        # Batch sizes this instance ran fused (their next forwards wait WAIT_S, not FIRST_WAIT_S).
+        self._seen: set[int] = set()
 
     # -- weights ------------------------------------------------------------------------------------------------
     def set_weights(
@@ -356,6 +526,7 @@ class MegaMoeTPGfx942:
         if M == 0:
             self.last_path = ()
             return part
+        fused = []
         moe_a8w4.fused_moe_a8w4(
             x_local,
             self._weights,
@@ -363,7 +534,13 @@ class MegaMoeTPGfx942:
             topk_ids,
             output=part,
             swiglu_limit=self._limit,
+            reduce=self._reducer(M, fused) if self._fuses(M) else None,
+            decode_down=self._decode_down(M, fused) if self._decode_fuses(M) else None,
         )
+        if fused:
+            self._seen.add(M)
+            self.last_path = tuple(moe_a8w4.last_path)
+            return part
         y = self._comm.all_reduce(part)
         self.last_path = (*moe_a8w4.last_path, self._comm.last)
         if out is not None and y is not out:
@@ -372,6 +549,100 @@ class MegaMoeTPGfx942:
         return y
 
     __call__ = forward
+
+    def _fuses(self, M):
+        """Whether an M-row batch fuses the cross-rank sum into its last kernel."""
+        return (
+            self._ws is not None
+            and M >= FUSED_MIN_M
+            and M * self.cfg.model_dim * 2 >= FUSED_MIN_BYTES[self.cfg.world_size]
+        )
+
+    def _decode_fuses(self, M):
+        """Whether an M-row batch on the decode path sums across the ranks in its Down kernel."""
+        return self._ws is not None and M <= DECODE_TP_MAX_M
+
+    def _decode_down(self, M, fused):
+        """The ``decode_down`` hook of ``fused_moe_a8w4``: decode_tp in place of the Down decode kernel and the
+        all-reduce (appends to ``fused``); from DECODE_TP_PREQUANT_MIN_M rows on the slot-pair kernel, on rows it
+        quantizes itself if ``fused_moe_a8w4`` passes the single-slot kernel's inputs.
+        """
+        cfg, ws = self.cfg, self._ws
+        limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
+
+        def down(paired, mid, mid_scale, topk_ids, topk_weight, weights, output):
+            topk = topk_ids.shape[1]
+            if (
+                not paired
+                and M >= DECODE_TP_PREQUANT_MIN_M
+                and moe_a8w4._down_pq_fits(cfg.model_dim, weights, topk)
+            ):
+                mid, mid_scale = moe_a8w4._quantize_decode(
+                    mid, M * topk, weights.inter_padded, False
+                )
+                paired = True
+            launch = decode_tp.compile_down_decode_tp(
+                N=cfg.model_dim,
+                K=weights.inter_padded,
+                TOPK=topk,
+                WAVES=moe_a8w4._decode_waves(topk, paired),
+                WORLD=cfg.world_size,
+                MAX_M=DECODE_TP_MAX_M,
+                PAIRED=paired,
+            )
+            moe_a8w4._launch(
+                "a8w4_down_decode_pq_tp" if paired else "a8w4_down_decode_tp",
+                launch,
+                mid,
+                mid_scale,
+                topk_ids,
+                topk_weight,
+                weights.w2,
+                weights.w2_delta,
+                weights.w2_scale,
+                output,
+                M,
+                ws.dtab,
+                ws.parity,
+                self._err,
+                cfg.rank,
+                limit,
+            )
+            fused.append(M)
+
+        return down
+
+    def _reducer(self, M, fused):
+        """The ``reduce`` hook of ``fused_moe_a8w4``: tp_reduce in place of its last step (appends to ``fused``)."""
+        cfg, ws = self.cfg, self._ws
+        tt = _tile_tokens(M, cfg.model_dim)
+        limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
+
+        def reduce(output, loc_ids, routes):
+            launch = tp_reduce.compile_tp_reduce(
+                WORLD=cfg.world_size,
+                H=cfg.model_dim,
+                TOPK=0 if loc_ids is None else loc_ids.shape[1],
+                TT=tt,
+            )
+            moe_a8w4._launch(
+                "a8w4_tp_reduce",
+                launch,
+                ws.epoch if loc_ids is None else loc_ids,
+                output if routes is None else routes,
+                output,
+                ws.tab,
+                ws.epoch,
+                self._err,
+                M,
+                cfg.rank,
+                ws.slots,
+                limit,
+                -(-M // tt),
+            )
+            fused.append(M)
+
+        return reduce
 
     def prepare(
         self,
@@ -382,7 +653,8 @@ class MegaMoeTPGfx942:
     ) -> None:
         """Collective: compile and run once every kernel of the batches of these local token counts (ar: every
         replicated batch M with ceil(M / world_size) in ``local_tokens``), so that serving and CUDA graph capture
-        compile nothing."""
+        compile nothing; then check every rank's watchdog: on a timeout ``reset()`` and retry once, else raise.
+        """
         if tail or tail_bf16:
             raise ValueError("MegaMoeTPGfx942: no fused tail (gfx950 ag_rs only)")
         if not warmup:
@@ -393,20 +665,34 @@ class MegaMoeTPGfx942:
         rows = sorted(
             {m for t in ts for m in range((t - 1) * tp + 1, t * tp + 1) if m > 0}
         )
-        for m in rows:
-            x = torch.zeros(
-                (m, cfg.model_dim), dtype=torch.bfloat16, device=self.device
-            )
-            # balanced routing: token i's slot j to expert (i * topk + j) % experts (distinct within a token)
-            ids = (
-                torch.arange(m, device=self.device)[:, None] * cfg.topk
-                + torch.arange(cfg.topk, device=self.device)
-            ) % cfg.experts
-            tw = torch.full(
-                (m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=self.device
-            )
-            self.forward(x, tw, ids.to(torch.int32))
-        torch.cuda.synchronize(self.device)
+        for _ in range(2):
+            for m in rows:
+                x = torch.zeros(
+                    (m, cfg.model_dim), dtype=torch.bfloat16, device=self.device
+                )
+                # balanced routing: token i's slot j to expert (i * topk + j) % experts (distinct within a token)
+                ids = (
+                    torch.arange(m, device=self.device)[:, None] * cfg.topk
+                    + torch.arange(cfg.topk, device=self.device)
+                ) % cfg.experts
+                tw = torch.full(
+                    (m, cfg.topk),
+                    1.0 / cfg.topk,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.forward(x, tw, ids.to(torch.int32))
+            torch.cuda.synchronize(self.device)
+            if self._ws is None:
+                return
+            errs = [None] * tp
+            dist.all_gather_object(errs, self.poll_errors(), group=self._comm.cpu_group)
+            if not any(errs):
+                return
+            self.reset()
+        raise RuntimeError(
+            f"MegaMoeTPGfx942.prepare: warmup launches timed out (error bits per rank: {errs})"
+        )
 
     @property
     def max_local_tokens(self) -> int:
@@ -418,24 +704,40 @@ class MegaMoeTPGfx942:
 
     # -- errors / lifetime --------------------------------------------------------------------------------------
     def error_flag(self) -> torch.Tensor:
-        """Sticky watchdog bits as a device tensor: always zero (no kernel waits on a peer)."""
+        """Sticky watchdog bits (nonzero: a wait of a fused launch gave up; ``tp_reduce.ERR_TIMEOUT`` = 1,
+        ``decode_tp.ERR_TIMEOUT`` = 2) as a device tensor (no sync)."""
         return self._err
 
     def poll_errors(self) -> int:
-        return 0
+        """Nonzero if a wait inside a fused launch gave up (a peer never arrived); synchronizes."""
+        return int(self._err.item())
 
     def check_errors(self) -> None:
-        """Raise RuntimeError if a wait gave up: never."""
+        """Raise RuntimeError (and clear) if a wait gave up since the last check."""
+        bits = self.poll_errors()
+        if bits:
+            self.clear_errors()
+            raise RuntimeError(
+                f"MegaMoeTPGfx942: a wait on a peer gave up (error bits {bits:#x}): outputs since the last check "
+                "are invalid; reset() (collective) before the next forward"
+            )
 
     def clear_errors(self) -> None:
-        pass
+        self._err.zero_()
 
     def reset(self) -> None:
-        """Collective in ``MegaMoeTP``; nothing to restart here (no cross-rank state)."""
+        """Collective: restart the cross-rank state (after a timeout / desync) and clear this instance's errors."""
+        if self._ws is not None:
+            self._ws.reset()
+        self.clear_errors()
 
     def close(self) -> None:
-        """Collective: release the weights and this instance's share of the communicator (unusable afterwards)."""
+        """Collective: release the weights and this instance's share of the fused sum's buffers and of the
+        communicator (unusable afterwards)."""
         self._weights = None
+        if self._ws is not None:
+            _release_workspace(self._ws_key)
+            self._ws = None
         if self._comm is not None:
             _release_comm(self._comm_key)
             self._comm = None
