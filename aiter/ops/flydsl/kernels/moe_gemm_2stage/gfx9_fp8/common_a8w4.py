@@ -89,6 +89,8 @@ def fp4x8_to_fp8(raw, lut):
 
 # XCDs of an MI308X: workgroup L of a launch runs on XCD L % XCDS (the XCD-chunked prefill grids).
 XCDS = 4
+# LDS of one workgroup on gfx942 (the shape checks of the decode kernels).
+LDS_BYTES = 64 * 1024
 
 
 def expert_bytes(p, expert, nbytes):

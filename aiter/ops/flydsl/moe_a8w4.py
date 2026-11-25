@@ -4,11 +4,14 @@
 """gfx942 A8W4 MoE (FlyDSL): FP8 per-token activations x MXFP4 weights, BF16 in and out.
 
 ``prepare_moe_a8w4_ptpc_weight`` converts standard MXFP4 MoE weights once (at load time) into the private layout
-of ``kernels/moe_gemm_2stage/gfx9_fp8/common_a8w4.py``. ``flydsl_moe_a8w4_ptpc`` runs the whole MoE with the
-prefill kernels: Opus ``moe_sorting``, per-row FP8 quantization of the input (the same kernel sets ``loc_ids`` to
--1), the A8W4 Gate/Up kernel (SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row
-FP8 quantization of the intermediate, the A8W4 Down kernel (routing weight applied; it also records each route's
-sorted row in ``loc_ids``) and ``sorted_sum``. The calls issue no host synchronization.
+of ``kernels/moe_gemm_2stage/gfx9_fp8/common_a8w4.py``. ``flydsl_moe_a8w4_ptpc`` runs the whole MoE. Token counts
+up to ``DECODE_MAX_M`` (``DECODE_REREAD_MAX_M`` for some shapes) skip the sorting and use the decode kernels of
+``gfx9_fp8/decode_a8w4.py`` when they support the shape (Gate/Up per route, Down per token summing its routes in the
+workgroup and writing BF16; activations quantized inside the kernels or by a row kernel). Other calls run the prefill
+kernels: Opus ``moe_sorting``, per-row FP8 quantization of the input (the same kernel sets ``loc_ids`` to -1), the
+A8W4 Gate/Up kernel (SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8
+quantization of the intermediate, the A8W4 Down kernel (routing weight applied; it also records each route's sorted
+row in ``loc_ids``) and ``sorted_sum``. The calls issue no host synchronization.
 """
 
 import functools
@@ -22,7 +25,7 @@ import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.moe_gemm_2stage.gfx9_fp8 import common_a8w4 as layout
-from .kernels.moe_gemm_2stage.gfx9_fp8 import gemm2_a8w4
+from .kernels.moe_gemm_2stage.gfx9_fp8 import decode_a8w4, gemm2_a8w4
 from .kernels.moe_gemm_2stage.gfx9_fp8.common import _TORCH_TO_FX
 from .kernels.moe_gemm_2stage.gfx9_fp8.gemm1_a8w4 import compile_a8w4_gemm1
 from .kernels.moe_gemm_2stage.gfx9_fp8.moe_reduce import sorted_sum
@@ -42,6 +45,22 @@ _E8M0_DTYPES = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
 _E8M0_NAN = 255
 # The kernels address activations, the intermediate and its quantization with 32-bit byte offsets.
 _MAX_BYTES = 1 << 31
+# Token counts up to this use the decode kernels (no sorting, one workgroup per route / token).
+DECODE_MAX_M = 32
+# The decode path quantizes activations in separate row kernels instead of inside every workgroup:
+# Down's intermediate rows from DECODE_PREQUANT_MIN_M tokens on, Gate/Up's token rows from
+# DECODE_GATEUP_PREQUANT_MIN_WGS Gate/Up workgroups (M * topk * I / 16) on.
+DECODE_PREQUANT_MIN_M = 4
+DECODE_GATEUP_PREQUANT_MIN_WGS = 2560
+DECODE_DOWN_PQ_WAVES = 3
+# Hidden sizes above 4096 that take the decode kernels (the Gate/Up decode then stages the FP8 token row in two
+# rounds of 16-byte pieces); measured: DeepSeek-V4.1 TP4 (H5120). Other hidden sizes above 4096 take prefill.
+DECODE_WIDE_HIDDEN = (5120,)
+# Hidden >= 4096 with padded I a multiple of 128 (MiMo TP8 / TP4): the per-route decode reads an expert's weights
+# once per route, which takes longer than prefill from about 22 (I 512) / 27 (I 256) tokens on (measured against
+# prefill: MiMo TP4 M20 / M24 0.97x / 1.03x the time, TP8 M24 / M28 0.78x / 1.02x), so these shapes take the
+# decode kernels up to DECODE_REREAD_MAX_M tokens only.
+DECODE_REREAD_MAX_M = 20
 # The prefill Down splits the hidden dimension over 2 or 4 workgroups per sorted block while the
 # estimated blocks (E * ceil(M * topk / E / block_m), uniform routing) times the split stay below this:
 # few blocks (M ~2048) otherwise leave the last round of workgroups mostly idle (MiMo M2048 Down -10%).
@@ -302,6 +321,136 @@ def _down_split(tokens, topk, experts, hidden, inter, block_m):
     return nsplit
 
 
+def _decode_waves(topk, paired):
+    """Waves of the Down decode kernel: few tokens (latency bound) one per routing slot; pre-quantized
+    rows (``paired``) DECODE_DOWN_PQ_WAVES waves with slot pairs in rounds."""
+    return (
+        min((topk + 1) // 2, DECODE_DOWN_PQ_WAVES)
+        if paired
+        else (topk if topk <= 16 else 4)
+    )
+
+
+def _decode_fits(H, I, topk, paired):
+    """Whether the decode kernels support this shape (Gate/Up and the single-slot or slot-pair Down) and it was
+    measured to take them (hidden <= 4096 or in DECODE_WIDE_HIDDEN)."""
+    return (
+        (H <= 4096 or H in DECODE_WIDE_HIDDEN)
+        and decode_a8w4.gateup_decode_fits(H)
+        and decode_a8w4.down_decode_fits(I, topk, _decode_waves(topk, paired), paired)
+    )
+
+
+def _decode_max_m(H, I):
+    """Most tokens that take the decode kernels: DECODE_MAX_M, DECODE_REREAD_MAX_M for hidden >= 4096 with padded I
+    a multiple of 128."""
+    return DECODE_REREAD_MAX_M if H >= 4096 and I % 128 == 0 else DECODE_MAX_M
+
+
+@functools.cache
+def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, waves, device):
+    """Decode Gate/Up and Down launchers. ``waves`` (``_decode_waves(topk, down_pq)``, it reads
+    DECODE_DOWN_PQ_WAVES) and ``device`` (a compiled handle runs on one GPU) key the cache.
+    """
+    gateup = decode_a8w4.compile_a8w4_gateup_decode(
+        N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, SWIGLU_LIMIT=limit
+    )
+    if down_pq:
+        # More tokens: 16-byte loads of slot pairs.
+        return gateup, decode_a8w4.compile_a8w4_down_decode_pq(
+            N=H, K=I, TOPK=topk, WAVES=waves
+        )
+    return gateup, decode_a8w4.compile_a8w4_down_decode(
+        N=H, K=I, TOPK=topk, WAVES=waves
+    )
+
+
+def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limit):
+    """The decode path: Gate/Up per route into the f32 intermediate, Down per token summing its routes into
+    ``output``; ``topk_ids`` / ``topk_weight`` are contiguous int32 / float32."""
+    M, H = hidden_states.shape
+    topk = topk_ids.shape[1]
+    I = weight.inter_padded
+    # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
+    gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
+    # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets; larger weights or
+    # shapes the slot-pair kernel does not support take the single-slot Down.
+    down_pq = (
+        M >= DECODE_PREQUANT_MIN_M
+        and weight.w2.numel() * weight.w2.element_size() < 2**32
+        and _decode_fits(H, I, topk, True)
+    )
+    gateup, down = _decode_kernels(
+        2 * I,
+        H,
+        I,
+        topk,
+        gateup_pq,
+        down_pq,
+        limit,
+        _decode_waves(topk, down_pq),
+        hidden_states.device.index,
+    )
+    mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
+    if gateup_pq:
+        xq, xs = _quantize_decode(hidden_states, M, H, True)
+    else:
+        xq, xs = hidden_states, topk_weight
+    _launch(
+        "a8w4_gateup_decode" + ("_pq" if gateup_pq else ""),
+        gateup,
+        xq,
+        xs,
+        topk_ids,
+        weight.w1,
+        weight.w1_delta,
+        weight.w1_scale,
+        mid,
+        mid,
+        mid,
+        M,
+    )
+    if down_pq:
+        mq, ms = _quantize_decode(mid, M * topk, I, False)
+    else:
+        mq, ms = mid, topk_weight
+    _launch(
+        "a8w4_down_decode" + ("_pq" if down_pq else ""),
+        down,
+        mq,
+        ms,
+        topk_ids,
+        topk_weight,
+        weight.w2,
+        weight.w2_delta,
+        weight.w2_scale,
+        output,
+        M,
+    )
+    return output
+
+
+@functools.cache
+def _row_quant_decode(cols, bf16, device):
+    """Decode row quantization launcher (``compile_a8w4_row_quant``). ``device`` only keys the cache."""
+    return decode_a8w4.compile_a8w4_row_quant(COLS=cols, BF16=bf16)
+
+
+def _quantize_decode(x, rows, cols, bf16):
+    """``_quantize`` with the decode path's vectorized kernel (same arithmetic, bit-identical)."""
+    q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
+    scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
+    _launch(
+        "a8w4_row_quant_decode",
+        _row_quant_decode(cols, bf16, x.device.index),
+        x,
+        q,
+        scale,
+        rows,
+    )
+    return q, scale
+
+
 def _quantize(x, rows, cols, dtype, fill=None):
     """Per-row FP8 quantization of ``x`` [rows, cols]; the same kernel sets int32 ``fill`` [rows, k] to -1."""
     q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
@@ -413,21 +562,25 @@ def flydsl_moe_a8w4_ptpc(
 
     ``weight`` comes from ``prepare_moe_a8w4_ptpc_weight``; ``topk_weight`` [M, topk] (float32) is applied
     in Down; ``topk_ids`` [M, topk] (int32) in ``[0, E)`` (a fused shared expert is an ordinary
-    expert id), distinct within a token (with a repeated id the Opus sort keeps one route); int64 ids,
-    other floating weights and non-contiguous routing tensors are converted first. The input
-    and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
+    expert id), distinct within a token (with a repeated id the Opus-sorted prefill keeps one route, the decode
+    path every route); int64 ids, other floating weights and non-contiguous routing tensors are converted first.
+    The input and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
     E4M3FNUZ with ``scale = amax / 240`` and ``q = RNE(x / scale)``. SiLU only, no expert mask /
     bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``. ``output`` may be a caller's contiguous
     BF16 [M, H] tensor, ``hidden_states`` itself included. Issues no host synchronization; compile a shape
     outside a CUDA graph capture before capturing it. Raises ``RuntimeError`` off gfx942.
 
-    ``block_m`` / ``block_n`` / ``tile_k`` select the tiles: ``block_m`` (default 64) is the sorting block and
-    M tile of both kernels (``block_m * I_padded % 4096 == 0``, e.g. 64 or 128); ``block_n`` (default 128) /
-    ``tile_k`` are the Gate/Up N tile (128 or 256, dividing 2 * padded I into whole gate/up halves) and K tile
-    (128 or 256; default 128 for M > 2048, where its lower LDS and register use raise occupancy, else 256).
+    Unless a tile option is given, M <= ``DECODE_MAX_M`` (``DECODE_REREAD_MAX_M`` for H >= 4096 with padded I a
+    multiple of 128) runs the decode kernels (no sorting) when they support the shape (H <= 4096 or in
+    ``DECODE_WIDE_HIDDEN``, the intermediate rows fit in LDS); other calls run the prefill kernels.
+    ``block_m`` / ``block_n`` / ``tile_k`` select the prefill kernels' tiles: ``block_m``
+    (default 64) is the sorting block and M tile of both kernels (``block_m * I_padded % 4096 == 0``, e.g. 64 or
+    128); ``block_n`` (default 128) / ``tile_k`` are the Gate/Up N tile (128 or 256, dividing 2 * padded I into
+    whole gate/up halves) and K tile (128 or 256; default 128 for M > 2048, where its lower LDS and register use
+    raise occupancy, else 256).
 
     ``swiglu_limit`` is the SwiGLU limit of DeepSeek-V4.1 (config ``swiglu_limit``, 10 for V4.1-Flash; the
-    ``Expert`` of its inference/model.py): when > 0 the Gate/Up kernel computes
+    ``Expert`` of its inference/model.py): when > 0 every Gate/Up kernel computes
     ``SiLU(gate.clamp(max=L)) * up.clamp(-L, L)`` on the dequantized f32 gate / up values (after the weight
     and activation scales). 0 (default) turns it off and runs exactly the kernels without it; otherwise
     the limit is a compile-time constant (kernels compiled per value, names ending in ``_swiglu``). Must
@@ -451,6 +604,12 @@ def flydsl_moe_a8w4_ptpc(
         topk_ids = topk_ids.to(torch.int32).contiguous()
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
         topk_weight = topk_weight.to(torch.float32).contiguous()
+    # The tier is chosen before the prefill tile defaults are filled in: any tile option selects prefill.
+    tile_given = block_m is not None or block_n is not None or tile_k is not None
+    if not tile_given and M <= _decode_max_m(H, I) and _decode_fits(H, I, topk, False):
+        return _fused_moe_decode(
+            hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
     block_m = 64 if block_m is None else block_m
     block_n = 128 if block_n is None else block_n
     tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k

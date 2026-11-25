@@ -315,6 +315,15 @@ def _prefill_path(tile_k, block_m=64, block_n=128):
     ]
 
 
+# The Gate/Up and Down kernels of the per-route decode path's three dispatches (as pyhip M17's tests name them): x and
+# mid quantized inside the kernels (nn), mid quantized by the row kernel first (np), both quantized first (pp).
+_DECODE_PATHS = {
+    "nn": ["a8w4_gateup_decode", "a8w4_down_decode"],
+    "np": ["a8w4_gateup_decode", "a8w4_down_decode_pq"],
+    "pp": ["a8w4_gateup_decode_pq", "a8w4_down_decode_pq"],
+}
+
+
 def _assert_path(expected):
     """The kernels of ``expected`` (exact names) occur in this order in ``moe_a8w4.last_path``, other kernels may lie
     between them (pyhip M17's check): the sorting front end, the row quantizations and the final sum are not
@@ -369,12 +378,12 @@ def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
 # limit (M 8 / 64). The token counts are one per tier of the pyhip original (decode, streaming, prefill). The
 # prefill cases include multi-block experts and partially filled tail blocks.
 # Kernel assertions hold in every milestone of the port: each call runs one A8W4 Gate/Up and one Down kernel
-# (_assert_kernels), and ``tier`` (a kernel-name fragment, as in pyhip M17's tests) is pinned only where pyhip M17
-# runs the same tier as the prefill-only port: Qwen M 1031, TP4 M 257 and MiMo TP4 M 1600 (prefill). The other
-# cases run the prefill kernels for now and take decode (Qwen M 3), expert-deduplicated decode (MiMo M 5 / 24,
-# DeepSeek M 8) or streaming (Qwen M 64, MiMo M 300, DeepSeek M 64) in pyhip M17: the reviews of M1 (decode),
-# M2 (deduplicated decode) and M3 (streaming) add their tier assertions as each tier is ported, ending with
-# pyhip M17's.
+# (_assert_kernels), and ``tier`` (a kernel-name fragment, as in pyhip M17's tests) is pinned only where the port
+# already runs pyhip M17's tier: prefill for Qwen M 1031, TP4 M 257 and MiMo TP4 M 1600, decode ("_decode", in the
+# names of the per-route and the expert-deduplicated decode kernels alike) for Qwen M 3 and MiMo TP8 M 5. The other
+# cases take the expert-deduplicated decode (MiMo TP4 M 24, which runs prefill for now, DeepSeek M 8, which runs the
+# per-route decode for now) or streaming (Qwen M 64, MiMo M 300, DeepSeek M 64; prefill for now) in pyhip M17: the
+# reviews of M2 (deduplicated decode) and M3 (streaming) add their tier assertions, ending with pyhip M17's.
 # =================================================================================================
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -465,7 +474,7 @@ def _a8w4_swiglu_check(
 @pytest.mark.basic
 @pytest.mark.parametrize(
     "tokens, tier",
-    [(3, None), (64, None), (1031, "_prefill_")],
+    [(3, "_decode"), (64, None), (1031, "_prefill_")],
     ids=["m3", "m64", "m1031"],
 )
 def test_tp2(tokens, tier):
@@ -482,7 +491,7 @@ def test_tp4_padded():
 @pytest.mark.parametrize(
     "inter, tokens, tier",
     [
-        (256, 5, None),
+        (256, 5, "_decode"),
         (256, 300, None),
         (512, 24, None),
         (512, 1600, "_gateup_prefill_"),
@@ -530,6 +539,11 @@ def test_deepseek_swiglu(tokens):
 # (_assert_path), not the sorting front end: pyhip M17 sorts with a8w4_stream_prep instead of Opus from H 2560 on
 # (H % 512 == 0) while M * topk <= 24576 (12288 from H 5120 on); the review of M3 (streaming) adds those
 # front-end cases.
+# Cases about the per-route decode kernels use shapes and token counts that pyhip M17 decodes per route too (H 2560 up
+# to M 32, H 4096 with I_pad % 128 != 0, H 512, DeepSeek H 5120 at M 3) and assert the decode kernels by name; H 4096
+# with I_pad % 128 == 0 (MiMo) from M 2 on and DeepSeek from M 8 on take the expert-deduplicated decode there, whose
+# cases come with its port (M2). test_decode_reread_max_m is transitional: it skips once M2 removes
+# DECODE_REREAD_MAX_M and is deleted when M2 closes.
 # =================================================================================================
 
 
@@ -725,7 +739,204 @@ def test_row_quant_fill(dtype, cols, fill):
     assert bool((aux[:rows] == -1).all()) and bool((aux[rows] == 7).all())
 
 
-# -- 2.3 prefill tiles, block boundaries and grid variants -----------------------------------------
+@pytest.mark.parametrize(
+    "dtype, cols",
+    [
+        ("f32", 192),
+        ("f32", 320),
+        ("f32", 640),
+        ("bf16", 1024),
+        ("bf16", 2560),
+        ("bf16", 4096),
+    ],
+)
+def test_decode_row_quant_bitexact(dtype, cols):
+    """The decode path's row quantization kernel (one wave per row, 16-byte pieces) equals the prefill path's
+    (``_quantize``) and the reference bit for bit (q bytes and scale bits), and writes no row past ``rows``.
+
+    Special rows: all zero, amax / 240 underflowing to 0 (scale 1; only f32 holds such an input), a subnormal scale,
+    -0 and negatives rounding to -0 (stored as +0). f32 192 / 320 / 640 columns have 48 / 80 / 160 pieces per row
+    (the last round of 64 lanes not full), bf16 1024 / 2560 / 4096 columns 128 / 320 / 512; 37 rows (the last
+    workgroup has one row, the 3 rows after it must stay unwritten). End to end the tolerance does not show a few
+    flipped FP8 values, and the basic tests and the benchmark only quantize random rows (f32 192 / 256 / 320 / 512 /
+    576 and bf16 2560 / 4096 / 5120 columns).
+    """
+    rows, guard = 37, 3
+    gen = torch.Generator(device="cuda").manual_seed(83)
+    x = torch.randn((rows, cols), generator=gen) * 3
+    x[1].zero_()
+    x[2].zero_()
+    x[2, 7] = 1e-45
+    x[3] *= 1e-38
+    x[4].zero_()
+    x[4, 0] = 200.0
+    x[4, 1:9] = -1e-6
+    x[4, 9] = -0.0
+    x = x.to(torch.bfloat16) if dtype == "bf16" else x
+    q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
+    scale = torch.full((rows + guard,), -1.0)
+    moe_a8w4._launch(
+        "a8w4_row_quant_decode",
+        moe_a8w4._row_quant_decode(cols, dtype == "bf16", x.device.index),
+        x,
+        q.view(torch.float8_e4m3fnuz),
+        scale,
+        rows,
+    )
+    assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
+    q0, scale0 = moe_a8w4._quantize(x, rows, cols, dtype)
+    assert torch.equal(q[:rows], q0.view(torch.uint8))
+    assert torch.equal(scale[:rows].view(torch.int32), scale0.view(torch.int32))
+    xf = x.float()
+    amax = xf.abs().amax(-1, keepdim=True)
+    ref_scale = amax / torch.full_like(amax, 240.0)
+    ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
+    assert torch.equal(scale[:rows].view(-1, 1), ref_scale)
+    assert torch.equal(
+        q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    )
+
+
+# -- 2.3 decode dispatch: tier boundaries, topk and routing variants, the w2 >= 4 GiB fallback ----
+
+
+def _decode_weights(inter):
+    """E 33 Qwen-shape weights (H 2560, topk 11) of the decode cases, cached per I (I 320 shared with the graph and
+    in-place cases)."""
+    return _weights(EXPERTS, HIDDEN, inter, 51)
+
+
+@pytest.mark.parametrize(
+    "inter, tokens, path",
+    [
+        (320, 4, "np"),
+        (320, 11, "np"),
+        (320, 12, "pp"),
+        (320, 32, "pp"),
+        (320, 33, None),
+        (160, 19, "np"),
+        (160, 20, "pp"),
+    ],
+    ids=["tp2_m4", "tp2_m11", "tp2_m12", "tp2_m32", "tp2_m33", "tp4_m19", "tp4_m20"],
+)
+def test_decode_dispatch_boundaries(inter, tokens, path):
+    """Both sides of each decode dispatch boundary on Qwen shapes (E 33), end to end with the Gate/Up and Down
+    kernels: M = 4 (Down takes the slot-pair kernel on rows quantized by the row kernel; M = 3 is a basic case),
+    TP2 M = 11 / 12 and TP4 M = 19 / 20 (the Gate/Up workgroups M * topk * I_pad / 16 reach
+    DECODE_GATEUP_PREQUANT_MIN_WGS = 2560 and Gate/Up reads x quantized by the row kernel), M = 32 / 33
+    (DECODE_MAX_M: M = 33 runs no decode kernel; the tier it takes instead is asserted where that tier is ported).
+
+    The basic tests decode Qwen M = 3 and MiMo M = 5, on none of these boundaries; the benchmark runs powers of two
+    and 48 (no 11 / 12, 19 / 20 or 33) and asserts no kernels: M = 4 and 32 run the benchmark's paths and stay as
+    one side of their boundaries.
+    """
+    w, prepared = _decode_weights(inter)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, HIDDEN, EXPERTS, TOPK, seed=90 + tokens
+    )
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    if path is None:
+        _assert_kernels()
+        assert not any(
+            "_decode" in name for name in moe_a8w4.last_path
+        ), moe_a8w4.last_path
+    else:
+        _assert_path(_DECODE_PATHS[path])
+    assert_close(out, ref)
+
+
+@pytest.mark.parametrize(
+    "inter, tokens, decode",
+    [(128, 20, True), (128, 21, False), (64, 21, True)],
+    ids=["i128_m20", "i128_m21", "i64_m21"],
+)
+def test_decode_reread_max_m(inter, tokens, decode):
+    """Transitional (delete this test when M2 closes; it skips once M2's expert-deduplicated decode removes
+    DECODE_REREAD_MAX_M): hidden >= 4096 with I_pad a multiple of 128 (MiMo TP8 / TP4; here H 4096, I 128) takes the
+    per-route decode kernels up to DECODE_REREAD_MAX_M = 20 tokens and the prefill kernels from M = 21 on; with
+    I_pad % 128 != 0 (I 64) M = 21 still decodes (DECODE_MAX_M = 32).
+
+    The benchmark's MiMo cases run M 16 and 32, on either side but not at the boundary, and assert no kernels; the
+    basic MiMo cases run M 5 and 24; E 5 and topk 2 keep this fast.
+    """
+    if not hasattr(moe_a8w4, "DECODE_REREAD_MAX_M"):
+        pytest.skip("transitional threshold removed with the M2 dedup tier")
+    w, prepared = _small_weights(4096, inter)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, 4096, 5, 2, seed=330 + tokens, shared=False
+    )
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(_DECODE_PATHS["np"] if decode else _prefill_path(256))
+    assert_close(out, ref)
+
+
+@pytest.mark.parametrize(
+    "topk, tokens, path",
+    [(8, 16, "pp"), (17, 2, "nn")],
+    ids=["topk8_m16", "topk17_m2"],
+)
+def test_decode_topk_variants(topk, tokens, path):
+    """topk other than 11: with topk = 8 (even) the slot-pair Down's 3 waves take two rounds and both slots of the
+    second round's last two waves are invalid, and M = 16 gives exactly 2560 Gate/Up workgroups (>=: x pre-quantized);
+    with topk = 17 (above 16) the Down quantizing in the kernel runs 4 waves taking the slots in turn, 3 slots of its
+    last round invalid.
+
+    The Qwen cases of the basic tests and the benchmark have topk = 11 (only the last slot pair lacks its upper
+    half); the benchmark's MiMo cases (topk 8) never land on exactly 2560 workgroups and assert no kernels; no case of
+    either has topk > 16.
+    """
+    w, prepared = _decode_weights(320)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, HIDDEN, EXPERTS, topk, seed=94 + topk
+    )
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(_DECODE_PATHS[path])
+    assert_close(out, ref)
+
+
+def test_decode_duplicate_and_int64_ids():
+    """Several slots of a token select the same expert (both halves of a slot pair included), with int64,
+    non-contiguous topk_ids and a non-contiguous topk_weight (M = 5): the entry converts them to contiguous int32 /
+    float32, and the decode path computes every slot (Gate/Up per route, Down summing the token's slots), as the
+    reference does.
+
+    The generated routes never repeat an expert within a token and are contiguous int32 / float32, so the basic tests
+    and the benchmark never get here; test_routing_input_dtypes converts on the prefill path.
+    """
+    w, prepared = _decode_weights(320)
+    tokens = 5
+    x, topk_weight, topk_ids = make_inputs(tokens, HIDDEN, EXPERTS, TOPK, seed=96)
+    topk_ids[:, 1] = topk_ids[:, 0]
+    topk_ids[:, 4] = topk_ids[:, 0]
+    ids = torch.empty((tokens, 2 * TOPK), dtype=torch.int64)[:, ::2]
+    ids.copy_(topk_ids)
+    weights = torch.empty((tokens, 2 * TOPK))[:, 1::2]
+    weights.copy_(topk_weight)
+    assert not ids.is_contiguous() and not weights.is_contiguous()
+    out, ref = _a8w4_run(w, prepared, x, weights, ids)
+    _assert_path(_DECODE_PATHS["np"])
+    assert_close(out, ref)
+
+
+def test_decode_down_fallback_w2_4gib():
+    """With w2 of 4 GiB or more Down does not take the slot-pair kernel on pre-quantized rows (it addresses all
+    experts' weights with 32-bit byte offsets) but the single-slot kernel quantizing in the kernel (M = 16).
+
+    Real 4 GiB weights are too large: a stride-0 view makes w2 report 2**32 bytes with the same data pointer (the
+    kernels read by pointer and expert offset); the basic tests, the benchmark and the other cases have w2 far below
+    4 GiB.
+    """
+    import dataclasses
+
+    w, prepared = _decode_weights(320)
+    big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(1 << 32))
+    x, topk_weight, topk_ids = make_inputs(16, HIDDEN, EXPERTS, TOPK, seed=99)
+    out, ref = _a8w4_run(w, big, x, topk_weight, topk_ids)
+    _assert_path(["a8w4_gateup_decode_pq", "a8w4_down_decode"])
+    assert_close(out, ref)
+
+
+# -- 2.4 prefill tiles, block boundaries and grid variants -----------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -966,27 +1177,36 @@ def test_h5120_prefill_limits(monkeypatch, case):
 
 
 @pytest.mark.parametrize(
-    "hidden, inter, tokens, options, tile_k",
-    [(4608, 64, 8, {}, 256), (512, 1024, 300, {"block_m": 64}, 256)],
-    ids=["h4608", "i1024"],
+    "hidden, inter, tokens, options, path",
+    [
+        (4096, 64, 8, {}, _DECODE_PATHS["np"]),
+        (4608, 64, 8, {}, _prefill_path(256)),
+        (512, 1024, 4, {}, _DECODE_PATHS["np"]),
+        (512, 1088, 4, {}, _DECODE_PATHS["nn"]),
+        (512, 1024, 300, {"block_m": 64}, _prefill_path(256)),
+    ],
+    ids=["h4096_decode", "h4608", "i1024_pair_down", "i1088_single_down", "i1024"],
 )
-def test_shape_fallbacks(hidden, inter, tokens, options, tile_k):
-    """Shapes outside the target set still run and are right: hidden 4608 = 9 x 512 (an odd count of 512-column
-    Gate/Up steps; the target shapes have 5, 8 and 10; the decode kernels do not take it, so it falls back to
-    prefill by default) and I 1024 (Down's activation tile exactly 64 KiB of LDS in one pass, the hidden dimension
-    split in 4; block_m=64 selects the prefill kernels, which pyhip M17 runs with the K tile 128 by default).
+def test_shape_fallbacks(hidden, inter, tokens, options, path):
+    """Shapes outside the target set still run and are right, on the path the kernels' limits and the measured
+    ranges give: the decode kernels take hidden <= 4096 (H 4096 with I 64, I_pad % 128 != 0: the per-route decode)
+    and the measured H 5120 only, so hidden 4608 = 9 x 512 (an odd count of 512-column Gate/Up steps; the target
+    shapes have 5, 8 and 10) falls back to prefill; the slot-pair Down needs a row's I_pad / 16 16-byte pieces in its
+    64 * WAVES lanes (topk 2: one wave), so I 1088 takes the single-slot Down where I 1024 still pairs; I 1024 at
+    M 300 (block_m=64 selects the prefill kernels, which pyhip M17 runs with the K tile 128 by default) fills Down's
+    activation tile with exactly 64 KiB of LDS in one pass, the hidden dimension split in 4.
 
-    The basic tests and the benchmark only use the target shapes (H 2560 / 4096 / 5120, I_pad 192-576); E 5 and
-    topk 2 keep this fast.
+    The basic tests and the benchmark only use the target shapes (H 2560 / 4096 / 5120, I_pad 192-576; H 4096 only
+    with I_pad % 128 == 0), out of reach of these limits; E 5 and topk 2 keep this fast.
     """
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = make_inputs(tokens, hidden, 5, 2, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
-    _assert_path(_prefill_path(tile_k))
+    _assert_path(path)
     assert_close(out, ref)
 
 
-# -- 2.4 CUDA graph -------------------------------------------------------------------------------
+# -- 2.5 CUDA graph -------------------------------------------------------------------------------
 
 
 def test_graph_replay():
@@ -1019,7 +1239,45 @@ def test_graph_replay():
     assert_close(out, ref)
 
 
-# -- 2.5 input errors, the gfx942 gate and compile-cache keys --------------------------------------
+@pytest.mark.parametrize(
+    "tokens, path",
+    [(1, "nn"), (5, "np"), (16, "pp")],
+    ids=["m1_nn", "m5_np", "m16_pp"],
+)
+def test_decode_graph_replay(tokens, path):
+    """Each of the decode path's three dispatches can be captured in a CUDA graph and replayed, and the replay reads
+    newly written inputs (xq / mid / mq allocated in the call belong to the graph's pool). The shape is compiled by an
+    eager call outside the capture first.
+
+    The basic tests and the benchmark call eagerly; test_graph_replay captures the prefill path.
+    """
+    w, prepared = _decode_weights(320)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, HIDDEN, EXPERTS, TOPK, seed=97 + tokens
+    )
+    out = torch.empty_like(x)
+    flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids, output=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids, output=out)
+    _assert_path(_DECODE_PATHS[path])
+    x2, topk_weight2, topk_ids2 = make_inputs(
+        tokens, HIDDEN, EXPERTS, TOPK, seed=98 + tokens
+    )
+    x.copy_(x2)
+    topk_weight.copy_(topk_weight2)
+    topk_ids.copy_(topk_ids2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = reference(
+        x2, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight2, topk_ids2
+    )
+    assert_close(out, ref)
+
+
+# -- 2.6 input errors, the gfx942 gate and compile-cache keys --------------------------------------
 
 
 def test_rejects_bad_inputs(monkeypatch):
@@ -1172,7 +1430,39 @@ def test_compile_cache_keys(monkeypatch):
     assert [args[-1] for args in calls["_row_quant_kernel"]] == [device] * 2
 
 
-# -- 2.6 routing and output variants: repeated expert ids, in-place output, input dtypes, M = 0 -------
+def test_decode_compile_cache_keys(monkeypatch):
+    """The decode launcher caches are keyed by the device (``_decode_kernels``, ``_row_quant_decode``) and, for Down,
+    by its wave count, which a call derives from DECODE_DOWN_PQ_WAVES (``_decode_waves``; the decode kernels read no
+    other tunable module constant): another device or wave count gets its own launcher, and a call passes its inputs'
+    device and the current wave count (topk 4: 2 waves by default, 1 with DECODE_DOWN_PQ_WAVES = 1, same result).
+    Building a launcher does not trace it, so the other device need not exist.
+
+    The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
+    passes as well; test_compile_cache_keys covers the prefill launchers.
+    """
+    decode = (128, 512, 64, 4, False, True, 0.0)
+    first = moe_a8w4._decode_kernels(*decode, 2, 0)
+    assert moe_a8w4._decode_kernels(*decode, 2, 0) is first
+    assert moe_a8w4._decode_kernels(*decode, 2, 1) is not first
+    assert moe_a8w4._decode_kernels(*decode, 1, 0) is not first
+    assert moe_a8w4._row_quant_decode(64, False, 1) is not moe_a8w4._row_quant_decode(
+        64, False, 0
+    )
+    built, quant = [], []
+    _spy(monkeypatch, "_decode_kernels", built)
+    _spy(monkeypatch, "_row_quant_decode", quant)
+    w, prepared = _small_weights(512, 64)
+    x, topk_weight, topk_ids = make_inputs(4, 512, 5, 4, seed=67, shared=False)
+    for waves in (moe_a8w4.DECODE_DOWN_PQ_WAVES, 1):
+        monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
+        assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
+        _assert_path(_DECODE_PATHS["np"])
+    device = x.device.index
+    assert [args[-2:] for args in built] == [(2, device), (1, device)], built
+    assert [args[-1] for args in quant] == [device] * 2
+
+
+# -- 2.7 routing and output variants: repeated expert ids, in-place output, input dtypes, M = 0 -------
 
 
 def test_prefill_duplicate_ids_keep_last_route():
@@ -1249,7 +1539,7 @@ def test_m_zero():
     assert moe_a8w4.last_path == []
 
 
-# -- 2.7 SwiGLU limit -----------------------------------------------------------------------------
+# -- 2.8 SwiGLU limit -----------------------------------------------------------------------------
 
 
 def test_swiglu_limit_tile_k128():
@@ -1270,6 +1560,36 @@ def test_swiglu_limit_tile_k128():
         tile_k=128,
     )
     _assert_path(_prefill_path(128))
+
+
+# case -> (shape, M, the decode path's Gate/Up and Down kernels); qwen = H 2560, E 33, topk 11, I 320; ds = DeepSeek
+# H 5120, E 24, topk 6, I 576.
+_SWIGLU_CASES = {
+    "decode_nn": ("qwen", 3, _DECODE_PATHS["nn"]),
+    "decode_pq": ("qwen", 12, _DECODE_PATHS["pp"]),
+    "h5120_nn": ("ds", 3, _DECODE_PATHS["nn"]),
+}
+
+
+@pytest.mark.parametrize("case", list(_SWIGLU_CASES))
+def test_swiglu_limit_kernels(case):
+    """``swiglu_limit=10`` in each decode Gate/Up variant (a compile-time constant wired into each kernel's own
+    epilogue): quantizing x in the kernel (nn) or reading it pre-quantized (pq), and the H 5120 decode quantizing in
+    the kernel (M = 3: 10 bf16 pairs per thread over K = 5120); inputs scaled by 10 so that more than 10% of the gate
+    and of the up values exceed the limit, graded against the reference with the limit.
+
+    The benchmark's DeepSeek cases have N(0, 1) inputs that almost never exceed 10 (they measure the cost of the
+    limit without checking it), the Qwen / MiMo cases pass no limit. The basic DeepSeek M 8 case also clamps in the
+    H 5120 Gate/Up quantizing x in the kernel for now, but M2 moves it to pyhip M17's Gate/Up-deduplicated decode (its
+    tier is not pinned), so h5120_nn keeps that kernel covered.
+    """
+    shape, tokens, path = _SWIGLU_CASES[case]
+    if shape == "qwen":
+        (w, prepared), dims = _decode_weights(320), (HIDDEN, EXPERTS, TOPK, True)
+    else:
+        (w, prepared), dims = _ds_weights(), (DS_HIDDEN, DS_EXPERTS, DS_TOPK, False)
+    _a8w4_swiglu_check(w, prepared, tokens, 410 + tokens, *dims)
+    _assert_path(path)
 
 
 def _ds_negative_gate_weights():
