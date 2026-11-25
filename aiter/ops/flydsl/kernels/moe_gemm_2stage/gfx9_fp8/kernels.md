@@ -80,6 +80,10 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #     不清零 out)，否则 moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1)；之后都是 gateup_prefill → row_quant_fp8(mid)
 #     → down_prefill（写有效路由的 loc_ids）→ sorted_sum → out；H5120 且 M·TOPK ≥ 16384 时两个 GEMM 按 XCD 分块
 #     （XCD_CHUNK）；I > 512 且估计 WG > 80 时 down_prefill 的激活分两段（TWO_PASS）
+#   带 shared expert（expert E 在路由最后一列，见 moe_a8w4.py 的 _moe_shared）：上面各档只算前 TOPK 列（routed）；shared 用
+#     aiter 稠密算子按 ATOM split：per_token_quant_hip(x) → gemm_a8w8_bpreshuffle(gate / up) → silu_and_mul(L)
+#     → per_token_quant_hip(mid) → gemm_a8w8_bpreshuffle(Down)；M ≤ 1024 且 out 与 x 不重叠时它在 side stream 上与 routed
+#     并发（路由权重的几个小 kernel 在第二条 side stream），join 后 out.addcmul_(shared, bf16(权重))；否则在当前流上先于 routed 跑
 ```
 
 ## A8W4 Gate/Up prefill（[gemm1_a8w4.py](gemm1_a8w4.py#L629)）
@@ -661,8 +665,8 @@ x 片 → LDS [组员, H+16]；barrier
   → f32 写 mid[组员路由, 16j + t%16]（条数以外的线程不写）
 ```
 关键代码：[组首判断](decode_dedup_a8w4.py#L545)、[x 行与权重](decode_dedup_a8w4.py#L343)、[主循环](decode_dedup_a8w4.py#L404)、
-[收尾](decode_dedup_a8w4.py#L418)、[pin](decode_dedup_a8w4.py#L82)、[host 分派](../../../moe_a8w4.py#L623)、
-[H5120 路径](../../../moe_a8w4.py#L719)。
+[收尾](decode_dedup_a8w4.py#L418)、[pin](decode_dedup_a8w4.py#L82)、[host 分派](../../../moe_a8w4.py#L867)、
+[H5120 路径](../../../moe_a8w4.py#L963)。
 
 **命名与不变量**：count / members / expert 组首条目与本路由的 expert；G = GROUP；XS = H+16 LDS 行距；KB_PART 本 wave 的 64-K 块数；
 em = t//16、cr = t%16 收尾线程的组员与通道行 2m'+h。
@@ -844,7 +848,7 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并
 ```
 关键代码：[前导](stream_a8w4.py#L360)、[按 S 特化](stream_a8w4.py#L779)、[共享激活](stream_a8w4.py#L641)、[ACT_STEPS 取址](stream_a8w4.py#L602)、
 [分组发与写](stream_a8w4.py#L693)、[预取](stream_a8w4.py#L692)、[主循环](stream_a8w4.py#L707)、[SiLU 与截断](stream_a8w4.py#L466)、
-[尾部量化](stream_a8w4.py#L506)、[夹逼与回退](stream_a8w4.py#L237)、[分派的 tile](../../../moe_a8w4.py#L905)。
+[尾部量化](stream_a8w4.py#L506)、[夹逼与回退](stream_a8w4.py#L237)、[分派的 tile](../../../moe_a8w4.py#L1149)。
 
 **命名与不变量**：S 有效子块数；P 预取步数；SYNC / RING = 2·SYNC 激活环的步数与槽数；LOADER 每 lane 每步读的激活字节，
 LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
@@ -940,7 +944,7 @@ for r in 0 … R−1：
 ```
 关键代码：[共享激活](stream_a8w4.py#L1373)、[通道因子](stream_a8w4.py#L1404)、[权重与 delta](stream_a8w4.py#L1336)、
 [delta 交换](stream_a8w4.py#L1354)、[主循环](stream_a8w4.py#L1469)、[写 routes](stream_a8w4.py#L1543)、[原子累加](stream_a8w4.py#L1494)、
-[bf16x2 原子加](stream_a8w4.py#L123)、[LDS 预算](stream_a8w4.py#L1231)、[H5120 的权重缓存位](../../../moe_a8w4.py#L1026)。
+[bf16x2 原子加](stream_a8w4.py#L123)、[LDS 预算](stream_a8w4.py#L1231)、[H5120 的权重缓存位](../../../moe_a8w4.py#L1270)。
 
 **命名与不变量**：S 有效子块数；P = min(PREFETCH, R) 预取的通道块数；REGION 每 wave 1 KiB 通道因子区；KP = I+16 LDS 行距。
 1. R ≤ 16（一条 16 B 加载放下本 wave 的全部通道因子）；ATOMIC 时 R 为偶数（两块凑一条 bf16x2 原子加）。
@@ -1010,7 +1014,7 @@ def a8w4_route_sum(loc_ids, routes, out, M):
 | `a8w4_route_sum` | ⌈M·H/512 / 4⌉ × 256 线程 | wave 管一个 token 的 512 列；lane 16 B |
 
 QW 由 host 选：H%2048 = 0 或 M ≤ 256 时 4（列块均分或行少），否则 1（行多时 CTA 少）。排序块 BM 也由 host 选
-（[_stream_block_m](../../../moe_a8w4.py#L1061)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
+（[_stream_block_m](../../../moe_a8w4.py#L1305)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
 
 **流水线**
 ```text

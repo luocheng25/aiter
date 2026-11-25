@@ -31,12 +31,20 @@ quant_type_a=QuantType.per_Token, swiglu_limit=...)`` calls ``flydsl_moe_a8w4_pt
 results of a direct call), before its custom op, its tuned-config lookup and its sorting (``_fused_moe_route`` lists
 how every other ``fused_moe`` parameter is treated). Untagged MXFP4 weights with that quantization raise there,
 pointing here.
+
+A shared expert in FP8 with per-row scales (DeepSeek-V4.1-Flash) joins the weight as expert E, after the E routed
+experts (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=..., shared_w1_scale=..., shared_w2=..., shared_w2_scale=...)``,
+the E385 / topk-7 convention of ATOM and aiter's FHMoE): routing tensors then have one more column, the last, that
+holds E. The routed experts run as above on the other columns; the shared expert runs ATOM's split (aiter's per-token
+FP8 quantization, ``gemm_a8w8_bpreshuffle``, ``silu_and_mul`` and ``gemm_a8w8_bpreshuffle`` again, ``_shared_split``),
+on a side stream up to ``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
 """
 
 import functools
 import inspect
 import math
 import numbers
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -189,9 +197,17 @@ XCD_MIN_ROUTES_H5120 = 16384
 # The prefill Down stages a large activation tile in two passes (gemm2_a8w4 TWO_PASS) only for grids of more
 # workgroups (estimated blocks times the split) than one per CU.
 DOWN_TWO_PASS_MIN_WGS = 80
+# Token counts up to this run the shared expert (``_shared_split``) on a side stream of the device, concurrently with
+# the routed experts (ATOM's dual-stream MoE, ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1024); more tokens run it on the
+# current stream before the routed experts.
+SHARED_DUAL_STREAM_MAX_M = 1024
+# Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): with a
+# shared expert, its id E in the last column of every row and routed ids in [0, E).
+DEBUG_CHECKS = os.environ.get("AITER_MOE_A8W4_DEBUG", "0") == "1"
 
 # Kernels launched by the most recent ``flydsl_moe_a8w4_ptpc`` call, in order (host-side record; tests and the
-# benchmark read it).
+# benchmark read it). With a shared expert it also holds its steps (``shared_*``) and, around them, the fork and join
+# of the side streams.
 last_path = []
 
 
@@ -202,6 +218,12 @@ class MoeA8W4PtpcWeight:
     Flat per expert (see ``common_a8w4``): ``w1`` / ``w2`` uint8 FP4 codes [E, bytes], ``w1_delta`` /
     ``w2_delta`` uint8 [E, bytes], ``w1_scale`` / ``w2_scale`` float32 [E, N] per-channel factors. ``inter`` is
     the checkpoint's intermediate size I, ``inter_padded`` I padded to a multiple of 64.
+
+    An optional shared expert (expert E, see ``prepare_moe_a8w4_ptpc_weight``), all four or none (None): FP8 E4M3FNUZ
+    ``shared_w1`` [2 * inter_padded, H] (gate rows first, then up rows, each I zero-padded to ``inter_padded``) and
+    ``shared_w2`` [H, inter_padded rounded up to 128] (zero-padded K) in the layout of
+    ``aiter.ops.shuffle.shuffle_weight(w, layout=(16, 16))`` that ``aiter.gemm_a8w8_bpreshuffle`` reads,
+    ``shared_w1_scale`` / ``shared_w2_scale`` float32 [N, 1] per-row scales.
     """
 
     w1: torch.Tensor
@@ -214,6 +236,27 @@ class MoeA8W4PtpcWeight:
     hidden: int
     inter: int
     inter_padded: int
+    shared_w1: torch.Tensor | None = None
+    shared_w1_scale: torch.Tensor | None = None
+    shared_w2: torch.Tensor | None = None
+    shared_w2_scale: torch.Tensor | None = None
+
+    def __post_init__(self):
+        shared = (
+            self.shared_w1,
+            self.shared_w1_scale,
+            self.shared_w2,
+            self.shared_w2_scale,
+        )
+        if any(t is None for t in shared) and any(t is not None for t in shared):
+            raise ValueError(
+                "shared_w1, shared_w1_scale, shared_w2 and shared_w2_scale are all given or all None"
+            )
+
+    @property
+    def has_shared(self):
+        """Whether the weight holds a shared expert (expert ``experts``, the last routing column)."""
+        return self.shared_w1 is not None
 
 
 # Attribute of the ``w1`` / ``w2`` tensors that ``prepare_moe_a8w4_ptpc_weight`` returns (as ``shuffle_weight`` sets
@@ -224,10 +267,11 @@ WEIGHT_TAG = "aiter_moe_a8w4_ptpc"
 @dataclass(frozen=True, eq=False)
 class _WeightTag:
     """The ``WEIGHT_TAG`` value: ``role`` "w1" or "w2", and ``rest`` = ``(w1_delta, w1_scale, w2_delta, w2_scale,
-    experts, hidden, inter, inter_padded)`` of the weight, one tuple shared by the two tags of a
-    ``prepare_moe_a8w4_ptpc_weight`` call. It holds no reference to the tagged tensors (no reference cycle keeps
-    them alive), so it can also be copied onto another tensor object of the same storage, e.g. an
-    ``nn.Parameter`` wrapper (views, copies and wrappers do not carry it, as ``is_shuffled``).
+    experts, hidden, inter, inter_padded, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale)`` of the weight (the
+    shared ones None without a shared expert), one tuple shared by the two tags of a ``prepare_moe_a8w4_ptpc_weight``
+    call. It holds no reference to the tagged tensors (no reference cycle keeps them alive), so it can also be copied
+    onto another tensor object of the same storage, e.g. an ``nn.Parameter`` wrapper (views, copies and wrappers do not
+    carry it, as ``is_shuffled``).
     """
 
     role: str
@@ -244,6 +288,10 @@ def _tag_weight(weight):
         weight.hidden,
         weight.inter,
         weight.inter_padded,
+        weight.shared_w1,
+        weight.shared_w1_scale,
+        weight.shared_w2,
+        weight.shared_w2_scale,
     )
     setattr(weight.w1, WEIGHT_TAG, _WeightTag("w1", rest))
     setattr(weight.w2, WEIGHT_TAG, _WeightTag("w2", rest))
@@ -263,7 +311,7 @@ def _tagged_weight(w1, w2):
             "w1 and w2 must be the w1 and w2 of one prepare_moe_a8w4_ptpc_weight result (tensor copies and views do "
             "not carry its tag)"
         )
-    w1_delta, w1_scale, w2_delta, w2_scale, E, H, I, ip = t1.rest
+    w1_delta, w1_scale, w2_delta, w2_scale, E, H, I, ip, *shared = t1.rest
     if (
         w1.dtype != torch.uint8
         or w2.dtype != torch.uint8
@@ -278,7 +326,7 @@ def _tagged_weight(w1, w2):
             f"{w1.device} / {w2.device}"
         )
     return MoeA8W4PtpcWeight(
-        w1, w1_delta, w1_scale, w2, w2_delta, w2_scale, E, H, I, ip
+        w1, w1_delta, w1_scale, w2, w2_delta, w2_scale, E, H, I, ip, *shared
     )
 
 
@@ -356,7 +404,184 @@ def _convert(q, codes, chunk=32):
     return tuple(torch.cat(p).view(E, -1) for p in zip(*parts))
 
 
-def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeight:
+_FP8_FORMATS = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+_E4M3FN_MAX = 448.0
+_SHARED_NAMES = ("shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale")
+
+
+def _shared_scale_format(name, w, scale):
+    """``"row"`` for float32 per-row scales ([N] or [N, 1]) of ``w`` [N, K], ``"block"`` for E8M0 scales of 32 x 32
+    blocks ([N / 32, K / 32], ``float8_e8m0fnu`` or uint8 codes); ValueError otherwise.
+    """
+    rows, cols = w.shape
+    shape = tuple(scale.shape)
+    if scale.dtype == torch.float32:
+        if shape not in ((rows,), (rows, 1)):
+            raise ValueError(
+                f"{name}_scale: per-row float32 scales of a [{rows}, {cols}] weight are [{rows}] or [{rows}, 1], "
+                f"got {list(shape)}"
+            )
+        return "row"
+    if scale.dtype in _E8M0_DTYPES:
+        if rows % 32 or cols % 32:
+            raise ValueError(
+                f"{name}_scale: E8M0 scales of 32x32 blocks need both weight dimensions to be multiples of 32, got "
+                f"[{rows}, {cols}]"
+            )
+        if shape != (rows // 32, cols // 32):
+            raise ValueError(
+                f"{name}_scale: E8M0 scales of 32x32 blocks of a [{rows}, {cols}] weight are "
+                f"[{rows // 32}, {cols // 32}], got {list(shape)}"
+            )
+        return "block"
+    raise ValueError(
+        f"{name}_scale must be float32 per-row scales ([N] or [N, 1]) or E8M0 scales of 32x32 blocks ([N/32, K/32], "
+        f"float8_e8m0fnu or uint8), got {scale.dtype} {list(shape)}"
+    )
+
+
+def _shared_inputs(tensors, hidden, inter, device):
+    """Checks the shared-expert arguments of ``prepare_moe_a8w4_ptpc_weight`` (``tensors`` in ``_SHARED_NAMES``
+    order) against the routed experts' H / I; returns their scale format (``_shared_scale_format``), or None without
+    a shared expert. Raises ValueError for a partial set, other shapes, dtypes or devices and mixed formats (TypeError
+    for an argument that is no tensor)."""
+    given = [t is not None for t in tensors]
+    if not any(given):
+        return None
+    if not all(given):
+        missing = [n for n, g in zip(_SHARED_NAMES, given) if not g]
+        raise ValueError(
+            f"a shared expert needs all of {', '.join(_SHARED_NAMES)}; missing {', '.join(missing)}"
+        )
+    w1, s1, w2, s2 = tensors
+    for name, t in zip(_SHARED_NAMES, tensors):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"{name} must be a tensor, got {type(t).__name__}")
+    for name, w in (("shared_w1", w1), ("shared_w2", w2)):
+        if w.dtype not in _FP8_FORMATS or w.dim() != 2:
+            raise ValueError(
+                f"{name} must be a 2-D float8_e4m3fn (the checkpoint's OCP E4M3) or float8_e4m3fnuz tensor, got "
+                f"{w.dtype} {list(w.shape)}"
+            )
+    if w1.dtype != w2.dtype:
+        raise ValueError(
+            f"shared_w1 and shared_w2 must have one FP8 format, got {w1.dtype} and {w2.dtype}"
+        )
+    formats = {
+        _shared_scale_format("shared_w1", w1, s1),
+        _shared_scale_format("shared_w2", w2, s2),
+    }
+    if len(formats) != 1:
+        raise ValueError(
+            "shared_w1_scale and shared_w2_scale must have one format (both per-row float32 or both E8M0 32x32 "
+            f"blocks), got {s1.dtype} {list(s1.shape)} and {s2.dtype} {list(s2.shape)}"
+        )
+    want1, want2 = (2 * inter, hidden), (hidden, inter)
+    if tuple(w1.shape) != want1 or tuple(w2.shape) != want2:
+        raise ValueError(
+            f"shared expert shapes must match the routed experts' H = {hidden} and I = {inter}: shared_w1 [2I, H] = "
+            f"{list(want1)} (gate rows, then up rows) and shared_w2 [H, I] = {list(want2)}, got "
+            f"{list(w1.shape)} and {list(w2.shape)}"
+        )
+    devices = {t.device for t in tensors}
+    if devices != {device}:
+        raise ValueError(
+            f"the shared expert must be on the routed experts' GPU {device}, got {sorted(map(str, devices))}"
+        )
+    return formats.pop()
+
+
+def _e4m3fn_to_fnuz(bits):
+    """E4M3FN bytes as E4M3FNUZ: the same bits are half the value (bias 8 instead of 7), so the scale doubles; -0
+    (0x80) is NaN in E4M3FNUZ and becomes +0."""
+    return bits.masked_fill(bits == 0x80, 0).view(torch.float8_e4m3fnuz)
+
+
+def _fold_blocks(w, codes):
+    """FP8 ``w`` [N, K] with E8M0 ``codes`` of 32x32 blocks -> (E4M3FN [N, K], float32 [N] power-of-two scale per
+    row).
+
+    The value of each element is v = w * 2**(code - 127) (exact); the row scale is s = 2**ceil(log2(max|v| / 448))
+    (1 for an all-zero row), the smallest power of two that keeps v / s within E4M3FN, and the element RNE(v / s).
+    Elements of blocks below the row's largest move down in exponent and round where they become E4M3FN subnormals
+    (relative L2 about 1e-7 of the real shared experts); FP4PTPC@97cc9b32 folded its main layers' shared experts this
+    way (byte-identical).
+    """
+    factor = torch.exp2(codes.float() - 127)
+    factor = factor.repeat_interleave(32, 0).repeat_interleave(32, 1)
+    v = w.float() * factor
+    amax = v.abs().amax(dim=1).double()
+    a = torch.where(amax > 0, amax, torch.full_like(amax, _E4M3FN_MAX))
+    k = torch.ceil(torch.log2(a / _E4M3FN_MAX))
+    # log2 is rounded: step to the smallest k with a <= 448 * 2**k (exact in float64).
+    k = torch.where(a > _E4M3FN_MAX * torch.exp2(k), k + 1, k)
+    k = torch.where(a <= _E4M3FN_MAX * torch.exp2(k - 1), k - 1, k)
+    scale = torch.exp2(k).float()
+    return (v / scale[:, None]).to(torch.float8_e4m3fn), scale
+
+
+def _shared_rows(name, w, scale, fmt):
+    """One shared-expert matrix [N, K] -> FP8 E4M3FNUZ [N, K] and its float32 [N] per-row scales: per-row input keeps
+    its elements (E4M3FN re-encoded by ``_e4m3fn_to_fnuz``, the scale doubled; E4M3FNUZ input as it is, its scale taken
+    as already doubled), 32x32 block input is folded to per-row scales first (``_fold_blocks``). NaN elements, scale
+    codes or scales raise ValueError (reads them on the host)."""
+    w = w.contiguous()
+    bits = w.view(torch.uint8)
+    fnuz = w.dtype == torch.float8_e4m3fnuz
+    nan = (bits == 0x80) if fnuz else ((bits & 0x7F) == 0x7F)
+    if bool(nan.any()):
+        raise ValueError(f"{name} holds NaN elements")
+    if fmt == "row":
+        s = scale.reshape(-1).float()
+        if not bool(torch.isfinite(s).all()):
+            raise ValueError(f"{name}_scale holds non-finite scales")
+        if fnuz:
+            return w, s.contiguous()
+        return _e4m3fn_to_fnuz(bits), (s * 2).contiguous()
+    codes = scale.contiguous().view(torch.uint8)
+    if bool((codes == _E8M0_NAN).any()):
+        raise ValueError(f"{name}_scale: E8M0 code 255 (NaN) is not supported")
+    folded, s = _fold_blocks(w, codes)
+    return _e4m3fn_to_fnuz(folded.view(torch.uint8)), s * 2
+
+
+def _prepare_shared(tensors, fmt, inter, inter_padded):
+    """The shared-expert fields of ``MoeA8W4PtpcWeight`` (``_SHARED_NAMES`` order) from checked inputs: per-row FP8
+    E4M3FNUZ (``_shared_rows``), I zero-padded to ``inter_padded`` (padded gate / up rows and Down columns are zero,
+    their gate / up scales 1), then ``shuffle_weight(layout=(16, 16))`` (the Down with ``pad_k_to=128``) and [N, 1]
+    scales, the operands of ``aiter.gemm_a8w8_bpreshuffle``."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    w1, s1, w2, s2 = tensors
+    q1, t1 = _shared_rows("shared_w1", w1, s1, fmt)
+    q2, t2 = _shared_rows("shared_w2", w2, s2, fmt)
+    pad = inter_padded - inter
+    if pad:
+        b1 = q1.view(torch.uint8)
+        z = b1.new_zeros((pad, b1.shape[1]))
+        q1 = torch.cat([b1[:inter], z, b1[inter:], z]).view(torch.float8_e4m3fnuz)
+        one = t1.new_ones(pad)
+        t1 = torch.cat([t1[:inter], one, t1[inter:], one])
+        q2 = F.pad(q2.view(torch.uint8), (0, pad)).view(torch.float8_e4m3fnuz)
+    return (
+        shuffle_weight(q1.contiguous(), layout=(16, 16)),
+        t1.reshape(-1, 1).contiguous(),
+        shuffle_weight(q2.contiguous(), layout=(16, 16), pad_k_to=128),
+        t2.reshape(-1, 1).contiguous(),
+    )
+
+
+def prepare_moe_a8w4_ptpc_weight(
+    w1,
+    w1_scale,
+    w2,
+    w2_scale,
+    *,
+    shared_w1=None,
+    shared_w1_scale=None,
+    shared_w2=None,
+    shared_w2_scale=None,
+) -> MoeA8W4PtpcWeight:
     """Convert standard MXFP4 MoE weights to the A8W4 layout (run once, at load time).
 
     Inputs: ``w1`` [E, 2I, H/2] FP4x2 (``torch.float4_e2m1fn_x2`` or uint8; rows ``[0, I)`` gate,
@@ -370,10 +595,22 @@ def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeigh
     code 255 (NaN) is rejected. One result serves every token count of ``flydsl_moe_a8w4_ptpc``.
     Synchronizes with the host once per scale tensor. Raises ``RuntimeError`` off gfx942.
 
+    Shared expert (optional, all four or none; DeepSeek-V4.1-Flash): FP8 ``shared_w1`` [2I, H] (gate rows, then up
+    rows: the checkpoint's w1 and w3 concatenated, ATOM's w13) and ``shared_w2`` [H, I] with the routed experts' H and
+    I (a tensor-parallel slice, cut by the caller), both ``torch.float8_e4m3fn`` (the checkpoint's OCP E4M3) or both
+    ``torch.float8_e4m3fnuz`` (already converted, scales taken as already doubled). The format follows the scales, the
+    same for both: float32 per row ([N] or [N, 1], FP4PTPC checkpoints) or E8M0 of 32x32 blocks ([N/32, K/32],
+    ``float8_e8m0fnu`` or uint8 codes; the official checkpoint), which are folded to one power-of-two scale per row
+    (``_fold_blocks``: byte-identical to FP4PTPC@97cc9b32's folding of whole rows). E4M3FN becomes E4M3FNUZ (same bits,
+    -0 -> 0, scale x2) and I is zero-padded to the routed experts' padded I (exact). It becomes expert E: routing tensors
+    of ``flydsl_moe_a8w4_ptpc`` then have topk + 1 columns, the last holding E. Other shapes, dtypes, devices, mixed
+    formats, NaN elements, scale codes or scales raise ValueError.
+
     The returned ``w1`` / ``w2`` carry the attribute ``WEIGHT_TAG`` (values and shapes unchanged), so that
     ``aiter.fused_moe(hidden_states, weight.w1, weight.w2, topk_weight, topk_ids,
     activation=ActivationType.Silu, quant_type=QuantType.per_1x32, quant_type_a=QuantType.per_Token)`` runs this
-    op on them (``_fused_moe_route``); the scales travel with the tags (pass no ``w1_scale`` / ``w2_scale``).
+    op on them (``_fused_moe_route``); the scales and the shared expert travel with the tags (pass no ``w1_scale`` /
+    ``w2_scale`` and no ``shared_*`` tensors there).
     """
     _require_supported_gfx()
     if w1.dim() != 3:
@@ -387,6 +624,8 @@ def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeigh
         raise ValueError(
             f"w1, w1_scale, w2, w2_scale must be on one GPU, got {sorted(map(str, devices))}"
         )
+    shared = (shared_w1, shared_w1_scale, shared_w2, shared_w2_scale)
+    shared_format = _shared_inputs(shared, H, I, w1.device)
     q1 = _packed(w1, (E, 2 * I, H // 2))
     q2 = _packed(w2, (E, H, I // 2))
     c1 = _codes(w1_scale, (E, 2 * I, H // 32))
@@ -414,9 +653,14 @@ def prepare_moe_a8w4_ptpc_weight(w1, w1_scale, w2, w2_scale) -> MoeA8W4PtpcWeigh
         )
         q2 = F.pad(q2, (0, pad // 2))
         c2 = F.pad(c2, (0, pad // 32))
+    shared = (
+        () if shared_format is None else _prepare_shared(shared, shared_format, I, ip)
+    )
     w1q, w1d, w1s = _convert(q1.contiguous(), c1.contiguous())
     w2q, w2d, w2s = _convert(q2.contiguous(), c2.contiguous())
-    return _tag_weight(MoeA8W4PtpcWeight(w1q, w1d, w1s, w2q, w2d, w2s, E, H, I, ip))
+    return _tag_weight(
+        MoeA8W4PtpcWeight(w1q, w1d, w1s, w2q, w2d, w2s, E, H, I, ip, *shared)
+    )
 
 
 def _trace_constants():
@@ -1273,12 +1517,21 @@ def _check_inputs(hidden_states, weight, topk_weight, topk_ids, output):
     tensors = [hidden_states, topk_weight, topk_ids, weight.w1, weight.w2] + (
         [] if output is None else [output]
     )
+    if weight.has_shared:
+        tensors += [weight.shared_w1, weight.shared_w2]
     devices = {t.device for t in tensors}
     if len(devices) != 1 or hidden_states.device.type != "cuda":
         raise ValueError(
             f"inputs, output and weight must be on one GPU, got {sorted(map(str, devices))}"
         )
     topk = topk_ids.shape[1]
+    if weight.has_shared:
+        if topk < 2:
+            raise ValueError(
+                f"with a shared expert topk_ids and topk_weight are [M, topk + 1] (routed experts, then the shared "
+                f"expert {weight.experts}) with topk >= 1, got {tuple(topk_ids.shape)}"
+            )
+        topk -= 1
     if max(M * topk * weight.inter_padded * 4, M * H * 2) >= _MAX_BYTES:
         raise ValueError(
             f"M={M} is too large: M * topk * I_padded * 4 and M * H * 2 must be below 2**31 (32-bit byte offsets)"
@@ -1328,24 +1581,182 @@ def flydsl_moe_a8w4_ptpc(
     the limit is a compile-time constant (kernels compiled per value, names ending in ``_swiglu``). Must
     be finite and >= 0 (``ValueError``).
 
+    With a shared expert in ``weight`` (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=...)``, expert E after the E
+    routed ones; ATOM's E385 / topk-7 convention for DeepSeek-V4.1-Flash), ``topk_ids`` / ``topk_weight`` are
+    [M, topk + 1]: the routed experts in the first topk columns, run as above, and the shared expert's id E in the last
+    column (checked only with ``DEBUG_CHECKS``, which reads the ids). The shared expert runs ATOM's split
+    (``_shared_split``: aiter's per-token FP8 quantization of the input, ``gemm_a8w8_bpreshuffle`` for gate / up,
+    ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` for Down) on a side
+    stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its routing weight on another; unless ``output``
+    overlaps ``hidden_states``), else before the routed experts on the current stream, and is added to their output
+    with the weight ``where(topk_ids[:, 0] >= 0 and topk_ids[:, -1] == E, topk_weight[:, -1], 0)`` per token, rounded
+    to BF16 (ATOM's rule and its ``addcmul_``; masking a whole row by a negative first id is not supported yet: the
+    routed experts need ids in [0, E)). The streams can be captured in a CUDA graph (compile outside the capture
+    first, as above). Tile options apply to the routed experts.
+
     ``aiter.fused_moe`` calls this function for the tagged ``w1`` / ``w2`` of a prepared weight (``_fused_moe_route``),
     with its ``swiglu_limit`` normalized as on aiter's other SiLU paths and without tile options: it takes only the
     automatic ``block_size_M``, so pinning the prefill tile (``block_m``) needs this function.
     """
-    from aiter.fused_moe import moe_sorting
-
     _require_supported_gfx()
     _check_inputs(hidden_states, weight, topk_weight, topk_ids, output)
     limit = _swiglu_limit(swiglu_limit)
+    if output is None:
+        output = torch.empty_like(hidden_states)
+    last_path.clear()
+    if hidden_states.shape[0] == 0:
+        return output
+    if weight.has_shared:
+        return _moe_shared(
+            hidden_states,
+            weight,
+            topk_weight,
+            topk_ids,
+            output,
+            limit,
+            (block_m, block_n, tile_k),
+        )
+    return _moe_routed(
+        hidden_states,
+        weight,
+        topk_weight,
+        topk_ids,
+        output,
+        limit,
+        block_m,
+        block_n,
+        tile_k,
+    )
+
+
+def _side_streams(device):
+    """The two side streams of ``device`` (created on first use): the shared expert's split and its routing weight
+    (a chain of small kernels that would otherwise wait behind the routed or the shared kernels).
+    """
+    streams = _SIDE_STREAMS.get(device.index)
+    if streams is None:
+        streams = _SIDE_STREAMS[device.index] = tuple(
+            torch.cuda.Stream(device=device) for _ in range(2)
+        )
+    return streams
+
+
+_SIDE_STREAMS = {}
+
+
+def _check_shared_ids(topk_ids, experts):
+    """``DEBUG_CHECKS`` with a shared expert (reads the ids on the host): its id E in the last column of every row,
+    routed ids in [0, E)."""
+    if not bool((topk_ids[:, -1] == experts).all()):
+        raise ValueError(
+            f"with a shared expert the last column of topk_ids holds its id {experts} (E) on every row"
+        )
+    routed = topk_ids[:, :-1]
+    if not bool(((routed >= 0) & (routed < experts)).all()):
+        raise ValueError(f"routed expert ids must lie in [0, {experts})")
+
+
+def _shared_split(hidden_states, weight, limit):
+    """ATOM's split shared expert on the current stream with aiter's dense ops: per-token FP8 quantization of the
+    input, the gate / up GEMM (``gemm_a8w8_bpreshuffle``, per-token x per-row scales), SiLU(gate) * up with the
+    SwiGLU limit (``silu_and_mul``, BF16), per-token FP8 quantization of that, the Down GEMM (aiter zero-pads it to
+    the weight's K, a multiple of 128). Returns BF16 [M, H]."""
+    import aiter
+    from aiter import dtypes
+
+    xq, xs = aiter.per_token_quant_hip(hidden_states, quant_dtype=dtypes.fp8)
+    last_path.append("shared_quant_x")
+    gate_up = aiter.gemm_a8w8_bpreshuffle(
+        xq, weight.shared_w1, xs, weight.shared_w1_scale, None, torch.bfloat16
+    )
+    last_path.append("shared_gemm_gateup")
+    mid = torch.empty(
+        (hidden_states.shape[0], weight.inter_padded),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    aiter.silu_and_mul(mid, gate_up, limit)
+    last_path.append("shared_silu_and_mul")
+    mq, ms = aiter.per_token_quant_hip(mid, quant_dtype=dtypes.fp8)
+    last_path.append("shared_quant_mid")
+    out = aiter.gemm_a8w8_bpreshuffle(
+        mq, weight.shared_w2, ms, weight.shared_w2_scale, None, torch.bfloat16
+    )
+    last_path.append("shared_gemm_down")
+    return out
+
+
+def _shared_gate(topk_weight, topk_ids, experts):
+    """The shared expert's weight per token, BF16 [M, 1] (ATOM's rule and rounding): ``topk_weight[:, -1]`` where
+    ``topk_ids[:, 0] >= 0`` and ``topk_ids[:, -1] == experts``, else 0."""
+    live = (topk_ids[:, 0] >= 0) & (topk_ids[:, -1] == experts)
+    gate = torch.where(live, topk_weight[:, -1], torch.zeros_like(topk_weight[:, -1]))
+    return gate.to(torch.bfloat16).unsqueeze(1)
+
+
+def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, tiles):
+    """``flydsl_moe_a8w4_ptpc`` with a shared expert: the routed experts on the first topk columns (``_moe_routed``),
+    the shared expert (``_shared_split``) and its routing weight (``_shared_gate``) on side streams up to
+    SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream, then ``output += shared * gate`` (BF16
+    operands, one rounding: ATOM's addcmul_)."""
+    M = hidden_states.shape[0]
+    E = weight.experts
+    if DEBUG_CHECKS:
+        _check_shared_ids(topk_ids, E)
+    routed_weight, routed_ids = topk_weight[:, :-1], topk_ids[:, :-1]
+    if M <= SHARED_DUAL_STREAM_MAX_M and not _overlaps(output, hidden_states):
+        # Fork the side streams from the current one and join them back before the add (also inside a graph
+        # capture); tensors crossing streams are recorded on the streams that use them.
+        current = torch.cuda.current_stream(hidden_states.device)
+        side, aux = _side_streams(hidden_states.device)
+        side.wait_stream(current)
+        aux.wait_stream(current)
+        last_path.append("shared_fork")
+        with torch.cuda.stream(side):
+            shared = _shared_split(hidden_states, weight, limit)
+        with torch.cuda.stream(aux):
+            gate = _shared_gate(topk_weight, topk_ids, E)
+        hidden_states.record_stream(side)
+        topk_weight.record_stream(aux)
+        topk_ids.record_stream(aux)
+        _moe_routed(
+            hidden_states, weight, routed_weight, routed_ids, output, limit, *tiles
+        )
+        current.wait_stream(side)
+        current.wait_stream(aux)
+        shared.record_stream(current)
+        gate.record_stream(current)
+        last_path.append("shared_join")
+    else:
+        # The shared expert first: output may be hidden_states itself.
+        shared = _shared_split(hidden_states, weight, limit)
+        _moe_routed(
+            hidden_states, weight, routed_weight, routed_ids, output, limit, *tiles
+        )
+        gate = _shared_gate(topk_weight, topk_ids, E)
+    output.addcmul_(shared, gate)
+    last_path.append("shared_add")
+    return output
+
+
+def _moe_routed(
+    hidden_states,
+    weight,
+    topk_weight,
+    topk_ids,
+    output,
+    limit,
+    block_m,
+    block_n,
+    tile_k,
+):
+    """The routed experts of ``flydsl_moe_a8w4_ptpc`` (M > 0) into ``output``: the tier and its kernels."""
+    from aiter.fused_moe import moe_sorting
+
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     E, I = weight.experts, weight.inter_padded
     device = hidden_states.device
-    if output is None:
-        output = torch.empty_like(hidden_states)
-    last_path.clear()
-    if M == 0:
-        return output
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
         topk_ids = topk_ids.to(torch.int32).contiguous()
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
@@ -1458,6 +1869,7 @@ _ROUTE_ARGS = frozenset(
         "output",
         "quant_dtype_a",
         "quant_dtype_a2",
+        "shared_expert_id",
     )
 )
 _ROUTE_IGNORED = frozenset(
@@ -1499,16 +1911,21 @@ def _fused_moe_route(args):
       overlapping ``hidden_states``; ``RuntimeError``), then passed on and returned;
     - ``dtype``: None or ``torch.bfloat16``; ``quant_dtype_a``, ``quant_dtype_a2``: None or ``dtypes.fp8`` (the
       FP8 E4M3FNUZ of this op); other values raise ``NotImplementedError``;
+    - ``shared_expert_id``: -1 (the default, not given) or, for a weight prepared with a shared expert, its id E (the
+      number of routed experts, aiter's FHMoE convention ``E - 1`` of its E + 1 rows); anything else raises
+      ``ValueError``. A shared expert in the weight runs whether or not it is given: ``topk_ids`` / ``topk_weight``
+      are then [M, topk + 1] with E in the last column (``flydsl_moe_a8w4_ptpc``);
     - ignored, hints that do not change the result: ``moe_sorting_dispatch_policy``, ``splitk``,
       ``herd_routed_scaling_factor`` (see ``_ROUTE_IGNORED``);
     - only at their ``fused_moe`` defaults (``NotImplementedError`` naming them): ``expert_mask``,
       ``doweight_stage1``, ``w1_scale`` / ``w2_scale`` (the scales travel with the tagged weights), ``a1_scale`` /
       ``a2_scale`` (this op quantizes its activations), ``num_local_tokens``, ``hidden_pad`` / ``intermediate_pad``
-      (the weight carries its sizes), ``bias1`` / ``bias2``, ``beta`` / ``linear_beta``, ``gate_mode``, the shared
-      expert (``shared_w1``, ``shared_w2``, ``shared_w1_scale``, ``shared_w2_scale``, ``shared_expert_id``; a fused
-      shared expert is an ordinary expert id here), ``stage2_scatter``, ``clamp_shared``, ``herd_topk``,
-      ``deterministic`` (this op picks its kernels by token count and some paths add with atomics),
-      ``w1_global_scale`` / ``w2_global_scale``, and any parameter ``fused_moe`` gains later.
+      (the weight carries its sizes), ``bias1`` / ``bias2``, ``beta`` / ``linear_beta``, ``gate_mode``, the raw
+      shared-expert tensors ``shared_w1``, ``shared_w2``, ``shared_w1_scale``, ``shared_w2_scale`` (a shared expert
+      goes into ``prepare_moe_a8w4_ptpc_weight(..., shared_w1=...)`` and travels with the tags; a fused MXFP4 shared
+      expert is an ordinary expert id), ``stage2_scatter``, ``clamp_shared``, ``herd_topk``, ``deterministic`` (this
+      op picks its kernels by token count and some paths add with atomics), ``w1_global_scale`` /
+      ``w2_global_scale``, and any parameter ``fused_moe`` gains later.
     """
     from aiter import ActivationType, QuantType, dtypes
     from aiter.fused_moe import (
@@ -1551,6 +1968,11 @@ def _fused_moe_route(args):
     hints = []
     if {"w1_scale", "w2_scale"} & set(unsupported):
         hints.append("the scales travel with the tagged w1 / w2")
+    if set(_SHARED_NAMES) & set(unsupported):
+        hints.append(
+            "a shared expert goes into prepare_moe_a8w4_ptpc_weight(..., shared_w1=, shared_w1_scale=, shared_w2=, "
+            "shared_w2_scale=) first and is routed as expert E in the last topk column"
+        )
     if args["block_size_M"] not in (None, 0, -1):
         unsupported.append(f"block_size_M={args['block_size_M']}")
         hints.append(
@@ -1561,6 +1983,23 @@ def _fused_moe_route(args):
             "fused_moe on the w1 / w2 of prepare_moe_a8w4_ptpc_weight does not support "
             + ", ".join(unsupported)
             + "".join(f" ({hint})" for hint in hints)
+        )
+    shared_id = args["shared_expert_id"]
+    if not _is_default(shared_id, defaults["shared_expert_id"]) and (
+        not weight.has_shared
+        or isinstance(shared_id, bool)
+        or not isinstance(shared_id, numbers.Integral)
+        or shared_id != weight.experts
+    ):
+        raise ValueError(
+            f"shared_expert_id is -1 (not given) or the shared expert's id {weight.experts} (E, the last topk "
+            f"column), got {shared_id!r}"
+            + (
+                ""
+                if weight.has_shared
+                else "; the weight has no shared expert (prepare_moe_a8w4_ptpc_weight(..., "
+                "shared_w1=...))"
+            )
         )
     limit = normalize_swiglu_limit(args["swiglu_limit"])
     hidden_states, topk_ids, output = (

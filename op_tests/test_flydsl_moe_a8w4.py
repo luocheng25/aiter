@@ -3,25 +3,30 @@
 
 """Tests and benchmark of the gfx942 FlyDSL A8W4 MoE (``flydsl_moe_a8w4_ptpc``, also reached through
 ``aiter.fused_moe`` with the tagged weights of ``prepare_moe_a8w4_ptpc_weight``): BF16 activations quantized
-per token to FP8 E4M3FNUZ, MXFP4 weights (E2M1 + one E8M0 per 32 K), SiLU, BF16 output.
+per token to FP8 E4M3FNUZ, MXFP4 weights (E2M1 + one E8M0 per 32 K), SiLU, BF16 output; optionally a shared expert
+in FP8 with per-row scales (DeepSeek-V4.1-Flash), expert E of the weight.
 
 One file, four regions:
   0. shared: the independent fp32 reference (a port of pyhip's ``testing/moe_a8w4.py``: weights and inputs drawn
      with the same generators and seeds as pyhip's benchmark, exact MXFP4 dequantization, per-row FP8
-     activations) and the grading (``calc_diff <= 1e-3`` and every element within 4.5% of ``max|ref|``);
-  1. basic functionality (``@pytest.mark.basic``): one case per target shape and token-count tier and one for the
-     ``aiter.fused_moe`` entry, the first thing to run after every change:
-     ``pytest op_tests/test_flydsl_moe_a8w4.py -m basic``;
+     activations; the shared expert's FP8 weights in both checkpoint formats and the reference of a whole layer) and
+     the grading (``calc_diff <= 1e-3`` and every element within 4.5% of ``max|ref|``);
+  1. basic functionality (``@pytest.mark.basic``): one case per target shape and token-count tier, per routed tier of
+     the layers with the shared expert, and one for each ``aiter.fused_moe`` call form, the first thing to run after
+     every change: ``pytest op_tests/test_flydsl_moe_a8w4.py -m basic``;
   2. other coverage: what regions 1 and 3 cannot cover (weight layout and delta flush, bit-exact row
      quantization, dedup plan, streaming prep and fused quantization, decode dispatch boundaries (per route and
      expert-deduplicated), streaming boundaries and variants, the prefill sorting front end, prefill tile options and
      the half-block / XCD / two-pass / Down-split variants, CUDA graph, input errors and the gfx942 gate, compile-cache
-     keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit, and the
-     ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag):
-     ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
+     keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit, the
+     ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag, and the
+     shared expert: prepare's bit-exact conversions, the real checkpoints, errors, the stream-mode threshold, graph,
+     in-place output, TP8 padding): ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): Qwen3.8 TP2 / TP4 (against aiter's FP8 per-token
-     ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48,
-     85 cases: ``python op_tests/test_flydsl_moe_a8w4.py``.
+     ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48 (85
+     cases), then the DeepSeek-V4.1-Flash main and MTP layers with the shared expert, TP4 / TP8, at the same token
+     counts (68 cases, against aiter's FP8 per-token ``fused_moe`` and ATOM's split): ``python
+     op_tests/test_flydsl_moe_a8w4.py`` (``--quick``: the layers at 6 token counts).
 ``MF_SEED`` seeds the benchmark's weights and inputs.
 """
 
@@ -30,6 +35,7 @@ import copy
 import functools
 import gc
 import itertools
+import json
 import math
 import os
 import shutil
@@ -318,6 +324,176 @@ def assert_close(out, ref):
     return result
 
 
+# -- the DeepSeek-V4.1-Flash layer with its shared expert ------------------------------------------------------------
+# The shared expert is FP8 E4M3 with per-row float32 scales (FP4PTPC checkpoints) or E8M0 scales of 32x32 blocks (the
+# official checkpoint). prepare takes it as expert E, routed in the last of topk + 1 columns (ATOM's E385 / topk-7
+# convention). The reference dequantizes its weights exactly and quantizes the input (the same per-row FP8 as the
+# routed reference) and the intermediate per row; the clamp of the SwiGLU limit as in ``reference``.
+
+# name: (routed experts, routed topk, I); H 5120, SwiGLU limit 10, routed weights normalized and times 1.5
+# (routed_scaling_factor), the shared expert's weight 1. TP8 pads the routed I 288 to 320 (prepare), the shared too.
+LAYER_SHAPES = {
+    "ds_layer_tp4": (384, 6, 576),
+    "ds_layer_tp8": (384, 6, 288),
+    "mtp_layer_tp4": (128, 3, 576),
+    "mtp_layer_tp8": (128, 3, 288),
+}
+LAYER_HIDDEN = 5120
+LAYER_SWIGLU_LIMIT = 10.0
+LAYER_ROUTED_SCALING = 1.5
+FP8_OCP_MAX = 448.0
+
+
+def _pow2_ceil_exponent(t):
+    """k = ceil(log2(t)) for positive float64 ``t`` from its exact binary exponent (t = m * 2**e, 0.5 <= m < 1)."""
+    m, e = torch.frexp(t)
+    return e - (m == 0.5).to(e.dtype)
+
+
+def _fp8_rows(v):
+    """float32 [N, K] -> E4M3FN [N, K] and float32 [N, 1] scales amax / 448 per row (1 for a zero row), RNE: the
+    per-row format of FP4PTPC checkpoints."""
+    amax = v.abs().amax(dim=1, keepdim=True)
+    scale = amax / torch.full_like(amax, FP8_OCP_MAX)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return (v / scale).to(torch.float8_e4m3fn), scale
+
+
+def _fp8_blocks(v):
+    """float32 [N, K] -> E4M3FN [N, K] and E8M0 [N/32, K/32] scales of 32x32 blocks, 2**ceil(log2(amax / 448)) (1 for
+    a zero block), RNE: the official checkpoint's format."""
+    n, k = v.shape
+    amax = v.view(n // 32, 32, k // 32, 32).abs().amax(dim=(1, 3)).double()
+    exp = _pow2_ceil_exponent(
+        torch.where(amax > 0, amax, torch.full_like(amax, FP8_OCP_MAX)) / FP8_OCP_MAX
+    )
+    scale = torch.exp2(exp.double()).float()
+    full = scale.repeat_interleave(32, 0).repeat_interleave(32, 1)
+    codes = (exp + 127).to(torch.uint8).view(torch.float8_e8m0fnu)
+    return (v / full).to(torch.float8_e4m3fn), codes
+
+
+def make_shared_weights(hidden, inter, *, seed=0, device="cuda"):
+    """Random BF16 shared-expert weights in both FP8 checkpoint formats.
+
+    Returns ``{"row": (w1, w1_scale, w2, w2_scale), "block": (...)}``, the arguments ``shared_w1``,
+    ``shared_w1_scale``, ``shared_w2``, ``shared_w2_scale`` of prepare: ``w1`` float8_e4m3fn [2I, H] (rows [0, I) gate,
+    [I, 2I) up), ``w2`` [H, I]; "row" with float32 [N, 1] scales (``_fp8_rows``), "block" with float8_e8m0fnu scales of
+    32x32 blocks (``_fp8_blocks``; None unless H and I are multiples of 32), both of the same BF16 weights. Standard
+    deviations: w1 1/sqrt(H), w2 1/sqrt(I).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    v1 = torch.randn((2 * inter, hidden), generator=gen, device=device) * hidden**-0.5
+    v2 = torch.randn((hidden, inter), generator=gen, device=device) * inter**-0.5
+    v1, v2 = v1.to(torch.bfloat16).float(), v2.to(torch.bfloat16).float()
+    blocks = hidden % 32 == 0 and inter % 32 == 0
+    return {
+        "row": (*_fp8_rows(v1), *_fp8_rows(v2)),
+        "block": (*_fp8_blocks(v1), *_fp8_blocks(v2)) if blocks else None,
+    }
+
+
+def dequant_fp8(w, scale):
+    """FP8 [N, K] (E4M3FN or E4M3FNUZ) with float32 per-row scales ([N] / [N, 1]) or E8M0 scales of 32x32 blocks ->
+    the exact float32 [N, K]."""
+    v = w.float()
+    if scale.dtype == torch.float32:
+        return v * scale.reshape(-1, 1)
+    factor = torch.exp2(scale.view(torch.uint8).double() - 127).float()
+    return v * factor.repeat_interleave(32, 0).repeat_interleave(32, 1)
+
+
+def reference_shared(x, w1, w1_scale, w2, w2_scale, *, swiglu_limit=0.0):
+    """Independent fp32 reference of the shared expert, float32 [M, H] before its routing weight: the input quantized
+    per row to FP8 (``quant_rows_fp8``, the routed reference's), the exactly dequantized FP8 weights, the SwiGLU limit
+    as in ``reference``, SiLU(gate) * up quantized per row, Down."""
+    inter = w1.shape[0] // 2
+    h = quant_rows_fp8(x) @ dequant_fp8(w1, w1_scale).T
+    gate, up = h[:, :inter], h[:, inter:]
+    if swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    mid = quant_rows_fp8(torch.nn.functional.silu(gate) * up)
+    return mid @ dequant_fp8(w2, w2_scale).T
+
+
+def shared_route_weight(topk_weight, topk_ids, experts):
+    """The shared expert's weight per token (ATOM's rule): the last column's weight where the first id is >= 0 and the
+    last id is the shared expert's (E), else 0."""
+    live = (topk_ids[:, 0] >= 0) & (topk_ids[:, -1] == experts)
+    return torch.where(live, topk_weight[:, -1].float(), 0.0)
+
+
+def make_layer_inputs(
+    tokens, hidden, experts, topk, *, seed=0, shared_weight=1.0, device="cuda"
+):
+    """Inputs of a layer with a shared expert: ``(hidden_states, topk_weight, topk_ids)``, ids int32 and weights
+    float32 [M, topk + 1], contiguous.
+
+    hidden_states BF16 [M, H] ~ N(0, 1); the first topk columns uniformly random distinct routed experts in [0, E)
+    with the softmax of topk random logits times LAYER_ROUTED_SCALING; the last column the shared expert E with weight
+    ``shared_weight``, or with None a random weight per token in [0.5, 1.5) (so that a weight applied to the wrong
+    token shows).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn((tokens, hidden), generator=gen, device=device).to(torch.bfloat16)
+    ids = (
+        torch.rand((tokens, experts), generator=gen, device=device)
+        .topk(topk, dim=-1)
+        .indices
+    )
+    logits = torch.randn((tokens, topk), generator=gen, device=device)
+    routed = torch.softmax(logits, dim=-1) * LAYER_ROUTED_SCALING
+    if shared_weight is None:
+        shared = torch.rand((tokens, 1), generator=gen, device=device) + 0.5
+    else:
+        shared = torch.full((tokens, 1), float(shared_weight), device=device)
+    ids = torch.cat([ids, torch.full_like(ids[:, :1], experts)], dim=1)
+    return (
+        x,
+        torch.cat([routed, shared], dim=1).float().contiguous(),
+        ids.to(torch.int32).contiguous(),
+    )
+
+
+def reference_layer(x, w, shared, topk_weight, topk_ids, *, swiglu_limit=0.0):
+    """Independent fp32 reference of a layer with a shared expert, float32 [M, H]: ``reference`` of the routed
+    experts (MXFP4 ``w`` in make_weights' format, the first topk columns) plus ``reference_shared`` of ``shared``
+    (prepare's four shared arguments) times ``shared_route_weight``."""
+    experts = w["w1"].shape[0]
+    routed = reference(
+        x,
+        w["w1"],
+        w["w1_scale"],
+        w["w2"],
+        w["w2_scale"],
+        topk_weight[:, :-1],
+        topk_ids[:, :-1],
+        swiglu_limit=swiglu_limit,
+    )
+    weight = shared_route_weight(topk_weight, topk_ids, experts)
+    return routed + reference_shared(
+        x, *shared, swiglu_limit=swiglu_limit
+    ) * weight.unsqueeze(-1)
+
+
+def aiter_shared_split(x, w1, w1_scale, w2, w2_scale, swiglu_limit):
+    """ATOM's split shared expert (its ptpc_split / a8w4 arms) with aiter's dense ops, BF16 [M, H] before the routing
+    weight: per-token FP8 quantization of x, ``gemm_a8w8_bpreshuffle`` on gate / up (``w1`` [2I, H] in
+    ``shuffle_weight(layout=(16, 16))``'s layout, ``w1_scale`` [2I, 1]), ``silu_and_mul`` with the SwiGLU limit,
+    per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` on Down (``w2`` [H, K] shuffled with ``pad_k_to=128``; aiter
+    zero-pads the activations to K). The comparison of the benchmark (a8w4_split) and of the accuracy cases.
+    """
+    q, s = aiter.per_token_quant_hip(x, quant_dtype=aiter.dtypes.fp8)
+    gate_up = aiter.gemm_a8w8_bpreshuffle(q, w1, s, w1_scale, None, torch.bfloat16)
+    mid = torch.empty(
+        (x.shape[0], w1.shape[0] // 2), dtype=torch.bfloat16, device=x.device
+    )
+    aiter.silu_and_mul(mid, gate_up, swiglu_limit)
+    q, s = aiter.per_token_quant_hip(mid, quant_dtype=aiter.dtypes.fp8)
+    return aiter.gemm_a8w8_bpreshuffle(q, w2, s, w2_scale, None, torch.bfloat16)
+
+
 def _prefill_path(tile_k, block_m=64, block_n=128):
     """The Gate/Up and Down kernels of the prefill path (the names carry the sorting block, Gate/Up's N tile and K
     tile), as pyhip M17's tests name them."""
@@ -429,6 +605,97 @@ def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
     return out, ref
 
 
+# The shared expert's steps in moe_a8w4.last_path (ATOM's split with aiter's dense ops).
+_SHARED_SPLIT = [
+    "shared_quant_x",
+    "shared_gemm_gateup",
+    "shared_silu_and_mul",
+    "shared_quant_mid",
+    "shared_gemm_down",
+]
+
+
+def _assert_shared(tokens):
+    """The shared expert ran ATOM's split and was added last: up to SHARED_DUAL_STREAM_MAX_M tokens on the side stream
+    (fork, the split, the routed kernels on the current stream, join), beyond it on the current stream before the
+    routed kernels."""
+    path = moe_a8w4.last_path
+    assert path[-1] == "shared_add", path
+    if tokens <= moe_a8w4.SHARED_DUAL_STREAM_MAX_M:
+        _assert_path(["shared_fork"] + _SHARED_SPLIT + ["shared_join", "shared_add"])
+        fork, join = path.index("shared_fork"), path.index("shared_join")
+        assert any(name.startswith("a8w4_gateup") for name in path[fork:join]), path
+    else:
+        assert "shared_fork" not in path, path
+        _assert_path(_SHARED_SPLIT + ["shared_add"])
+        first = min(i for i, name in enumerate(path) if name.startswith("a8w4_"))
+        assert path.index("shared_gemm_down") < first, path
+
+
+@functools.cache
+def _layer_weights(experts, inter, seed, fmt="row"):
+    """MXFP4 routed weights (H 5120), the shared expert's four prepare arguments in format ``fmt`` ("row" or "block",
+    make_shared_weights) and the prepared layer, cached per E, I, seed and format."""
+    w = make_weights(experts, LAYER_HIDDEN, inter, seed=seed)
+    shared = make_shared_weights(LAYER_HIDDEN, inter, seed=seed + 1)[fmt]
+    prepared = prepare_moe_a8w4_ptpc_weight(
+        w["w1"],
+        w["w1_scale"],
+        w["w2"],
+        w["w2_scale"],
+        shared_w1=shared[0],
+        shared_w1_scale=shared[1],
+        shared_w2=shared[2],
+        shared_w2_scale=shared[3],
+    )
+    return w, shared, prepared
+
+
+def _shared_over(x, shared, limit):
+    """[share of gate > L, share of |up| > L] of the shared expert's Gate/Up output at the reference's quantization
+    point (x quantized per row)."""
+    inter = shared[0].shape[0] // 2
+    h = quant_rows_fp8(x) @ dequant_fp8(shared[0], shared[1]).T
+    return [
+        (h[:, :inter] > limit).float().mean().item(),
+        (h[:, inter:].abs() > limit).float().mean().item(),
+    ]
+
+
+def _layer_check(
+    experts, topk, inter, tokens, seed, *, fmt="row", amplify=1.0, **options
+):
+    """A whole layer call (routed experts plus the shared expert, ``LAYER_SWIGLU_LIMIT``) into a NaN-filled output,
+    graded against ``reference_layer``: weights of _layer_weights(seed), inputs of make_layer_inputs(seed + 7) with
+    random shared weights per token, scaled by ``amplify`` (with more than 1, more than 10% of the shared expert's gate
+    and up values must exceed the limit first). Returns ``(prepared, x, topk_weight, topk_ids, out)``.
+    """
+    w, shared, prepared = _layer_weights(experts, inter, seed, fmt)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, LAYER_HIDDEN, experts, topk, seed=seed + 7, shared_weight=None
+    )
+    if amplify != 1.0:
+        x = (x.float() * amplify).to(torch.bfloat16)
+        over = _shared_over(x, shared, LAYER_SWIGLU_LIMIT)
+        assert min(over) > 0.1, over
+    out = torch.full_like(x, float("nan"))
+    result = flydsl_moe_a8w4_ptpc(
+        x,
+        prepared,
+        topk_weight,
+        topk_ids,
+        output=out,
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+        **options,
+    )
+    assert result is out
+    ref = reference_layer(
+        x, w, shared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert_close(out, ref)
+    return prepared, x, topk_weight, topk_ids, out
+
+
 # =================================================================================================
 # Region 1: basic functionality (@pytest.mark.basic)
 # prepare_moe_a8w4_ptpc_weight + flydsl_moe_a8w4_ptpc on whole calls, graded against the region-0 reference, with
@@ -448,6 +715,14 @@ def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
 # streaming kernels (_assert_h5120 follows the H 5120 decode limit DECODE_WIDE_MAX_M).
 # The aiter.fused_moe entry (test_fused_moe_entry): fused_moe on the tagged w1 / w2 of a prepared weight with
 # activation=Silu, quant_type=per_1x32 and quant_type_a=per_Token runs flydsl_moe_a8w4_ptpc (one Qwen decode case).
+# DeepSeek-V4.1-Flash layers with the shared expert (test_layer, test_fused_moe_shared_entry; LAYER_SHAPES with their
+# full E, the bench's shapes): prepare with the shared expert, routing [M, topk + 1] with the shared expert E in the
+# last column and a random weight per token, swiglu_limit 10, inputs scaled by 10 (more than 10% of the shared
+# expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier and the shared
+# expert's steps asserted (_assert_shared: the side stream up to SHARED_DUAL_STREAM_MAX_M tokens, else serial). One
+# case per routed tier of the main layer TP4 (decode M 1, streaming M 64, prefill M 2048 with the serial shared
+# expert), the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128, topk 3, the official 32x32-block
+# format folded by prepare; decode M 16), and fused_moe on the E385 / topk-7 call (M 8, with shared_expert_id=E).
 # =================================================================================================
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -630,6 +905,70 @@ def test_fused_moe_entry():
     assert_close(out, ref)
 
 
+# (shape, tokens, routed tier, shared-expert format): see the region header; the routed tier is a kernel path of the
+# full-E shape (asserted) and the H 5120 decode limit DECODE_WIDE_MAX_M decides the MTP M 16 case (_assert_h5120).
+_LAYER_CASES = [
+    ("ds_layer_tp4", 1, _DECODE_PATHS["nn"], "row"),
+    (
+        "ds_layer_tp4",
+        64,
+        ["a8w4_stream_prep"] + _stream_path(16, False) + ["a8w4_route_sum"],
+        "row",
+    ),
+    ("ds_layer_tp4", 2048, ["a8w4_stream_prep"] + _prefill_path(128), "row"),
+    ("ds_layer_tp8", 4, _DECODE_PATHS["np"], "row"),
+    ("mtp_layer_tp4", 16, _DEDUP_PATHS["wide"], "block"),
+]
+
+
+@pytest.mark.basic
+@pytest.mark.parametrize(
+    "shape, tokens, path, fmt",
+    _LAYER_CASES,
+    ids=[f"{shape}_m{m}" for shape, m, _, _ in _LAYER_CASES],
+)
+def test_layer(shape, tokens, path, fmt):
+    experts, topk, inter = LAYER_SHAPES[shape]
+    prepared = _layer_check(
+        experts, topk, inter, tokens, seed=700, fmt=fmt, amplify=10.0
+    )[0]
+    assert (prepared.experts, prepared.inter) == (experts, inter)
+    _assert_kernels()
+    if shape.startswith("mtp"):
+        _assert_h5120(tokens, path)
+    else:
+        _assert_path(path)
+    _assert_shared(tokens)
+
+
+@pytest.mark.basic
+def test_fused_moe_shared_entry():
+    """``aiter.fused_moe`` on the tagged w1 / w2 of a weight prepared with the shared expert, called as ATOM calls the
+    FP8 layer (E385 / topk 7: the shared expert E in the last column, swiglu_limit 10, here with shared_expert_id=E),
+    runs flydsl_moe_a8w4_ptpc with its bits and kernels, within the tolerance of the reference (main layer TP4 M 8).
+    """
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
+    prepared, x, topk_weight, topk_ids, want = _layer_check(
+        experts, topk, inter, 8, seed=700, amplify=10.0
+    )
+    path = list(moe_a8w4.last_path)
+    out = torch.full_like(x, float("nan"))
+    result = _fused_moe(
+        x,
+        prepared.w1,
+        prepared.w2,
+        topk_weight,
+        topk_ids,
+        output=out,
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+        shared_expert_id=experts,
+    )
+    assert result is out
+    assert moe_a8w4.last_path == path
+    _assert_shared(8)
+    assert torch.equal(_bits(out), _bits(want))
+
+
 # =================================================================================================
 # Region 2: other coverage (not basic)
 # Only what region 1 and the benchmark (region 3) cannot cover; each docstring says why ("the basic tests" are
@@ -654,6 +993,13 @@ def test_fused_moe_entry():
 # Gate/Up, grid shrinking, CUDA graph, compile-cache keys, repeated ids, in-place output and the SwiGLU limit.
 # The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
 # benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
+# The shared expert (2.10) is covered by the basic layer tests (one case per routed tier, TP8, the MTP layer in the
+# 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 68 layer cases (graded); here what they
+# cannot show: the bit-exact conversions of prepare (E4M3FN -> FNUZ, -0, the block folding, the I padding), the
+# folding of the real checkpoints (byte-identical to FP4PTPC@97cc9b32; needs AITER_MOE_A8W4_DSV41_DIR, else skipped)
+# and the accuracy on real weights, input errors and the debug checks, the stream-mode threshold, CUDA graph of both
+# stream modes, in-place output, the exactness of the TP8 padding, and fused_moe's shared_expert_id and raw shared
+# tensors.
 # =================================================================================================
 
 
@@ -3044,11 +3390,13 @@ def test_fused_moe_arguments(monkeypatch):
 
 def test_fused_moe_rejects():
     """The route raises before any kernel runs: for every fused_moe parameter it cannot honour, naming it
-    (NotImplementedError; w1_scale / w2_scale too, the scales travel with the tagged weights; block_size_M other than
-    None / 0 / -1, pointing at flydsl_moe_a8w4_ptpc(block_m=...) to pin a tile); for another activation / quant_type /
-    quant_type_a (ValueError); for w1 / w2 that are not the pair of one prepare call (another call's w2, swapped, one
-    of them an untagged copy) or do not match their tag (ValueError); for an output that breaks fused_moe's contract
-    (shape, dtype, layout, overlapping hidden_states: RuntimeError). Off gfx942: test_requires_gfx942.
+    (NotImplementedError; w1_scale / w2_scale too, the scales travel with the tagged weights; the raw shared-expert
+    tensors, pointing at prepare_moe_a8w4_ptpc_weight(..., shared_w1=...); block_size_M other than None / 0 / -1,
+    pointing at flydsl_moe_a8w4_ptpc(block_m=...) to pin a tile); for another activation / quant_type / quant_type_a
+    (ValueError); for w1 / w2 that are not the pair of one prepare call (another call's w2, swapped, one of them an
+    untagged copy) or do not match their tag (ValueError); for an output that breaks fused_moe's contract (shape,
+    dtype, layout, overlapping hidden_states: RuntimeError). Off gfx942: test_requires_gfx942. shared_expert_id:
+    test_fused_moe_shared_expert_id.
 
     The basic test and the other cases pass only supported arguments.
     """
@@ -3077,7 +3425,6 @@ def test_fused_moe_rejects():
         "shared_w2": prepared.w2,
         "shared_w1_scale": w["w1_scale"],
         "shared_w2_scale": w["w2_scale"],
-        "shared_expert_id": 0,
         "stage2_scatter": object(),
         "clamp_shared": False,
         "herd_topk": 1,
@@ -3093,6 +3440,12 @@ def test_fused_moe_rejects():
             run(**{name: value})
     with pytest.raises(NotImplementedError, match="scales travel"):
         run(w1_scale=w["w1_scale"], w2_scale=w["w2_scale"])
+    for name in ("shared_w1", "shared_w2", "shared_w1_scale", "shared_w2_scale"):
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"{name}.*prepare_moe_a8w4_ptpc_weight\(\.\.\., shared_w1=",
+        ):
+            run(**{name: unsupported[name]})
     for value in (64, 32):
         with pytest.raises(
             NotImplementedError,
@@ -3297,9 +3650,619 @@ def test_weight_tag_lifetime():
     assert torch.equal(_bits(got), _bits(want))
 
 
+# -- 2.10 shared expert: prepare's conversions, real checkpoints, errors, stream mode, graph, in-place, TP8, fused_moe
+# Real-checkpoint cases read AITER_MOE_A8W4_DSV41_DIR (the shared experts of DeepSeek-V4.1-Flash-1017 layers 2, 37 and
+# mtp.0 from the official checkpoint and FP4PTPC @97cc9b32 / @main: manifest.json and <source>_<layer>.pt of raw
+# bytes, written by the task tool fetch_dsv41_shared.py) and skip without it.
+
+_DSV41_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "F32": torch.float32,
+}
+
+
+def _dsv41(key):
+    """The shared expert of one checkpoint layer (``<source>_<layer>``) as {"w1.weight", "w1.scale" or
+    "w1.weight_scale", ... "w3.*", "w2.*"} on the GPU in the manifest's dtypes and shapes; skips without the data.
+    """
+    root = os.environ.get("AITER_MOE_A8W4_DSV41_DIR")
+    if not root:
+        pytest.skip(
+            "AITER_MOE_A8W4_DSV41_DIR is not set (DeepSeek-V4.1-Flash shared experts)"
+        )
+    path = Path(root) / f"{key}.pt"
+    if not path.exists():
+        pytest.skip(f"{path} not found")
+    tensors = json.loads((Path(root) / "manifest.json").read_text())[key]["tensors"]
+    raw = torch.load(path)
+    return {
+        name.split("shared_experts.")[1]: raw[name]
+        .cuda()
+        .view(_DSV41_DTYPES[meta["dtype"]])
+        .reshape(meta["shape"])
+        for name, meta in tensors.items()
+    }
+
+
+def _rel_l2(a, b):
+    return ((a.double() - b.double()).norm() / b.double().norm()).item()
+
+
+def _routed_only(prepared):
+    """A weight prepared with a shared expert without it (the same routed tensors)."""
+    p = prepared
+    return MoeA8W4PtpcWeight(
+        p.w1,
+        p.w1_delta,
+        p.w1_scale,
+        p.w2,
+        p.w2_delta,
+        p.w2_scale,
+        p.experts,
+        p.hidden,
+        p.inter,
+        p.inter_padded,
+    )
+
+
+def _prepare_shared(w, shared):
+    return prepare_moe_a8w4_ptpc_weight(
+        w["w1"],
+        w["w1_scale"],
+        w["w2"],
+        w["w2_scale"],
+        shared_w1=shared[0],
+        shared_w1_scale=shared[1],
+        shared_w2=shared[2],
+        shared_w2_scale=shared[3],
+    )
+
+
+def _shared_fields(prepared):
+    return (
+        prepared.shared_w1,
+        prepared.shared_w1_scale,
+        prepared.shared_w2,
+        prepared.shared_w2_scale,
+    )
+
+
+def _fold_reference(w, codes):
+    """Independent 32x32-block folding: the exact values (dequant_fp8), one scale per row 2**ceil(log2(amax / 448))
+    with the exponent from frexp (_pow2_ceil_exponent; 1 for a zero row), elements RNE to E4M3FN.
+    """
+    v = dequant_fp8(w, codes)
+    amax = v.abs().amax(dim=1).double()
+    exp = _pow2_ceil_exponent(
+        torch.where(amax > 0, amax, torch.full_like(amax, FP8_OCP_MAX)) / FP8_OCP_MAX
+    )
+    scale = torch.exp2(exp.double()).float()
+    return (v / scale[:, None]).to(torch.float8_e4m3fn), scale
+
+
+def test_shared_prepare_bitexact():
+    """prepare's shared-expert fields bit for bit. Per-row E4M3FN input keeps its bits except -0 (0x80, NaN in FNUZ),
+    which becomes +0, with twice the scale; the same weights already in E4M3FNUZ (bits and scales converted) give the
+    same fields; 32x32-block input is folded to one power-of-two scale per row exactly as an independent folding computes
+    it (_fold_reference; scale codes spread over 16 values, so that elements of low blocks become E4M3FN subnormals and
+    round; an all-zero row takes the scale 1); I 288 is zero-padded to 320 (gate and up rows with scale 1, Down
+    columns) and the Down K to 384, in shuffle_weight's (16, 16) layout. [N] and [N, 1] per-row scales and uint8 and
+    float8_e8m0fnu codes are accepted.
+
+    The basic tests and the benchmark grade whole layers within the reference's tolerance, which a bit error of the
+    conversion (a lost -0, one row's scale off by a power of two, a rounding of the folding) could pass.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    E, H, I, ip = 3, 512, 288, 320
+    w = make_weights(E, H, I, seed=710)
+    gen = torch.Generator(device="cuda").manual_seed(711)
+
+    def fp8(rows, cols):
+        bits = torch.randint(
+            0, 256, (rows, cols), generator=gen, device="cuda", dtype=torch.uint8
+        )
+        bits = torch.where((bits & 0x7F) == 0x7F, bits ^ 0x01, bits)  # no NaN codes
+        bits[:, :8] = 0x80
+        return bits.view(torch.float8_e4m3fn)
+
+    def expect(q1, t1, q2, t2):
+        """prepare's fields for E4M3FN q1 / q2 with float32 per-row scales t1 / t2."""
+        b1, b2 = (
+            q.view(torch.uint8).masked_fill(q.view(torch.uint8) == 0x80, 0)
+            for q in (q1, q2)
+        )
+        z = torch.zeros((ip - I, H), dtype=torch.uint8)
+        b1 = torch.cat([b1[:I], z, b1[I:], z])
+        b2 = torch.cat([b2, torch.zeros((H, 384 - I), dtype=torch.uint8)], dim=1)
+        t1 = t1.reshape(-1) * 2
+        one = torch.ones(ip - I)
+        return (
+            shuffle_weight(b1.view(torch.float8_e4m3fnuz), layout=(16, 16)),
+            torch.cat([t1[:I], one, t1[I:], one]).view(-1, 1),
+            shuffle_weight(b2.view(torch.float8_e4m3fnuz), layout=(16, 16)),
+            (t2.reshape(-1) * 2).view(-1, 1),
+        )
+
+    def same(got, want):
+        for g, x in zip(got, want):
+            assert g.shape == x.shape and g.dtype == x.dtype, (g.shape, x.shape)
+            assert torch.equal(g.view(torch.uint8), x.view(torch.uint8))
+
+    w1, w2 = fp8(2 * I, H), fp8(H, I)
+    s1 = torch.rand((2 * I, 1), generator=gen, device="cuda") + 0.5
+    s2 = torch.rand((H,), generator=gen, device="cuda") + 0.5
+    got = _shared_fields(_prepare_shared(w, (w1, s1, w2, s2)))
+    same(got, expect(w1, s1, w2, s2))
+    fnuz = tuple(
+        q.view(torch.uint8)
+        .masked_fill(q.view(torch.uint8) == 0x80, 0)
+        .view(torch.float8_e4m3fnuz)
+        for q in (w1, w2)
+    )
+    same(_shared_fields(_prepare_shared(w, (fnuz[0], s1 * 2, fnuz[1], s2 * 2))), got)
+    c1 = torch.randint(
+        110, 126, (2 * I // 32, H // 32), generator=gen, device="cuda"
+    ).to(torch.uint8)
+    c2 = torch.randint(110, 126, (H // 32, I // 32), generator=gen, device="cuda").to(
+        torch.uint8
+    )
+    zero = w1.view(torch.uint8).clone()
+    zero[5] = 0  # an all-zero row folds to the scale 1
+    zero = zero.view(torch.float8_e4m3fn)
+    blocks = (zero, c1.view(torch.float8_e8m0fnu), w2, c2)
+    want = expect(*_fold_reference(zero, c1), *_fold_reference(w2, c2))
+    got = _shared_fields(_prepare_shared(w, blocks))
+    same(got, want)
+    assert got[1][5, 0].item() == 2.0  # 1, doubled for E4M3FNUZ
+
+
+@pytest.mark.parametrize("layer", ["layers.2", "layers.37"])
+def test_shared_fold_matches_fp4ptpc(layer):
+    """prepare's folding of the official checkpoint's 32x32-block shared expert (w1, w3 and w2 whole: a row's scale
+    needs the whole row) is byte-identical to FP4PTPC@97cc9b32's per-row weights and scales of the layer and within
+    relative L2 1e-6 of the block dequantization; the TP4 rank-0 slice (gate / up rows [0, 576), Down columns
+    [0, 576)) prepared from either checkpoint stores the same gate / up (rows fold alone; the Down slice folds over its
+    own columns, within 1e-6 of the blocks too).
+
+    The basic tests and the benchmark use synthetic weights.
+    """
+    official, ptpc = _dsv41(f"official_{layer}"), _dsv41(f"ptpc97_{layer}")
+    for m in ("w1", "w3", "w2"):
+        q, s = moe_a8w4._fold_blocks(
+            official[f"{m}.weight"], official[f"{m}.scale"].view(torch.uint8)
+        )
+        assert torch.equal(q.view(torch.uint8), ptpc[f"{m}.weight"].view(torch.uint8))
+        assert torch.equal(s, ptpc[f"{m}.weight_scale"].reshape(-1)), m
+        exact = dequant_fp8(official[f"{m}.weight"], official[f"{m}.scale"])
+        error = _rel_l2(dequant_fp8(q, s), exact)
+        print(f"{layer} {m}: relative L2 of the folding {error:.3e}")
+        assert error <= 1e-6, (m, error)
+    I = 576
+    w = make_weights(2, LAYER_HIDDEN, I, seed=720)
+    block = (
+        torch.cat([official["w1.weight"][:I], official["w3.weight"][:I]]),
+        torch.cat([official["w1.scale"][: I // 32], official["w3.scale"][: I // 32]]),
+        official["w2.weight"][:, :I].contiguous(),
+        official["w2.scale"][:, : I // 32].contiguous(),
+    )
+    row = (
+        torch.cat([ptpc["w1.weight"][:I], ptpc["w3.weight"][:I]]),
+        torch.cat([ptpc["w1.weight_scale"][:I], ptpc["w3.weight_scale"][:I]]),
+        ptpc["w2.weight"][:, :I].contiguous(),
+        ptpc["w2.weight_scale"],
+    )
+    a = _shared_fields(_prepare_shared(w, block))
+    b = _shared_fields(_prepare_shared(w, row))
+    assert torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8))
+    assert torch.equal(a[1], b[1])
+    q, s = moe_a8w4._fold_blocks(block[2], block[3].view(torch.uint8))
+    assert _rel_l2(dequant_fp8(q, s), dequant_fp8(block[2], block[3])) <= 1e-6
+
+
+def test_shared_fold_mtp_blocks():
+    """The MTP layer's shared expert (mtp.0) is in 32x32 blocks in the official checkpoint and FP4PTPC@97cc9b32 alike
+    (the same bytes); prepare's folding keeps every element of at least 1% of its row's largest magnitude exactly and the
+    whole within relative L2 1e-6 of the block dequantization. FP4PTPC@main stores it per row, re-quantized with other
+    scales: its distance to the blocks (2.5-2.8% relative L2) is printed, not asserted.
+
+    The basic tests and the benchmark use synthetic weights.
+    """
+    official, ptpc, main = (
+        _dsv41(f"{source}_mtp.0") for source in ("official", "ptpc97", "ptpcmain")
+    )
+    for m in ("w1", "w3", "w2"):
+        for part in ("weight", "scale"):
+            key = f"{m}.{part}"
+            assert torch.equal(
+                official[key].view(torch.uint8), ptpc[key].view(torch.uint8)
+            ), key
+        exact = dequant_fp8(ptpc[f"{m}.weight"], ptpc[f"{m}.scale"])
+        q, s = moe_a8w4._fold_blocks(
+            ptpc[f"{m}.weight"], ptpc[f"{m}.scale"].view(torch.uint8)
+        )
+        folded = dequant_fp8(q, s)
+        large = exact.abs() >= 0.01 * exact.abs().amax(dim=1, keepdim=True)
+        assert torch.equal(folded[large], exact[large]), m
+        error = _rel_l2(folded, exact)
+        gap = _rel_l2(
+            dequant_fp8(main[f"{m}.weight"], main[f"{m}.weight_scale"]), exact
+        )
+        print(f"mtp.0 {m}: folding {error:.3e}, FP4PTPC@main per-row weights {gap:.3%}")
+        assert error <= 1e-6, (m, error)
+
+
+def _quant_1x32(t):
+    """The model's activation quantization: FP8 E4M3FN with one UE8M0 scale per 32 elements, 2**ceil(log2(amax /
+    448)), RNE; dequantized, float32."""
+    rows, cols = t.shape
+    b = t.float().view(rows, cols // 32, 32)
+    amax = b.abs().amax(dim=-1, keepdim=True).double()
+    exp = _pow2_ceil_exponent(
+        torch.where(amax > 0, amax, torch.full_like(amax, FP8_OCP_MAX)) / FP8_OCP_MAX
+    )
+    scale = torch.exp2(exp.double()).float()
+    return ((b / scale).to(torch.float8_e4m3fn).float() * scale).view(rows, cols)
+
+
+def _shared_fp32(x, w1, w2, limit, quant=None):
+    """The shared expert in float32 on dequantized weights; ``quant`` quantizes x and the intermediate (None: not)."""
+    inter = w1.shape[0] // 2
+    xa = x.float() if quant is None else quant(x)
+    h = xa @ w1.T
+    gate, up = h[:, :inter].clamp(max=limit), h[:, inter:].clamp(-limit, limit)
+    mid = torch.nn.functional.silu(gate) * up
+    return (mid if quant is None else quant(mid)) @ w2.T
+
+
+@pytest.mark.parametrize("layer", ["layers.2", "layers.37"])
+def test_shared_real_weights_accuracy(layer):
+    """The shared expert on the official weights of a layer (TP4 rank 0: w1 / w3 rows [0, 576), w2 columns [0, 576);
+    32x32 blocks folded by prepare), inputs N(0, 1) and N(0, 1) with 4 outlier channels times 50, seeds 0-2, M 64,
+    swiglu_limit 10. Its relative L2 error against the fp32 expert (the same block weights; x and the intermediate not
+    quantized) is at most 1.5 times that of the model's own quantization (x and the intermediate in FP8 with one UE8M0
+    scale per 32, _quant_1x32, as DeepSeek-V4.1 runs it). The routed experts get weight 0, so the call's output is the
+    shared expert's; the error of ATOM's split on the same prepared weights is printed too.
+
+    The basic tests and the benchmark grade synthetic weights against a reference with this op's own quantization.
+    """
+    I, limit = 576, LAYER_SWIGLU_LIMIT
+    official = _dsv41(f"official_{layer}")
+    shared = (
+        torch.cat([official["w1.weight"][:I], official["w3.weight"][:I]]),
+        torch.cat([official["w1.scale"][: I // 32], official["w3.scale"][: I // 32]]),
+        official["w2.weight"][:, :I].contiguous(),
+        official["w2.scale"][:, : I // 32].contiguous(),
+    )
+    w1, w2 = dequant_fp8(*shared[:2]), dequant_fp8(*shared[2:])
+    experts, topk, tokens = 8, 2, 64
+    prepared = _prepare_shared(make_weights(experts, LAYER_HIDDEN, I, seed=730), shared)
+    ids = torch.arange(topk + 1, dtype=torch.int32).repeat(tokens, 1)
+    ids[:, -1] = experts
+    weight = torch.zeros((tokens, topk + 1))
+    weight[:, -1] = 1.0
+    for kind, seed in itertools.product(("gauss", "outliers"), range(3)):
+        gen = torch.Generator(device="cuda").manual_seed(731 + seed)
+        x = torch.randn((tokens, LAYER_HIDDEN), generator=gen, device="cuda")
+        if kind == "outliers":
+            channels = torch.randperm(LAYER_HIDDEN, generator=gen, device="cuda")[:4]
+            x[:, channels] *= 50
+        x = x.to(torch.bfloat16)
+        exact = _shared_fp32(x, w1, w2, limit)
+        model = _rel_l2(_shared_fp32(x, w1, w2, limit, _quant_1x32), exact)
+        ours = _rel_l2(
+            flydsl_moe_a8w4_ptpc(x, prepared, weight, ids, swiglu_limit=limit), exact
+        )
+        split = _rel_l2(
+            aiter_shared_split(x, *_shared_fields(prepared), limit).float(), exact
+        )
+        print(
+            f"{layer} {kind} seed {seed}: relative L2 ours {ours:.4e}, split {split:.4e}, model {model:.4e}, "
+            f"ours / model {ours / model:.3f}"
+        )
+        assert ours <= 1.5 * model, (kind, seed, ours, model)
+
+
+def test_shared_rejects(monkeypatch):
+    """Shared-expert inputs prepare cannot take raise ValueError before any conversion: a partial set, weights that are
+    not 2-D FP8 E4M3FN / E4M3FNUZ, mixed FP8 or scale formats, scales of another shape or dtype, 32x32 blocks over an I
+    that is no multiple of 32, shapes other than the routed experts' [2I, H] / [H, I], NaN elements (E4M3FN and
+    E4M3FNUZ input) / E8M0 codes / scales, another device; an argument that is no tensor raises TypeError, a
+    MoeA8W4PtpcWeight with part of the shared fields ValueError. A call with a shared expert needs at least 2 routing
+    columns (ValueError). DEBUG_CHECKS reads the routing: a last column other than E or routed ids outside [0, E) raise
+    ValueError; without it a row whose last id is not E gets no shared expert (ATOM's rule, as reference_layer). M = 0
+    returns the output untouched with no kernel; int64 ids and bfloat16 weights give the bits of int32 / float32 ones.
+    The 32-bit offset limit on M counts the routed columns, not the shared one.
+
+    The basic tests and the benchmark pass valid inputs with E in the last column, far below the offset limit.
+    """
+    import dataclasses
+
+    E, H, I = 4, 512, 64
+    w = make_weights(E, H, I, seed=740)
+    shared = make_shared_weights(H, I, seed=741)
+    rows, blocks = shared["row"], shared["block"]
+
+    def prepare(*args):
+        return _prepare_shared(w, args)
+
+    def bad(index, value, base=rows):
+        args = list(base)
+        args[index] = value
+        with pytest.raises(ValueError):
+            prepare(*args)
+
+    for missing in range(4):
+        args = list(rows)
+        args[missing] = None
+        with pytest.raises(ValueError, match="needs all of"):
+            prepare(*args)
+    bad(0, rows[0].float().to(torch.bfloat16))
+    bad(0, rows[0][None])
+    bad(0, rows[0].view(torch.uint8).view(torch.float8_e4m3fnuz))
+    bad(1, rows[1].view(1, -1))
+    bad(1, rows[1].half())
+    bad(1, blocks[1])
+    bad(3, blocks[3][:, :1].contiguous(), base=blocks)
+    for hidden, inter in ((H, 32), (2 * H, I)):
+        with pytest.raises(ValueError, match="must match the routed experts"):
+            prepare(*make_shared_weights(hidden, inter, seed=742)["row"])
+    small = make_shared_weights(H, 48, seed=742)["row"]
+    with pytest.raises(ValueError, match="multiples of 32"):
+        prepare(
+            small[0],
+            torch.zeros((96 // 32, H // 32), dtype=torch.uint8),
+            small[2],
+            torch.zeros((H // 32, 1), dtype=torch.uint8),
+        )
+    nan = rows[0].view(torch.uint8).clone()
+    nan[3, 5] = 0x7F
+    bad(0, nan.view(torch.float8_e4m3fn))
+    bad(1, torch.where(torch.arange(2 * I)[:, None] == 2, math.inf, rows[1]))
+    codes = blocks[1].view(torch.uint8).clone()
+    codes[0, 0] = 255
+    bad(1, codes, base=blocks)
+    bad(2, rows[2].cpu())
+    with pytest.raises(TypeError, match="shared_w1_scale must be a tensor"):
+        prepare(rows[0], 1.0, rows[2], rows[3])
+    fnuz = [
+        q.view(torch.uint8).masked_fill(q.view(torch.uint8) == 0x80, 0)
+        for q in (rows[0], rows[2])
+    ]
+    fnuz[0][3, 5] = 0x80  # NaN in E4M3FNUZ
+    with pytest.raises(ValueError, match="NaN"):
+        prepare(
+            fnuz[0].view(torch.float8_e4m3fnuz),
+            rows[1] * 2,
+            fnuz[1].view(torch.float8_e4m3fnuz),
+            rows[3] * 2,
+        )
+    prepared = prepare(*rows)
+    with pytest.raises(ValueError, match="all given or all None"):
+        dataclasses.replace(_routed_only(prepared), shared_w1=prepared.shared_w1)
+    x, topk_weight, topk_ids = make_layer_inputs(6, H, E, 2, seed=743)
+    with pytest.raises(ValueError, match="topk \\+ 1"):
+        flydsl_moe_a8w4_ptpc(x, prepared, topk_weight[:, -1:], topk_ids[:, -1:])
+    want = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+    half = topk_weight.to(torch.bfloat16)
+    got = flydsl_moe_a8w4_ptpc(x, prepared, half, topk_ids.long())
+    assert torch.equal(
+        _bits(got), _bits(flydsl_moe_a8w4_ptpc(x, prepared, half.float(), topk_ids))
+    )
+    other = topk_ids.clone()
+    other[::2, -1] = E - 1 - other[::2, 0] % 2
+    out = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, other)
+    ref = reference_layer(x, w, rows, topk_weight, other)
+    assert_close(out, ref)
+    assert shared_route_weight(topk_weight, other, E)[::2].eq(0).all()
+    monkeypatch.setattr(moe_a8w4, "DEBUG_CHECKS", True)
+    assert torch.equal(
+        _bits(flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)), _bits(want)
+    )
+    with pytest.raises(ValueError, match="last column"):
+        flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, other)
+    for value in (E, -1):
+        routed = topk_ids.clone()
+        routed[1, 0] = value
+        with pytest.raises(ValueError, match="routed expert ids"):
+            flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, routed)
+    monkeypatch.undo()
+    empty = torch.empty((0, H), dtype=torch.bfloat16)
+    out = flydsl_moe_a8w4_ptpc(
+        empty, prepared, topk_weight[:0], topk_ids[:0], output=empty
+    )
+    assert out is empty and moe_a8w4.last_path == []
+    # The 32-bit offset limit counts the routed columns only: E 8, topk 6, I 576, M 4, where M * topk * I_pad * 4
+    # (55296) exceeds M * H * 2 and the shared column would add 9216.
+    _, _, wide = _layer_weights(8, 576, 780)
+    x, topk_weight, topk_ids = make_layer_inputs(4, LAYER_HIDDEN, 8, 6, seed=744)
+    limit = 4 * 6 * wide.inter_padded * 4
+    monkeypatch.setattr(moe_a8w4, "_MAX_BYTES", limit)
+    with pytest.raises(ValueError, match="2\\*\\*31"):
+        flydsl_moe_a8w4_ptpc(x, wide, topk_weight, topk_ids)
+    monkeypatch.setattr(moe_a8w4, "_MAX_BYTES", limit + 1)
+    flydsl_moe_a8w4_ptpc(x, wide, topk_weight, topk_ids)
+    _assert_shared(4)
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [moe_a8w4.SHARED_DUAL_STREAM_MAX_M, moe_a8w4.SHARED_DUAL_STREAM_MAX_M + 1],
+    ids=["side_stream_last", "serial_first"],
+)
+def test_layer_stream_mode_boundary(tokens):
+    """The shared expert's stream mode switches exactly past SHARED_DUAL_STREAM_MAX_M tokens (ATOM's dual-stream
+    threshold): at it the split runs on the side stream, one token more on the current stream before the routed
+    experts; both graded against reference_layer (E 8, topk 6, I 576: the routed experts take the prefill tier on
+    both sides, so only the stream mode differs).
+
+    The basic and graph cases take M 64 / 4 and 2048, far from the threshold; the benchmark does not assert the mode.
+    """
+    _layer_check(8, 6, 576, tokens, seed=780)
+    _assert_kernels("_prefill")
+    _assert_shared(tokens)
+
+
+@pytest.mark.parametrize("tokens", [4, 2048], ids=["m4_side_stream", "m2048_serial"])
+def test_layer_graph_replay(tokens):
+    """A layer call with the shared expert can be captured in a CUDA graph and replayed in both stream modes: up to
+    SHARED_DUAL_STREAM_MAX_M tokens the side stream forks from the capturing stream and joins it inside the capture,
+    beyond it everything runs on the capturing stream. The replay reads newly written inputs and gives the bits of an
+    eager call on them (main layer TP4: decode M 4 and prefill M 2048, both without atomics). Compiled by an eager call
+    outside the capture first.
+
+    The basic tests call eagerly; the benchmark times graph replays and grades their output within the reference's
+    tolerance, not their bits against an eager call.
+    """
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
+    _, _, prepared = _layer_weights(experts, inter, 700)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, LAYER_HIDDEN, experts, topk, seed=750, shared_weight=None
+    )
+    out = torch.empty_like(x)
+    run = functools.partial(
+        flydsl_moe_a8w4_ptpc,
+        x,
+        prepared,
+        topk_weight,
+        topk_ids,
+        output=out,
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+    )
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    _assert_shared(tokens)
+    x2, topk_weight2, topk_ids2 = make_layer_inputs(
+        tokens, LAYER_HIDDEN, experts, topk, seed=751, shared_weight=None
+    )
+    x.copy_(x2)
+    topk_weight.copy_(topk_weight2)
+    topk_ids.copy_(topk_ids2)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    want = flydsl_moe_a8w4_ptpc(
+        x2, prepared, topk_weight2, topk_ids2, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert torch.equal(_bits(out), _bits(want))
+
+
+def test_layer_inplace_output():
+    """output = hidden_states with the shared expert: the shared expert reads the input before the routed experts
+    overwrite it, so it runs first on the current stream even below SHARED_DUAL_STREAM_MAX_M (no fork), and the result
+    has the bits of a separate output (main layer TP4 decode M 4, no atomics).
+
+    The basic tests pass a separate output.
+    """
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
+    _, _, prepared = _layer_weights(experts, inter, 700)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        4, LAYER_HIDDEN, experts, topk, seed=760, shared_weight=None
+    )
+    want = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert "shared_fork" in moe_a8w4.last_path
+    result = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, output=x, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert result is x
+    _assert_shared(moe_a8w4.SHARED_DUAL_STREAM_MAX_M + 1)
+    assert torch.equal(_bits(x), _bits(want))
+
+
+def test_layer_tp8_padding_exact():
+    """TP8's shared I 288, zero-padded to the routed experts' 320 by prepare, changes no bit: the layer's output equals
+    the routed experts alone (the prepared weight without its shared expert, the first topk columns) plus aiter's dense
+    chain on the unpadded shared expert (gate / up [576, 5120], Down [5120, 288] with K padded to 384 by
+    shuffle_weight), added as the op adds it (ATOM's addcmul_ with the weight in BF16; decode M 4, no atomics).
+
+    The basic tests and the benchmark grade TP8 within the reference's tolerance, which a small padding error could
+    pass.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp8"]
+    _, shared, prepared = _layer_weights(experts, inter, 700)
+    assert prepared.shared_w1.shape[0] == 2 * prepared.inter_padded == 640
+    x, topk_weight, topk_ids = make_layer_inputs(
+        4, LAYER_HIDDEN, experts, topk, seed=770, shared_weight=None
+    )
+    got = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    routed = flydsl_moe_a8w4_ptpc(
+        x,
+        _routed_only(prepared),
+        topk_weight[:, :-1],
+        topk_ids[:, :-1],
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+    )
+    w1, s1, w2, s2 = shared
+    fnuz = [
+        q.view(torch.uint8)
+        .masked_fill(q.view(torch.uint8) == 0x80, 0)
+        .view(torch.float8_e4m3fnuz)
+        for q in (w1, w2)
+    ]
+    unpadded = aiter_shared_split(
+        x,
+        shuffle_weight(fnuz[0], layout=(16, 16)),
+        s1 * 2,
+        shuffle_weight(fnuz[1], layout=(16, 16), pad_k_to=128),
+        s2 * 2,
+        LAYER_SWIGLU_LIMIT,
+    )
+    gate = shared_route_weight(topk_weight, topk_ids, experts).to(torch.bfloat16)
+    routed.addcmul_(unpadded, gate[:, None])
+    assert torch.equal(_bits(got), _bits(routed))
+
+
+def test_fused_moe_shared_expert_id():
+    """fused_moe's shared_expert_id on tagged weights: with a shared expert, -1 (the default) and E give the bits of
+    the direct call (the shared expert runs either way: it is in the weight) and other values (E - 1, E + 1, None, True,
+    float E) raise ValueError; without one, any value but -1 raises ValueError, E included.
+
+    The basic test passes E.
+    """
+    experts, topk, inter = 8, 6, 576
+    _, _, prepared = _layer_weights(experts, inter, 780)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        4, LAYER_HIDDEN, experts, topk, seed=781, shared_weight=None
+    )
+    want = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+    for value in (-1, experts):
+        got = _fused_moe(
+            x, prepared.w1, prepared.w2, topk_weight, topk_ids, shared_expert_id=value
+        )
+        assert torch.equal(_bits(got), _bits(want)), value
+    for value in (experts - 1, experts + 1, None, True, float(experts)):
+        with pytest.raises(ValueError, match="shared_expert_id"):
+            _fused_moe(
+                x,
+                prepared.w1,
+                prepared.w2,
+                topk_weight,
+                topk_ids,
+                shared_expert_id=value,
+            )
+    _, plain = _weights(EXPERTS, HIDDEN, 320, 11)
+    x, topk_weight, topk_ids = make_inputs(3, HIDDEN, EXPERTS, TOPK, seed=782)
+    for value in (EXPERTS, EXPERTS - 1, 0):
+        with pytest.raises(ValueError, match="no shared expert"):
+            _fused_moe(
+                x, plain.w1, plain.w2, topk_weight, topk_ids, shared_expert_id=value
+            )
+
+
 # =================================================================================================
 # Region 3: benchmark (script entry, not collected by pytest)
-# 85 cases = 5 shapes x M = 1, 2, 4, ..., 32768 and M = 48, named <shape>_m<M>; SiLU, BF16 in and out:
+# 153 cases, named <shape>_m<M> with M = 1, 2, 4, ..., 32768 and 48; SiLU, BF16 in and out. First the 85 cases of
+# moe-a8w4 (unchanged: names, seeds, timing, output), 5 shapes:
 #   tp2 / tp4: Qwen3.8-Flash-Next, H 2560, E 513 (512 routed + a fused shared expert that every token's last slot
 #     selects), topk 11, I 320 / 160 (padded to 192 by prepare; aiter gets the same BF16 weights padded to 192);
 #     against aiter's FP8 per-token fused_moe with the shipped tuned table.
@@ -3311,8 +4274,27 @@ def test_weight_tag_lifetime():
 # Every candidate is timed by bench_time_us (run_perftest with BENCH_PERFTEST_KW, see there); the timed A8W4
 # output is graded against the fp32 reference, aiter's must be finite. Per case: MF_METRIC (A8W4) and, for Qwen,
 # MF_REF (aiter) with flops = 6 * M * topk * I_pad * H and each implementation's minimal bytes (the selected
-# experts' weights and scales, the input read and the output write), and an INFO line with the launched kernels;
-# at the end the markdown table.
+# experts' weights and scales, the input read and the output write), and an INFO line with the launched kernels.
+# Then 68 whole-layer cases of DeepSeek-V4.1-Flash with its shared expert (bench_moe_a8w4_layer): LAYER_SHAPES (main
+# layer E 384 + shared, topk 6 + 1; MTP layer E 128 + shared, topk 3 + 1; TP4 I 576, TP8 I 288 padded to 320), H 5120,
+# swiglu_limit 10, synthetic weights (routed MXFP4, shared FP8 per row), uniform routing with routed weights normalized
+# and times 1.5, the shared expert E in the last column with weight 1 (ATOM's routing); seeds MF_SEED * 1000 + 500 +
+# shape index (routed weights), + 550 + shape index (shared), inputs + 600 + 4 * layer case index. Four implementations,
+# each timed by bench_graph_us (CUDA graph replays, wall time, so that side streams overlap as in serving):
+#   a8w4 (MF_METRIC): flydsl_moe_a8w4_ptpc on the weight with the shared expert, graded against reference_layer;
+#   aiter_fp8_ptpc (MF_REF, printed first, the name of the Qwen reference): aiter's fused_moe per_Token FP8 on E + 1
+#     experts and topk + 1 columns as ATOM's original arm calls it, the routed weights the exact MXFP4 values
+#     re-quantized per channel to FP8 E4M3FNUZ, the shared expert the last one, I padded to 320 for TP8 (aiter has no
+#     kernel for I 288 with the limit); finite;
+#   a8w4_split (MF_REF, in the summary table): ATOM's split arm on this worktree: flydsl_moe_a8w4_ptpc on the routed
+#     experts and aiter_shared_split, on a side stream up to BENCH_SPLIT_DUAL_STREAM_MAX_M tokens, without the final
+#     add (ATOM folds it into its all-reduce); finite;
+#   routed (INFO): flydsl_moe_a8w4_ptpc on the routed experts alone, for the shared expert's increment.
+# flops = 6 * M * H * (topk * I_pad + I) (the shared expert at its own I); bytes per implementation: the weights and
+# scales of the experts the call reads in its own format, the input read and the output write. INFO: routed time, the
+# shared increment (a8w4 - routed) with its TB/s and TFLOPS, the routed TB/s and TFLOPS, a8w4's kernel time summed by
+# bench_time_us, a8w4's kernels, the kernels aiter resolved and a8w4's error. At the end one markdown table of all cases.
+# main: -s / -m select shapes and token counts; --quick runs the layer shapes at BENCH_QUICK_TOKENS only.
 # =================================================================================================
 
 # shape: (H, E, topk, I, padded I, fused shared expert, aiter reference)
@@ -3359,6 +4341,17 @@ BENCH_WARMUP_MS = 18.0
 # The ROCm profiler records no GPU event for ~0.1 s while another process initializes HIP on the same GPU: an
 # empty record is retried after these pauses (seconds).
 BENCH_RETRY_S = (0.05, 0.1, 0.2, 0.4)
+# The layer cases, after the 85 above; the order gives each case's input seed.
+BENCH_LAYER_CASES = [
+    f"{shape}_m{m}" for shape in LAYER_SHAPES for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS
+]
+# --quick (bench_quick): the layer shapes at these token counts only.
+BENCH_QUICK_TOKENS = (1, 4, 16, 64, 512, 4096)
+# bench_graph_us: at most this many argument sets (run_perftest's num_iters) and at least this many timed replays.
+BENCH_GRAPH_MAX_SETS = 101
+BENCH_GRAPH_MIN_REPLAYS = 5
+# a8w4_split runs the shared expert on a side stream up to this many tokens (ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD).
+BENCH_SPLIT_DUAL_STREAM_MAX_M = 1024
 
 
 def bench_time_us(fn, args):
@@ -3400,6 +4393,64 @@ def bench_time_us(fn, args):
                 f"the profiler recorded no kernel time in {len(BENCH_RETRY_S) + 1} runs"
             )
         time.sleep(pause)
+
+
+def bench_graph_us(fn, args):
+    """Wall time of one ``fn(*args)`` call in microseconds from CUDA graph replays, the protocol of the layer cases.
+
+    n independent sets of the arguments (``args`` and n - 1 deep copies: weights, inputs and outputs), n =
+    min(ceil(L2 size * 64 * 128 / bytes of a set), BENCH_GRAPH_MAX_SETS) as run_perftest rotates its copies (32 GiB on
+    MI308X; at most 90% of the free memory), so that each call starts with cold L2 and MALL. One eager call compiles;
+    the n calls, one per set, are captured into one graph (side streams a call forks and joins are captured with it,
+    so their overlap counts); right before timing, eager calls worth BENCH_WARMUP_MS as bench_time_us counts them
+    (the fastest of 3 bursts of 8 calls) and one replay warm the GPU up; then R = max(BENCH_GRAPH_MIN_REPLAYS,
+    ceil(BENCH_GRAPH_MAX_SETS / n)) replays, each timed with CUDA events. Returns the median of replay time / n and
+    the results of the eager call on ``args`` (outputs written by the replays are those of the first set).
+    """
+    import copy
+    import statistics
+
+    tensors = {
+        a.data_ptr(): a.numel() * a.element_size()
+        for a in args
+        if isinstance(a, torch.Tensor)
+    }
+    set_bytes = max(sum(tensors.values()), 1)
+    device = torch.cuda.current_device()
+    l2 = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 4 << 20)
+    budget = min(l2 * 64 * 128, torch.cuda.mem_get_info(device)[0] * 0.9)
+    n = max(1, min(math.ceil(budget / set_bytes), BENCH_GRAPH_MAX_SETS))
+    sets = [args] + [copy.deepcopy(args) for _ in range(n - 1)]
+    result = fn(*args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for one in sets:
+            fn(*one)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    bursts = []
+    for _ in range(3):
+        fn(*args)
+        start.record()
+        for k in range(8):
+            fn(*sets[k % n])
+        end.record()
+        end.synchronize()
+        bursts.append(start.elapsed_time(end) / 8)
+    for k in range(max(2, int(BENCH_WARMUP_MS / min(bursts)) + 1)):
+        fn(*sets[k % n])
+    graph.replay()
+    times = []
+    for _ in range(max(BENCH_GRAPH_MIN_REPLAYS, math.ceil(BENCH_GRAPH_MAX_SETS / n))):
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1000 / n)
+    del graph, sets
+    torch.cuda.empty_cache()
+    return statistics.median(times), result
 
 
 @functools.lru_cache(maxsize=1)
@@ -3678,6 +4729,307 @@ def bench_moe_a8w4(shape, m):
     return ret
 
 
+@functools.lru_cache(maxsize=1)
+def _bench_layer_weights(shape):
+    """(MXFP4 routed weights, the shared expert's four prepare arguments, the A8W4 weight with the shared expert,
+    aiter's FP8 per-channel weights of E + 1 experts) of a layer shape.
+
+    aiter's: the routed experts' exact MXFP4 values (dequant_mxfp4) and the shared expert's FP8 values with I
+    zero-padded to the A8W4 padded I (320 for TP8: aiter has no kernel for I 288 with the SwiGLU limit; the padding is
+    exact), quantized per output channel to FP8 E4M3FNUZ (the routed ones; the shared one keeps its FP8 bits in
+    E4M3FNUZ with twice its scale), the shared expert last, then shuffle_weight(layout=(16, 16)).
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    experts, _, inter = LAYER_SHAPES[shape]
+    index = list(LAYER_SHAPES).index(shape)
+    w = make_weights(experts, LAYER_HIDDEN, inter, seed=SEED * 1000 + 500 + index)
+    shared = make_shared_weights(LAYER_HIDDEN, inter, seed=SEED * 1000 + 550 + index)[
+        "row"
+    ]
+    prepared = prepare_moe_a8w4_ptpc_weight(
+        w["w1"],
+        w["w1_scale"],
+        w["w2"],
+        w["w2_scale"],
+        shared_w1=shared[0],
+        shared_w1_scale=shared[1],
+        shared_w2=shared[2],
+        shared_w2_scale=shared[3],
+    )
+    pad = prepared.inter_padded - inter
+    fp8, quant = aiter.dtypes.fp8, aiter.get_torch_quant(aiter.QuantType.per_Token)
+    n1, h, device = 2 * prepared.inter_padded, LAYER_HIDDEN, w["w1"].device
+    w1 = torch.empty((experts + 1, n1, h), dtype=fp8, device=device)
+    s1 = torch.empty((experts + 1, n1, 1), dtype=torch.float32, device=device)
+    w2 = torch.empty((experts + 1, h, prepared.inter_padded), dtype=fp8, device=device)
+    s2 = torch.empty((experts + 1, h, 1), dtype=torch.float32, device=device)
+
+    def padded(v1, v2):
+        z = v1.new_zeros((pad, h))
+        return torch.cat([v1[:inter], z, v1[inter:], z]), torch.nn.functional.pad(
+            v2, (0, pad)
+        )
+
+    for e in range(experts):
+        v1, v2 = padded(
+            dequant_mxfp4(w["w1"][e], w["w1_scale"][e]),
+            dequant_mxfp4(w["w2"][e], w["w2_scale"][e]),
+        )
+        for out, scale, value in ((w1, s1, v1), (w2, s2, v2)):
+            q, sc = quant(value, quant_dtype=fp8)
+            out[e].copy_(q)
+            scale[e].copy_(sc.view(-1, 1))
+    fnuz = [
+        q.view(torch.uint8).masked_fill(q.view(torch.uint8) == 0x80, 0).view(fp8)
+        for q in (shared[0], shared[2])
+    ]
+    q1, q2 = padded(fnuz[0].view(torch.uint8), fnuz[1].view(torch.uint8))
+    w1[experts].copy_(q1.view(fp8))
+    w2[experts].copy_(q2.view(fp8))
+    one = torch.ones((pad, 1), device=device)
+    sc1 = shared[1].reshape(-1, 1) * 2
+    s1[experts].copy_(torch.cat([sc1[:inter], one, sc1[inter:], one]))
+    s2[experts].copy_(shared[3].reshape(-1, 1) * 2)
+    fp8_w = {
+        "w1": shuffle_weight(w1, layout=(16, 16)),
+        "w1_scale": s1,
+        "w2": shuffle_weight(w2, layout=(16, 16)),
+        "w2_scale": s2,
+    }
+    return w, shared, prepared, fp8_w
+
+
+def _aiter_kernels(meta):
+    """What aiter's fused_moe resolved (get_2stage_cfgs' metadata): ``impl__<implementation>__<config>`` of a
+    whole-graph implementation (the FlyDSL gfx942 MoE picks its batch-1, split-K decode or prefill kernels from the
+    config and the token count), the 1-stage asm kernel or the CK 2-stage pair."""
+    from aiter.fused_moe_registry import _IMPLEMENTATIONS
+
+    if meta.full_impl is not None:
+        cells = [c.cell_contents for c in meta.full_impl.__closure__ or ()]
+        config = next((c for c in cells if isinstance(c, str)), "?")
+        impl = next((c for c in cells if callable(c)), None)
+        names = [
+            name
+            for name, value in _IMPLEMENTATIONS.items()
+            if value is impl
+            or value
+            == f"{getattr(impl, '__module__', '')}:{getattr(impl, '__name__', '')}"
+        ]
+        return f"impl__{names[0] if names else getattr(impl, '__qualname__', impl)}__{config}"
+    kernel = getattr(meta.stage1, "keywords", {}).get("kernelName")
+    if meta.run_1stage:
+        return f"asm_1stage:{kernel}"
+    return f"{kernel}+{getattr(meta.stage2, 'keywords', {}).get('kernelName')}"
+
+
+_BENCH_SIDE_STREAMS = {}
+
+
+def _bench_side_stream():
+    device = torch.cuda.current_device()
+    if device not in _BENCH_SIDE_STREAMS:
+        _BENCH_SIDE_STREAMS[device] = torch.cuda.Stream(device=device)
+    return _BENCH_SIDE_STREAMS[device]
+
+
+@benchmark()
+def bench_moe_a8w4_layer(shape, m):
+    import aiter.fused_moe as fm
+    from aiter import ActivationType, QuantType
+
+    case = f"{shape}_m{m}"
+    experts, topk, inter = LAYER_SHAPES[shape]
+    hidden, limit = LAYER_HIDDEN, LAYER_SWIGLU_LIMIT
+    w, shared, prepared, fp8_w = _bench_layer_weights(shape)
+    inter_pad = prepared.inter_padded
+    x, topk_weight, topk_ids = make_layer_inputs(
+        m,
+        hidden,
+        experts,
+        topk,
+        seed=SEED * 1000 + 600 + BENCH_LAYER_CASES.index(case) * 4,
+    )
+    routed_weight = topk_weight[:, :-1].contiguous()
+    routed_ids = topk_ids[:, :-1].contiguous()
+    ref = reference_layer(x, w, shared, topk_weight, topk_ids, swiglu_limit=limit)
+    flops_routed = 6 * m * topk * inter_pad * hidden
+    flops_shared = 6 * m * inter * hidden
+    flops = flops_routed + flops_shared
+    p = prepared
+    routed_args = (p.w1, p.w1_delta, p.w1_scale, p.w2, p.w2_delta, p.w2_scale)
+    shared_args = (p.shared_w1, p.shared_w1_scale, p.shared_w2, p.shared_w2_scale)
+    # Bytes of the weights and scales a call reads, each implementation in its own format (io added below).
+    shared_bytes = sum(t.numel() * t.element_size() for t in shared_args)
+    routed_bytes = routed_ids.unique().numel() * _bytes_per_expert(
+        MoeA8W4PtpcWeight(*routed_args, experts, hidden, inter, inter_pad), experts
+    )
+    aiter_bytes = topk_ids.unique().numel() * _bytes_per_expert(fp8_w, experts + 1)
+
+    # Weight tensors are arguments of their own, so that bench_graph_us copies them for every set.
+    def a8w4(
+        x, w1, w1d, w1s, w2, w2d, w2s, sw1, sw1s, sw2, sw2s, topk_weight, ids, out
+    ):
+        weight = MoeA8W4PtpcWeight(
+            w1, w1d, w1s, w2, w2d, w2s, experts, hidden, inter, inter_pad,
+            sw1, sw1s, sw2, sw2s,
+        )  # fmt: skip
+        return flydsl_moe_a8w4_ptpc(
+            x, weight, topk_weight, ids, output=out, swiglu_limit=limit
+        )
+
+    def routed(x, w1, w1d, w1s, w2, w2d, w2s, topk_weight, ids, out):
+        weight = MoeA8W4PtpcWeight(
+            w1, w1d, w1s, w2, w2d, w2s, experts, hidden, inter, inter_pad
+        )
+        return flydsl_moe_a8w4_ptpc(
+            x, weight, topk_weight, ids, output=out, swiglu_limit=limit
+        )
+
+    def a8w4_split(
+        x, w1, w1d, w1s, w2, w2d, w2s, sw1, sw1s, sw2, sw2s, topk_weight, ids, out
+    ):
+        # ATOM's split arm: the routed A8W4 call and the shared expert's aiter chain, on a side stream (forked from and
+        # joined to the current one) up to BENCH_SPLIT_DUAL_STREAM_MAX_M tokens, else first; no final add.
+        if m <= BENCH_SPLIT_DUAL_STREAM_MAX_M:
+            current, side = torch.cuda.current_stream(), _bench_side_stream()
+            side.wait_stream(current)
+            with torch.cuda.stream(side):
+                shared_out = aiter_shared_split(x, sw1, sw1s, sw2, sw2s, limit)
+            x.record_stream(side)
+            routed(x, w1, w1d, w1s, w2, w2d, w2s, topk_weight, ids, out)
+            current.wait_stream(side)
+            shared_out.record_stream(current)
+        else:
+            shared_out = aiter_shared_split(x, sw1, sw1s, sw2, sw2s, limit)
+            routed(x, w1, w1d, w1s, w2, w2d, w2s, topk_weight, ids, out)
+        return out, shared_out
+
+    def aiter_fp8_ptpc(x, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale):
+        return fm.fused_moe(
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.per_Token,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            swiglu_limit=limit,
+        )
+
+    io = m * hidden * 2 * 2
+    out = torch.full_like(x, float("nan"))
+    candidates = {
+        "a8w4": (
+            a8w4,
+            (x, *routed_args, *shared_args, topk_weight, topk_ids, out),
+            routed_bytes + shared_bytes,
+        ),
+        "aiter_fp8_ptpc": (
+            aiter_fp8_ptpc,
+            (
+                x,
+                fp8_w["w1"],
+                fp8_w["w2"],
+                topk_weight,
+                topk_ids,
+                fp8_w["w1_scale"],
+                fp8_w["w2_scale"],
+            ),
+            aiter_bytes,
+        ),
+        "a8w4_split": (
+            a8w4_split,
+            (
+                x,
+                *routed_args,
+                *shared_args,
+                routed_weight,
+                routed_ids,
+                torch.empty_like(x),
+            ),
+            routed_bytes + shared_bytes,
+        ),
+        "routed": (
+            routed,
+            (x, *routed_args, routed_weight, routed_ids, torch.empty_like(x)),
+            routed_bytes,
+        ),
+    }
+    # The kernels aiter resolves for this call (one eager call with get_2stage_cfgs watched).
+    seen, resolve = [], fm.get_2stage_cfgs
+
+    def spy(*a, **k):
+        meta = resolve(*a, **k)
+        seen.append(meta)
+        return meta
+
+    fm.get_2stage_cfgs = spy
+    try:
+        aiter_fp8_ptpc(*candidates["aiter_fp8_ptpc"][1])
+    finally:
+        fm.get_2stage_cfgs = resolve
+    aiter_kernels = _aiter_kernels(seen[-1]) if seen else "?"
+
+    ret = {"gfx": get_gfx_runtime()}
+    times, results = {}, {}
+    for name, (fn, args, nbytes) in candidates.items():
+        times[name], results[name] = bench_graph_us(fn, args)
+        if name == "a8w4":
+            path = list(moe_a8w4.last_path)
+            results[name] = out  # written by the last replay (the first argument set)
+        elif name == "a8w4_split":
+            results[name] = results[name][0].float() + results[name][1].float()
+        us = times[name]
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = (flops if name != "routed" else flops_routed) / us / 1e6
+        ret[f"{name} TB/s"] = (nbytes + io) / us / 1e6
+        if name == "routed":
+            # Only the routed experts: finite, not graded against the layer's reference.
+            assert bool(torch.isfinite(results[name]).all()), f"{case} {name}: NaN/Inf"
+            continue
+        # aiter's routed experts are per-channel FP8 re-quantizations of the MXFP4 weights the reference dequantizes:
+        # aiter's and the split's outputs are only required to be finite; their err is recorded.
+        graded = check(results[name], ref, msg=f"{case} {name}: ")
+        assert "reason" not in graded, f"{case} {name}: {graded['reason']}"
+        if name == "a8w4":
+            assert graded["ok"], f"{case}: A8W4 output out of tolerance: {graded}"
+            metric = graded
+        ret[f"{name} err"] = graded["err"]
+    kernel_sum = bench_time_us(a8w4, candidates["a8w4"][1])
+    ret["a8w4 kernel_sum us"] = kernel_sum
+    for name, kind in (
+        ("a8w4", "MF_METRIC"),
+        ("aiter_fp8_ptpc", "MF_REF"),
+        ("a8w4_split", "MF_REF"),
+    ):
+        impl = "" if kind == "MF_METRIC" else f" impl={name}"
+        print(
+            f"{kind} case={case}{impl} value={times[name]:.2f} unit=us flops={flops} "
+            f"bytes={candidates[name][2] + io}",
+            flush=True,
+        )
+    routed_us = times["routed"]
+    increment = times["a8w4"] - routed_us
+
+    def rate(amount, us):
+        return f"{amount / us / 1e6:.3f}" if us > 0 else "nan"
+
+    print(
+        f"INFO case={case} I={inter}->{inter_pad} swiglu_limit={limit:g} routed_us={routed_us:.2f} "
+        f"shared_inc_us={increment:.2f} shared_tbps={rate(shared_bytes, increment)} "
+        f"shared_tflops={rate(flops_shared, increment)} routed_tbps={rate(routed_bytes + io, routed_us)} "
+        f"routed_tflops={rate(flops_routed, routed_us)} kernel_sum_us={kernel_sum:.2f} "
+        f"a8w4_path={'>'.join(path)} aiter_kernels={aiter_kernels} "
+        f"err=calc_diff:{metric['calc_diff']:.2e},err_ratio:{metric['err_ratio'] * 100:.2f}%",
+        flush=True,
+    )
+    return ret
+
+
 def main():
     if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -3692,10 +5044,18 @@ def main():
         "-s",
         "--shape",
         nargs="*",
-        choices=list(BENCH_SHAPES),
-        default=list(BENCH_SHAPES),
-        help="shapes (name -> H, E, topk, I, padded I, fused shared expert, aiter reference):\n"
-        + "\n".join(f"  {name}: {dims}" for name, dims in BENCH_SHAPES.items()),
+        choices=list(BENCH_SHAPES) + list(LAYER_SHAPES),
+        default=None,
+        help="shapes (default all; the moe-a8w4 shapes run first):\n"
+        + "\n".join(
+            f"  {name}: (H, E, topk, I, padded I, fused shared expert, aiter reference) {dims}"
+            for name, dims in BENCH_SHAPES.items()
+        )
+        + "\n"
+        + "\n".join(
+            f"  {name}: layer with the shared expert, (routed E, routed topk, I) {dims}, H {LAYER_HIDDEN}"
+            for name, dims in LAYER_SHAPES.items()
+        ),
     )
     tokens = sorted(BENCH_TOKENS + BENCH_EXTRA_TOKENS)
     parser.add_argument(
@@ -3703,10 +5063,24 @@ def main():
         type=int,
         nargs="*",
         choices=tokens,
-        default=tokens,
+        default=None,
         help="token counts M (default 1, 2, 4, ..., 32768, 48)",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help=f"the layer shapes only, at M = {', '.join(map(str, BENCH_QUICK_TOKENS))} (unless -s / -m say "
+        "otherwise; the lanes' bench_quick)",
+    )
     args = parser.parse_args()
+    if args.shape is None:
+        args.shape = (
+            list(LAYER_SHAPES)
+            if args.quick
+            else list(BENCH_SHAPES) + list(LAYER_SHAPES)
+        )
+    if args.m is None:
+        args.m = sorted(BENCH_QUICK_TOKENS) if args.quick else tokens
     import aiter.fused_moe as fm
     from aiter.jit.core import AITER_CONFIGS
 
@@ -3726,7 +5100,20 @@ def main():
         )
         rows = [
             bench_moe_a8w4(shape, m)
-            for shape, m in itertools.product(args.shape, args.m)
+            for shape, m in itertools.product(
+                [s for s in args.shape if s in BENCH_SHAPES], args.m
+            )
+        ]
+        layers = [s for s in args.shape if s in LAYER_SHAPES]
+        if layers:
+            print(
+                f"INFO layer_cases timing=bench_graph_us max_sets={BENCH_GRAPH_MAX_SETS} "
+                f"min_replays={BENCH_GRAPH_MIN_REPLAYS} split_dual_stream_max_m={BENCH_SPLIT_DUAL_STREAM_MAX_M}",
+                flush=True,
+            )
+        rows += [
+            bench_moe_a8w4_layer(shape, m)
+            for shape, m in itertools.product(layers, args.m)
         ]
     df = pd.DataFrame(rows)
     aiter.logger.info(

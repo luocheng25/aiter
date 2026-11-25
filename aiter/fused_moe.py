@@ -1283,13 +1283,17 @@ def fused_moe(
     ``shuffle_weight`` tags ``is_shuffled``) run that MoE with
     ``activation=ActivationType.Silu``, ``quant_type=QuantType.per_1x32`` and
     ``quant_type_a=QuantType.per_Token`` (BF16 input quantized to FP8 per
-    token): the result of ``flydsl_moe_a8w4_ptpc`` on them. Parameters it
-    cannot honour raise (``aiter.ops.flydsl.moe_a8w4._fused_moe_route``).
+    token): the result of ``flydsl_moe_a8w4_ptpc`` on them. A shared expert
+    prepared with them (FP8, per-row scales) is expert E in the last topk
+    column; ``shared_expert_id`` may name it (E), the raw ``shared_*``
+    tensors are not taken there. Parameters it cannot honour raise
+    (``aiter.ops.flydsl.moe_a8w4._fused_moe_route``).
     """
     if hasattr(w1, "aiter_moe_a8w4_ptpc") or hasattr(w2, "aiter_moe_a8w4_ptpc"):
         # Tagged by prepare_moe_a8w4_ptpc_weight (moe_a8w4.WEIGHT_TAG). Routed
         # before the custom op, which drops tensor attributes, the tuned-config
-        # lookup and moe_sorting: the A8W4 op sorts and quantizes itself.
+        # lookup, moe_sorting and the FHMoE shared-expert dispatch: the A8W4 op
+        # sorts and quantizes itself and carries its shared expert.
         args = dict(locals())
         from aiter.ops.flydsl.moe_a8w4 import _fused_moe_route
 
