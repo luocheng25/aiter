@@ -276,7 +276,7 @@ def compile_gemm_a8w4_ptpc_large(
 
     if block_scale:
         # x_block_scale: X buffers and per wave group two buffers of a K step's block
-        # scales (f32, [block][token % 16][token // 16]).
+        # scales (f32, [block][token % 32][token // 32]).
         @fx.struct
         class SharedStorage:
             x0: fx.Array[fp8, BLOCK_M * TILE_K, 16]

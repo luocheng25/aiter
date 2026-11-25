@@ -53,6 +53,9 @@ from .kernels.gemm_a8w4_ptpc.quant_1x32 import (
 )
 from .kernels.gemm_a8w4_ptpc.small_m import (
     compile_small_m,
+    compile_small_m_1x32,
+    small_m_1x32_config,
+    small_m_1x32_kernel_name_of,
     small_m_config,
     small_m_kernel_name_of,
 )
@@ -142,16 +145,17 @@ _MID_TABLE = {
 
 # The 1x32 GEMM's path per weight shape (N, K) and token bucket (M up to the bucket): the
 # general kernel's GemmConfig fields, None for the default GemmConfig (M below the middle
-# range, where the per-token dispatch runs the small-M kernel) or "large" for the 1x32 variant
-# of the persistent large-M kernel; past the last bucket, the large-M kernel where the
-# per-token dispatch takes it. Measured on MI308X on the benchmark's inputs: the general tiles
-# up to M = 128 (tp2_qkvz), 512 (tp2_qkv) or 1024 with the GEMM alone, the rest with the full
-# call against the large-M kernel. Tiles of 32 x 128 and up run 32x32x16 MMAs. Up to M = 1024
-# (tp2_qkvz), 1920 (tp2_o, tp4_qkv) or 2048 the large-M kernel's 128 x 256 tiles are up to
-# 1.5x slower, except where they fill whole waves of the CUs: up to 18% faster there, taken
-# when over 10% (tp4_qkvz M = 513..640). At M = 65..112 tp2_qkv keeps the per-token tile
-# (48 x 128), which op_tests/test_gemm_a8w4_ptpc.py expects at M = 100 (32 x 128 is 14%
-# faster there).
+# range, where the 1x32 calls run the small-M 1x32 kernel instead wherever its LDS fits; see
+# _small_1x32_config) or "large" for the 1x32 variant of the persistent large-M kernel; past
+# the last bucket, the large-M kernel where the per-token dispatch takes it. Measured on
+# MI308X on the benchmark's inputs: the general tiles up to M = 128 (tp2_qkvz), 512 (tp2_qkv)
+# or 1024 with the GEMM alone, the rest with the full call against the large-M kernel. Tiles
+# of 32 x 128 and up run 32x32x16 MMAs. Up to M = 1024 (tp2_qkvz), 1920 (tp2_o, tp4_qkv) or
+# 2048 the large-M kernel's 128 x 256 tiles are up to 1.5x slower, except where they fill
+# whole waves of the CUs: up to 18% faster there, taken when over 10% (tp4_qkvz M =
+# 513..640). At M = 65..112 tp2_qkv takes 32 x 128 with an XCD super tile of 1: 0.66x the
+# time of the per-token tile 48 x 128 (16x16x32 MMAs) up to M = 96 and 0.85x above; against
+# the 128 bucket's super tile of 2, 0.78x up to M = 96 and 1.03x above (under 10%, one tile).
 _MID_TABLE_1X32 = {
     (8192, 2560): {
         16: None,
@@ -166,7 +170,7 @@ _MID_TABLE_1X32 = {
         16: None,
         32: (32, 128, 2, 2, 1, 2, TILE_K),
         64: (64, 128, 2, 2, 1, 1, _TK256),
-        112: (48, 128, 2, 2, 1, 1, _TK256),
+        112: (32, 128, 2, 2, 1, 1, _TK256),
         128: (32, 128, 2, 2, 2, 1, _TK256),
         512: (64, 128, 2, 2, 2, 1, _TK256),
         576: (64, 128, 2, 2, 1, 1, _TK256),
@@ -275,6 +279,9 @@ def gemm_a8w4_ptpc_kernel_names(
     if m == 0:
         return ()
     if x_quant == X_QUANT_1X32:
+        small = _small_1x32_config(m, n, k)
+        if small is not None:
+            return (small_m_1x32_kernel_name_of(small),)
         return (
             quant_1x32_kernel_name(k, quant_config(m, k)),
             _gemm_1x32_kernel_name(m, n, k),
@@ -288,17 +295,30 @@ def gemm_a8w4_ptpc_kernel_names(
 
 def gemm_a8w4_mxfp8_kernel_names(m: int, n: int, k: int) -> tuple[str, ...]:
     """Kernels ``flydsl_gemm_a8w4_mxfp8`` launches for ``xq`` [m, k] and weight [n, k]: the
-    1x32 GEMM (the second kernel of ``x_quant="1x32"``)."""
+    small-M 1x32 kernel's pre-quantized variant, or the 1x32 GEMM (the second kernel of
+    ``x_quant="1x32"``)."""
     if not gemm_a8w4_ptpc_shape_supported(n, k):
         raise ValueError(_shape_error(n, k))
     if m == 0:
         return ()
+    small = _small_1x32_config(m, n, k)
+    if small is not None:
+        return (small_m_1x32_kernel_name_of(small, prequant=True),)
     return (_gemm_1x32_kernel_name(m, n, k),)
 
 
 def _check_x_quant(x_quant) -> None:
     if x_quant not in _X_QUANTS:
         raise ValueError(f"x_quant must be one of {_X_QUANTS}, got {x_quant!r}")
+
+
+def _small_1x32_config(m: int, n: int, k: int):
+    """The one-launch 1x32 small-M kernel (``small_m.small_m_1x32_config``) at the M where the
+    per-token dispatch takes its small-M kernel, else None (quantization + 1x32 GEMM).
+    """
+    if _gemm_choice(m, n, k) != _SMALL:
+        return None
+    return small_m_1x32_config(m, n, k)
 
 
 def _gemm_choice_1x32(m: int, n: int, k: int):
@@ -534,7 +554,9 @@ def flydsl_gemm_a8w4_ptpc(
     FNUZ (scale byte + 1, same FP8 codes, -0 stored as 0; ``2**ceil(log2(max(amax, 1e-4) /
     448))``; see ``kernels/gemm_a8w4_ptpc/quant_1x32.py``, also for NaN / Inf and the
     differences from ``aiter.ops.triton.quant.dynamic_mxfp8_quant``), and the GEMM of
-    ``flydsl_gemm_a8w4_mxfp8`` runs on it, for every M. Accumulation is f32. ``out`` may be a
+    ``flydsl_gemm_a8w4_mxfp8`` runs on it: at the M where the per-token call takes its one-launch
+    small-M kernel, one small-M 1x32 kernel that quantizes ``x`` itself, else the 1x32
+    quantization and the 1x32 GEMM. Accumulation is f32. ``out`` may be a
     preallocated contiguous BF16 [M, N] tensor on ``x.device``. Any M (M = 0 returns the
     empty output).
     """
@@ -559,6 +581,20 @@ def flydsl_gemm_a8w4_ptpc(
         return out
 
     if x_quant == X_QUANT_1X32:
+        small = _small_1x32_config(m, n, k)
+        if small is not None:
+            # Small M: one kernel that quantizes x 1x32 itself.
+            _run_compiled(
+                compile_small_m_1x32(small, n, k, x.device.index),
+                ptr_arg(x),
+                ptr_arg(weight.q),
+                ptr_arg(weight.d),
+                ptr_arg(weight.s),
+                ptr_arg(out),
+                m,
+                current_stream_arg(x.device),
+            )
+            return out
         xq = torch.empty((m, k), dtype=torch.float8_e4m3fnuz, device=x.device)
         x_scale = torch.empty((m, k // _BLOCK_K), dtype=torch.uint8, device=x.device)
         quant = compile_quant_x_1x32(k, x.device.index, quant_config(m, k))
@@ -662,6 +698,22 @@ def flydsl_gemm_a8w4_mxfp8(
         raise ValueError("xq must be 16-byte aligned and x_scale 4-byte aligned")
     out = _output(out, m, weight.n, device)
     if m == 0:
+        return out
+    small = _small_1x32_config(m, weight.n, weight.k)
+    if small is not None:
+        _run_compiled(
+            compile_small_m_1x32(
+                small, weight.n, weight.k, device.index, prequant=True
+            ),
+            ptr_arg(xq),
+            ptr_arg(x_scale),
+            ptr_arg(weight.q),
+            ptr_arg(weight.d),
+            ptr_arg(weight.s),
+            ptr_arg(out),
+            m,
+            current_stream_arg(device),
+        )
         return out
     gemm, gemm_args = _gemm_1x32_args(
         xq, x_scale, weight, out, m, current_stream_arg(device)

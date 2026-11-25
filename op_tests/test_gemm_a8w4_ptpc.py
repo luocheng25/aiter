@@ -16,8 +16,9 @@ One file, three regions:
      orders (per-token and 1x32), the small-M dispatch boundaries and LDS fallbacks, partial
      token tiles and bit-exact in-kernel quantization, the M where each target shape's
      dispatch switches kernels or tiles; for 1x32: bit-exact quantization against the
-     DeepSeek-V4.1 rule and aiter's, extreme E8M0 scales, the M where its kernel switches, a
-     ragged N off the table, input errors, M = 0, CUDA graph, compile cache):
+     DeepSeek-V4.1 rule and aiter's and inside the small-M 1x32 kernel, its LDS limits,
+     extreme E8M0 scales, every M where the 1x32 dispatch switches paths or tiles, a ragged N
+     off the table, input errors, M = 0, CUDA graph, compile cache):
      ``pytest op_tests/test_gemm_a8w4_ptpc.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): 6 Qwen3.8-Flash-Next shapes x
      M = 1, 2, 4, ..., 32768 against aiter's FP8 per-token GEMM, per-token quantization and
@@ -335,12 +336,16 @@ def run_torch_1x32(xq, x_scale, w, w_scale):
 
 
 def gemm_1x32_path(name):
-    """MMA path of a 1x32 GEMM kernel name: ``large`` (the persistent large-M kernel's 1x32
-    variant), ``mma32`` (the general GEMM on MFMA 32x32x16, which gemm.py takes for tiles of
-    whole 32 x 128 MMA rows: block_m % 32 == 0 and block_n % 128 == 0) or ``mma16`` (the
+    """Path of a 1x32 kernel name: ``q4`` or ``h2`` (the one-launch small-M 1x32 kernel's two
+    token mappings, from BF16 X or pre-quantized), ``large`` (the persistent large-M kernel's
+    1x32 variant), ``mma32`` (the general GEMM on MFMA 32x32x16, which gemm.py takes for tiles
+    of whole 32 x 128 MMA rows: block_m % 32 == 0 and block_n % 128 == 0) or ``mma16`` (the
     general GEMM on MFMA 16x16x32, one MMA per 32-K block)."""
     import re
 
+    small = re.match(r"gemm_a8w4_ptpc_tile_(q4|h2)_.*_(1x32|mxfp8)$", name)
+    if small:
+        return small.group(1)
     if kernel_tiers([name]) == ("large",):
         return "large"
     block_m, block_n = map(int, re.search(r"_bm(\d+)_bn(\d+)_", name).groups())
@@ -355,8 +360,8 @@ def gemm_1x32_path(name):
 # M = 33..1000 with non-powers of two (per-token quant, then the general GEMM, each with the
 # tile its shape's dispatch table picks) and M = 4096 (quant, then the persistent large-M
 # kernel); asserts that the launched FlyDSL kernels are the ones the dispatch predicts. The
-# 1x32 activations: both entries at two general-GEMM M (16x16x32 and 32x32x16 MMAs) and at
-# M > 2048 (test_gemm_1x32).
+# 1x32 activations: both entries at a small M (the one-launch small-M 1x32 kernel), at two
+# general-GEMM M (16x16x32 and 32x32x16 MMAs) and at M > 2048 (test_gemm_1x32).
 # =============================================================================================
 
 BASIC_CASES = [
@@ -391,15 +396,18 @@ def test_gemm(shape, m):
     check_output(out, run_torch(x, w, w_scale), msg=f"{shape}_m{m}")
 
 
-# 1x32 activations, one case per entry at three M: x_quant="1x32" runs the 1x32 quantization and
-# then the 1x32 GEMM, which scales every 32-K block; flydsl_gemm_a8w4_mxfp8 runs that GEMM on an
-# activation quantized beforehand. The general GEMM: tp2_qkv, M = 100 (its MMA path left to the
-# 1x32 dispatch table; 16x16x32 when written) and tp4_qkvz, M = 200 (a 64 x 128 tile on MFMA
-# 32x32x16, asserted: the main path of the middle range); tp4_o, M = 2049 the persistent large-M
-# kernel's 1x32 variant (17 M blocks, the last with 1 row). Where the 1x32 dispatch moves from
-# the general to the large-M kernel below M = 2048 is left to kernel_names, and the review of
-# the last milestone of this round that changes the 1x32 dispatch pins it again.
+# 1x32 activations, one case per entry at four M. tp2_qkv, M = 3: one launch of the small-M
+# 1x32 kernel (mapping q4, 3 of its 4 token columns; 80 CTAs of 5 or 6 row blocks), which
+# quantizes BF16 X itself or takes the pre-quantized X as it is. Otherwise x_quant="1x32" runs
+# the 1x32 quantization and then the 1x32 GEMM, which scales every 32-K block;
+# flydsl_gemm_a8w4_mxfp8 runs that GEMM on an activation quantized beforehand. The general
+# GEMM: tp2_qkv, M = 100 (its MMA path left to the 1x32 dispatch table; 32x32x16 when written)
+# and tp4_qkvz, M = 200 (a 64 x 128 tile on MFMA 32x32x16, asserted: the main path of the
+# middle range); tp4_o, M = 2049 the persistent large-M kernel's 1x32 variant (17 M blocks,
+# the last with 1 row). Where the 1x32 dispatch switches paths is pinned in
+# test_1x32_dispatch.
 BASIC_1X32 = [
+    ("tp2_qkv", 3, "q4"),
     ("tp2_qkv", 100, None),
     ("tp4_qkvz", 200, "mma32"),
     ("tp4_o", 2049, "large"),
@@ -412,23 +420,30 @@ BASIC_1X32 = [
     "shape, m, path", BASIC_1X32, ids=[f"{s}_m{m}" for s, m, _ in BASIC_1X32]
 )
 def test_gemm_1x32(shape, m, path, entry):
-    """``flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")`` launches the 1x32 quantization and
-    1x32 GEMM that ``gemm_a8w4_ptpc_kernel_names(..., x_quant="1x32")`` predicts and matches
-    the fp32 reference on the reference quantization; ``flydsl_gemm_a8w4_mxfp8`` on that
-    quantization (uint8 E8M0) launches the GEMM alone and gives the same output bit for bit.
+    """``flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")`` launches the kernels that
+    ``gemm_a8w4_ptpc_kernel_names(..., x_quant="1x32")`` predicts (the small-M 1x32 kernel, or
+    the 1x32 quantization and the 1x32 GEMM) and matches the fp32 reference on the reference
+    quantization; ``flydsl_gemm_a8w4_mxfp8`` on that quantization (uint8 E8M0) launches the
+    small-M kernel's pre-quantized variant or the GEMM alone and gives the same output bit for
+    bit.
     """
     n, k = SHAPES[shape]
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
     x = make_x_1x32(m, k, case_seed("x_1x32", shape, m))
     xq, x_scale = quant_1x32_ref(x)
     names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
-    assert names[0].startswith("gemm_a8w4_ptpc_quant1x32_"), names
-    assert names[1].endswith("_1x32") and len(names) == 2, names
-    assert path is None or gemm_1x32_path(names[1]) == path, names
+    if path in ("q4", "h2"):
+        assert len(names) == 1 and gemm_1x32_path(names[0]) == path, names
+        mxfp8_names = (names[0].removesuffix("_1x32") + "_mxfp8",)
+    else:
+        assert names[0].startswith("gemm_a8w4_ptpc_quant1x32_"), names
+        assert names[1].endswith("_1x32") and len(names) == 2, names
+        assert path is None or gemm_1x32_path(names[1]) == path, names
+        mxfp8_names = names[1:]
     if entry == "mxfp8":
         call = functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight)
         names = gemm_a8w4_mxfp8_kernel_names(m, n, k)
-        assert names == gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")[1:]
+        assert names == mxfp8_names, names
     else:
         call = functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32")
     call()  # compile outside the profiler
@@ -1344,28 +1359,37 @@ SMALL_M_NONFINITE = [
     ("tp4_o", 5, "decode"),
     ("tp2_qkv", 4, "dec2"),
     ("tp4_o", 20, "tile"),
+    # x_quant="1x32": the small-M 1x32 kernel's two mappings (h2 with three token sets).
+    ("tp4_o", 4, "q4"),
+    ("tp4_o", 20, "h2"),
 ]
 
 
 @pytest.mark.parametrize(
     "shape, m, kind",
     SMALL_M_NONFINITE,
-    ids=["m5_decode", "m4_dec2", "m20_tile"],
+    ids=["m5_decode", "m4_dec2", "m20_tile", "m4_1x32_q4", "m20_1x32_h2"],
 )
 def test_small_m_nonfinite_rows(shape, m, kind):
     """A token row holding NaN or +-Inf gets scale NaN or Inf inside the small-M kernels
     and turns only its own output row NaN, as in the reference; every other token of the
     CTA, in the same and the other token tile, still matches the reference (dec2: rows
-    quantized by other X waves of the CTA).
+    quantized by other X waves of the CTA). With x_quant="1x32" (q4, h2) NaN stays out of
+    its block's maximum and a block holding +-Inf gets scale byte 254; both still turn only
+    their own token's output row NaN, the other token columns and sets matching.
 
     The basic cases and the benchmark only pass finite activations;
     test_quant_max_quotient_and_nonfinite covers the separate quantization kernel.
     """
-    # tp4_o's table keeps the tile kernel up to M = 20; the tier is asserted.
+    # tp4_o's table keeps the small-M kernels up to M = 20; the tier or mapping is asserted.
     n, k = SHAPES[shape]
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
-    tiers = kernel_tiers(gemm_a8w4_ptpc_kernel_names(m, n, k))
-    assert tiers == (kind,), tiers
+    x_quant = "1x32" if kind in ("q4", "h2") else "per_token"
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant=x_quant)
+    if x_quant == "1x32":
+        assert len(names) == 1 and gemm_1x32_path(names[0]) == kind, names
+    else:
+        assert kernel_tiers(names) == (kind,), names
     x = make_x(m, k, case_seed("small_nonfinite", m))
     bad = [1, 3] if m <= 8 else [1, 3, 17]
     x[1, 7] = float("nan")
@@ -1373,8 +1397,11 @@ def test_small_m_nonfinite_rows(shape, m, kind):
     if m > 8:
         x[17, 5] = -float("inf")
     good = [t for t in range(m) if t not in bad]
-    out = flydsl_gemm_a8w4_ptpc(x, weight)
-    ref = run_torch(x, w, w_scale)
+    out = flydsl_gemm_a8w4_ptpc(x, weight, x_quant=x_quant)
+    if x_quant == "1x32":
+        ref = run_torch_1x32(*quant_1x32_ref(x), w, w_scale)
+    else:
+        ref = run_torch(x, w, w_scale)
     assert bool(out[bad].isnan().all()) and bool(ref[bad].isnan().all())
     check_output(out[good], ref[good], msg=f"m{m} finite rows")
 
@@ -1479,7 +1506,8 @@ def test_target_shape_tile_switches(shape, m):
 
 # -- 2.11 1x32 activations: x_quant="1x32" and flydsl_gemm_a8w4_mxfp8 -------------------------
 # The benchmark times x_quant="1x32" on Gaussian BF16 X at powers of two of M only; the basic
-# cases run each 1x32 entry at two M.
+# cases run each 1x32 entry at four M (the small-M 1x32 kernel, the general GEMM's two MMA paths
+# and the large-M kernel). The small-M 1x32 kernel's NaN / +-Inf rows are in 2.9.
 
 
 def _bf16_block(head, fill=(0x3F80, 0x3F00, 0xBF40, 0x3E80)):
@@ -1631,12 +1659,154 @@ def test_1x32_quant_vs_aiter():
         assert bool((differs & mask).any()), name
 
 
+# (M, mapping of the small-M 1x32 kernel) on tp4_qkvz (N >= K for the one-hot weight).
+SMALL_M_1X32_QUANT = [(4, "q4"), (13, "h2")]
+
+
+@pytest.mark.parametrize(
+    "m, mode",
+    SMALL_M_1X32_QUANT,
+    ids=[f"m{m}_{mode}" for m, mode in SMALL_M_1X32_QUANT],
+)
+def test_small_m_1x32_quant_bitexact(m, mode):
+    """The small-M 1x32 kernel quantizes BF16 X inside each CTA (one lane per 32-K block)
+    exactly like quant_1x32_ref. With a one-hot weight (channel c reads K position c % K with
+    weight 1.0; N >= K) the output is Y[t, c] = bf16(xq[t, c % K] x 2**(e - 127)) of its
+    block bit for bit, which exposes every FP8 code and scale. Rows: the finite blocks of
+    QUANT_1X32_BLOCKS (all zero, +-0, amax with the mantissa 1.75 and one step above it,
+    around the 1e-4 floor and far below it, subnormals, BF16's largest values, rounding ties),
+    each with its first value at four positions; random bit patterns below 2 in magnitude
+    (zeros, subnormals and values under the floor included); Gaussian blocks of magnitude
+    2**-40 .. 2**40. M = 4 fills the q4 mapping's 4 token columns; M = 13 runs h2 with two
+    token sets, the named blocks in both. Outputs of blocks with a scale byte above 226 are
+    not compared: the f32 accumulator overflows there (BF16 values from about 2**107;
+    documented in the kernel).
+
+    Grading against the reference cannot see a few flipped FP8 codes or a scale one step
+    off with codes to match; test_1x32_quant_bitexact covers the separate quantization
+    kernel. NaN and +-Inf would turn every output of their MFMA NaN here (0 x NaN):
+    test_small_m_nonfinite_rows.
+    """
+    n, k = SHAPES["tp4_qkvz"]
+    per_row = k // X_BLOCK
+    blocks = []
+    for name, (bits, _) in QUANT_1X32_BLOCKS.items():
+        if "nan" not in name and "inf" not in name:
+            for lane in range(4):
+                shift = X_BLOCK - 9 * lane
+                blocks.append(bits[shift:] + bits[:shift])
+    special_rows = -(-len(blocks) // per_row)
+    blocks += [[0x3F80] * X_BLOCK] * (special_rows * per_row - len(blocks))
+    special = _bf16_rows(blocks).view(special_rows, k)
+    gen = _generator(case_seed("small_quant_1x32", m))
+    x = _random_blocks_bf16(m, k, gen)
+    x[:special_rows] = special
+    if m > 8:
+        x[8 : 8 + special_rows] = special  # the second token set
+    bits = torch.randint(-(1 << 15), 1 << 15, (k,), generator=gen, device=DEVICE)
+    x[special_rows] = (bits & ~0x4000).to(torch.int16).view(torch.bfloat16)  # |x| < 2
+    columns = torch.arange(n, device=DEVICE) % k
+    nibbles = torch.zeros((n, k), dtype=torch.uint8, device=DEVICE)
+    nibbles[torch.arange(n, device=DEVICE), columns] = 2  # E2M1 1.0
+    codes = torch.full((n, k // 32), 127, dtype=torch.uint8, device=DEVICE)  # 2**0
+    weight = prepare_gemm_a8w4_ptpc_weight(pack_fp4(nibbles), codes)
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
+    assert len(names) == 1 and gemm_1x32_path(names[0]) == mode, names
+    out = flydsl_gemm_a8w4_ptpc(x, weight, x_quant="1x32")
+    xq, x_scale = quant_1x32_ref(x)
+    expected = dequant_1x32(xq, x_scale)[:, columns].to(torch.bfloat16)
+    compared = x_scale[:, columns // X_BLOCK] <= 226
+    assert float(compared.float().mean()) > 0.9
+    got = out.view(torch.int16)[compared]
+    assert torch.equal(got, expected.view(torch.int16)[compared])
+
+
+# (M, N, K, mapping of the small-M 1x32 kernel or None for the 1x32 quantization and the 1x32
+# GEMM), off the dispatch table: the per-token dispatch runs a small-M kernel at each of them.
+SMALL_M_1X32_LIMITS = [
+    (8, 3584, 5632, "h2"),  # one token set: its LDS just fits (65408 bytes)
+    (9, 3584, 5632, None),  # two token sets do not fit
+    # Per token two 16-token tiles; 1x32: three token sets do not fit.
+    (17, 4160, 2560, None),
+    # Four token sets (the 32-token limit), K-part sums reusing the token rows' LDS, 20 CTAs.
+    (32, 320, 1536, "h2"),
+]
+
+
+@pytest.mark.parametrize(
+    "m, n, k, mode",
+    SMALL_M_1X32_LIMITS,
+    ids=[f"m{m}_n{n}_k{k}" for m, n, k, _ in SMALL_M_1X32_LIMITS],
+)
+def test_small_m_1x32_limits(m, n, k, mode):
+    """The small-M 1x32 kernel holds the FP8 rows of all of K for its token sets, their f32
+    scales and the CTA's deltas in LDS: where the per-token dispatch runs its small-M kernel
+    but these exceed 64 KiB, the 1x32 calls run the 1x32 quantization and the 1x32 GEMM
+    instead, and a kernel just under the limit still runs (its LDS estimate is not below what
+    it allocates). M = 32 on N = 320 runs four token sets, the K-part sums in the token rows'
+    LDS behind one more barrier, on 20 CTAs (fewer than CUs). Both entries write through
+    ``out=`` (the head of a NaN buffer), flydsl_gemm_a8w4_mxfp8 with the scales as uint8 and
+    as torch.float8_e8m0fnu: the launched kernels are the predicted ones, every row matches
+    the reference, nothing past ``out`` changes and the three outputs are equal bit for bit.
+
+    The target shapes' 1x32 small-M kernels all fit (one or two token sets, tp4_o three);
+    the benchmark and the basic cases let the op allocate the output.
+    """
+    assert len(gemm_a8w4_ptpc_kernel_names(m, n, k)) == 1  # per token: small-M kernel
+    names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
+    if mode is None:
+        assert a8w4_module.small_m_1x32_config(m, n, k) is None
+        assert len(names) == 2 and names[0].startswith("gemm_a8w4_ptpc_quant1x32_")
+        assert gemm_1x32_path(names[1]) in ("mma16", "mma32"), names
+        mxfp8_names = names[1:]
+    else:
+        assert len(names) == 1 and gemm_1x32_path(names[0]) == mode, names
+        mxfp8_names = (names[0].removesuffix("_1x32") + "_mxfp8",)
+    assert gemm_a8w4_mxfp8_kernel_names(m, n, k) == mxfp8_names
+    w, w_scale = make_weight(n, k, case_seed("w", n, k))
+    weight = prepare_gemm_a8w4_ptpc_weight(w, w_scale)
+    x = make_x_1x32(m, k, case_seed("small_limits_1x32", m, n, k))
+    xq, x_scale = quant_1x32_ref(x)
+    ref = run_torch_1x32(xq, x_scale, w, w_scale)
+    outs = []
+    for call, predicted in [
+        (functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32"), names),
+        (functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight), mxfp8_names),
+        (
+            functools.partial(
+                flydsl_gemm_a8w4_mxfp8, xq, x_scale.view(torch.float8_e8m0fnu), weight
+            ),
+            mxfp8_names,
+        ),
+    ]:
+        buffer = torch.full(
+            (m + 32, n), float("nan"), dtype=torch.bfloat16, device=DEVICE
+        )
+        out = buffer[:m]
+        call(out=out)  # compile outside the profiler
+        out.fill_(float("nan"))
+        got, kernels = launched_kernels(lambda call=call, out=out: call(out=out))
+        assert got is out and kernels == list(predicted), kernels
+        check_output(out, ref, msg=f"m{m}_n{n}_k{k}")
+        assert bool(buffer[m:].isnan().all())
+        outs.append(out.view(torch.int16))
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
 # (E8M0 bytes of X's blocks, E8M0 bytes of W's 32-K groups) for flydsl_gemm_a8w4_mxfp8.
 EXTREME_1X32 = [((0, 1), (247, 250)), ((200, 226), (40, 45))]
-# (M, MMA path) of the extreme-scale cases on tp4_o: the general GEMM on MFMA 16x16x32 (a
-# 32 x 64 tile) and 32x32x16 (64 x 128, the scale of a 32-token tile per lane) and, past
-# M = 2048, the persistent large-M kernel's 1x32 variant (block scales expanded to f32 in LDS).
-EXTREME_1X32_M = [(37, "mma16"), (300, "mma32"), (2049, "large")]
+# (M, path) of the extreme-scale cases on tp4_o: the small-M 1x32 kernel's pre-quantized variant
+# (q4; h2 with three token sets: E8M0 bytes turned into f32 scales in LDS), the general GEMM on
+# MFMA 16x16x32 (a 32 x 64 tile) and 32x32x16 (64 x 128, the scale of a 32-token tile per
+# lane) and, past M = 2048, the persistent large-M kernel's 1x32 variant (block scales expanded
+# to f32 in LDS).
+EXTREME_1X32_M = [
+    (4, "q4"),
+    (20, "h2"),
+    (37, "mma16"),
+    (300, "mma32"),
+    (2049, "large"),
+]
 
 
 @pytest.mark.parametrize(
@@ -1651,9 +1821,11 @@ def test_1x32_extreme_scales(x_codes, w_codes, m, path):
     scales (byte 0 is the f32 subnormal 2**-127, which the kernels keep; the byte-0 blocks
     make up a large part of the output, checked) and X bytes up to 226 (a block amax just
     under 2**107, the bound gemm.py documents for its f32 accumulator) with tiny W scales.
-    M = 37 and 300 run the general GEMM's two MMA paths (each builds the scale from the E8M0
-    byte with its own byte permute and shift-add), M = 2049 the persistent large-M kernel's
-    1x32 variant; the path is asserted.
+    M = 4 and 20 run the small-M 1x32 kernel (q4; h2 with three token sets), which turns the
+    bytes into f32 scales once (byte 0 by a floor on the f32 bits); M = 37 and 300 the general
+    GEMM's two MMA paths (each builds the scale from the E8M0 byte with its own byte permute
+    and shift-add), M = 2049 the persistent large-M kernel's 1x32 variant; the path is
+    asserted.
 
     The quantization of x_quant="1x32" writes bytes 106..248 only (254 for a block holding
     +-Inf), and the basic cases and the benchmark use moderate scales.
@@ -1689,38 +1861,34 @@ def test_1x32_extreme_scales(x_codes, w_codes, m, path):
 
 # (shape, first M of a 1x32 GEMM kernel). Up to its large-M range the 1x32 GEMM takes the tile
 # of the shape's 1x32 dispatch table (_MID_TABLE_1X32) at M: these are the M where that tile
-# changes, every general-GEMM kernel of the table from M = 17 (tp4_o 21) included. The moves
-# to and from the persistent large-M kernel are in test_1x32_large_buckets.
+# changes inside the general GEMM's range, every general-GEMM kernel of the table from M = 33
+# included (tp2_qkv's 32 x 128 tile with an XCD super tile of 1 at M = 65..112). The first one
+# (M = 17, tp4_o 21) and the moves to and from the small-M and the large-M kernels are pinned
+# in test_1x32_dispatch.
 SWITCHES_1X32 = [
-    ("tp2_qkvz", 17),
     ("tp2_qkvz", 33),
     ("tp2_qkvz", 65),
     ("tp2_qkvz", 129),
     ("tp2_qkvz", 193),
-    ("tp2_qkv", 17),
     ("tp2_qkv", 33),
     ("tp2_qkv", 65),
     ("tp2_qkv", 113),
     ("tp2_qkv", 129),
     ("tp2_qkv", 513),
     ("tp2_qkv", 577),
-    ("tp2_o", 17),
     ("tp2_o", 33),
     ("tp2_o", 65),
     ("tp2_o", 129),
     ("tp2_o", 1025),
-    ("tp4_qkvz", 17),
     ("tp4_qkvz", 33),
     ("tp4_qkvz", 65),
     ("tp4_qkvz", 129),
     ("tp4_qkvz", 1025),
-    ("tp4_qkv", 17),
     ("tp4_qkv", 33),
     ("tp4_qkv", 65),
     ("tp4_qkv", 129),
     ("tp4_qkv", 257),
     ("tp4_qkv", 1025),
-    ("tp4_o", 21),
     ("tp4_o", 33),
     ("tp4_o", 65),
     ("tp4_o", 129),
@@ -1733,19 +1901,23 @@ SWITCHES_1X32 = [
     "shape, m", SWITCHES_1X32, ids=[f"{s}_m{m}" for s, m in SWITCHES_1X32]
 )
 def test_1x32_tile_switches(shape, m):
-    """x_quant="1x32" at each M where the 1x32 GEMM kernel changes on a target shape (its
-    predicted kernel at M differs from the one at M - 1: the general GEMM's tile size, MMA
-    path, pipeline depths, XCD super tile, K groups or K per stage): the launched kernels are
-    the predicted ones and the output matches the reference, the new tile's last row block
-    partly filled. Every general-GEMM kernel the six shapes use from M = 17 up to their
-    large-M kernel runs here once, and both configurations of the quantization (one CTA per
-    row up to M = 128, one wave per row above).
+    """x_quant="1x32" at each M where the 1x32 GEMM kernel changes inside the general GEMM's
+    range on a target shape (its predicted kernel at M differs from the one at M - 1: the
+    tile size, MMA path, pipeline depths, XCD super tile, K groups or K per stage): the
+    launched kernels are the predicted ones and the output matches the reference, the new
+    tile's last row block partly filled. With test_1x32_dispatch every general-GEMM kernel
+    the six shapes use from M = 17 up to their large-M kernel runs once, and both
+    configurations of the quantization (one CTA per row up to M = 128, one wave per row
+    above).
 
-    The basic cases run three M (100, 200 and 2049) and the benchmark powers of two only.
+    The basic cases run four M (3, 100, 200 and 2049) and the benchmark powers of two only.
     """
     n, k = SHAPES[shape]
     names = gemm_a8w4_ptpc_kernel_names(m, n, k, x_quant="1x32")
     below = gemm_a8w4_ptpc_kernel_names(m - 1, n, k, x_quant="1x32")
+    assert len(below) == len(names) == 2, (below, names)
+    assert gemm_1x32_path(below[1]) in ("mma16", "mma32"), below
+    assert gemm_1x32_path(names[1]) in ("mma16", "mma32"), names
     assert names[-1] != below[-1], (below, names)
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
     x = make_x_1x32(m, k, case_seed("tile_switch_1x32", shape, m))
@@ -1757,43 +1929,77 @@ def test_1x32_tile_switches(shape, m):
     check_output(out, run_torch_1x32(xq, x_scale, w, w_scale), msg=f"{shape}_m{m}")
 
 
-# (shape, M) with the 1x32 GEMM's large-M kernel on one side of M - 1 / M when written: where
-# _MID_TABLE_1X32's "large" buckets start (tp2_qkvz 1025, tp2_o and tp4_qkv 1921) and the one
-# bucket in the middle of a table (tp4_qkvz 513..640).
-LARGE_BUCKETS_1X32 = [
-    ("tp2_qkvz", 1025),
-    ("tp2_o", 1921),
-    ("tp4_qkv", 1921),
-    ("tp4_qkvz", 513),
-    ("tp4_qkvz", 641),
+# (shape, the last M of a 1x32 path, its path, the path from M + 1): every move of the 1x32
+# dispatch on the target shapes. The small-M 1x32 kernel runs where the per-token dispatch takes
+# its small-M kernel (M <= 16, tp4_o 20), with the q4 mapping up to M = 4 (every shape; one
+# here) and h2 above; then the 1x32 quantization and the general GEMM, and the large-M kernel
+# where _MID_TABLE_1X32 marks a bucket "large" (tp2_qkvz from 1025, tp2_o and tp4_qkv from
+# 1921, tp4_qkvz 513..640) and past M = 2048 (tp2_qkv, tp4_qkvz, tp4_o).
+DISPATCH_1X32 = [
+    ("tp2_qkvz", 4, "q4", "h2"),
+    ("tp2_qkvz", 16, "h2", "general"),
+    ("tp2_qkv", 16, "h2", "general"),
+    ("tp2_o", 16, "h2", "general"),
+    ("tp4_qkvz", 16, "h2", "general"),
+    ("tp4_qkv", 16, "h2", "general"),
+    ("tp4_o", 20, "h2", "general"),
+    ("tp2_qkvz", 1024, "general", "large"),
+    ("tp2_o", 1920, "general", "large"),
+    ("tp4_qkv", 1920, "general", "large"),
+    ("tp4_qkvz", 512, "general", "large"),
+    ("tp4_qkvz", 640, "large", "general"),
+    ("tp2_qkv", 2048, "general", "large"),
+    ("tp4_qkvz", 2048, "general", "large"),
+    ("tp4_o", 2048, "general", "large"),
 ]
 
 
 @pytest.mark.parametrize(
-    "shape, m", LARGE_BUCKETS_1X32, ids=[f"{s}_m{m}" for s, m in LARGE_BUCKETS_1X32]
+    "shape, m, below, above",
+    DISPATCH_1X32,
+    ids=[f"{s}_m{m}_{m + 1}" for s, m, _, _ in DISPATCH_1X32],
 )
-def test_1x32_large_buckets(shape, m):
-    """x_quant="1x32" at M - 1 and M around the moves between the general GEMM and the
-    persistent large-M kernel that the 1x32 dispatch table makes below M = 2048: on both
-    sides the launched kernels are the ones kernel_names predicts and the output matches the
-    reference. Which side runs which kernel is not asserted: the review of the last
-    milestone of this round that changes the 1x32 dispatch pins these boundaries again.
+def test_1x32_dispatch(shape, m, below, above):
+    """Each target shape's 1x32 calls switch paths at their own M: the small-M 1x32 kernel's
+    q4 mapping to h2 after M = 4; the small-M 1x32 kernel to the 1x32 quantization and the
+    general GEMM after M = 16 (tp4_o: 20); the general GEMM to the large-M kernel's 1x32
+    variant after M = 1024 (tp2_qkvz), 1920 (tp2_o, tp4_qkv), 512 (tp4_qkvz, back to the
+    general GEMM after 640) or 2048. On both sides the predicted kernels of both entries take
+    the expected path, the launched ones are the predicted ones, the output matches the
+    reference and the two entries agree bit for bit. The first M of a path leaves its last
+    token set, row block or tile partly filled.
 
-    The benchmark runs powers of two only (never M = 513..640, the large bucket inside the
-    tp4_qkvz table) and the basic cases M = 100, 200 and 2049.
+    The benchmark runs powers of two only (one side of each switch at most, never M = 5, 17,
+    21, 513, 641, 1025, 1921 or 2049) and does not check which kernels ran; the basic cases
+    run M = 3, 100, 200 and 2049.
     """
     n, k = SHAPES[shape]
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
-    for rows in (m - 1, m):
+    for rows, path in [(m, below), (m + 1, above)]:
         names = gemm_a8w4_ptpc_kernel_names(rows, n, k, x_quant="1x32")
-        x = make_x_1x32(rows, k, case_seed("large_bucket_1x32", shape, rows))
-        call = functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32")
-        call()  # compile outside the profiler
-        out, kernels = launched_kernels(call)
-        assert kernels == list(names), (rows, kernels)
+        mxfp8_names = gemm_a8w4_mxfp8_kernel_names(rows, n, k)
+        if path in ("q4", "h2"):
+            assert len(names) == 1 and gemm_1x32_path(names[0]) == path, names
+            assert mxfp8_names == (names[0].removesuffix("_1x32") + "_mxfp8",)
+        else:
+            assert names[0].startswith("gemm_a8w4_ptpc_quant1x32_"), names
+            gemm_path = gemm_1x32_path(names[1])
+            expected = ("large",) if path == "large" else ("mma16", "mma32")
+            assert len(names) == 2 and gemm_path in expected, names
+            assert mxfp8_names == names[1:], mxfp8_names
+        x = make_x_1x32(rows, k, case_seed("dispatch_1x32", shape, rows))
         xq, x_scale = quant_1x32_ref(x)
         ref = run_torch_1x32(xq, x_scale, w, w_scale)
-        check_output(out, ref, msg=f"{shape}_m{rows}")
+        ptpc = functools.partial(flydsl_gemm_a8w4_ptpc, x, weight, x_quant="1x32")
+        mxfp8 = functools.partial(flydsl_gemm_a8w4_mxfp8, xq, x_scale, weight)
+        outs = []
+        for call, predicted in [(ptpc, names), (mxfp8, mxfp8_names)]:
+            call()  # compile outside the profiler
+            out, kernels = launched_kernels(call)
+            assert kernels == list(predicted), (rows, kernels)
+            check_output(out, ref, msg=f"{shape}_m{rows}")
+            outs.append(out.view(torch.int16))
+        assert torch.equal(outs[0], outs[1]), rows
 
 
 OFF_TABLE_1X32 = [(65, 320, 512), (1, 192, 256)]
@@ -1942,10 +2148,11 @@ def test_1x32_m_zero():
     assert gemm_a8w4_mxfp8_kernel_names(0, n, k) == ()
 
 
-# (shape, M, MMA path) of test_1x32_cuda_graph_replay: the general GEMM with two K groups on
-# MFMA 16x16x32 (32 x 64, 256 K per stage) and 32x32x16 (32 x 128, 128 K per stage), and the
-# persistent large-M kernel's 1x32 variant.
+# (shape, M, path) of test_1x32_cuda_graph_replay: the small-M 1x32 kernel (h2, two token
+# sets), the general GEMM with two K groups on MFMA 16x16x32 (32 x 64, 256 K per stage) and
+# 32x32x16 (32 x 128, 128 K per stage), and the persistent large-M kernel's 1x32 variant.
 GRAPH_1X32 = [
+    ("tp2_qkvz", 12, "h2"),
     ("tp2_o", 48, "mma16"),
     ("tp2_qkvz", 20, "mma32"),
     ("tp4_o", 2049, "large"),
@@ -1959,9 +2166,10 @@ def test_1x32_cuda_graph_replay(shape, m, path):
     """Both 1x32 entries (x_quant="1x32" allocating its FP8 and E8M0 buffers and its output
     inside the capture, and flydsl_gemm_a8w4_mxfp8) are captured in one CUDA graph and replay
     on new input: no host synchronization. Both replayed outputs equal an eager call on the
-    new input bit for bit and match the reference. The general GEMM runs two K groups (their
-    sums added through LDS before the epilogue) on each MMA path; M = 2049 the persistent
-    large-M kernel's 1x32 variant (its tile order chosen on the host at capture).
+    new input bit for bit and match the reference. M = 12 runs the small-M 1x32 kernel (one
+    launch per entry); the general GEMM runs two K groups (their sums added through LDS
+    before the epilogue) on each MMA path; M = 2049 the persistent large-M kernel's 1x32
+    variant (its tile order chosen on the host at capture).
 
     The basic cases and the benchmark call the op eagerly.
     """
@@ -1969,7 +2177,7 @@ def test_1x32_cuda_graph_replay(shape, m, path):
     w, w_scale, weight = cached_weight(n, k, case_seed("w", shape))
     names = gemm_a8w4_mxfp8_kernel_names(m, n, k)
     assert gemm_1x32_path(names[0]) == path, names
-    if path != "large":
+    if path in ("mma16", "mma32"):
         assert a8w4_module._config_1x32(m, n, k).k_groups == 2
     x = make_x_1x32(m, k, case_seed("graph_1x32", shape, m, 0))
     xq, x_scale = quant_1x32_ref(x)
