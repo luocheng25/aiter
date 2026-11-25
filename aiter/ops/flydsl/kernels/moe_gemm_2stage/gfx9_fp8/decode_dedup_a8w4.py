@@ -14,8 +14,9 @@ from ``DECODE_DEDUP_MIN_H`` on with padded I a multiple of 128 (Down; Gate/Up to
 row's token: wave ``t`` loads all ``M * TOPK`` expert ids and, for each route ``r = t * TOPK + s``, ranks
 it among the routes of the same expert (route order) with ballots. ``plan[r] = [count, r, r1, ...]``:
 the route of rank ``GROUP * g`` leads a group of ``count`` routes (itself and the next ``count - 1``
-routes of the expert), every other route gets ``count = 0``. (``decode_a8w4.compile_a8w4_gateup_decode``
-with ``PLAN`` writes the same plan from its per-route workgroups.)
+routes of the expert), every other route gets ``count = 0``; a masked route (id -1) leads and joins no group, so no
+kernel here computes it. (``decode_a8w4.compile_a8w4_gateup_decode`` with ``PLAN`` writes the same plan from its
+per-route workgroups.)
 
 ``compile_a8w4_gateup_decode_dd`` keeps the grid of ``decode_a8w4.compile_a8w4_gateup_decode`` (``(I / 16,
 M * TOPK)``, workgroup ``(j, route)``) and its block-pair weight loads; a workgroup reads its plan entry
@@ -162,7 +163,10 @@ def _plan_route(r, lane, routes, ids_rsrc, ids_ptr, plan_rsrc, SEGS, GROUP):
         words.append(fx.Int32(_NONE))
     left = total - rank
     count = (left < GROUP).select(left, fx.Int32(GROUP))
-    words[0] = ((rank % GROUP) == 0).select(count, fx.Int32(0))
+    # A masked route (id -1) leads no group (its ballots also match the -1 padding past the routes): count 0, so no
+    # workgroup computes it and no group lists it.
+    leads = ((rank % GROUP) == 0) & (expert >= 0)
+    words[0] = leads.select(count, fx.Int32(0))
     _store(
         plan_rsrc,
         [fx.Uint32(w) for w in words],

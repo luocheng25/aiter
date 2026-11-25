@@ -93,15 +93,26 @@ XCDS = 4
 LDS_BYTES = 64 * 1024
 
 
-def expert_bytes(p, expert, nbytes):
-    """Buffer view of one expert's ``nbytes`` bytes of a byte array."""
+def expert_bytes(p, expert, nbytes, masked=False):
+    """Buffer view of one expert's ``nbytes`` bytes of a byte array. With ``masked`` a negative ``expert`` (a masked
+    route, id -1) gets a view of 0 bytes: the range check returns 0 for every load through it, which reads no memory.
+    """
+    base = fx.recast_iter(fx.Uint8, fxh._as_ptr(p))
+    if not masked:
+        return fx.rocdl.make_buffer_tensor(
+            fx.make_view(base + fx.Int64(expert) * nbytes, fx.make_layout(nbytes, 1)),
+            max_size=False,
+            num_records_bytes=nbytes,
+        )
+    # The id zero-extended (a masked one gives some offset that the 0-byte view never reads): sign-extending it makes
+    # LLVM build its high word right after its load, and the wait for that load then precedes the loads issued
+    # ahead of this view.
+    offset = fx.Int64(fx.Uint32(expert)) * nbytes
+    records = (fx.Int32(expert) >= 0).select(fx.Int64(nbytes), fx.Int64(0))
     return fx.rocdl.make_buffer_tensor(
-        fx.make_view(
-            fx.recast_iter(fx.Uint8, fxh._as_ptr(p)) + fx.Int64(expert) * nbytes,
-            fx.make_layout(nbytes, 1),
-        ),
+        fx.make_view(base + offset, fx.make_layout(nbytes, 1)),
         max_size=False,
-        num_records_bytes=nbytes,
+        num_records_bytes=records,
     )
 
 

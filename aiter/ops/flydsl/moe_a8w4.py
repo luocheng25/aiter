@@ -22,7 +22,9 @@ streaming prep up to ``PREFILL_PREP_MAX_ROUTES`` routes from hidden 2560 on, els
 per-row FP8 quantization of the input that sets ``loc_ids`` to -1), the A8W4 Gate/Up kernel (SiLU(gate) * up ->
 f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the intermediate, the A8W4 Down
 kernel (routing weight applied; it also records each route's sorted row in ``loc_ids``) and ``sorted_sum``. The
-calls issue no host synchronization.
+calls issue no host synchronization. A routing id of -1 masks its route (ATOM's padding rows): no tier reads its
+weights or adds it (the decode kernels load through zero-byte views and leave it out of the deduplication plan, the
+sortings drop it).
 
 ``aiter.fused_moe`` is the other entry: ``prepare_moe_a8w4_ptpc_weight`` tags the ``w1`` / ``w2`` it returns with the
 attribute ``WEIGHT_TAG`` (as ``shuffle_weight`` sets ``is_shuffled``), and ``fused_moe(hidden_states, weight.w1,
@@ -201,8 +203,9 @@ DOWN_TWO_PASS_MIN_WGS = 80
 # the routed experts (ATOM's dual-stream MoE, ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1024); more tokens run it on the
 # current stream before the routed experts.
 SHARED_DUAL_STREAM_MAX_M = 1024
-# Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): with a
-# shared expert, its id E in the last column of every row and routed ids in [0, E).
+# Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): routed
+# ids in [0, E) or -1 (masked), no id repeated within a token apart from -1 and, with a shared expert, its id E in the
+# last column of every row (``_check_routing``).
 DEBUG_CHECKS = os.environ.get("AITER_MOE_A8W4_DEBUG", "0") == "1"
 
 # Kernels launched by the most recent ``flydsl_moe_a8w4_ptpc`` call, in order (host-side record; tests and the
@@ -1026,6 +1029,14 @@ def _fused_moe_decode_wide_dd(
     return output
 
 
+def _slot_pair_offsets_fit(weight):
+    """Whether the slot-pair Down (``compile_a8w4_down_decode_pq``) can address all experts' w2 with 32-bit byte
+    offsets: its range check ends one expert's bytes below 2**32 (where a masked route's offsets fall).
+    """
+    w2_bytes = weight.w2.numel() * weight.w2.element_size()
+    return w2_bytes + layout.weight_bytes(weight.hidden, weight.inter_padded) <= 2**32
+
+
 def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limit):
     """The decode path: Gate/Up per route into the f32 intermediate, Down per token summing its routes into
     ``output`` (or the expert-deduplicated variants); ``topk_ids`` / ``topk_weight`` are contiguous int32 /
@@ -1041,7 +1052,7 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
     if (
         H in DECODE_WIDE_HIDDEN
         and M >= DECODE_WIDE_DEDUP_MIN_M
-        and weight.w2.numel() * weight.w2.element_size() < 2**32
+        and _slot_pair_offsets_fit(weight)
         and _decode_fits(H, I, topk, True)
     ):
         return _fused_moe_decode_wide_dd(
@@ -1053,7 +1064,7 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
     # shapes the slot-pair kernel does not support take the single-slot Down.
     down_pq = (
         M >= DECODE_PREQUANT_MIN_M
-        and weight.w2.numel() * weight.w2.element_size() < 2**32
+        and _slot_pair_offsets_fit(weight)
         and _decode_fits(H, I, topk, True)
     )
     gateup, down = _decode_kernels(
@@ -1290,6 +1301,17 @@ def _stream_atomic(hidden, inter, block_m):
     return STREAM_ATOMIC == 2 or (STREAM_ATOMIC == 1 and inter < 512)
 
 
+def _stream_prefill_down(hidden, inter, block_m):
+    """Whether the streaming path writes its routes with the prefill Down (gemm2_a8w4) instead of the streaming Down
+    (see ``STREAM_PREFILL_DOWN``)."""
+    return (
+        bool(STREAM_PREFILL_DOWN)
+        and block_m == 64
+        and hidden >= 4096
+        and not _stream_atomic(hidden, inter, block_m)
+    )
+
+
 def _stream_max_rows(hidden, inter, routes=0):
     """Most mean rows per expert (M * topk / E) for the streaming kernels (``routes`` = M * topk)."""
     if hidden >= 5120 and hidden % 512 == 0 and routes >= STREAM_H5120_MIN_ROUTES:
@@ -1425,7 +1447,7 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
         )
         return output
     routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=device)
-    if STREAM_PREFILL_DOWN and block_m == 64 and H >= 4096:
+    if _stream_prefill_down(H, I, block_m):
         # The prefill Down also stores each route's sorted row into loc_ids, the same values the prep wrote.
         _launch(
             f"a8w4_down_prefill_bm{block_m}",
@@ -1554,11 +1576,16 @@ def flydsl_moe_a8w4_ptpc(
 
     ``weight`` comes from ``prepare_moe_a8w4_ptpc_weight``; ``topk_weight`` [M, topk] (float32) is applied
     in Down; ``topk_ids`` [M, topk] (int32) in ``[0, E)`` (a fused shared expert is an ordinary
-    expert id), distinct within a token (with a repeated id the Opus-sorted prefill keeps one route, the other
-    paths every route); int64 ids, other floating weights and non-contiguous routing tensors are converted first.
+    expert id) or -1, a masked route (ATOM's padding rows): it reads no weights and adds nothing whatever its weight,
+    so a token whose ids are all -1 gets 0. Ids are distinct within a token apart from -1 (with a repeated id the
+    Opus-sorted prefill keeps one route, the other paths every route); other ids are invalid. Only ``DEBUG_CHECKS``
+    (``AITER_MOE_A8W4_DEBUG=1``, a host synchronization) reads the ids to check both rules (``ValueError``). int64
+    ids, other floating weights and non-contiguous routing tensors are converted first.
     The input and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
     E4M3FNUZ with ``scale = amax / 240`` and ``q = RNE(x / scale)``. SiLU only, no expert mask /
-    bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``. ``output`` may be a caller's contiguous
+    bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``; a call that takes the prefill Down (the
+    prefill tier, or streaming blocks of 64 from hidden 4096 on) needs ``block_m * I_padded <= 64 KiB`` (I_padded <=
+    1024 by default). Both raise ``ValueError`` before any kernel runs. ``output`` may be a caller's contiguous
     BF16 [M, H] tensor, ``hidden_states`` itself included. Issues no host synchronization; compile a shape
     outside a CUDA graph capture before capturing it. Raises ``RuntimeError`` off gfx942.
 
@@ -1584,14 +1611,14 @@ def flydsl_moe_a8w4_ptpc(
     With a shared expert in ``weight`` (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=...)``, expert E after the E
     routed ones; ATOM's E385 / topk-7 convention for DeepSeek-V4.1-Flash), ``topk_ids`` / ``topk_weight`` are
     [M, topk + 1]: the routed experts in the first topk columns, run as above, and the shared expert's id E in the last
-    column (checked only with ``DEBUG_CHECKS``, which reads the ids). The shared expert runs ATOM's split
+    column (``DEBUG_CHECKS`` checks it). The shared expert runs ATOM's split
     (``_shared_split``: aiter's per-token FP8 quantization of the input, ``gemm_a8w8_bpreshuffle`` for gate / up,
     ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` for Down) on a side
     stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its routing weight on another; unless ``output``
     overlaps ``hidden_states``), else before the routed experts on the current stream, and is added to their output
     with the weight ``where(topk_ids[:, 0] >= 0 and topk_ids[:, -1] == E, topk_weight[:, -1], 0)`` per token, rounded
-    to BF16 (ATOM's rule and its ``addcmul_``; masking a whole row by a negative first id is not supported yet: the
-    routed experts need ids in [0, E)). The streams can be captured in a CUDA graph (compile outside the capture
+    to BF16 (ATOM's rule and its ``addcmul_``: a masked first routed id drops the row's shared expert too, so ATOM's
+    padding rows, all routed ids -1, get 0). The streams can be captured in a CUDA graph (compile outside the capture
     first, as above). Tile options apply to the routed experts.
 
     ``aiter.fused_moe`` calls this function for the tagged ``w1`` / ``w2`` of a prepared weight (``_fused_moe_route``),
@@ -1606,6 +1633,12 @@ def flydsl_moe_a8w4_ptpc(
     last_path.clear()
     if hidden_states.shape[0] == 0:
         return output
+    routed_topk = topk_ids.shape[1] - (1 if weight.has_shared else 0)
+    _check_prefill_down(
+        hidden_states.shape[0], weight, routed_topk, block_m, block_n, tile_k
+    )
+    if DEBUG_CHECKS:
+        _check_routing(topk_ids, weight.experts, weight.has_shared)
     if weight.has_shared:
         return _moe_shared(
             hidden_states,
@@ -1642,18 +1675,6 @@ def _side_streams(device):
 
 
 _SIDE_STREAMS = {}
-
-
-def _check_shared_ids(topk_ids, experts):
-    """``DEBUG_CHECKS`` with a shared expert (reads the ids on the host): its id E in the last column of every row,
-    routed ids in [0, E)."""
-    if not bool((topk_ids[:, -1] == experts).all()):
-        raise ValueError(
-            f"with a shared expert the last column of topk_ids holds its id {experts} (E) on every row"
-        )
-    routed = topk_ids[:, :-1]
-    if not bool(((routed >= 0) & (routed < experts)).all()):
-        raise ValueError(f"routed expert ids must lie in [0, {experts})")
 
 
 def _shared_split(hidden_states, weight, limit):
@@ -1701,8 +1722,6 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
     operands, one rounding: ATOM's addcmul_)."""
     M = hidden_states.shape[0]
     E = weight.experts
-    if DEBUG_CHECKS:
-        _check_shared_ids(topk_ids, E)
     routed_weight, routed_ids = topk_weight[:, :-1], topk_ids[:, :-1]
     if M <= SHARED_DUAL_STREAM_MAX_M and not _overlaps(output, hidden_states):
         # Fork the side streams from the current one and join them back before the add (also inside a graph
@@ -1739,6 +1758,76 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
     return output
 
 
+def _many_rows(M, H, I, topk, E):
+    """Whether the mean rows per expert (M * topk / E) exceed the streaming kernels' limit (``_stream_max_rows``)."""
+    return M * topk > _stream_max_rows(H, I, M * topk) * E
+
+
+def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
+    """Tier of the routed experts of a call (M > 0): "decode", "stream" or "prefill". Chosen before the prefill tile
+    defaults are filled in: any tile option selects prefill."""
+    if block_m is None and block_n is None and tile_k is None:
+        if (
+            M <= DECODE_MAX_M or _dedup_beyond_decode(M, H, I, topk, E)
+        ) and _decode_fits(H, I, topk, False):
+            return "decode"
+        if M > DECODE_MAX_M and not _many_rows(M, H, I, topk, E):
+            return "stream"
+    return "prefill"
+
+
+def _prefill_down_block_m(M, H, I, topk, E, block_m, block_n, tile_k):
+    """Sorting block of the prefill Down (gemm2_a8w4) the routed experts of a call build (the prefill tier, or the
+    streaming tier's blocks of 64, ``_stream_prefill_down``), 0 if none."""
+    tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
+    if tier == "decode":
+        return 0
+    if tier == "stream":
+        stream_bm = _stream_block_m(M, topk, E, H)
+        return stream_bm if _stream_prefill_down(H, I, stream_bm) else 0
+    return 64 if block_m is None else block_m
+
+
+def _check_prefill_down(M, weight, topk, block_m, block_n, tile_k):
+    """ValueError before any launch when the call's prefill Down cannot hold its block_m x padded-I FP8 activation
+    tile in LDS (``gemm2_a8w4``: block_m * I_padded <= 64 KiB, so I_padded <= 1024 with the default block_m 64); the
+    decode and streaming Downs take any padded I their dispatch accepts."""
+    I = weight.inter_padded
+    # Every prefill Down of the call fits (the streaming tier's takes blocks of 64): no tier needed.
+    if I * (64 if block_m is None else block_m) <= layout.LDS_BYTES:
+        return
+    bm = _prefill_down_block_m(
+        M, weight.hidden, I, topk, weight.experts, block_m, block_n, tile_k
+    )
+    if bm and bm * I > layout.LDS_BYTES:
+        raise ValueError(
+            f"padded I {I} is too large for the prefill Down this call takes (M={M}, block_m {bm}): it stages a "
+            f"block_m x I_padded FP8 tile in {layout.LDS_BYTES} bytes of LDS, so I_padded <= "
+            f"{layout.LDS_BYTES // bm}; the decode and streaming tiers take larger I"
+        )
+
+
+def _check_routing(topk_ids, experts, shared):
+    """``DEBUG_CHECKS`` (reads the ids on the host): routed ids in [0, E) or -1 (a masked route), no expert id repeated
+    within a token's routed columns (-1 aside) and, with a shared expert, its id E in the last column of every row.
+    """
+    routed = topk_ids[:, :-1] if shared else topk_ids
+    if shared and not bool((topk_ids[:, -1] == experts).all()):
+        raise ValueError(
+            f"with a shared expert the last column of topk_ids holds its id {experts} (E) on every row"
+        )
+    if not bool((((routed >= 0) & (routed < experts)) | (routed == -1)).all()):
+        raise ValueError(
+            f"routed expert ids must lie in [0, {experts}) or be -1 (a masked route)"
+        )
+    ids = routed.sort(dim=1).values
+    if bool(((ids[:, 1:] == ids[:, :-1]) & (ids[:, 1:] >= 0)).any()):
+        raise ValueError(
+            "a token's routed expert ids must be distinct (-1 aside): with a repeated id the Opus-sorted prefill "
+            "keeps one route, the other paths every route"
+        )
+
+
 def _moe_routed(
     hidden_states,
     weight,
@@ -1761,20 +1850,17 @@ def _moe_routed(
         topk_ids = topk_ids.to(torch.int32).contiguous()
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
         topk_weight = topk_weight.to(torch.float32).contiguous()
-    # The tier is chosen before the prefill tile defaults are filled in: any tile option selects prefill.
+    tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
+    if tier == "decode":
+        return _fused_moe_decode(
+            hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
+    if tier == "stream":
+        return _fused_moe_stream(
+            hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
     if block_m is None and block_n is None and tile_k is None:
-        if (
-            M <= DECODE_MAX_M or _dedup_beyond_decode(M, H, I, topk, E)
-        ) and _decode_fits(H, I, topk, False):
-            return _fused_moe_decode(
-                hidden_states, weight, topk_weight, topk_ids, output, limit
-            )
-        many_rows = M * topk > _stream_max_rows(H, I, M * topk) * E
-        if M > DECODE_MAX_M and not many_rows:
-            return _fused_moe_stream(
-                hidden_states, weight, topk_weight, topk_ids, output, limit
-            )
-        tile_k = 128 if many_rows else 256
+        tile_k = 128 if _many_rows(M, H, I, topk, E) else 256
     block_m = 64 if block_m is None else block_m
     block_n = 128 if block_n is None else block_n
     tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k

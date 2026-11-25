@@ -221,6 +221,42 @@ def make_inputs(tokens, hidden, experts, topk, *, seed=0, shared=True, device="c
     return x, weights, ids
 
 
+def mask_routes(
+    topk_weight, topk_ids, *, seed, share=0.3, full=(), first=(), routed=None
+):
+    """Masked copies ``(topk_weight, topk_ids)`` of a routing: a random ``share`` of the routed ids (the first
+    ``routed`` columns, all by default), every routed id of the rows in ``full`` (``"all"``: every row) and the first id
+    of the rows in ``first`` set to -1, with weight NaN (a masked route must add nothing, whatever its weight).
+    """
+    gen = torch.Generator(device=topk_ids.device).manual_seed(seed)
+    weights, ids = topk_weight.clone(), topk_ids.clone()
+    cols = ids.shape[1] if routed is None else routed
+    drop = torch.rand((ids.shape[0], cols), generator=gen, device=ids.device) < share
+    drop[slice(None) if full == "all" else list(full)] = True
+    drop[list(first), 0] = True
+    ids[:, :cols] = torch.where(drop, -1, ids[:, :cols])
+    weights[:, :cols] = torch.where(drop, float("nan"), weights[:, :cols])
+    return weights, ids
+
+
+def poisoned(w, prepared):
+    """Experts 1 .. E-1 of a make_weights dict and of its prepared weight, as views (E - 1 experts): the bytes just
+    before every routed tensor of the view are expert 0's, real weights, where a kernel addressing a masked route's
+    expert (-1) would read. Masked cases run on such views, so that such a read shows in the result (and stays inside
+    the allocation)."""
+    import dataclasses
+
+    view = dataclasses.replace(
+        prepared,
+        **{
+            name: getattr(prepared, name)[1:]
+            for name in ("w1", "w1_delta", "w1_scale", "w2", "w2_delta", "w2_scale")
+        },
+        experts=prepared.experts - 1,
+    )
+    return {name: t[1:] for name, t in w.items()}, view
+
+
 def dequant_mxfp4(q, scale):
     """Standard MXFP4 [..., N, K/2] + E8M0 [..., N, K/32] -> the exact float32 [..., N, K]."""
     b = q.view(torch.uint8)
@@ -255,15 +291,18 @@ def reference(
     per (token, slot) row. ``swiglu_limit`` = L > 0 applies DeepSeek-V4.1's SwiGLU limit (``Expert`` in its
     inference/model.py, config ``swiglu_limit``, 10 for V4.1-Flash) to the f32 gate / up (the product of the
     quantized input and the dequantized weights): gate = min(gate, L), up = clamp(up, -L, L), then
-    SiLU(gate) * up; 0 (default) means no limit and gives the same bits as not passing it.
+    SiLU(gate) * up; 0 (default) means no limit and gives the same bits as not passing it. An id of -1 masks its
+    route: it adds nothing, whatever its weight.
     """
     M, H = x.shape
     E, n1 = w1.shape[0], w1.shape[1]
     I, topk = n1 // 2, topk_ids.shape[1]
     xa = quant_rows_fp8(x)
     flat = topk_ids.reshape(-1).long()
+    # Masked routes sort last, as expert E, which the groups leave out.
+    flat = torch.where(flat < 0, E, flat)
     order = torch.argsort(flat, stable=True)
-    counts = torch.bincount(flat, minlength=E).tolist()
+    counts = torch.bincount(flat, minlength=E + 1).tolist()[:E]
     tokens, slots = order // topk, order % topk
     groups, start = [], 0
     for e, n in enumerate(counts):
@@ -663,17 +702,33 @@ def _shared_over(x, shared, limit):
 
 
 def _layer_check(
-    experts, topk, inter, tokens, seed, *, fmt="row", amplify=1.0, **options
+    experts,
+    topk,
+    inter,
+    tokens,
+    seed,
+    *,
+    fmt="row",
+    amplify=1.0,
+    mask=None,
+    **options,
 ):
     """A whole layer call (routed experts plus the shared expert, ``LAYER_SWIGLU_LIMIT``) into a NaN-filled output,
     graded against ``reference_layer``: weights of _layer_weights(seed), inputs of make_layer_inputs(seed + 7) with
     random shared weights per token, scaled by ``amplify`` (with more than 1, more than 10% of the shared expert's gate
-    and up values must exceed the limit first). Returns ``(prepared, x, topk_weight, topk_ids, out)``.
+    and up values must exceed the limit first). With ``mask`` (``mask_routes`` arguments) the routed experts are the
+    ``poisoned`` view of experts 1 .. E-1 and routed ids are masked to -1. Returns ``(prepared, x, topk_weight,
+    topk_ids, out)``.
     """
     w, shared, prepared = _layer_weights(experts, inter, seed, fmt)
+    if mask is not None:
+        w, prepared = poisoned(w, prepared)
+        experts -= 1
     x, topk_weight, topk_ids = make_layer_inputs(
         tokens, LAYER_HIDDEN, experts, topk, seed=seed + 7, shared_weight=None
     )
+    if mask is not None:
+        topk_weight, topk_ids = mask_routes(topk_weight, topk_ids, routed=topk, **mask)
     if amplify != 1.0:
         x = (x.float() * amplify).to(torch.bfloat16)
         over = _shared_over(x, shared, LAYER_SWIGLU_LIMIT)
@@ -969,6 +1024,35 @@ def test_fused_moe_shared_entry():
     assert torch.equal(_bits(out), _bits(want))
 
 
+def _zero_rows(out, rows):
+    """Rows ``rows`` of ``out`` hold +0.0 in every element, bit for bit."""
+    return bool((_bits(out[list(rows)]) == 0).all())
+
+
+@pytest.mark.basic
+def test_layer_masked_routes():
+    """Masked routes (id -1, ATOM's padding) in a layer call, main layer TP4 decode M 4 (per-route Gate/Up, slot-pair
+    Down, the shared expert on the side stream): a random 30% of the routed ids, every routed id of row 1 and the
+    first id of row 2 are -1, with weight NaN, on the ``poisoned`` view (expert -1 is real data). Graded against
+    reference_layer: a masked route adds nothing, and a masked first id also drops the row's shared expert (ATOM's
+    rule), so row 1 is bitwise 0.
+    """
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
+    *_, topk_ids, out = _layer_check(
+        experts,
+        topk,
+        inter,
+        4,
+        seed=700,
+        amplify=10.0,
+        mask={"seed": 711, "full": (1,), "first": (2,)},
+    )
+    assert int((topk_ids[:, :-1] < 0).sum()) > topk + 1
+    assert _zero_rows(out, [1])
+    _assert_path(_DECODE_PATHS["np"])
+    _assert_shared(4)
+
+
 # =================================================================================================
 # Region 2: other coverage (not basic)
 # Only what region 1 and the benchmark (region 3) cannot cover; each docstring says why ("the basic tests" are
@@ -1254,11 +1338,15 @@ def test_decode_row_quant_bitexact(dtype, cols):
 
 
 @pytest.mark.parametrize(
-    "cols, topk, rows, max_m, zero",
-    [(MIMO_HIDDEN, MIMO_TOPK, 37, 64, True), (DS_HIDDEN, DS_TOPK, 29, 32, False)],
-    ids=["h4096_zero_out", "h5120_keep_out"],
+    "cols, topk, rows, max_m, zero, masked",
+    [
+        (MIMO_HIDDEN, MIMO_TOPK, 37, 64, True, False),
+        (DS_HIDDEN, DS_TOPK, 29, 32, False, False),
+        (DS_HIDDEN, DS_TOPK, 29, 32, False, True),
+    ],
+    ids=["h4096_zero_out", "h5120_keep_out", "h5120_masked"],
 )
-def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero):
+def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero, masked):
     """The plan kernel of the expert-deduplicated decode (a8w4_row_quant_plan: four waves quantize a row of x in
     16-byte pieces, the amax merged in LDS, and the same launch writes the dedup plan; for H 4096 it also zeroes the
     output rows that the atomic Down adds into): xq / xs equal ``_quantize`` and the reference bit for bit; with
@@ -1274,6 +1362,11 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero):
     tolerance does not show a few flipped FP8 values, nor H 5120 zeroing out by mistake (the slot-pair Down
     overwrites whole rows); a wrong plan mostly fails end to end, but random routing may miss the cross-segment and
     partial-tail combinations.
+
+    With masked routes (id -1, a random 30% and rows 2 and 7 whole) a masked route gets the entry [0, route] and the
+    groups list valid routes only: its ballots also match the -1 that pads the plan past the routes, so it must
+    lead no group. End to end a masked leader would show only through the result of its group (test_masked_routes
+    runs the dedup paths on poisoned weights); this pins every entry.
     """
     guard, group = 3, 3
     gen = torch.Generator(device="cuda").manual_seed(87)
@@ -1286,6 +1379,10 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero):
     x[4, 9] = -0.0
     x = x.to(torch.bfloat16)
     _, _, topk_ids = make_inputs(rows, 512, 40, topk, seed=88, shared=False)
+    if masked:
+        _, topk_ids = mask_routes(
+            torch.zeros(topk_ids.shape), topk_ids, seed=89, full=(2, 7)
+        )
     q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
     scale = torch.full((rows + guard,), -1.0)
     plan = torch.full((rows * topk, 4), -1, dtype=torch.int32)
@@ -1316,8 +1413,12 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero):
         q[:rows], (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
     )
     ids, entries = topk_ids.flatten().tolist(), plan.tolist()
+    assert masked == (min(ids) < 0)
     full = partial = 0
     for r, e in enumerate(ids):
+        if e < 0:
+            assert entries[r][:2] == [0, r], (r, entries[r])
+            continue
         same = [s for s, f in enumerate(ids) if f == e]
         rank = same.index(r)
         count = min(group, len(same) - rank) if rank % group == 0 else 0
@@ -1638,21 +1739,29 @@ def test_decode_duplicate_and_int64_ids():
     assert_close(out, ref)
 
 
-def test_decode_down_fallback_w2_4gib():
-    """With w2 of 4 GiB or more Down does not take the slot-pair kernel on pre-quantized rows (it addresses all
-    experts' weights with 32-bit byte offsets) but the single-slot kernel quantizing in the kernel (M = 16).
+@pytest.mark.parametrize(
+    "over, down",
+    [(1, "a8w4_down_decode"), (0, "a8w4_down_decode_pq")],
+    ids=["over", "fits"],
+)
+def test_decode_down_fallback_w2_4gib(over, down):
+    """Down takes the slot-pair kernel on pre-quantized rows only while w2 plus one expert's bytes fit in 4 GiB (it
+    addresses all experts' weights with 32-bit byte offsets, its range check ending one expert below 2**32, where a
+    masked route's offsets fall); larger w2 takes the single-slot kernel quantizing in the kernel (M = 16). Both sides
+    of that boundary: w2 of 2**32 bytes minus one expert's (``fits``) and one byte more (``over``, still below 4 GiB).
 
-    Real 4 GiB weights are too large: a stride-0 view makes w2 report 2**32 bytes with the same data pointer (the
-    kernels read by pointer and expert offset); the basic tests, the benchmark and the other cases have w2 far below
-    4 GiB.
+    Real 4 GiB weights are too large: a stride-0 view makes w2 report that many bytes with the same data pointer (the
+    kernels read by pointer and expert offset, the routes only real experts); the basic tests, the benchmark and the
+    other cases have w2 far below 4 GiB.
     """
     import dataclasses
 
     w, prepared = _decode_weights(320)
-    big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(1 << 32))
+    size = (1 << 32) - prepared.w2[0].numel() * prepared.w2.element_size() + over
+    big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(size))
     x, topk_weight, topk_ids = make_inputs(16, HIDDEN, EXPERTS, TOPK, seed=99)
     out, ref = _a8w4_run(w, big, x, topk_weight, topk_ids)
-    _assert_path(["a8w4_gateup_decode_pq", "a8w4_down_decode"])
+    _assert_path(["a8w4_gateup_decode_pq", down])
     assert_close(out, ref)
 
 
@@ -3970,8 +4079,9 @@ def test_shared_rejects(monkeypatch):
     that is no multiple of 32, shapes other than the routed experts' [2I, H] / [H, I], NaN elements (E4M3FN and
     E4M3FNUZ input) / E8M0 codes / scales, another device; an argument that is no tensor raises TypeError, a
     MoeA8W4PtpcWeight with part of the shared fields ValueError. A call with a shared expert needs at least 2 routing
-    columns (ValueError). DEBUG_CHECKS reads the routing: a last column other than E or routed ids outside [0, E) raise
-    ValueError; without it a row whose last id is not E gets no shared expert (ATOM's rule, as reference_layer). M = 0
+    columns (ValueError). DEBUG_CHECKS reads the routing: a last column other than E, routed ids outside [0, E) other
+    than -1 (E, -2) or a routed id repeated in a token raise ValueError, masked ids (-1, repeated) pass; without it a row
+    whose last id is not E gets no shared expert (ATOM's rule, as reference_layer). M = 0
     returns the output untouched with no kernel; int64 ids and bfloat16 weights give the bits of int32 / float32 ones.
     The 32-bit offset limit on M counts the routed columns, not the shared one.
 
@@ -4062,11 +4172,17 @@ def test_shared_rejects(monkeypatch):
     )
     with pytest.raises(ValueError, match="last column"):
         flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, other)
-    for value in (E, -1):
+    for value in (E, -2):
         routed = topk_ids.clone()
         routed[1, 0] = value
         with pytest.raises(ValueError, match="routed expert ids"):
             flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, routed)
+    routed = topk_ids.clone()
+    routed[1, 1] = routed[1, 0]
+    with pytest.raises(ValueError, match="distinct"):
+        flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, routed)
+    routed[1, :2] = -1
+    flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, routed)
     monkeypatch.undo()
     empty = torch.empty((0, H), dtype=torch.bfloat16)
     out = flydsl_moe_a8w4_ptpc(
@@ -4257,6 +4373,401 @@ def test_fused_moe_shared_expert_id():
             _fused_moe(
                 x, plain.w1, plain.w2, topk_weight, topk_ids, shared_expert_id=value
             )
+
+
+# -- 2.11 masked routes (id -1) and entry checks ------------------------------------------------------------------
+# A routing id of -1 masks its route (ATOM's padding rows): no tier reads its weights or adds it, whatever its weight.
+# The basic test covers the main layer's per-route decode (np) with the shared expert on the side stream and the
+# benchmark never masks; here the other tiers, whole rows and whole calls masked (the sortings left without a route,
+# the dedup plan without a leader), the shared expert of masked rows in both stream modes, CUDA graph replays that move
+# the masks, the reads of the per-route Gate/Up, and the entry checks. Masked cases run on ``poisoned`` weights (the
+# bytes before every routed tensor are real weights, where a masked route's expert -1 would read) with NaN weights on
+# the masked routes, graded against the reference (masked routes add nothing); a row without a live route is bitwise 0.
+
+
+@pytest.mark.parametrize(
+    "weights, tokens, topk, fused, options, path, full",
+    [
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            3,
+            DS_TOPK,
+            False,
+            {},
+            _DECODE_PATHS["nn"],
+            (1,),
+            id="nn_ds_m3",
+        ),
+        pytest.param(
+            (EXPERTS, HIDDEN, 320, 51),
+            16,
+            TOPK,
+            True,
+            {},
+            _DECODE_PATHS["pp"],
+            (3, 11),
+            id="pp_qwen_m16",
+        ),
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            24,
+            DS_TOPK,
+            False,
+            {},
+            _DEDUP_PATHS["wide"],
+            (0, 13),
+            id="wide_ds_m24",
+        ),
+        pytest.param(
+            (12, MIMO_HIDDEN, 256, 456),
+            5,
+            MIMO_TOPK,
+            False,
+            {},
+            _DEDUP_PATHS["dd2"],
+            (2,),
+            id="dd2_mimo_m5",
+        ),
+        pytest.param(
+            (12, MIMO_HIDDEN, 512, 712),
+            24,
+            MIMO_TOPK,
+            False,
+            {},
+            _DEDUP_PATHS["dd4"],
+            (5, 6),
+            id="dd4_mimo_m24",
+        ),
+        pytest.param(
+            (12, MIMO_HIDDEN, 512, 712),
+            24,
+            MIMO_TOPK,
+            False,
+            {},
+            _DEDUP_PATHS["dd4"],
+            "all",
+            id="dd4_all",
+        ),
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            64,
+            DS_TOPK,
+            False,
+            {},
+            ["a8w4_stream_prep"] + _stream_path(32, False) + ["a8w4_route_sum"],
+            (7, 40),
+            id="stream_ds_m64",
+        ),
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            64,
+            DS_TOPK,
+            False,
+            {},
+            ["a8w4_stream_prep"] + _stream_path(32, False) + ["a8w4_route_sum"],
+            "all",
+            id="stream_all",
+        ),
+        pytest.param(
+            (MIMO_EXPERTS, MIMO_HIDDEN, 512, 41),
+            1200,
+            MIMO_TOPK,
+            False,
+            {},
+            ["a8w4_stream_prep", "a8w4_gateup_stream_bm64"]
+            + ["a8w4_down_prefill_bm64", "a8w4_route_sum"],
+            (9, 600),
+            id="stream_prefill_down_mimo_m1200",
+        ),
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            200,
+            DS_TOPK,
+            False,
+            {"block_m": 64},
+            ["a8w4_stream_prep"] + _prefill_path(256) + ["sorted_sum"],
+            (4, 150),
+            id="prefill_prep_ds_m200",
+        ),
+        pytest.param(
+            (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
+            200,
+            DS_TOPK,
+            False,
+            {"block_m": 64},
+            ["a8w4_stream_prep"] + _prefill_path(256) + ["sorted_sum"],
+            "all",
+            id="prefill_prep_all",
+        ),
+        pytest.param(
+            (5, 512, 64, 576),
+            300,
+            2,
+            False,
+            {"block_m": 64},
+            ["moe_sorting_opus"] + _prefill_path(256) + ["sorted_sum"],
+            (8, 299),
+            id="prefill_opus_h512",
+        ),
+        pytest.param(
+            (5, 512, 64, 576),
+            300,
+            2,
+            False,
+            {"block_m": 64},
+            ["moe_sorting_opus"] + _prefill_path(256) + ["sorted_sum"],
+            "all",
+            id="prefill_opus_all",
+        ),
+    ],
+)
+def test_masked_routes(weights, tokens, topk, fused, options, path, full):
+    """Masked routes on every tier but the basic test's (routed experts only): a random 30% of the ids and the case's
+    rows whole, on poisoned weights with NaN weights on the masked routes; graded, the rows without a live route
+    bitwise 0, the kernels asserted. The per-route decode Gate/Up and Down (nn) and the pre-quantized Gate/Up (pp) with
+    the slot-pair Down; the dedup plan and its forms (H 5120 wide, the MiMo two- and four-kernel ones; groups of 2 and
+    3); streaming with route_sum behind the streaming Down and behind the prefill Down (blocks of 64, H 4096: it writes
+    loc_ids only for sorted routes); prefill sorted by the prep and by Opus (moe_sorting, which skips ids outside [0, E);
+    the input quantization sets loc_ids to -1, which sorted_sum skips). The ``_all`` cases mask every route: the dedup
+    plan has no leader, the sortings no row (num_valid 0), and the output is all zero.
+
+    The basic test masks the per-route decode (np) only; the benchmark never masks.
+    """
+    experts, hidden, inter, seed = weights
+    w, prepared = poisoned(*_weights(experts, hidden, inter, seed))
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, hidden, prepared.experts, topk, seed=seed + 3, shared=fused
+    )
+    topk_weight, topk_ids = mask_routes(topk_weight, topk_ids, seed=seed + 4, full=full)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
+    _assert_path(path)
+    assert_close(out, ref)
+    dead = (topk_ids < 0).all(dim=1).nonzero().flatten().tolist()
+    assert set(range(tokens) if full == "all" else full) <= set(dead)
+    assert _zero_rows(out, dead)
+
+
+@pytest.mark.parametrize(
+    "shape, tokens, path",
+    [
+        ("ds_layer_tp8", 64, ["a8w4_stream_prep"] + _stream_path(16, False)),
+        ("ds_layer_tp4", 2048, ["a8w4_stream_prep"] + _prefill_path(128)),
+    ],
+    ids=["tp8_m64_stream_atomic", "tp4_m2048_prefill_serial"],
+)
+def test_layer_masked_routes_tiers(shape, tokens, path):
+    """Masked routes in layer calls beyond the basic test's decode: TP8 streaming (I 320: the atomic Down adds only the
+    sorted routes into the output the prep zeroed) with the shared expert on the side stream, and TP4 prefill with the
+    shared expert serial (M 2048 > SHARED_DUAL_STREAM_MAX_M). A random 30% of the routed ids, rows 1 and 5 whole and
+    row 2's first id masked: ATOM's rule drops the shared expert of every row whose first id is -1, so rows 1 and 5 are
+    bitwise 0. Poisoned weights, graded against reference_layer.
+
+    The basic test masks the per-route decode with the side stream only; the benchmark never masks.
+    """
+    experts, topk, inter = LAYER_SHAPES[shape]
+    *_, topk_ids, out = _layer_check(
+        experts,
+        topk,
+        inter,
+        tokens,
+        seed=700,
+        mask={"seed": 712, "full": (1, 5), "first": (2,)},
+    )
+    assert int((topk_ids[:, 0] < 0).sum()) > 3
+    assert _zero_rows(out, [1, 5])
+    _assert_path(path)
+    _assert_shared(tokens)
+
+
+@pytest.mark.parametrize("tokens", [8, 64], ids=["m8_wide", "m64_stream"])
+def test_masked_graph_replay(tokens):
+    """One CUDA graph of a layer call replays with the masks moved (main layer TP4 with the shared expert on the side
+    stream: decode wide-dd M 8, the plan in the graph; streaming M 64, the prep in the graph): the routing tensors are
+    rewritten with another random mask plus whole rows, with no mask and with every routed id masked, and each replay
+    gives the bits of an eager call on the same inputs (all zero when every row is masked). Poisoned weights.
+
+    The other graph cases replay unmasked routing; the masked eager cases capture nothing.
+    """
+    experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
+    w, _, prepared = _layer_weights(experts, inter, 700)
+    _, prepared = poisoned(w, prepared)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, LAYER_HIDDEN, prepared.experts, topk, seed=760, shared_weight=None
+    )
+    original = (topk_weight.clone(), topk_ids.clone())
+    masked_weight, masked_ids = mask_routes(*original, seed=761, routed=topk)
+    topk_weight.copy_(masked_weight)
+    topk_ids.copy_(masked_ids)
+    out = torch.empty_like(x)
+    run = functools.partial(
+        flydsl_moe_a8w4_ptpc,
+        x,
+        prepared,
+        topk_weight,
+        topk_ids,
+        output=out,
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+    )
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    _assert_shared(tokens)
+    for seed, full in ((762, (0, 3)), (None, ()), (763, "all")):
+        weights, ids = (
+            original
+            if seed is None
+            else mask_routes(*original, seed=seed, full=full, routed=topk)
+        )
+        topk_weight.copy_(weights)
+        topk_ids.copy_(ids)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        want = flydsl_moe_a8w4_ptpc(
+            x, prepared, weights, ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+        )
+        assert torch.equal(_bits(out), _bits(want)), (seed, full)
+        dead = (ids[:, :-1] < 0).all(dim=1).nonzero().flatten().tolist()
+        assert _zero_rows(out, dead)
+        assert set(range(tokens) if full == "all" else full) <= set(dead)
+        assert full or not dead
+
+
+@pytest.mark.parametrize("case", ["ds_m3", "mimo_m5_plan"])
+def test_masked_gateup_reads_no_weights(case):
+    """The per-route decode Gate/Up reads no weights of a masked route: launched on poisoned weights (expert -1, where
+    a masked route would read, is real data), every masked route's f32 row is exactly 0 and every other row has the bits
+    of the launch without masks; the form that writes the dedup plan (dd2) also gives each masked route the entry
+    [0, route] and still zeroes the output. DeepSeek M 3 (x quantized in the kernel, the SwiGLU limit), MiMo M 5 (PLAN).
+
+    End to end a read would not show (the Down kernels drop masked routes by a select, the dedup Down never sees them).
+    """
+    if case == "ds_m3":
+        (w, prepared), hidden, topk, tokens, limit = (
+            _ds_weights(),
+            DS_HIDDEN,
+            DS_TOPK,
+            3,
+            SWIGLU_LIMIT,
+        )
+    else:
+        (w, prepared), hidden, topk, tokens, limit = (
+            _mimo_small_weights(256),
+            MIMO_HIDDEN,
+            MIMO_TOPK,
+            5,
+            0.0,
+        )
+    _, view = poisoned(w, prepared)
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, hidden, view.experts, topk, seed=850, shared=False
+    )
+    _, masked = mask_routes(topk_weight, topk_ids, seed=851, full=(1,))
+    I, device = view.inter_padded, x.device.index
+    if case == "ds_m3":
+        waves = moe_a8w4._decode_waves(topk, False)
+        kernel = moe_a8w4._decode_kernels(
+            2 * I, hidden, I, topk, False, False, limit, waves, device
+        )[0]
+    else:
+        kernel = moe_a8w4._gateup_plan_kernel(
+            2 * I, hidden, topk, False, 2, limit, moe_a8w4.DECODE_MAX_M, device
+        )
+
+    def gateup(ids):
+        mid = torch.full((tokens, topk, I), float("nan"))
+        plan = torch.full((tokens * topk, 4), -7, dtype=torch.int32)
+        y = torch.full((tokens, hidden), float("nan"), dtype=torch.bfloat16)
+        moe_a8w4._launch(
+            "a8w4_gateup_decode",
+            kernel,
+            x,
+            topk_weight,
+            ids,
+            view.w1,
+            view.w1_delta,
+            view.w1_scale,
+            mid,
+            plan,
+            y,
+            tokens,
+        )
+        return mid, plan, y
+
+    mid0 = gateup(topk_ids)[0]
+    mid1, plan, y = gateup(masked)
+    live = masked >= 0
+    assert 0 < int((~live).sum()) < live.numel()
+    assert bool((mid1[~live] == 0).all())
+    assert torch.equal(mid1[live].view(torch.int32), mid0[live].view(torch.int32))
+    if case == "mimo_m5_plan":
+        entries = plan.tolist()
+        for r in (~live).flatten().nonzero().flatten().tolist():
+            assert entries[r][:2] == [0, r], (r, entries[r])
+        assert bool((y == 0).all())
+
+
+def test_entry_checks(monkeypatch):
+    """Errors raised before any kernel runs (ValueError; last_path empty, the output untouched):
+    - padded I above what the prefill Down stages in LDS (block_m * I_pad <= 64 KiB): I 1088 at H 512 for the prefill
+      tier (M 300, many rows per expert) and with block_m 64 (M 40), at H 4096 for streaming blocks of 64 (M 100, 40
+      rows per expert), which take the prefill Down, and with a shared expert (H 5120, block_m 64: no shared-expert
+      kernel either); block_m 128 with I 576 (DeepSeek). Streaming with the streaming Down (H 512, M 48, blocks of 32)
+      still runs I 1088 (graded; decode in test_shape_fallbacks).
+    - with DEBUG_CHECKS (AITER_MOE_A8W4_DEBUG=1, a host synchronization): a token's routed id repeated, an id of E or
+      -2; -1, repeated or not, passes. Without it a repeated id runs (test_duplicate_ids_keep_every_route).
+    The 32-bit offset limit M * topk * I_pad * 4 < 2**31 is checked by test_rejects_bad_inputs and, with a shared
+    expert (its column not counted), test_shared_rejects.
+
+    The basic tests and the benchmark pass I_pad <= 576, the default block_m and valid routing.
+    """
+
+    def rejects(prepared, x, topk_weight, topk_ids, match, **options):
+        out = torch.full_like(x, float("nan"))
+        with pytest.raises(ValueError, match=match):
+            flydsl_moe_a8w4_ptpc(
+                x, prepared, topk_weight, topk_ids, output=out, **options
+            )
+        assert moe_a8w4.last_path == [] and bool(out.isnan().all())
+
+    for hidden, tokens, options in (
+        (512, 300, {}),
+        (512, 40, {"block_m": 64}),
+        (4096, 100, {}),
+    ):
+        _, prepared = _small_weights(hidden, 1088)
+        x, topk_weight, topk_ids = make_inputs(tokens, hidden, 5, 2, seed=860)
+        rejects(prepared, x, topk_weight, topk_ids, "padded I 1088", **options)
+    w, prepared = _small_weights(512, 1088)
+    x, topk_weight, topk_ids = make_inputs(48, 512, 5, 2, seed=861)
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    _assert_path(_stream_path(32, False))
+    assert_close(out, ref)
+    _, _, layer = _layer_weights(4, 1088, 862)
+    x, topk_weight, topk_ids = make_layer_inputs(40, LAYER_HIDDEN, 4, 2, seed=863)
+    rejects(layer, x, topk_weight, topk_ids, "padded I 1088", block_m=64)
+    w, prepared = _ds_weights()
+    x, topk_weight, topk_ids = make_inputs(40, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=864)
+    rejects(prepared, x, topk_weight, topk_ids, "block_m 128", block_m=128)
+
+    w, prepared = _decode_weights(320)
+    x, topk_weight, topk_ids = make_inputs(3, HIDDEN, EXPERTS, TOPK, seed=865)
+    repeated = topk_ids.clone()
+    repeated[1, 3] = repeated[1, 0]
+    masked = topk_ids.clone()
+    masked[1, :4] = -1
+    monkeypatch.setattr(moe_a8w4, "DEBUG_CHECKS", True)
+    rejects(prepared, x, topk_weight, repeated, "distinct")
+    for value in (EXPERTS, -2):
+        bad = topk_ids.clone()
+        bad[2, 5] = value
+        rejects(prepared, x, topk_weight, bad, "routed expert ids")
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, masked)
+    assert_close(out, ref)
+    monkeypatch.undo()
+    flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, repeated)
 
 
 # =================================================================================================

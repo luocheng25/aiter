@@ -35,6 +35,13 @@ Slot pairs (Down): the 16-byte loads cover the same block of two routing slots i
 tensor), with the lane mapping above. The two slots need separate sums (their channel factors
 differ), so the A operand of lane ``l`` is zero unless ``l % 2`` equals its slot's half: output rows
 0 / 8 then sum the lower slot and rows 1 / 9 the upper one, from one MFMA.
+
+Masked routes (id -1): no kernel reads their weights, codes, deltas or channel factors. Gate/Up and the single-slot
+Down load through zero-byte buffer views of the expert (``common_a8w4.expert_bytes(masked=True)``: the hardware range
+check, which counts the SGPR offset too, returns 0 without a memory access) and skip the factor loads, so a masked
+route's intermediate row is 0; the slot-pair Down's whole-tensor views end one expert's bytes below 2**32, where the
+32-bit offsets of expert -1 fall. Down drops a masked slot's product with a select (whatever its routing weight and
+intermediate row), so a token whose slots are all masked gets BF16 +0.
 """
 
 import flydsl.compiler as flyc
@@ -198,10 +205,15 @@ def _load_dwordx4(buffer, voffset_bytes, soffset_bytes):
     ).bitcast(fx.Uint32)
 
 
-def _all_bytes(p):
-    """Buffer over a whole tensor (descriptor size 0xFFFFFFFF, no range check): per-lane offsets."""
+def _all_bytes(p, unit):
+    """Buffer over a whole tensor addressed by per-lane 32-bit offsets ``expert * unit + (offset within the expert)``:
+    the range check ends ``unit`` bytes before 2**32, so a masked route (expert -1, offsets in the last ``unit`` bytes
+    of the 32-bit range) loads 0 without reading memory; the tensor's ``E * unit`` bytes must fit below that.
+    """
     return fx.rocdl.make_buffer_tensor(
-        fx.make_view(fx.recast_iter(fx.Uint8, fxh._as_ptr(p)), fx.make_layout(1, 1))
+        fx.make_view(fx.recast_iter(fx.Uint8, fxh._as_ptr(p)), fx.make_layout(1, 1)),
+        max_size=False,
+        num_records_bytes=(1 << 32) - unit,
     )
 
 
@@ -246,11 +258,12 @@ def compile_a8w4_gateup_decode(
 
     ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``).
     x BF16 [M, K] quantized per row inside the kernel (``x_scale`` unused), or with ``PREQUANT``
-    FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK]; w / w_delta in the ``common_a8w4``
-    layout; w_scale f32 [E, N]; out f32 [M, TOPK, I]. ``PLAN = (GROUP, MAX_M, ZERO_COLS)``: the workgroups
-    of channel block 0 also write the expert-dedup plan entry of their route (``decode_dedup_a8w4``, plan
-    int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its share of its token's row of y BF16
-    [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without ``PLAN`` plan / y are unused.
+    FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK] (-1: a masked route, its out row 0, no weight
+    read); w / w_delta in the ``common_a8w4`` layout; w_scale f32 [E, N]; out f32 [M, TOPK, I].
+    ``PLAN = (GROUP, MAX_M, ZERO_COLS)``: the workgroups of channel block 0 also write the expert-dedup plan entry of
+    their route (``decode_dedup_a8w4``, plan int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its
+    share of its token's row of y BF16 [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without
+    ``PLAN`` plan / y are unused.
     ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
     """
     I = N // 2
@@ -340,8 +353,8 @@ def compile_a8w4_gateup_decode(
                 fx.make_layout(K // 2, 1),
             )
             xbits = [fx.Uint32(x_row[tid + 256 * m]) for m in range_constexpr(X_DWORDS)]
-        w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES)
-        d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES)
+        w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES, masked=True)
+        d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES, masked=True)
         w_voff = fx.Int32(lane * 16)
         d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
         d_shift = fx.Uint32((lane // 32) * 8)
@@ -368,13 +381,16 @@ def compile_a8w4_gateup_decode(
             )
         rocdl.sched_barrier(0)
         # Channel factors of the epilogue (thread t < 16 owns channel j * 16 + t), loaded now so that
-        # the epilogue does not wait for another memory round trip; only wave 0 issues these loads.
+        # the epilogue does not wait for another memory round trip; only wave 0 issues these loads. A masked route
+        # (id -1) reads no weights: its zero-byte buffer views above load 0 and it skips these loads (factors 0), so
+        # its intermediate row is 0.
         channel = j * 16 + tid
         ws_gate = fx.Float32(0.0)
         ws_up = fx.Float32(0.0)
-        if tid < 16:
+        if (tid < 16) & (expert >= 0):
+            # The id zero-extended, as in expert_bytes(masked=True).
             ws = fx.make_view(
-                fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(expert) * N,
+                fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(fx.Uint32(expert)) * N,
                 fx.make_layout(N, 1),
             )
             ws_gate = ws[channel]
@@ -524,8 +540,8 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
 
     ``N`` = hidden (``N % 16 == 0``), ``K`` = padded I (``K % 64 == 0``). mid f32 [M, TOPK, K] is
     quantized per row inside the kernel (``mid_scale`` unused); topk_ids int32 / topk_weight f32
-    [M, TOPK]; w_scale f32 [E, N]; out BF16 [M, N]. ``WAVES`` waves per workgroup (default one per
-    slot), slots in rounds.
+    [M, TOPK] (id -1: a masked route, adds nothing, no weight read); w_scale f32 [E, N]; out BF16 [M, N]. ``WAVES``
+    waves per workgroup (default one per slot), slots in rounds.
     """
     assert N % 16 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
     KB = K // 64
@@ -571,7 +587,6 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
         tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
         w_voff = fx.Int32(lane * 8)
         d_voff = fx.Int32((lane // 32) * 64 + (lane % 16) * 4)
-        channel = j * 16 + lane % 16
 
         slots, valid = [], []
         for r in range_constexpr(ROUNDS):
@@ -592,8 +607,8 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
             mids.append([mid[lane + 64 * u] for u in range_constexpr(K_PER_LANE)])
         raws, deltas, chan_scale = [], [], []
         for r in range_constexpr(ROUNDS):
-            w_buf = a8w4.expert_bytes(p_weight, experts[r], W_BYTES)
-            d_buf = a8w4.expert_bytes(p_w_delta, experts[r], D_BYTES)
+            w_buf = a8w4.expert_bytes(p_weight, experts[r], W_BYTES, masked=True)
+            d_buf = a8w4.expert_bytes(p_w_delta, experts[r], D_BYTES, masked=True)
             # Each delta dword right before the weight blocks it covers.
             raws.append([])
             deltas.append([])
@@ -611,11 +626,10 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
                         w_buf, w_voff, fx.Int32((j * KB + i) * a8w4.W_BLOCK_BYTES)
                     )
                 )
-            ws = fx.make_view(
-                fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(experts[r]) * N,
-                fx.make_layout(N, 1),
-            )
-            chan_scale.append(ws[channel])
+            # Channel factor of the lane's channel, through the expert's factor row (zero bytes when masked).
+            s_buf = a8w4.expert_bytes(p_w_scale, experts[r], N * 4, masked=True)
+            factor = a8w4.load_dword(s_buf, fx.Int32((lane % 16) * 4), fx.Int32(j * 64))
+            chan_scale.append(fx.Uint32(factor[0]).bitcast(fx.Float32))
         rocdl.sched_barrier(0)
 
         # Quantize this wave's intermediate rows into its LDS slots.
@@ -657,7 +671,9 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
                 for c in range_constexpr(2):
                     acc = _mfma(xop[c], ops[c], acc)
             contrib = Vec(acc)[0] * chan_scale[r] * row_scale[r] * weights[r]
-            total = total + valid[r].select(contrib, fx.Float32(0.0))
+            # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
+            live = valid[r] & (experts[r] >= 0)
+            total = total + live.select(contrib, fx.Float32(0.0))
 
         if lane < 16:
             _lds_store(
@@ -714,7 +730,8 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
 
     Down of ``compile_a8w4_down_decode`` for pre-quantized rows (mid FP8 [M, TOPK, K], mid_scale
     f32 [M, TOPK]) with 16-byte loads of slot pairs (see "Slot pairs" in the module docstring).
-    ``WAVES`` waves per workgroup (default one per slot pair), pairs in rounds.
+    ``WAVES`` waves per workgroup (default one per slot pair), pairs in rounds. Every expert's w2 bytes plus one
+    expert's must fit in 2**32 (32-bit offsets, the range check ending below expert -1's).
     """
     assert N % 16 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
     KB = K // 64
@@ -805,9 +822,9 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
                     ]
                 )
         # Whole-tensor buffers with per-lane expert offsets (the two halves read different experts).
-        w_all = _all_bytes(p_weight)
-        d_all = _all_bytes(p_w_delta)
-        s_all = _all_bytes(p_w_scale)
+        w_all = _all_bytes(p_weight, W_BYTES)
+        d_all = _all_bytes(p_w_delta, D_BYTES)
+        s_all = _all_bytes(p_w_scale, N * 4)
         w_lane = fx.Int32((lane % 32) * 16)
         d_lane = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
         s_lane = fx.Int32((lane % 8) * 8)
@@ -886,7 +903,10 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
                 for s in range_constexpr(2):
                     q = 2 * r + s
                     contrib = acc[s] * chan_scale[q][h] * row_scale[q] * weights[q]
-                    vals[h] = vals[h] + valid[q].select(contrib, fx.Float32(0.0))
+                    # A masked route (id -1) adds nothing (its weight may be anything); its loads above fell past
+                    # the range of _all_bytes.
+                    live = valid[q] & (experts[q] >= 0)
+                    vals[h] = vals[h] + live.select(contrib, fx.Float32(0.0))
 
         # Columns 0..7 from row 0 / 1 (lane n), columns 8..15 from row 8 / 9 (lane 32 + n).
         if (lane < 8) | ((lane >= 40) & (lane < 48)):

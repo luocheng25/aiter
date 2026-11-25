@@ -31,6 +31,7 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #   填充行（只在每个 expert 的末块尾部）；sorted_weights[排序行] = 路由权重；num_valid = 排序行总数（含填充行）：grid 按
 #   排序块数的上界发射，e·BM ≥ num_valid 的 CTA 直接退出；loc_ids[token, slot] = 该路由排序后的行号（< 0 表示没有这条
 #   路由，求和时跳过；同一 token 重复选同一 expert 时 Opus 排序只保留最后一个槽、其余为 −1，stream_prep 每条路由都保留）。
+#   topk_ids 里的 −1 是被屏蔽的路由（ATOM 的 padding 行）：两种排序都不放它（loc = −1），decode 各 kernel 见各节。
 # w1 / w2：fp4 权重码，w1_delta / w2_delta：delta 字节；w1_scale / w2_scale [E, 通道]：通道因子 2^(cmax − 132)，收尾才乘。
 # plan [M·TOPK, 4]（decode 按 expert 去重的计划）：同一 expert 的路由按路由号每 GROUP 条一组（M ≤ 16 时 2，否则 3）；
 #   plan[r] = [条数, r, 同 expert 的后续路由…]，条数只在组首非 0；组首的 CTA 算全组，只读前「条数」个组员。
@@ -56,6 +57,7 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 # —— 语义 ——
 # silu(g) = g · rcp(1 + exp2(−g·log2e))；swiglu(g, u) = silu(g)·u，g、u 已乘完通道因子与激活 scale；
 #   SwiGLU 截断 L > 0（编译期常量，kernel 名加 _swiglu）时先 g = min(g, L)、u = clamp(u, −L, L)；L = 0 时不发指令
+# 屏蔽路由（id −1）：任何 kernel 都不读它的权重、不把它计入 out（路由权重是什么都一样），整行屏蔽的 token 得 bf16 +0
 # row_scale(amax) = amax / 240（IEEE 除法），结果为 0 时取 1；quant_row(v) → (q, s)：s = row_scale(max|v|)，q = to_fp8(v / s)
 #   行量化都按 quant_row 逐位一致：row_quant_fp8 是通用版（bf16 或 f32 输入），row_quant_decode 是 decode 档用的版本，
 #   去重的 row_quant_plan 与流式的 stream_prep 在同一次 launch 里顺带量化 x，流式 Gate/Up 可在收尾直接量化 mid
@@ -64,13 +66,14 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 # 调用顺序（host 见 ../../../moe_a8w4.py；给了 tile 参数时一律 prefill）：
 #   decode（M ≤ 32，H ≤ 4096 或 5120，decode kernel 放得下；不排序，也没有 sorted_sum）：
 #     逐路由（H < 4096、I%128 ≠ 0 或 M = 1；H5120 且 I%128 ≠ 0 时只到 M = 7）：
-#       [row_quant_decode(x)：M·TOPK·I/16 ≥ 2560] → gateup_decode → [row_quant_decode(mid)：M ≥ 4、w2 < 4 GiB、槽对版放得下]
+#       [row_quant_decode(x)：M·TOPK·I/16 ≥ 2560] → gateup_decode → [row_quant_decode(mid)：M ≥ 4、w2 加一个 expert ≤ 4 GiB、
+#       槽对版放得下]
 #       → down_decode(_pq) → out
 #     按 expert 去重（H ≥ 4096、I%128 = 0、M ≥ 2；H4096 时 M ≤ 64 且 2·M·TOPK ≤ 3E 的 M > 32 也用；Down 原子加进清零的 out）：
 #       M·I < 3072、I%256 = 0 且 out 与 x 不重叠：[row_quant_decode(x)] → gateup_decode(PLAN：写计划、清零 out)
 #         → down_decode_dd(WG 内量化 mid)
 #       其余：row_quant_plan(x；写计划、清零 out) → gateup_decode_dd → row_quant_decode(mid) → down_decode_dd
-#     只去重 Gate/Up（H5120、I%128 ≠ 0、8 ≤ M ≤ 32、w2 < 4 GiB；Down 不去重，逐 token 直接写 out）：
+#     只去重 Gate/Up（H5120、I%128 ≠ 0、8 ≤ M ≤ 32、w2 加一个 expert ≤ 4 GiB；Down 不去重，逐 token 直接写 out）：
 #       row_quant_plan(x；写计划、不清零 out) → gateup_decode_dd(4 wave) → row_quant_decode(mid) → down_decode_pq
 #   流式（M > 32 且 M·TOPK ≤ R·E；R = 22，H ≥ 4096 为 48，H5120 且 M·TOPK ≥ 4096 为 16，H2560–4095 且排序块 64 尾部量化为 56；
 #     排序块：每 expert 平均 ≤ 12 行为 16（H < 5120 还要 3·M·TOPK ≥ 4E，否则 32），≤ 28 行为 32，其余 64）：
@@ -80,6 +83,7 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #     不清零 out)，否则 moe_sorting → row_quant_fp8(x；顺带把 loc_ids 置 −1)；之后都是 gateup_prefill → row_quant_fp8(mid)
 #     → down_prefill（写有效路由的 loc_ids）→ sorted_sum → out；H5120 且 M·TOPK ≥ 16384 时两个 GEMM 按 XCD 分块
 #     （XCD_CHUNK）；I > 512 且估计 WG > 80 时 down_prefill 的激活分两段（TWO_PASS）
+#   入口：会建 down_prefill（prefill 档，或流式 BM64 且 H ≥ 4096）且 BM·I > 64 KiB（BM64 即 I > 1024）时，任何 kernel 启动前报错
 #   带 shared expert（expert E 在路由最后一列，见 moe_a8w4.py 的 _moe_shared）：上面各档只算前 TOPK 列（routed）；shared 用
 #     aiter 稠密算子按 ATOM split：per_token_quant_hip(x) → gemm_a8w8_bpreshuffle(gate / up) → silu_and_mul(L)
 #     → per_token_quant_hip(mid) → gemm_a8w8_bpreshuffle(Down)；M ≤ 1024 且 out 与 x 不重叠时它在 side stream 上与 routed
@@ -243,8 +247,8 @@ lane 数 L 从 64 起减半，直到整除每行的 16 B 片数且每 lane 至�
 
 **资源**：不用 LDS。
 
-## A8W4 Gate/Up decode（[decode_a8w4.py](decode_a8w4.py#L242)）
-逐路由 decode（M ≤ 32、形状受支持：H%512 = 0，见 [gateup_decode_fits](decode_a8w4.py#L59)；host 只放行 H ≤ 4096 与 H5120）不排序：
+## A8W4 Gate/Up decode（[decode_a8w4.py](decode_a8w4.py#L254)）
+逐路由 decode（M ≤ 32、形状受支持：H%512 = 0，见 [gateup_decode_fits](decode_a8w4.py#L66)；host 只放行 H ≤ 4096 与 H5120）不排序：
 每个 WG 算一条路由 (token, slot) 的 16 个 gate 与同号 16 个 up 通道，写 mid[token, slot, ch]（f32）。
 去重的两 kernel 路径也用它（编译期 `PLAN`：顺带写去重计划并清零 out，给后面的 down_decode_dd）；不带 PLAN 时 plan / y 两个参数位不读。
 
@@ -269,6 +273,8 @@ def a8w4_gateup_decode(x, xq, xs, topk_ids, w1, w1_delta, w1_scale, mid, plan, o
     wr = [cdna3.buffer_load(w1[expert, wrows, 64 * (kb0 + 2 * p):64 * (kb0 + 2 * p + 2)])   # 块对 p：每 lane 16 B；
           for p in range(H // 256)]          # p 为偶数时先发一条 w1_delta 的 8 B（两行 × 4 个 64-K 块，供块对 p、p+1）
     cs = w1_scale[expert, ch], w1_scale[expert, I + ch]   # 收尾的通道因子也在序言读（tid < 16），收尾不再等访存
+    # 屏蔽路由（expert = −1）：w1 / w1_delta 的 buffer 视图记录数取 0（越界检查连 SGPR 偏移一起算 → 读到 0、不访存），
+    #   cs 不读（0），于是 mid 行为 0；id 零扩展后才乘字节数（符号扩展会让编译器在 id 的 s_load 后立刻等它，挡住 x 行加载）
     if PREQUANT:                                     # 编译期开关：M·TOPK·I/16（CTA 数）≥ 2560 时 host 先用 row_quant_decode 量化 x
         xl.store(xr); s = xs[token]
     else:                                            # CTA 少时每个 CTA 自己量化 bf16 的 x 行，省一次 launch
@@ -326,9 +332,9 @@ x 行 → LDS xq
   × 通道因子 × scale → [截断] → gate · rcp(1 + exp2(−gate·log2e)) · up → f32 写 mid[route, j·16 + tid]
   [PLAN] tid < ZPW：16 B 零写 out[token] 的第 (slot·I/16 + j)·ZPW + tid 片；通道块 0 的 wave 0：plan_route(route) → plan[route]
 ```
-关键代码：[LUT 表](decode_a8w4.py#L177)、[x 行加载](decode_a8w4.py#L320)、[权重加载](decode_a8w4.py#L348)、[片写 LDS](decode_a8w4.py#L384)、
-[核内量化](decode_a8w4.py#L393)、[主循环](decode_a8w4.py#L423)、[块解码](decode_a8w4.py#L208)、[收尾](decode_a8w4.py#L439)、
-[计划与清零](decode_a8w4.py#L472)。
+关键代码：[LUT 表](decode_a8w4.py#L184)、[x 行加载](decode_a8w4.py#L333)、[权重加载](decode_a8w4.py#L361)、[片写 LDS](decode_a8w4.py#L400)、
+[核内量化](decode_a8w4.py#L409)、[主循环](decode_a8w4.py#L439)、[块解码](decode_a8w4.py#L220)、[收尾](decode_a8w4.py#L455)、
+[计划与清零](decode_a8w4.py#L488)。
 
 **命名**：rb 本 wave 的 16 行权重块号；kb0 本 wave 那半段 K 的首个 64-K 块；块对 p = 64-K 块 kb0+2p、kb0+2p+1；raws[p] 块对 p 的
 16 B，deltas[p/2] 块对 p、p+1 共用的 delta 8 B；accs[h] 行 2m+h（h = 0/1）的累加器；ZPW 每个 CTA 清零的 16 B 片数
@@ -336,17 +342,18 @@ x 行 → LDS xq
 
 **流水线不变量**
 1. x 行加载先于全部权重加载发出（它不依赖 expert），每条 delta 加载紧挨它覆盖的两个块对之前（sched_barrier 固定），第 p 个块对只等自己那几条。
-2. 通道因子在序言由 tid < 16 读入，收尾不再访存。
+2. 通道因子在序言由 tid < 16 读入（屏蔽路由不读），收尾不再访存。
 3. LDS xq 写完后有一次 barrier 才进主循环；核内量化版另有一次 barrier 保护 4 个 wave 的 max（red）。
 4. 只有 lane 0–7、40–47 的 acc[h][0] 有效（A 与 B 的 K 组对齐的输出），写 part 后 barrier，tid < 16 才合并。
 5. PLAN 版清零 out 时同 token 的其他 CTA 可能还在读 x：out 与 x 重叠时 host 改走去重的四个 kernel。
+6. 屏蔽路由不读权重、delta 与通道因子（0 字节视图、跳过），mid 行为 0；PLAN 版照样清零 out 并写它的计划条目（条数 0）。
 
 **资源**：LDS 约 3.2 KiB（xq H B、part 512 B、red 16 B、LUT 96 B；H5120 多 2.5 KiB）；本 wave 的权重全部同时在途
 （H2560 每 lane 10 条 16 B，H5120 为 20 条）。
 
-## A8W4 Down decode（核内量化，[decode_a8w4.py](decode_a8w4.py#L522)）
-M ≤ 3、w2 ≥ 4 GiB 或槽对版放不下时用：每个 WG 算一个 token 的 16 个输出通道，在 LDS 里把 topk 个 expert 相加后直接写 bf16 out。
-它的 LDS 放不下时（[down_decode_fits](decode_a8w4.py#L65)）decode 整体不用，M ≤ 32 走 prefill。
+## A8W4 Down decode（核内量化，[decode_a8w4.py](decode_a8w4.py#L538)）
+M ≤ 3、w2 加一个 expert 超过 4 GiB 或槽对版放不下时用：每个 WG 算一个 token 的 16 个输出通道，在 LDS 里把 topk 个 expert 相加后直接写 bf16 out。
+它的 LDS 放不下时（[down_decode_fits](decode_a8w4.py#L72)）decode 整体不用，M ≤ 32 走 prefill。
 
 **Gluon 风格**
 ```python
@@ -367,6 +374,7 @@ def a8w4_down_decode(mid, topk_ids, topk_weight, w2, w2_delta, w2_scale, out):
     mr = [cdna3.buffer_load(mid[token, q, :]) for q in slot]   # lane 读 I/64 个 f32（列 l + 64u）
     wr = [cdna3.buffer_load(w2[expert[r], n, :]) for r in range(R)]   # 连同 w2_delta；每 64-K 块每 lane 8 B（同 prefill）
     cs = [cdna3.buffer_load(w2_scale[expert[r], n]) for r in range(R)]   # 通道因子
+    # expert = −1（屏蔽）：三者都经记录数为 0 的 buffer 视图读到 0、不访存（同 Gate/Up decode）
     sa = []
     for r in range(R):                               # wave 内量化本槽的 mid 行
         amax = wave_max(gl.abs(mr[r])); sa.append(row_scale(amax))
@@ -378,7 +386,7 @@ def a8w4_down_decode(mid, topk_ids, topk_weight, w2, w2_delta, w2_scale, out):
         for kb in gl.static_range(I // 64):          # 每个 64-K 块 2 条 MFMA
             a = mq_l.index(w).index(r).load(A 操作数布局)[:, 64 * kb:64 * kb + 64]
             acc = cdna3.mfma(a, decode(wr[r], kb, lut), acc)
-        total += gl.where(w + W * r < TOPK, acc[0] * cs[r] * sa[r] * tw[r], 0)
+        total += gl.where(w + W * r < TOPK and expert[r] >= 0, acc[0] * cs[r] * sa[r] * tw[r], 0)   # select，不乘 0
     part = gl.allocate_shared_memory(f32, [W, 16], …)
     part.index(w).store(total); gl.barrier()         # barrier：W 个 wave 的部分和写完才合并
     out[token, n] = tree_sum(part.load(…), axis=0).to(bf16)   # RTE；直接写 out，不需清零，也没有 sorted_sum
@@ -410,18 +418,19 @@ wave 内量化本槽 mid 行
   lane < 16：total → LDS part[w]；barrier
   tid < 16：W 个 wave 的部分和树形相加 → bf16（RTE）→ out[token, j·16 + tid]（不需清零与 sorted_sum）
 ```
-关键代码：[槽与 expert](decode_a8w4.py#L576)、[加载](decode_a8w4.py#L585)、[wave 内量化](decode_a8w4.py#L621)、
-[主循环](decode_a8w4.py#L647)、[收尾](decode_a8w4.py#L662)。
+关键代码：[槽与 expert](decode_a8w4.py#L591)、[加载](decode_a8w4.py#L600)、[wave 内量化](decode_a8w4.py#L635)、
+[主循环](decode_a8w4.py#L661)、[收尾](decode_a8w4.py#L678)。
 
 **命名与不变量**：slots[r] / valid[r] 第 r 轮的槽（钳过）与是否有效；mids[r] 本 lane 的 I/64 个 mid 值；raws[r][i] 第 i 个 64-K 块的 8 B。
 1. mid 行加载先于权重加载发出；每条 delta dword 紧挨它覆盖的 4 个块之前。
-2. 越界槽钳到 topk−1（读的都是合法地址），贡献由 valid 置零；每个 wave 只读自己写的 mq 行，barrier 后才读。
+2. 越界槽钳到 topk−1（读的都是合法地址），贡献由 valid 置零；屏蔽槽（id −1）的权重读到 0，贡献同样由 select 置零
+   （它的 mid 行可能是任意值、路由权重可能是 NaN）；每个 wave 只读自己写的 mq 行，barrier 后才读。
 3. 部分和按固定顺序 tree_sum：同输入的输出逐位确定。
 
 **资源**：LDS = W·⌈topk/W⌉·I B（mq）+ 64·W B（part）+ 96 B，TP2 topk11 约 4.2 KiB。
 
-## A8W4 Down decode 槽对（预量化，[decode_a8w4.py](decode_a8w4.py#L712)）
-M ≥ 4、w2 < 4 GiB 且放得下（每行 I/16 个 16 B 片 ≤ 64·W 个线程，全零行由每线程写一片；LDS 够）时用（H5120 只去重 Gate/Up 的
+## A8W4 Down decode 槽对（预量化，[decode_a8w4.py](decode_a8w4.py#L728)）
+M ≥ 4、w2 加一个 expert ≤ 4 GiB 且放得下（每行 I/16 个 16 B 片 ≤ 64·W 个线程，全零行由每线程写一片；LDS 够）时用（H5120 只去重 Gate/Up 的
 路径也用它）：读预量化的 mq fp8 与 ms；一条 16 B 加载覆盖两个路由槽的同一 64-K 块，其余同核内量化版。
 
 **Gluon 风格**
@@ -462,6 +471,7 @@ def a8w4_down_decode_pq(mq, ms, topk_ids, topk_weight, w2, w2_delta, w2_scale, o
         for h in gl.static_range(2):
             for s in gl.static_range(2):             # acc[h] 的行 s 与 8+s 属于槽 s；两槽的因子不同，分开乘
                 ok = 2 * (w + W * r) + s < TOPK
+                ok = ok and expert[r][s] >= 0           # 屏蔽槽：select 置零
                 vals[h] += gl.where(ok, acc[h][行 s 与 8+s] * cs[r][s][本列的通道] * sm[r][s] * tw[r][s], 0)
     part = gl.allocate_shared_memory(f32, [W, 2, 16], …)
     part.index(w).store(vals 的行 0/1 列 0–7 与行 8/9 列 8–15); gl.barrier()
@@ -497,19 +507,22 @@ mq 片 → LDS 行 [w, r, 半]（只写有效片）；barrier
   lane 0–7、40–47：vals[h] → LDS part[w, h]；barrier
   tid < 16（通道 2m+h）：各 wave 取列 m + 列 m+8 → 树形相加 → bf16（RTE）→ out[token, j·16 + tid]
 ```
-关键代码：[零行](decode_a8w4.py#L762)、[槽对](decode_a8w4.py#L770)、[mq 片](decode_a8w4.py#L786)、
-[整张量寻址](decode_a8w4.py#L807)、[屏蔽 A 操作数](decode_a8w4.py#L859)、[主循环](decode_a8w4.py#L865)、[收尾](decode_a8w4.py#L891)。
+关键代码：[零行](decode_a8w4.py#L779)、[槽对](decode_a8w4.py#L787)、[mq 片](decode_a8w4.py#L803)、
+[整张量寻址](decode_a8w4.py#L824)、[屏蔽 A 操作数](decode_a8w4.py#L876)、[主循环](decode_a8w4.py#L882)、[收尾](decode_a8w4.py#L911)。
 
 **命名与不变量**：ROWS = 2·W·R 个暂存行，之后是零行；upper = l ≥ 32（高槽半）；keep = (l%2 == l/32)；chan_scale[q][h] 槽 q 的行 2(l%8)+h。
 1. 零行（tid < I/16 各写一片）与 mq 片都在同一次 barrier 之前写完；越界片读最后一片、不写。
-2. expert 号 readfirstlane 成标量，供通道因子的标量偏移；权重偏移是 32 位，host 只在 w2 < 4 GiB 时选本 kernel。
+2. expert 号 readfirstlane 成标量，供通道因子的标量偏移；权重偏移是 32 位，整张量视图的记录数是 2^32 减一个 expert 的字节：
+   expert −1 的偏移（含 SGPR 偏移）正落在其上，读到 0、不访存；host 只在 w2 加一个 expert ≤ 4 GiB 时选本 kernel。
 3. 被屏蔽 lane 读零行：行 s / 8+s 只含槽 s，两槽各乘自己的通道因子、ms 与路由权重后才相加。
 4. 部分和按固定顺序 tree_sum：同输入的输出逐位确定。
+5. 屏蔽槽（id −1）的权重读到 0；H5120 只去重 Gate/Up 的路径里没人写它的 mid 行，mq / ms 由它量化而来（可为任意值，含 NaN）：
+   按不变量 3 只进它自己的输出行，再由 select 丢弃，不会混进同一 MFMA 的另一槽。
 
 **资源**：LDS = (2·W·轮数 + 1)·I B + 128·W B + 96 B，TP2 topk11 约 4.5 KiB；
-每 lane 偏移是 32 位，w2 总字节数须 < 4 GiB（否则 host 改用核内量化版）。
+每 lane 偏移是 32 位，w2 总字节数加一个 expert 须 ≤ 4 GiB（否则 host 改用核内量化版）。
 
-## 行量化 decode（[decode_a8w4.py](decode_a8w4.py#L946)）
+## 行量化 decode（[decode_a8w4.py](decode_a8w4.py#L966)）
 槽对 Down 与去重的四个 kernel 路径量化 mid（f32 [M·topk, I]），M·topk·I/16 ≥ 2560 时量化 x（bf16 [M, H]）；逐元素 IEEE 除法，
 结果与 [quant_a8w4.py](quant_a8w4.py) 逐位一致。
 
@@ -541,11 +554,11 @@ lane 内 max|x| → DPP 4 步 + readlane 4 行得整行 amax；scale = amax / 24
 q = clamp(x / scale, ±240)（IEEE）→ cvt_pk_fp8（RNE）→ -0 改 +0 → 每 4 个打包成 32 位字
 有效片写回：bf16 每片 8 B、f32 每片 4 B；lane 0 写 scale
 ```
-关键代码：[读片](decode_a8w4.py#L969)、[scale](decode_a8w4.py#L992)、[写回](decode_a8w4.py#L995)、[-0 处理](decode_a8w4.py#L150)。
+关键代码：[读片](decode_a8w4.py#L989)、[scale](decode_a8w4.py#L1012)、[写回](decode_a8w4.py#L1015)、[-0 处理](decode_a8w4.py#L157)。
 
 **资源**：不用 LDS。
 
-## 去重计划与 x 行量化（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L173)）
+## 去重计划与 x 行量化（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L177)）
 按 expert 去重的四个 kernel 的路径与只去重 Gate/Up 的 H5120 路径的第一步：一次 launch 量化 x 的每一行（与 row_quant_decode
 同算术、逐位一致）、把 out 清零（给 down_decode_dd 原子加；H5120 路径编译成 ZERO_COLS = 0、不清零，其槽对 Down 直接写），
 并为每条路由写计划条目（格式见文首 plan）。两 kernel 路径由 PLAN 版 Gate/Up decode 写同样的计划。
@@ -567,7 +580,8 @@ def a8w4_row_quant_plan(x, xq, xs, topk_ids, plan, out):
             hit = [ballot(ids[k] == e) for k in range(SEGS)]           # 每段 64 位
             rank = Σ popcount(hit 中路由号 < r 的位); total = Σ popcount(hit)
             nxt = 依次取上一个成员之后的最低置位（从低段找起），共 GROUP−1 个；没有记 0x7FFFFFFF（其后的字无意义）
-            plan[r] = [min(GROUP, total - rank) if rank % GROUP == 0 else 0, r, *nxt]   # lane 0 写 16 B
+            lead = rank % GROUP == 0 and e >= 0       # 屏蔽路由（e = −1）也会配上越界的 −1，所以不让它领组
+            plan[r] = [min(GROUP, total - rank) if lead else 0, r, *nxt]   # lane 0 写 16 B
     else:                                            # 量化第 b 行
         v = cdna3.buffer_load(x[b, :])               # 越过行尾的线程重读最后一片（不改 amax）
         red = gl.allocate_shared_memory(f32, [4], …)
@@ -592,16 +606,17 @@ def a8w4_row_quant_plan(x, xq, xs, topk_ids, plan, out):
   scale = max(red)/240（0 取 1）；q = clamp(x/scale)（IEEE）→ RNE fp8 → 每片 8 B 写 xq；tid 0 写 xs；ZERO_COLS > 0 时同一行
   out 每片 16 B 写 0
 ```
-关键代码：[规划一条路由](decode_dedup_a8w4.py#L129)、[量化分支](decode_dedup_a8w4.py#L222)、[清零 out](decode_dedup_a8w4.py#L268)。
+关键代码：[规划一条路由](decode_dedup_a8w4.py#L130)、[量化分支](decode_dedup_a8w4.py#L226)、[清零 out](decode_dedup_a8w4.py#L272)。
 
 **命名与不变量**：PW = ⌈TOPK/4⌉ 每个 token 的规划 CTA 数；SEGS 规划的 ballot 段数；_NONE = 0x7FFFFFFF 表示没有后续成员。
 1. 量化 CTA 读 x 行在 barrier 之前、清零 out 在 barrier 之后：out 可以就是 x（原地输出时 host 走这条路）。
-2. 规划 wave 只读 topk_ids、只由 lane 0 写 plan[r]；越界的路由号读 −1，不会与任何 expert 相同。
+2. 规划 wave 只读 topk_ids、只由 lane 0 写 plan[r]；越界的路由号读 −1，不会与任何 expert ≥ 0 相同；屏蔽路由（−1）
+   与它们相配，所以条数固定为 0：不领组、也不进任何组，去重的 Gate/Up 与 Down 都不算它。
 3. SEGS 编译期固定（MAX_M 由 host 按 M ≤ 32 / ≤ 64 选）：M > MAX_M 时 ballot 段不够，计划出错。
 
 **资源**：LDS 16 B（4 个 wave 的 amax）；不用 MFMA。
 
-## A8W4 Gate/Up decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L462)）
+## A8W4 Gate/Up decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L466)）
 按 expert 去重的四个 kernel 的路径与 H5120 只去重 Gate/Up 的路径里代替逐路由 Gate/Up：grid 与逐路由版相同，但只有组首路由的
 CTA 计算，一次读该 expert 的 16 行块，算组内 ≤ GROUP 条路由（每个 token 都选的 shared expert 只读 ⌈M/GROUP⌉ 次而不是 M 次）。
 
@@ -664,9 +679,9 @@ x 片 → LDS [组员, H+16]；barrier
   tid < GROUP·16：各 wave 的列 c + 列 c+8 → tree_sum（偶数 wave 为 gate）→ × 通道因子 × xs → [截断] → SiLU(gate)·up
   → f32 写 mid[组员路由, 16j + t%16]（条数以外的线程不写）
 ```
-关键代码：[组首判断](decode_dedup_a8w4.py#L545)、[x 行与权重](decode_dedup_a8w4.py#L343)、[主循环](decode_dedup_a8w4.py#L404)、
-[收尾](decode_dedup_a8w4.py#L418)、[pin](decode_dedup_a8w4.py#L82)、[host 分派](../../../moe_a8w4.py#L867)、
-[H5120 路径](../../../moe_a8w4.py#L963)。
+关键代码：[组首判断](decode_dedup_a8w4.py#L549)、[x 行与权重](decode_dedup_a8w4.py#L347)、[主循环](decode_dedup_a8w4.py#L408)、
+[收尾](decode_dedup_a8w4.py#L422)、[pin](decode_dedup_a8w4.py#L83)、[host 分派](../../../moe_a8w4.py#L870)、
+[H5120 路径](../../../moe_a8w4.py#L966)。
 
 **命名与不变量**：count / members / expert 组首条目与本路由的 expert；G = GROUP；XS = H+16 LDS 行距；KB_PART 本 wave 的 64-K 块数；
 em = t//16、cr = t%16 收尾线程的组员与通道行 2m'+h。
@@ -678,7 +693,7 @@ em = t//16、cr = t%16 收尾线程的组员与通道行 2m'+h。
 **资源**：LDS = GROUP·(H+16) B + 128·WAVES·GROUP B + 96 B LUT（H4096：GROUP2·8 wave 约 10.1 KiB，GROUP3·4 wave 约 13.6 KiB；
 H5120 GROUP3·4 wave 约 16.6 KiB）；每 lane PAIRS 条 16 B 权重加载同时在途（4 wave 为 16 条）。
 
-## A8W4 Down decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L783)）
+## A8W4 Down decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L787)）
 按 expert 去重的两种路径（两个 / 四个 kernel）都用它：组首的 CTA 一次读 expert 的 4·CB 个 16 通道块，算组内各路由，结果乘路由权重后用 bf16x2
 原子加进已清零的 out（求和顺序不定，输出不逐位确定）。
 
@@ -741,8 +756,8 @@ for 本 wave 的 CB 个块：
   每个组员 g：lane c < 8 的行 g 列 c + ds_bpermute 取 lane c+40 的行 8+g 列 c+8 → × 通道因子[h] × 因子[g]
     → 通道 2c、2c+1 打包 bf16x2 → lane < 8 且 g < 条数：agent 范围原子加 out[token_g, 16·块 + 2c]
 ```
-关键代码：[组首判断](decode_dedup_a8w4.py#L869)、[组员行](decode_dedup_a8w4.py#L651)、[权重](decode_dedup_a8w4.py#L684)、
-[WG 内量化](decode_dedup_a8w4.py#L708)、[主循环](decode_dedup_a8w4.py#L749)、[原子加](decode_dedup_a8w4.py#L780)。
+关键代码：[组首判断](decode_dedup_a8w4.py#L873)、[组员行](decode_dedup_a8w4.py#L655)、[权重](decode_dedup_a8w4.py#L688)、
+[WG 内量化](decode_dedup_a8w4.py#L712)、[主循环](decode_dedup_a8w4.py#L753)、[原子加](decode_dedup_a8w4.py#L784)。
 
 **命名与不变量**：ROWS 暂存行数（QUANT 为 4，否则 GROUP）；factors[g] 组员 g 的行 scale × 路由权重；src = (l+40)·4 是 ds_bpermute 的源地址。
 1. 同 Gate/Up 去重的 1、2：标量钉在分支前，组员行先于权重发出，条数以外的组员读到 0。
@@ -848,7 +863,7 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并
 ```
 关键代码：[前导](stream_a8w4.py#L360)、[按 S 特化](stream_a8w4.py#L779)、[共享激活](stream_a8w4.py#L641)、[ACT_STEPS 取址](stream_a8w4.py#L602)、
 [分组发与写](stream_a8w4.py#L693)、[预取](stream_a8w4.py#L692)、[主循环](stream_a8w4.py#L707)、[SiLU 与截断](stream_a8w4.py#L466)、
-[尾部量化](stream_a8w4.py#L506)、[夹逼与回退](stream_a8w4.py#L237)、[分派的 tile](../../../moe_a8w4.py#L1149)。
+[尾部量化](stream_a8w4.py#L506)、[夹逼与回退](stream_a8w4.py#L237)、[分派的 tile](../../../moe_a8w4.py#L1160)。
 
 **命名与不变量**：S 有效子块数；P 预取步数；SYNC / RING = 2·SYNC 激活环的步数与槽数；LOADER 每 lane 每步读的激活字节，
 LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
@@ -944,7 +959,7 @@ for r in 0 … R−1：
 ```
 关键代码：[共享激活](stream_a8w4.py#L1373)、[通道因子](stream_a8w4.py#L1404)、[权重与 delta](stream_a8w4.py#L1336)、
 [delta 交换](stream_a8w4.py#L1354)、[主循环](stream_a8w4.py#L1469)、[写 routes](stream_a8w4.py#L1543)、[原子累加](stream_a8w4.py#L1494)、
-[bf16x2 原子加](stream_a8w4.py#L123)、[LDS 预算](stream_a8w4.py#L1231)、[H5120 的权重缓存位](../../../moe_a8w4.py#L1270)。
+[bf16x2 原子加](stream_a8w4.py#L123)、[LDS 预算](stream_a8w4.py#L1231)、[H5120 的权重缓存位](../../../moe_a8w4.py#L1281)。
 
 **命名与不变量**：S 有效子块数；P = min(PREFETCH, R) 预取的通道块数；REGION 每 wave 1 KiB 通道因子区；KP = I+16 LDS 行距。
 1. R ≤ 16（一条 16 B 加载放下本 wave 的全部通道因子）；ATOMIC 时 R 为偶数（两块凑一条 bf16x2 原子加）。
@@ -1014,7 +1029,7 @@ def a8w4_route_sum(loc_ids, routes, out, M):
 | `a8w4_route_sum` | ⌈M·H/512 / 4⌉ × 256 线程 | wave 管一个 token 的 512 列；lane 16 B |
 
 QW 由 host 选：H%2048 = 0 或 M ≤ 256 时 4（列块均分或行少），否则 1（行多时 CTA 少）。排序块 BM 也由 host 选
-（[_stream_block_m](../../../moe_a8w4.py#L1305)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
+（[_stream_block_m](../../../moe_a8w4.py#L1327)：H5120 时每 expert 平均 ≤ 12 行一律 16）。
 
 **流水线**
 ```text
