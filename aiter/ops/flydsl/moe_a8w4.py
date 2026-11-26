@@ -33,6 +33,7 @@ import flydsl.expr as fx
 import torch
 
 from aiter.fused_moe import moe_sorting
+from aiter.ops.flydsl.kernels.moe_a8w4 import chunks as a8w4_chunks
 from aiter.ops.flydsl.kernels.moe_a8w4 import common as a8w4_common
 from aiter.ops.flydsl.kernels.moe_a8w4 import decode as a8w4_decode
 from aiter.ops.flydsl.kernels.moe_a8w4.decode_dedup import (
@@ -639,10 +640,14 @@ def _stream_block_m(tokens, topk, experts, hidden):
     return 32 if rows <= STREAM_BM32_ROWS else 64
 
 
-def _quantize(x, rows, cols, dtype, fill=None):
-    """Per-row FP8 quantization of ``x`` [rows, cols]; the same kernel sets int32 ``fill`` [rows, k] to -1."""
-    q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
-    scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
+def _quantize(x, rows, cols, dtype, fill=None, out=None):
+    """Per-row FP8 quantization of ``x`` [rows, cols] (into ``out`` = (q, scale) if given); the same kernel sets
+    int32 ``fill`` [rows, k] to -1."""
+    if out is not None:
+        q, scale = out
+    else:
+        q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
+        scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
     kernel = compile_row_quant_fp8(cols, dtype, 0 if fill is None else fill.shape[1])
     _launch(
         "a8w4_row_quant_fp8", kernel, x, q, scale, scale if fill is None else fill, rows
@@ -779,7 +784,7 @@ def _down_split(tokens, topk, experts, hidden, inter, block_m):
 
 
 @functools.cache
-def _gateup_prefill_kernel(N, K, topk, experts, limit, xcd_chunk):
+def _gateup_prefill_kernel(N, K, topk, experts, limit, xcd_chunk, chunked=False):
     return compile_a8w4_gemm1(
         N=N,
         K=K,
@@ -790,6 +795,7 @@ def _gateup_prefill_kernel(N, K, topk, experts, limit, xcd_chunk):
         E=experts,
         SWIGLU_LIMIT=limit,
         XCD_CHUNK=xcd_chunk,
+        CHUNKED=chunked,
     )
 
 
@@ -817,7 +823,8 @@ def _fused_moe_prefill(
     prep_routes = (
         PREFILL_PREP_MAX_ROUTES_H5120 if H >= 5120 else PREFILL_PREP_MAX_ROUTES
     )
-    if H >= 2560 and routes_n <= prep_routes:
+    chunks = getattr(down, "chunks", None)
+    if H >= 2560 and routes_n <= prep_routes and chunks is None:
         sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
             _stream_prep(
                 hidden_states, topk_weight, topk_ids, E, block_m, output, False
@@ -835,9 +842,22 @@ def _fused_moe_prefill(
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
-    gateup = _gateup_prefill_kernel(
-        2 * I, H, topk, E, limit, _xcd_chunk(GATEUP_XCD_CHUNK_H5120, H, routes_n)
-    )
+    gateup_xcd = _xcd_chunk(GATEUP_XCD_CHUNK_H5120, H, routes_n)
+    if chunks is not None:
+        return _prefill_chunks(
+            down,
+            _gateup_prefill_kernel(2 * I, H, topk, E, limit, gateup_xcd, True),
+            xq,
+            xs,
+            weights,
+            routing,
+            mid,
+            loc_ids,
+            output,
+            grid,
+            _xcd_chunk(DOWN_XCD_CHUNK_H5120, H, routes_n),
+        )
+    gateup = _gateup_prefill_kernel(2 * I, H, topk, E, limit, gateup_xcd)
     _launch(
         f"a8w4_gateup_prefill_bm{block_m}_bn{PREFILL_BLOCK_N}_tk{PREFILL_TILE_K}",
         gateup,
@@ -879,6 +899,56 @@ def _fused_moe_prefill(
         return output
     sorted_sum(topk, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
+    return output
+
+
+def _prefill_chunks(
+    down, gateup, xq, xs, weights, routing, mid, loc_ids, output, grid, xcd_chunk
+):
+    """The prefill path after the sort in token chunks (``prefill_down.chunks``, ``fused_moe_a8w4``): the chunks'
+    sorted-block lists (``a8w4_chunk_blocks``, ``kernels/moe_a8w4/chunks.py``), then per chunk the ``CHUNKED``
+    Gate/Up of its blocks, the quantization of the routes from the chunk's first token on (the later ones again
+    with the later chunks: a sorted block of the chunk may hold routes of later tokens) and ``prefill_down``; the
+    kernels of a chunk launch the bound of its blocks (``chunks.chunk_bound``)."""
+    starts, chunk_desc = down.chunks
+    sorted_ids, sorted_weights, sorted_experts, num_valid = routing
+    M, topk, I = mid.shape
+    rows = M * topk
+    desc = chunk_desc(grid)
+    build = a8w4_chunks.compile_chunk_blocks(
+        CHUNKS=len(starts),
+        K=-(-grid // (64 * a8w4_chunks.WAVES)),
+        BM=PREFILL_BLOCK_M,
+        ROW=desc.shape[1],
+    )
+    _launch("a8w4_chunk_blocks", build, sorted_ids, num_valid, desc)
+    mid_rows = mid.view(rows, I)
+    mq = torch.empty((rows, I), dtype=torch.float8_e4m3fnuz, device=mid.device)
+    ms = torch.empty((rows,), dtype=torch.float32, device=mid.device)
+    routes = torch.empty(
+        (grid * PREFILL_BLOCK_M, xq.shape[1]), dtype=torch.bfloat16, device=mid.device
+    )
+    for c, (first, end) in enumerate(zip(starts, (*starts[1:], M))):
+        bound = a8w4_chunks.chunk_bound(
+            end - first, topk, PREFILL_BLOCK_M, weights.experts, grid
+        )
+        chunk = (sorted_ids, sorted_weights, sorted_experts, desc[c])
+        _launch(
+            f"a8w4_gateup_prefill_bm{PREFILL_BLOCK_M}_bn{PREFILL_BLOCK_N}_tk{PREFILL_TILE_K}",
+            gateup,
+            xq,
+            weights.w1,
+            weights.w1_delta,
+            mid,
+            *chunk,
+            weights.w1_scale,
+            xs,
+            M,
+            bound,
+        )
+        r0 = first * topk
+        _quantize(mid_rows[r0:], rows - r0, I, "f32", out=(mq[r0:], ms[r0:]))
+        down(mq, ms, chunk, loc_ids, routes, output, weights, bound, xcd_chunk, c)
     return output
 
 
@@ -944,7 +1014,17 @@ def fused_moe_a8w4(
     [M * topk, I] with its row scales ``mid_scale``, ``routing`` the sorted (ids, weights, experts, valid count),
     ``loc_ids`` as for ``reduce`` (not yet stored by Down), ``routes`` the uninitialized BF16 [grid * 64, H] route
     rows, ``grid`` the sorted blocks and ``xcd_chunk`` the Down kernel's XCD_CHUNK -- and must launch on the current
-    stream and leave the result in ``output``. The other paths never call it.
+    stream and leave the result in ``output``. The other paths never call it. If it has an attribute ``chunks`` =
+    (``starts``, ``desc``), the prefill path runs in token chunks after the sort: chunk c takes the tokens from
+    ``starts[c]`` (``starts[0]`` = 0, increasing) to the next chunk's first one (the last one to M) and the sorted
+    blocks whose first route's token is among them (``moe_sorting``, which keeps the token order within an expert,
+    is then used at any M); ``desc(grid)`` returns the chunk descriptors on the device, int32 [chunks,
+    ``chunks.desc_row_words(grid)``] (``kernels/moe_a8w4/chunks.py``: per chunk its first token, its end and c set
+    by the host, the valid count and the chunk's sorted-block list stored by each call). Per chunk, Gate/Up
+    (``CHUNKED``) of its blocks, the quantization of the routes from its first token on, then ``prefill_down(...,
+    routing, ..., grid, xcd_chunk, c)`` with ``desc[c]`` in place of the valid count in ``routing`` and ``grid`` the
+    chunk's block bound (``chunks.chunk_bound``): the routes of the tokens below a chunk's end are complete after its
+    call.
 
     ``stream_down`` (default None) likewise replaces the Down kernel and ``reduce`` of the stream path: it is called
     as ``stream_down(mid, mid_scale, routing, loc_ids, routes, output, weights, block_m, task_num)`` -- ``mid`` FP8

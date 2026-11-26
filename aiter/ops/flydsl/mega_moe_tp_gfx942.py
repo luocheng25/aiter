@@ -17,7 +17,9 @@ per-token activations, MXFP4 weights) and sums the partial outputs over the rank
   prefill path of the shapes in ``STREAM_SPEC`` (``STREAM_DOWN``) the same sum streams out of the Down kernel
   instead (``kernels/mega_moe_tp_gfx942/down_tp.py``, ``a8w4_down_prefill_bm64_tp``: workgroups of the Down launch
   reduce, scatter and gather each column block of the output while the next ones compute), and ``a8w4_tp_reduce``
-  only copies the rows the other ranks summed into the output;
+  only copies the rows the other ranks summed into the output; TP2 batches of the shapes in ``CHUNK_SPEC``
+  (``AITER_MEGA_MOE_TP_CHUNK``) run in token chunks instead, each one's Down storing this rank's partials that an
+  SDMA queue pushes to the peer while the next chunk computes, and ``a8w4_tp_reduce`` adds the two partials;
 * otherwise: the BF16 partials are all-reduced: aiter ``CustomAllreduce`` when its ``should_custom_ar`` accepts
   the tensor, RCCL (``torch.distributed.all_reduce`` on ``group``) otherwise.
 
@@ -47,8 +49,11 @@ Contract (as ``MegaMoeTP``):
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import math
 import os
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -58,6 +63,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import moe_a8w4
 from .kernels.mega_moe_tp_gfx942 import decode_tp, down_tp, tp_reduce
+from .kernels.moe_a8w4 import chunks as a8w4_chunks
 from .mega_moe_tp import MegaMoeTPConfig
 
 __all__ = ["MegaMoeTPConfig", "MegaMoeTPGfx942", "mega_moe_tp_gfx942_supported"]
@@ -243,7 +249,25 @@ STREAM_TIER_SPEC = {
 # 640-1280 items.
 GATHER_ITEMS = 4
 GATHER_FROM = 2048
-# Timing analysis (DownTP.TRACE): room for this many workgroups' timestamps after the counters.
+# Token chunks of the streamed prefill Down with the one-shot cross-rank sum (down_tp rules 11-12) per (world,
+# hidden size): (from M rows, split points as fractions of M) -- the batches of at least that many rows run in
+# token chunks (the split points rounded to whole tiles of every rank; chunk c's sort, Gate/Up, quantization and
+# Down after chunk c - 1's Down), and every rank's SDMA queue (on KFD's recommended engine, sdma.push_order) pushes
+# each chunk's partials into the peer's landing block by block while the Downs go on; the gather sums both ranks'.
+# Only with SDMA queues on every rank (else the batch takes the path without chunks). Paired timing on MI308X
+# against the path without chunks (20261126-180318-tcs-run-a818, 20261126-180107-tcs-run-0a5b,
+# 20261126-184959-tcs-run-c2a7): TP2 0.95 / 0.92 / 0.90 (M 8192 / 16384 / 32768) but 1.01-1.04 at M 4096 and 1.17
+# at M 2048; one chunk 0.99-1.02. TP4 with an SDMA all-gather of the owners' sums instead: 0.99 at M 32768,
+# 1.01-1.06 at M 8192 - 16384; DeepSeek-V4.1 TP4 1.01-1.04 (M 16384 / 32768): none. AITER_MEGA_MOE_TP_CHUNK=0: no
+# token chunks.
+CHUNK_SPEC = {
+    (2, 2560): (8192, (0.78,)),
+}
+CHUNK_DOWN = os.environ.get("AITER_MEGA_MOE_TP_CHUNK", "1") != "0"
+# Timing analysis of the one-shot path (DownTP.STAMP; needs TRACE_WGS >= down_tp.STAMP_BYTES / 16).
+OS_STAMP = 0
+# Timing analysis (DownTP.TRACE; DownTP.STAMP needs down_tp.STAMP_BYTES): room for this many workgroups'
+# timestamps after the counters.
 TRACE_WGS = 0
 
 
@@ -288,6 +312,17 @@ def _tile_tokens(m, H):
     return 4 if H <= 1280 else 2 if H <= 2560 else 1
 
 
+def _chunk_starts(M, unit, fracs):
+    """First tokens of the token chunks of an M-row batch (``CHUNK_SPEC``): 0, then each split point rounded to
+    a multiple of ``unit`` (empty chunks dropped)."""
+    starts = [0]
+    for f in fracs:
+        first = round(M * f / unit) * unit
+        if starts[-1] < first < M:
+            starts.append(first)
+    return tuple(starts)
+
+
 def _wait_limit(seconds):
     """The ``limit`` launch argument of tp_reduce for a wait bound in seconds."""
     return max(1, math.ceil(seconds * _TIMER_HZ / tp_reduce.LIMIT_TICKS))
@@ -297,9 +332,10 @@ class _Workspace:
     """Buffers of the fused sums (their module docstrings) of one communicator, hidden size and batch bound
     ``m_max``. tp_reduce: symmetric ``landing`` / ``inbox`` / ``flags`` (hipIpc, uncached, zeroed), their address
     table ``tab`` and this rank's ``epoch``; down_tp: ``landing`` / ``inbox`` and its own symmetric ``flags2``, their
-    table ``tab2``, this rank's ``epoch2`` and block counters ``ctr``; decode_tp: the symmetric ``dinbox`` (uncached,
-    0xFF), its address table ``dtab`` and this rank's ``parity``. Creation and ``close`` are collective over the
-    communicator's gloo group.
+    table ``tab2``, this rank's ``epoch2`` and block counters ``ctr`` (room for the token chunks in ``flags2`` and
+    ``ctr``); decode_tp: the symmetric ``dinbox`` (uncached, 0xFF), its address table ``dtab`` and this rank's
+    ``parity``. ``sdma_table`` (the token chunks' SDMA pushes, down_tp rule 12) acquires this device's SDMA queues
+    on first use. Creation, ``close`` and the first ``sdma_table`` are collective over the communicator's gloo group.
     """
 
     def __init__(self, comm, rank, world, H, m_max):
@@ -334,7 +370,7 @@ class _Workspace:
                 (self.slots * (world + 1),), torch.int32
             )
             self.flags2 = self.heap.create_tensor(
-                (self.slots2 * (world + 1),), torch.int32
+                (down_tp.flag_words(self.slots2, world, True),), torch.int32
             )
             self.dinbox = self.heap.create_tensor(
                 (decode_tp.inbox_words(H, world, DECODE_TP_MAX_M),), torch.int32
@@ -350,23 +386,46 @@ class _Workspace:
             [self.heap.p2p_table(t) for t in (self.landing, self.inbox, self.flags)]
         ).view(torch.int32)
         self.epoch = torch.zeros(self.slots, dtype=torch.int32, device=comm.device)
-        self.tab2 = torch.stack(
+        self._tab2 = torch.stack(
             [self.heap.p2p_table(t) for t in (self.landing, self.inbox, self.flags2)]
-        ).view(torch.int32)
+        )
+        self.tab2 = self._tab2.view(torch.int32)
         self.epoch2 = torch.zeros(self.slots2, dtype=torch.int32, device=comm.device)
         self.ctr = torch.zeros(
-            down_tp.NSPLIT_MAX + 4 * TRACE_WGS, dtype=torch.int32, device=comm.device
+            down_tp.ctr_words(True) + 4 * TRACE_WGS,
+            dtype=torch.int32,
+            device=comm.device,
         )
+        self.rank, self.world, self.sdma, self.tab3, self._sdma_tried = rank, world, None, None, False
+        self.sdma_order = self._sdma_desc = None
         self.dtab = self.heap.p2p_table(self.dinbox).view(torch.int32)
         self.parity = torch.zeros(
             DECODE_TP_MAX_M * (H // 16), dtype=torch.int32, device=comm.device
         )
 
+    def sdma_table(self):
+        """``tab2`` with a fourth row (``down_tp`` rule 12: the address of this device's
+        ``sdma.SdmaQueues.desc`` in the order ``sdma_order``, queue k the one of peer ``(rank + 1 + k) % world``) if
+        every rank has its SDMA queues, else None (with a warning). The first call acquires them (collective, not
+        while capturing a CUDA graph: None then)."""
+        if not self._sdma_tried and not torch.cuda.is_current_stream_capturing():
+            self._sdma_tried = True
+            got = _acquire_sdma(self.comm, self.rank, self.world)
+            if got is not None:
+                self.sdma, self.sdma_order = got
+                self._sdma_desc = self.sdma.ordered(self.sdma_order)
+                row = torch.zeros(self.world, dtype=torch.int64, device=self.comm.device)
+                row[0] = self._sdma_desc.data_ptr()
+                self.tab3 = torch.cat([self._tab2, row[None]]).view(torch.int32)
+        return self.tab3
+
     def reset(self):
-        """Collective: zero the flags, epochs and parities and refill the decode inbox once no kernel of any rank
-        runs, before any rank launches again."""
+        """Collective: zero the flags, epochs and parities, refill the decode inbox and recreate the SDMA queues
+        once no kernel of any rank runs, before any rank launches again."""
         torch.cuda.synchronize(self.comm.device)
         dist.barrier(group=self.comm.cpu_group)
+        if self.sdma is not None:
+            self.sdma.recreate()
         self.flags.zero_()
         self.epoch.zero_()
         self.flags2.zero_()
@@ -379,10 +438,44 @@ class _Workspace:
 
     def close(self):
         """Collective (``IpcSymmetricHeap.close``)."""
+        if self.sdma is not None:
+            from .kernels.mega_moe_tp_gfx942 import sdma
+
+            torch.cuda.synchronize(self.comm.device)
+            sdma.release(self.sdma)
+            self.sdma = None
         self.heap.close()
         self.landing = self.inbox = self.flags = self.tab = self.epoch = None
-        self.flags2 = self.tab2 = self.epoch2 = self.ctr = None
-        self.dinbox = self.dtab = self.parity = None
+        self.flags2 = self._tab2 = self.tab2 = self.tab3 = self.epoch2 = self.ctr = None
+        self.dinbox = self.dtab = self.parity = self._sdma_desc = None
+
+
+def _acquire_sdma(comm, rank, world):
+    """Collective: (this device's SDMA queues, the queue order of its pushes: ``sdma.push_order`` for the peers
+    ``(rank + 1 + k) % world``, the identity if ``sdma.ENGINES_ENV`` is set) if every rank got its own queues, else
+    None (with a warning)."""
+    from .kernels.mega_moe_tp_gfx942 import sdma
+
+    queues, error = None, None
+    try:
+        queues = sdma.acquire(comm.device)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+    errors = [None] * world
+    dist.all_gather_object(errors, (error, queues.gpu_id if queues is not None else 0), group=comm.cpu_group)
+    failed = [e for e, _ in errors if e is not None]
+    if not failed:
+        order = tuple(range(len(queues.engines)))
+        if not os.environ.get(sdma.ENGINES_ENV):
+            peers = [errors[(rank + 1 + k) % world][1] for k in range(world - 1)]
+            order = sdma.push_order(queues.engines, [sdma.recommended(queues.gpu_id, p) for p in peers])
+        return queues, order
+    if queues is not None:
+        sdma.release(queues)
+    warnings.warn(
+        f"MegaMoeTPGfx942: no SDMA queues ({failed[0]}): the batches take the path without token chunks"
+    )
+    return None
 
 
 _WORKSPACES: dict = {}
@@ -527,8 +620,10 @@ class MegaMoeTPGfx942:
                 raise
         # Sticky watchdog bits of this instance's fused launches (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT).
         self._err = torch.zeros(1, dtype=torch.int32, device=device)
-        # Batch sizes this instance ran fused (their next forwards wait WAIT_S, not FIRST_WAIT_S).
-        self._seen: set[int] = set()
+        # Batch sizes this instance ran fused (their next forwards wait WAIT_S, not FIRST_WAIT_S; token chunks:
+        # (M, starts)).
+        self._seen: set = set()
+        self._chunk_descs: dict = {}
 
     # -- weights ------------------------------------------------------------------------------------------------
     def set_weights(
@@ -709,14 +804,22 @@ class MegaMoeTPGfx942:
     def _prefill_down(self, M, fused):
         """The ``prefill_down`` hook of ``fused_moe_a8w4``: the Down kernel with the cross-rank sum streamed out of
         it (down_tp), then ``a8w4_tp_reduce`` copying the other ranks' rows (appends to ``fused``); None if the
-        batch does not stream (``STREAM_DOWN``, ``STREAM_SPEC``)."""
+        batch does not stream (``STREAM_DOWN``, ``STREAM_SPEC``). In token chunks (``CHUNK_SPEC``, attribute
+        ``chunks``): one one-shot Down per chunk (``DownTP.OS``), then ``a8w4_tp_reduce`` summing both ranks'
+        partials (``compile_tp_gather(OS=1)``)."""
         cfg, ws = self.cfg, self._ws
         spec = _stream_spec(cfg.world_size, cfg.model_dim, cfg.topk, M)
         if not STREAM_DOWN or spec is None:
             return None
-        limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
+        starts, tab = (), ws.tab2
+        entry = CHUNK_SPEC.get((cfg.world_size, cfg.model_dim)) if CHUNK_DOWN else None
+        if entry is not None and M >= entry[0] and cfg.world_size == 2 and ws.sdma_table() is not None:
+            starts, tab = _chunk_starts(M, cfg.world_size * spec.TT, entry[1]), ws.tab3
+            spec = dataclasses.replace(spec, NY=0, NYT=0, OS=1, STAMP=OS_STAMP)
+        key = (M, starts) if starts else M
+        limit = _wait_limit(WAIT_S if key in self._seen else FIRST_WAIT_S)
 
-        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd):
+        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd, c=0):
             launch = down_tp.compile_down_tp(
                 N=cfg.model_dim,
                 K=weights.inter_padded,
@@ -739,7 +842,7 @@ class MegaMoeTPGfx942:
                 loc_ids,
                 output,
                 ws.ctr,
-                ws.tab2,
+                tab,
                 ws.epoch2,
                 self._err,
                 M,
@@ -748,8 +851,17 @@ class MegaMoeTPGfx942:
                 limit,
                 grid,
             )
-            items = spec.NSPLIT * -(-M // spec.TT)
+            if c < len(starts) - 1:
+                return
+            tiles = -(-M // spec.TT)
+            items = spec.NSPLIT * tiles
             per_wg = GATHER_ITEMS if items >= GATHER_FROM else 1
+            one_shot, extra = {}, ()
+            if starts:
+                # Every item: this rank's partial plus the peer's pushed one (down_tp rule 12).
+                firsts = [s // spec.TT for s in starts[1:]]
+                one_shot = dict(OS=1, STAMP=spec.STAMP)
+                extra = (*firsts, *[tiles] * (down_tp.MAX_CHUNKS - 1 - len(firsts)), len(starts))
             gather = down_tp.compile_tp_gather(
                 WORLD=cfg.world_size,
                 H=cfg.model_dim,
@@ -757,12 +869,13 @@ class MegaMoeTPGfx942:
                 NSPLIT=spec.NSPLIT,
                 DRY=spec.DRY,
                 G=per_wg,
+                **one_shot,
             )
             moe_a8w4._launch(
                 "a8w4_tp_reduce",
                 gather,
                 output,
-                ws.tab2,
+                tab,
                 ws.epoch2,
                 ws.ctr,
                 self._err,
@@ -771,10 +884,30 @@ class MegaMoeTPGfx942:
                 ws.tpq,
                 limit,
                 -(-items // per_wg),
+                *extra,
             )
             fused.append(M)
+            if starts:
+                self._seen.add(key)
 
+        if starts:
+            down.chunks = (starts, functools.partial(self._chunk_desc, M, starts))
         return down
+
+    def _chunk_desc(self, M, starts, grid):
+        """The chunk descriptors of ``fused_moe_a8w4``'s ``prefill_down.chunks`` for a call of ``grid`` sorted blocks
+        (int32 [chunks, ``moe_a8w4.chunks.desc_row_words(grid)``], ``moe_a8w4.chunks``; cached per batch size,
+        split and grid; the host sets the tokens and indices, the sort's block lists the rest)."""
+        desc = self._chunk_descs.get((M, starts, grid))
+        if desc is None:
+            words = a8w4_chunks.desc_row_words(grid)
+            desc = torch.zeros((len(starts), words), dtype=torch.int32, device=self.device)
+            for c, (lo, hi) in enumerate(zip(starts, (*starts[1:], M))):
+                desc[c, 1].fill_(lo)
+                desc[c, 2].fill_(hi)
+                desc[c, 3].fill_(c)
+            self._chunk_descs[(M, starts, grid)] = desc
+        return desc
 
     def _stream_down(self, M, fused):
         """The ``stream_down`` hook of ``fused_moe_a8w4``: the streaming Down kernel with the cross-rank sum streamed

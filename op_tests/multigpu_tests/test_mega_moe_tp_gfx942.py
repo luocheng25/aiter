@@ -707,8 +707,21 @@ def pool():
 # Region 1: basic tests (-m basic): one case per dispatch tier x shape. Each pins the tier -- the Gate/Up kernel of
 # the unfused kernel sequence listed -- and the communication segment: FUSED_COMM (the cross-rank sum fused into the
 # Down decode kernel up to 16 rows, from 2 MiB (TP2) / 1 MiB (TP4) of BF16 output into tp_reduce or streamed out of
-# the Down kernel) or CA (the custom all-reduce in between). Not pinned: the kernels after Gate/Up.
+# the Down kernel) or CA (the custom all-reduce in between). Not pinned: the kernels after Gate/Up, but for the token
+# chunks (CHUNK_FROM_M): CHUNK_KERNEL before them and the gather a8w4_tp_reduce last.
 # =====================================================================================================================
+# First M in token chunks (the host's CHUNK_SPEC; TP2 with SDMA queues on every rank): CHUNK_KERNEL lists each
+# chunk's sorted blocks, then Gate/Up and a one-shot Down per chunk (SDMA pushes its partials to the peer), and
+# a8w4_tp_reduce sums both ranks' partials.
+CHUNK_FROM_M = {"tp2": 8192}
+CHUNK_KERNEL = "a8w4_chunk_blocks"
+
+
+def in_chunks(shape, M):
+    """Whether an M-row batch of shape runs in token chunks."""
+    return shape in CHUNK_FROM_M and M >= CHUNK_FROM_M[shape]
+
+
 BASIC = [
     # decode: one workgroup per route / token
     ("tp2", 1, DEC, FUSED_COMM),
@@ -726,6 +739,7 @@ BASIC = [
     ("tp2", 2048, PF_PREP, FUSED_COMM),  # sorting by the streaming prep
     ("tp4", 4096, PF_SORT, FUSED_COMM),  # Opus moe_sorting
     ("ds_tp4", 4096, PF_SORT, FUSED_COMM),
+    ("tp2", 8192, PF_SORT, FUSED_COMM),  # token chunks, the partials pushed by SDMA
 ]
 
 
@@ -741,6 +755,10 @@ def test_basic(pool, shape, M, path, comm):
         assert (
             gateup_tier(r["path"]) == tier and comm_kind(r["path"]) == comm
         ), f"rank {r['rank']}: expected Gate/Up {tier} and communication {comm}, path {r['path']}"
+        kernels = r["path"].split(">")
+        assert not in_chunks(shape, M) or (
+            CHUNK_KERNEL in kernels and kernels[-1] == "a8w4_tp_reduce"
+        ), f"rank {r['rank']}: expected token chunks ending in a8w4_tp_reduce, path {r['path']}"
 
 
 # =====================================================================================================================
@@ -997,7 +1015,8 @@ def test_set_weights(pool):
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
 # prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups. The
 # streamed Down (its counters reset by its own kernels) is replayed on the prefill path at DeepSeek-V4.1 TP4 8192
-# (10 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048.
+# (10 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048; the token
+# chunks at TP2 8192 (the replayed Down kernels submit the SDMA pushes).
 GRAPH_CASES = [
     ("tp2", 8),
     ("ds_tp4", 1),
@@ -1006,6 +1025,7 @@ GRAPH_CASES = [
     ("ds_tp4", 8192),
     ("tp4", 2048),
     ("tp2", 4096),
+    ("tp2", 8192),
 ]
 
 
@@ -1046,6 +1066,9 @@ def test_cuda_graph(pool, shape, M):
     rows = _member_rows(pool.run("graph", shape=shape, M=M), shape)
     _assert_verified(rows)
     assert all(_known_path(r["path"]) for r in rows), rows
+    assert all(
+        (CHUNK_KERNEL in r["path"].split(">")) == in_chunks(shape, M) for r in rows
+    ), rows
 
 
 # --- 2.7 default communicators ----------------------------------------------------------------------------------
@@ -1278,7 +1301,8 @@ def test_path_checks():
 # --- 2.10 waits on peers: a late rank, a rank that skips a call, reset(), prepare()'s retry ----------------------
 # Why: the benchmark and the basic tests start every rank's fused kernel together and never time out. Here the fused
 # decode Down (8 rows), tp_reduce (256 rows) and the streamed Down with its gather (TP4 1024 / TP2 512: streaming
-# path, BF16 atomics; DeepSeek-V4.1 TP4 4096: prefill path) wait for a rank that starts 0.5 s late (right sums, no
+# path, BF16 atomics; DeepSeek-V4.1 TP4 4096: prefill path) and the token chunks (TP2 8192: the SDMA queue's wait
+# for the peer, the gather's waits for both pushes) wait for a rank that starts 0.5 s late (right sums, no
 # error bits); with the wait bound cut to 50 ms, for a rank that skips the call: the others give up within the bound
 # with their kernel's error bit, check_errors() raises once and clears it, the skipping rank's call after that is
 # right or has its error bit too, and reset() restores right sums. prepare() resets every rank and warms up again
@@ -1289,6 +1313,7 @@ PEER_WAIT_CASES = (
     ("tp4", 1024),
     ("tp2", 512),
     ("ds_tp4", 4096),
+    ("tp2", 8192),
 )
 # error_flag() bit of a wait that gave up, by fused kernel (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT; down_tp
 # and its gather a8w4_tp_reduce set tp_reduce's)
@@ -1412,6 +1437,10 @@ def test_peer_waits_and_timeouts(pool, shape, M):
             continue
         _assert_verified(res["rows"])
         assert all(r["path"].split(">")[-1] == last for r in res["rows"]), res["rows"]
+        assert all(
+            (CHUNK_KERNEL in r["path"].split(">")) == in_chunks(shape, M)
+            for r in res["rows"]
+        ), res["rows"]
         assert res["late_bits"] == 0, f"rank {rank}: error bits after a late peer {res}"
         if rank == W - 1:  # skipped; its late call is right or flagged
             assert res["bits"] == 0 and res["raised"] is None, res
@@ -1554,8 +1583,9 @@ def test_single_slot_decode_fallback(pool):
 # their batch sizes leave the streamed Down's gather at 1 item per workgroup or in full groups. Where the routes and
 # the ranks are summed in f32 (prefill path, DeepSeek-V4.1's streaming path) the streamed Down must equal the
 # unstreamed path (STREAM_DOWN off: Down kernel, tp_reduce) bitwise: TP4 3272 / 3273 (2045 / 2050 tiles of 8 tokens
-# over the column blocks: 1 / 4 per gather workgroup, the last group partial), TP4 / TP2 8193 (a 1-token last tile,
-# rank 0 owning one tile more), DeepSeek-V4.1 TP4 4097 (10 column blocks) and 513 (its first streamed batch). Not
+# over the column blocks: 1 / 4 per gather workgroup, the last group partial), TP4 8193 (a 1-token last tile, rank 0
+# owning one tile more), TP2 8193 (token chunks: the gather sums both ranks' partials, a 1-token last tile),
+# DeepSeek-V4.1 TP4 4097 (10 column blocks) and 513 (its first streamed batch). Not
 # here: Qwen's streaming path, whose BF16 atomics add the routes in a different order every call.
 STREAM_BITWISE_CASES = (
     ("tp4", 3272),
@@ -1602,6 +1632,160 @@ def test_streamed_down_bitwise(pool, shape, M):
         assert streams_down(r["path"]) and not streams_down(r["off_path"]), r
         assert r["off_path"].split(">")[-1] == "a8w4_tp_reduce", r
         assert r["same"] and r["bits"] == 0, r
+
+
+# --- 2.14 token chunks: both sides of the threshold, odd M, alternating with unchunked batches --------------------
+# Why: the benchmark and the basic test run token chunks at powers of two only, each batch size by itself, against
+# the tolerance only. One instance here alternates chunked and unchunked batches -- 8192, 8191 (both sides of
+# CHUNK_FROM_M), 12345 and 8193 (odd: a 1-token last tile, the chunks split at 9632 / 6384), 4096 -- and every output
+# must equal the path without token chunks (CHUNK_DOWN off: the owners' sums streamed out of one Down) bitwise.
+CHUNK_TOKENS = (8192, 8191, 12345, 4096, 8193)
+
+
+def _job_token_chunks(state):
+    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
+
+    shape = "tp2"
+    if not state.member(shape):
+        return None
+    layer, raw = state.get(shape)
+    rows = []
+    for M in CHUNK_TOKENS:
+        inputs = state.inputs(shape, M, 1)
+        y = layer.forward(*inputs)
+        row = dict(
+            M=M, path=">".join(layer.last_path), **_verify(state, shape, raw, inputs, y)
+        )
+        saved = mod.CHUNK_DOWN
+        mod.CHUNK_DOWN = False
+        try:
+            y_off = layer.forward(*inputs)
+        finally:
+            mod.CHUNK_DOWN = saved
+        row.update(
+            off_path=">".join(layer.last_path),
+            same=torch.equal(y, y_off),
+            bits=layer.poll_errors(),
+        )
+        rows.append(row)
+    return rows
+
+
+def test_token_chunks(pool):
+    rows = _member_rows(pool.run("token_chunks"), "tp2")
+    _assert_verified(rows)
+    assert [r["M"] for r in rows if r["rank"] == 0] == list(CHUNK_TOKENS), rows
+    for r in rows:
+        kernels, off = r["path"].split(">"), r["off_path"].split(">")
+        chunks = in_chunks("tp2", r["M"])
+        assert _known_path(r["path"]) and kernels[-1] == off[-1] == "a8w4_tp_reduce", r
+        assert (CHUNK_KERNEL in kernels) == chunks and CHUNK_KERNEL not in off, r
+        downs = [k for k in kernels if k.startswith("a8w4_down_")]
+        assert len(downs) == (2 if chunks else 1), r
+        assert streams_down(r["path"]) and streams_down(r["off_path"]), r
+        assert r["same"] and r["bits"] == 0, r
+
+
+# --- 2.15 SDMA queues: none on one rank, AITER_MEGA_TP_SDMA_ENGINES -----------------------------------------------
+# Why: the benchmark and the tests above get every rank's SDMA queues on the default engines. A new instance (its
+# own workspace: max_local_tokens) acquires them at its first chunked batch: with an invalid ENGINES_ENV on rank 1
+# (its acquire raises) every rank warns and takes the path without token chunks; with the permutation 4,2,6 on both
+# the queues are on those engines, pushing in that order. Both outputs, and the shared instance's after them (its
+# queues kept), equal the shared instance's chunked output bitwise. sdma._SHARED (the queues of a device, shared by
+# the workspaces) is set aside where the queues must be created anew.
+SDMA_STEPS = (
+    ("no_queues", 4096, {1: "1,2,3"}),
+    ("engines", 4160, {0: "4,2,6", 1: "4,2,6"}),
+)
+
+
+def _job_sdma_setup(state):
+    import warnings
+
+    from aiter.ops.flydsl.kernels.mega_moe_tp_gfx942 import sdma
+    from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
+
+    shape, M = "tp2", 8192
+    if not state.member(shape):
+        return None
+    layer, raw = state.get(shape)
+    group, cpu = state.tp[SHAPES[shape]["world"]]
+    inputs = state.inputs(shape, M, 1)
+    y = layer.forward(*inputs)
+    rows = [
+        dict(
+            step="shared",
+            path=">".join(layer.last_path),
+            **_verify(state, shape, raw, inputs, y),
+        )
+    ]
+    for step, local, env in SDMA_STEPS:
+        mine = env.get(state.rank)
+        shared, saved_env = dict(sdma._SHARED), os.environ.get(sdma.ENGINES_ENV)
+        other = MegaMoeTPGfx942(
+            make_config(shape, state.rank, max_local_tokens=local),
+            **to_megamoe_layout(raw),
+            group=group,
+            device=state.device,
+            cpu_group=cpu,
+        )
+        try:
+            if mine is not None:
+                sdma._SHARED.clear()
+                os.environ[sdma.ENGINES_ENV] = mine
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                y2 = other.forward(*inputs)
+            queues = other._ws.sdma
+            rows.append(
+                dict(
+                    step=step,
+                    path=">".join(other.last_path),
+                    warned=any("no SDMA queues" in str(w.message) for w in caught),
+                    engines=None if queues is None else queues.engines,
+                    order=other._ws.sdma_order,
+                    same=torch.equal(y, y2),
+                    bits=other.poll_errors(),
+                )
+            )
+        finally:
+            if saved_env is None:
+                os.environ.pop(sdma.ENGINES_ENV, None)
+            else:
+                os.environ[sdma.ENGINES_ENV] = saved_env
+            other.close()
+            sdma._SHARED.clear()
+            sdma._SHARED.update(shared)
+    y3 = layer.forward(*inputs)
+    rows.append(
+        dict(
+            step="shared_after",
+            path=">".join(layer.last_path),
+            same=torch.equal(y, y3),
+            bits=layer.poll_errors(),
+        )
+    )
+    return rows
+
+
+def test_sdma_fallback_and_engines(pool):
+    rows = _member_rows(pool.run("sdma_setup"), "tp2")
+    _assert_verified([r for r in rows if r["step"] == "shared"])
+    steps = {}
+    for r in rows:
+        steps.setdefault(r["step"], []).append(r)
+        assert r["path"].split(">")[-1] == "a8w4_tp_reduce", r
+        assert streams_down(r["path"]), r
+        assert r["step"] == "shared" or (r["same"] and r["bits"] == 0), r
+    assert sorted(steps) == ["engines", "no_queues", "shared", "shared_after"], rows
+    for r in steps["shared"] + steps["shared_after"] + steps["engines"]:
+        assert CHUNK_KERNEL in r["path"].split(">"), r
+    for r in steps["no_queues"]:
+        assert r["warned"] and r["engines"] is None, r
+        assert CHUNK_KERNEL not in r["path"].split(">"), r
+    for r in steps["engines"]:
+        assert not r["warned"] and r["engines"] == (4, 2, 6), r
+        assert r["order"] == (0, 1, 2), r
 
 
 # =====================================================================================================================

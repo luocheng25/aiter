@@ -38,7 +38,7 @@ A_TWO_PASS_MIN_K = 512
 
 
 def compile_a8w4_gemm2(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, XCD_CHUNK=0, TP=None
+    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, XCD_CHUNK=0, TP=None, CHUNKED=False
 ):
     """Build the A8W4 Down launcher.
 
@@ -53,6 +53,9 @@ def compile_a8w4_gemm2(
     all their hidden-dimension parts, dealt to the XCDs in turn, so blocks of one expert share its weights in L2).
     ``TP``: the streamed Down (module docstring); the launcher then takes ``out``, ``ctr``, ``tab``, ``epoch``,
     ``err``, M, rank, tpq, limit, task_num, stream after ``loc`` (``down_tp.compile_down_tp``).
+    ``CHUNKED``: ``num_valid_ids`` is a token chunk's descriptor row (``chunks``) and the sorted-block positions are
+    those of its block list (``common.chunk_block``), task_num its bound (``chunks.chunk_bound``); with ``TP`` its
+    roles take the chunk's tokens (``TPArgs.t_lo`` / ``t_hi`` / ``chunk``).
     """
     BM = BLOCK_TILE_SIZE_M
     assert (N // 64) % (
@@ -97,6 +100,11 @@ def compile_a8w4_gemm2(
             if XCD_CHUNK > 0 or TP is not None
             else fx.Int32(fx.gpu.block_idx.x)
         )
+
+    def _chunk_tokens(p_desc):
+        """TP roles of a ``CHUNKED`` launch: the chunk's tokens ``[desc[1], desc[2])`` and its index ``desc[3]``."""
+        desc = fxh.view_as_torch_tensor(p_desc, (4,), fx.Int32)
+        return dict(t_lo=fx.Int32(desc[1]), t_hi=fx.Int32(desc[2]), chunk=fx.Int32(desc[3]))
 
     def _rne_bits(value):
         bits = value.bitcast(fx.Uint32)
@@ -158,8 +166,15 @@ def compile_a8w4_gemm2(
         else:
             e_idx = fx.gpu.block_idx.y
             part = e_idx  # unused: _part reads grid x
-        max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
-        active = e_idx * BM < max_valid_id
+        if const_expr(CHUNKED):
+            pos = e_idx
+            if const_expr(TP is not None):
+                # The reduce / owner workgroups read position 0 (their idx may pass the chunk's bound).
+                pos = (role == 0).select(e_idx, fx.Int32(0))
+            active, e_idx = a8w4.chunk_block(p_num_valid_ids, pos)
+        else:
+            max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
+            active = e_idx * BM < max_valid_id
         if const_expr(TP is not None):
             active = (role == 0) & active
 
@@ -499,6 +514,7 @@ def compile_a8w4_gemm2(
                     tpq=tpq,
                     limit=limit,
                     task_pad=task_pad,
+                    **(_chunk_tokens(p_num_valid_ids) if CHUNKED else {}),
                 ),
             )
 

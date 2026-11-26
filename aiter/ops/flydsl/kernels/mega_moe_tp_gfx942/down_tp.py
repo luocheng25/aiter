@@ -12,7 +12,10 @@ every rank (all-gather). The second kernel, ``compile_tp_gather`` (launched as `
 the other ranks summed from ``landing`` into ``out``. Same arithmetic, buffers and flag protocol as ``tp_reduce``
 (its rules 1-6; ``SYS``, ``POISON``, ``ERR_TIMEOUT``): with route rows the output is bitwise that of ``tp_reduce``;
 with ``COPY`` (the atomic streaming Down has summed the routes into this rank's ``out`` itself, in the order its
-atomics land) it is that of the atomic Down followed by ``tp_reduce``'s copy mode up to that order.
+atomics land) it is that of the atomic Down followed by ``tp_reduce``'s copy mode up to that order. With ``OS``
+(two ranks, rules 11-12) the prefill Down runs as token chunks without owners: the reduce workgroups store this
+rank's partials into ``out``, an SDMA queue pushes each finished block of them to the peer while the next chunk
+computes, and the second kernel adds the peer's partials from ``landing`` (bitwise the same output).
 
 Tile: column block ``q``: hidden columns ``[q * CWD, (q + 1) * CWD)``, ``CWD = H / NSPLIT`` (a multiple of 512). Item
 ``(q, tile)``: the ``TT`` tokens ``tile * TT ..`` (the last tile masked at M) of block ``q``, owned by rank
@@ -56,7 +59,12 @@ Naming: ``tab`` int64 [3, WORLD] as int32: per rank the address of ``landing`` (
 ``[WORLD * rps, H]``, ``rps = ceil(tiles / WORLD) * TT``) and ``flags`` (int32 ``[slots * (WORLD + 1)]``, ``slots =
 NSPLIT_MAX * tpq`` whatever ``NSPLIT`` a call uses: ``RS[v][s]`` at ``v * WORLD + s``, ``AG[v]`` at ``slots * WORLD +
 v``); ``epoch`` int32 [slots] and ``ctr`` int32 [NSPLIT] (this rank's, plain device memory, ``ctr`` zero between
-calls); ``err`` int32 [1]. C / X / Y: compute / reduce / owner workgroups (``ROLE_*``).
+calls); ``err`` int32 [1]. C / X / Y: compute / reduce / owner workgroups (``ROLE_*``). Token chunks of the one-shot
+sum (``OS``, rules 11-12): ``tab`` [4, 2] (row 3 [0]: the address of this rank's ``sdma.SdmaQueues.desc``),
+``flags`` ``MAX_CHUNKS * CHUNK_WORDS`` more words (``flag_words``; chunk c's at ``slots * 3 + c * CHUNK_WORDS``:
+``CEP[o]`` / ``PSN[o]`` at ``CEP`` / ``PSN + o``, per column block q ``TRG[q]`` / ``ARR[q]`` / ``SNT[q]`` /
+``XCN[q]`` at ``TRG`` / ``ARR`` / ``SNT`` / ``XCN + q``; ``RDY[o]`` at ``RDY + o`` of chunk 0's), ``ctr``
+``ctr_words(True)`` (chunk c's counters at ``c * NSPLIT_MAX``).
 
 Rules (in addition to tp_reduce's):
 
@@ -68,11 +76,42 @@ Rules (in addition to tp_reduce's):
    so every wait ends (a rank that never comes: rule 5).
 9. Reuse across calls: a rank writes partials (any path) only after its previous call ended, whose gather waited
    for the AG of every item it sent a partial for (the owner's reads came first); an owner's own region is read
-   by its own Y in the same launch. Landing as in tp_reduce rule 3.
+   by its own Y in the same launch. Landing as in tp_reduce rule 3 (one-shot: rule 12).
 10. X / Y loops (the table above): the loop carries the words loaded for the next step and nothing else is in
     flight when it starts (``s_waitcnt vmcnt(0)``), so its waits count only the previous step's memory operations;
     a group's flags are stored after ``s_waitcnt vmcnt(0)`` and a barrier, i.e. after the partial / sum stores of
     all of its tiles by every wave (the next step's loads are waited for there too).
+11. Token chunks (``OS``; ``moe_a8w4.fused_moe_a8w4``, ``prefill_down.chunks``): chunk c, the tokens ``[t_lo,
+    t_hi)`` (multiples of ``WORLD * TT`` but the call's end), is a Down launch of its own after chunk c - 1's, of
+    the sorted blocks whose first route's token is in the chunk (``CHUNKED``): every route of its tokens is then
+    complete (the sort keeps the token order within an expert; a block's routes of later tokens are computed with
+    it). Its X take the chunk's tiles only; its compute workgroups count in its own ``ctr`` words (the final kernel
+    zeroes all).
+12. One-shot sum (``OS``, two ranks, ``MegaMoeTPGfx942.CHUNK_SPEC``; every chunk the same; peer ``o = 1 - rank``):
+    no owner workgroups and no inbox. X stores this rank's partials into its own ``out`` (token rows, written
+    through, ``SYS``); every X workgroup at its end (``s_waitcnt vmcnt(0)``, barrier) adds 1 to the chunk's
+    ``XCN[q]``, the last of block q zeroes it and stores ``TRG[q] = CEP[rank] + 1`` (``| POISON`` if ``err`` is set,
+    after ``PSN[rank] = (CEP[rank] + 1) | POISON`` on o). X(0) workgroup 0 first, wave 0: advances ``CEP[o]``;
+    chunk 0 stores ``RDY[rank] = CEP[rank] + 1`` on o; it submits to SDMA queue 0 (``sdma.py``): chunk 0 POLLs until
+    o's ``RDY[o]`` here reaches ``CEP[o]``, then per column block q: POLL until ``TRG[q] & _EPOCH_BITS == CEP[rank]
+    + 1``, one 2-D copy of the block's columns of the chunk's rows (``2 * CWD`` bytes, ``2 * H`` apart) from ``out``
+    into o's ``landing`` at the same place, FENCE ``ARR[q]`` on o and FENCE ``SNT[q]`` here (both ``CEP[rank] +
+    1``); a FENCE on the queue's completion word. Chunk 0's submission needs the queue idle (else it submits
+    nothing and sets ``ERR_TIMEOUT``: a wait of an earlier call gave up, ``reset()`` recreates the queues); later
+    chunks queue behind it. The final kernel (``compile_tp_gather(OS=1)``) takes every item (all ranks' tiles): it waits
+    (bounded, one poll for its ``G`` items) until ``ARR[q]`` (o's partials are in ``landing``) and ``SNT[q]`` (the
+    queue has read this rank's ``out``) of the item's chunk have reached ``CEP[o]`` (``ERR_TIMEOUT`` if it gave up
+    or ``PSN[o] == CEP[o] | POISON``), then stores ``out`` = the f32 sum of ``out`` and ``landing`` rounded once
+    (the two partials' sum in rank order: bitwise the owner's of the other modes, on both ranks). At its end
+    workgroup 0, wave 0, waits (bounded) for the queue's completion fence; if it gave up, it releases the queue's
+    POLLs (``TRG`` of every chunk to ``CEP[rank] + 1 | POISON``, after ``PSN[rank]`` on o, and ``RDY[o]`` here),
+    waits again and sets ``ERR_TIMEOUT``; then it advances ``CEP[rank]`` of every chunk. Between the Downs and the
+    final kernel's end ``CEP[o] = CEP[rank] + 1``, so the final kernel reads ``CEP[o]`` only. Reuse: o's queue
+    writes this rank's ``landing`` only after this rank's ``RDY`` of the call, stored when its first Down started,
+    i.e. after its previous final kernel ended (whatever mode it was: the other modes' writers into ``landing``,
+    o's owner workgroups, wait for this rank's partials of the same call); this rank's queue reads ``out`` before
+    ``SNT``, which the final kernel waits for before storing the sums. The queues are the device's (shared by its
+    kernels on one stream, ``sdma.py`` rule 1).
 """
 
 import functools
@@ -100,6 +139,7 @@ from ..moe_a8w4.stream import (
     _uniform,
     compile_a8w4_down_stream,
 )
+from . import sdma
 from .tp_reduce import (
     _EPOCH_BITS,
     ERR_TIMEOUT,
@@ -120,6 +160,37 @@ ROLE_COMPUTE, ROLE_REDUCE, ROLE_OWNER = 0, 1, 2
 NSPLIT_MAX = 16
 # Tile sizes (tokens) DownTP takes; the workspace sizes the slots and inbox rows for all of them.
 TILE_TOKENS = (4, 8, 16, 32, 64)
+# Token chunks of the one-shot sum (``DownTP.OS``, rules 11-12): chunks of a call, and the words of chunk c's region
+# at ``flags`` word ``slots * (WORLD + 1) + c * CHUNK_WORDS``: CEP[o] / PSN[o] at CEP / PSN + o (o < 4), RDY[o] at
+# RDY + o, and per column block q < NSPLIT_MAX TRG[q] / ARR[q] / SNT[q] / XCN[q] at TRG / ARR / SNT / XCN + q.
+MAX_CHUNKS = 4
+CHUNK_WORDS, CEP, PSN, RDY, TRG, ARR, SNT, XCN = 128, 4, 12, 16, 32, 48, 64, 80
+
+
+def _os_submit_bytes(nsplit, stamps=0):
+    """Bytes of one-shot SDMA submission of a chunk (``DownTP.OS``): the RDY POLL, per column block POLL, COPY2D
+    and two FENCEs, the completion FENCE (``stamps``: ``DownTP.STAMP``, a TIMESTAMP after the RDY POLL and after
+    every POLL and COPY2D), NOPs up to a multiple of 64 bytes."""
+    return -(-(4 * (6 + 34 * nsplit + 4 + (3 * (1 + 2 * nsplit) if stamps else 0))) // 64) * 64
+
+
+# DownTP.STAMP (timing analysis of rule 12) from ctr word ctr_words(True): per chunk a row of STAMP_SLOTS 64-byte
+# slots (0: _plan_os, 1: SDMA past the RDY POLL, 2 + 2q / 3 + 2q: SDMA past the POLL of TRG[q] / its COPY2D,
+# 12 + q: TRG[q] stored, 17 + q / 22 + q: reduce workgroup 0 of block q past / before its wait), then per final
+# kernel workgroup (< STAMP_WGS) 32 bytes: its start, past its last wait, its end.
+STAMP_SLOTS = 32
+STAMP_WGS = 1024
+STAMP_BYTES = MAX_CHUNKS * STAMP_SLOTS * 64 + STAMP_WGS * 32
+
+
+def flag_words(slots, world, chunks):
+    """Words of ``flags`` (module docstring, Naming) for ``slots`` slots, ``chunks``: room for the token chunks."""
+    return slots * (world + 1) + (MAX_CHUNKS * CHUNK_WORDS if chunks else 0)
+
+
+def ctr_words(chunks):
+    """Words of ``ctr`` before the ``TRACE`` timestamps."""
+    return NSPLIT_MAX * (MAX_CHUNKS if chunks else 1)
 
 
 def _entry(tab, world, row, p):
@@ -158,6 +229,18 @@ def _stamp():
     )
 
 
+def _stamp_at(p_ctr, offset, live):
+    """``DownTP.STAMP``: stores ``s_memrealtime`` at byte ``offset`` of the stamp area where ``live``."""
+    pair = Vec.from_elements([_stamp()], fx.Int64).bitcast(fx.Uint32)
+    base = 4 * ctr_words(True)
+    _store(
+        _rsrc(_address(p_ctr), base + STAMP_BYTES),
+        [pair[0], pair[1]],
+        live.select(base + offset, fx.Int32(_DROP)),
+        SYS,
+    )
+
+
 def _loop_carry(lb, ub, step, init, fn):
     """``state = fn(i, state)`` for ``i`` in ``range(lb, ub, step)`` as one scf.for carrying ``state`` (a list of
     32-bit values, passed to ``fn`` as Int32); returns the final state."""
@@ -193,8 +276,14 @@ class DownTP:
     nothing), 2 = the Down and this rank's reduction over the routes into ``out``, nothing sent, 3 = as 1 without
     the compute workgroups' counting (no ``s_waitcnt vmcnt(0)`` before they end), 4 = the Down and the reduce
     workgroups' reduce-scatter (owner workgroups and the gather do nothing). ``TRACE``: every workgroup stores its
-    start and end ``s_memrealtime`` (int64 pair) at ``ctr`` byte ``64 + 16 * wg``. ``WPE``: the kernel's
-    ``waves_per_eu`` compile hint (0: none)."""
+    start and end ``s_memrealtime`` (int64 pair) at ``ctr`` word ``ctr_words(OS)`` + 4 * wg. ``WPE``: the
+    kernel's ``waves_per_eu`` compile hint (0: none). ``STAMP`` (with ``OS``): the one-shot sum's timestamps
+    (``STAMP_SLOTS``).
+
+    ``OS`` (two ranks, no owner workgroups; the ``CHUNKED`` prefill Down of one token chunk, ``TPArgs.t_lo`` /
+    ``t_hi`` / ``chunk``, rule 11): the one-shot sum, the reduce workgroups take the chunk's tiles only and store
+    this rank's partials into ``out``, the SDMA queue pushes them to the peer (rule 12); the chunk's block counters
+    are ``ctr`` words ``chunk * NSPLIT_MAX`` on."""
     WORLD: int
     H: int
     TOPK: int
@@ -214,6 +303,8 @@ class DownTP:
     DRY: int = 0
     TRACE: int = 0
     WPE: int = 0
+    OS: int = 0
+    STAMP: int = 0
 
     def __post_init__(self):
         assert self.WORLD in (2, 4, 8), self.WORLD
@@ -230,6 +321,15 @@ class DownTP:
         assert self._upw() * self._rows() <= 64, (self.TT, self.TOPK, self.COPY)
         assert self.UX >= 0 and self._upw() % (self.UX or self._upw()) == 0, self.UX
         assert self.GY * self.WORLD <= 64, (self.GY, self.WORLD)
+        # OS: two ranks (one SDMA queue), no owner workgroups (rule 12).
+        assert not self.OS or (self.WORLD == 2 and self.NY == 0 and self.NYT == 0 and not self.COPY), (
+            self.OS,
+            self.WORLD,
+            self.NY,
+            self.NYT,
+            self.COPY,
+        )
+        assert not self.STAMP or (self.OS and not self.TRACE), (self.STAMP, self.OS, self.TRACE)
 
     def _rows(self):
         """Rows a reduce workgroup sums per token: the ``TOPK`` routes, one with ``COPY``."""
@@ -287,10 +387,11 @@ class DownTP:
         """``TRACE``: thread 0 stores ``s_memrealtime`` at byte ``at`` (0: start, 8: end) of its workgroup's pair."""
         pair = Vec.from_elements([_stamp()], fx.Int64).bitcast(fx.Uint32)
         wg = fx.Int32(gpu.block_id("x"))
+        base = 4 * ctr_words(self.OS)
         _store(
-            _rsrc(_address(p_ctr), 64 + 16 * self.grid(task_pad)),
+            _rsrc(_address(p_ctr), base + 16 * self.grid(task_pad)),
             [pair[0], pair[1]],
-            (fx.Int32(gpu.thread_id("x")) == 0).select(64 + wg * 16 + at, fx.Int32(_DROP)),
+            (fx.Int32(gpu.thread_id("x")) == 0).select(base + wg * 16 + at, fx.Int32(_DROP)),
             SYS,
         )
 
@@ -304,7 +405,7 @@ class DownTP:
             _when(role == ROLE_COMPUTE, lambda: self._signal(a, blk))
         if self.DRY not in (1, 3):
             _when(role == ROLE_REDUCE, lambda: self._reduce(a, blk, idx))
-        if not self.DRY:
+        if not self.DRY and not self.OS:
             _when(role == ROLE_OWNER, lambda: self._owner(a, blk, idx))
         if self.TRACE:
             self.trace(a.p_ctr, a.task_pad, 8)
@@ -314,10 +415,11 @@ class DownTP:
         tid = fx.Int32(gpu.thread_id("x"))
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
+        word = part + a.chunk * NSPLIT_MAX if self.OS else part
         _when(
             tid == 0,
             lambda: atomic_add_global_at(
-                _address(a.p_ctr) + fx.Int64(part * 4),
+                _address(a.p_ctr) + fx.Int64(word * 4),
                 1,
                 syncscope=fx.rocdl.SyncScope.Agent,
             ),
@@ -329,8 +431,8 @@ class DownTP:
         tiles = (a.M + (TT - 1)) // TT
         rps = (tiles + (W - 1)) // W * TT
         slots = a.tpq * NSPLIT_MAX
-        tab = _rsrc(_address(a.p_tab), 3 * W * 8)
-        return dict(
+        tab = _rsrc(_address(a.p_tab), (4 if self.OS else 3) * W * 8)
+        g = dict(
             ROW=ROW,
             tiles=tiles,
             rps=rps,
@@ -339,7 +441,21 @@ class DownTP:
             inbox_bytes=rps * (W * ROW),
             flag_bytes=slots * ((W + 1) * 4),
             out_bytes=a.M * ROW,
+            tile_lo=0,
+            tile_hi=tiles,
         )
+        if self.OS:
+            # The chunk's tiles (its bounds are multiples of WORLD * TT but the call's end).
+            g.update(
+                flag_bytes=flag_words(slots, W, True) * 4,
+                tile_lo=a.t_lo // TT,
+                tile_hi=(a.t_hi + (TT - 1)) // TT,
+                region=slots * (W + 1) + a.chunk * CHUNK_WORDS,
+                t_lo=a.t_lo,
+                t_hi=a.t_hi,
+                chunk=a.chunk,
+            )
+        return g
 
     def _units(self, t0, q, M):
         """(token, byte offset in a row, liveness) of this wave's units of a tile in block ``q``."""
@@ -379,23 +495,38 @@ class DownTP:
         lane = tid & 63
         wave = _uniform(tid >> 6)
         rank, M = a.rank, a.M
-        inbox_addr = [_entry(tab, W, 1, p) for p in range(W)]
-        flags = [_rsrc(_entry(tab, W, 2, p), g["flag_bytes"]) for p in range(W)]
+        inbox_addr = [] if self.OS else [_entry(tab, W, 1, p) for p in range(W)]
+        flags = [] if self.OS else [_rsrc(_entry(tab, W, 2, p), g["flag_bytes"]) for p in range(W)]
         ep_rsrc = _rsrc(_address(a.p_epoch), g["slots"] * 4)
         if not self.COPY:
             loc_rsrc = _rsrc(_address(a.p_loc), M * (TOPK * 4))
-        ctr_rsrc = _rsrc(_address(a.p_ctr), self.NSPLIT * 4)
+        if self.OS:
+            ctr_rsrc = _rsrc(_address(a.p_ctr), ctr_words(True) * 4)
+            cbase = a.chunk * NSPLIT_MAX
+        else:
+            ctr_rsrc = _rsrc(_address(a.p_ctr), self.NSPLIT * 4)
+            cbase = 0
         src_base = _address(a.p_routes)
         src_rsrc = _rsrc(src_base, g["out_bytes"]) if self.COPY else None
         out_rsrc = _rsrc(_address(a.p_out), g["out_bytes"])
         cnt = self._counts(q)[0]
-        n = (tiles - j + (cnt - 1)) // cnt
+        lo = g["tile_lo"]
+        if self.OS:
+            n = (g["tile_hi"] - lo - j + (cnt - 1)) // cnt
+        else:
+            n = (tiles - j + (cnt - 1)) // cnt
 
         def tile_of(i):
-            return j + cnt * i
+            return lo + j + cnt * i if self.OS else j + cnt * i
+
+        if self.OS and not self.DRY:
+            _when((q == 0) & (j == 0), lambda: self._plan_os(a, g))
 
         def pending():
-            at = (lane == 0).select(fx.Int32(0), q * 4)
+            if self.OS:
+                at = (lane == 0).select(cbase, cbase + q) * 4
+            else:
+                at = (lane == 0).select(fx.Int32(0), q * 4)
             seen = fx.Int32(
                 _load(ctr_rsrc, (lane < 2).select(at, fx.Int32(_DROP)), 0, 1, aux=SYS)[
                     0
@@ -403,7 +534,11 @@ class DownTP:
             )
             return _ballot_any((lane < 2) & (seen < a.task_pad))
 
+        if self.STAMP:
+            _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 22 + q) * 64, (j == 0) & (tid == 0))
         _wait(a.p_err, a.limit, pending)
+        if self.STAMP:
+            _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 17 + q) * 64, (j == 0) & (tid == 0))
         # Lane l < UPW * TOPK holds slot l % TOPK of the token of unit l // TOPK (one load per tile).
         lu = lane // TOPK
         lk = lane - lu * TOPK
@@ -467,13 +602,17 @@ class DownTP:
         def body(i, state):
             words, loc_i, loc_next = state[:-2], state[-2], state[-1]
             tile = tile_of(i)
-            owner = _uniform(tile % W)
-            region = (rank + (W - 1) - owner) & (W - 1)
-            base = region * rps + (tile // W) * TT - tile * TT
-            address = inbox_addr[0]
-            for p in range(1, W):
-                address = (owner == p).select(inbox_addr[p], address)
-            dest = _rsrc(address, g["inbox_bytes"])
+            if self.OS:
+                # One-shot: this rank's partials into its own out, written through (its SDMA queue reads them).
+                dest, base = out_rsrc, 0
+            else:
+                owner = _uniform(tile % W)
+                region = (rank + (W - 1) - owner) & (W - 1)
+                base = region * rps + (tile // W) * TT - tile * TT
+                address = inbox_addr[0]
+                for p in range(1, W):
+                    address = (owner == p).select(inbox_addr[p], address)
+                dest = _rsrc(address, g["inbox_bytes"])
             loc_far = None
             for s in range(STEPS):
                 rows = [[fx.Uint32(w) for w in words[4 * m : 4 * m + 4]] for m in range(UX * TOPK)]
@@ -497,7 +636,7 @@ class DownTP:
                             ok.select((base + token) * ROW + col2, fx.Int32(_DROP)),
                             SYS,
                         )
-            if self.DRY != 2:
+            if self.DRY != 2 and not self.OS:
                 _when((i % G == G - 1) | (i == n - 1), lambda: release(i))
             return words + [loc_next, loc_far]
 
@@ -506,6 +645,8 @@ class DownTP:
         # Nothing in flight into the loop: its waits count only the previous iteration's memory operations.
         rocdl.s_waitcnt(vmcnt=0)
         _loop_carry(0, n, 1, start, body)
+        if self.OS and self.DRY != 2:
+            self._xdone(a, g, q, cnt)
 
     def _owner(self, a, q, j):
         """Y workgroup ``j`` of block ``q`` (module docstring): ``GY`` owned tiles at a time, one poll for the group's
@@ -600,6 +741,123 @@ class DownTP:
 
         _loop(0, n, 1, group)
 
+    # -- one-shot: this rank's partials pushed to the peer by SDMA (OS, rule 12) ---------------------------------
+    def _plan_os(self, a, g):
+        """Reduce workgroup 0 of block 0 before it waits, wave 0, peer o = 1 - rank: advances CEP[o]; chunk 0 stores
+        this rank's RDY flag on o (this call has started, its landing is free); SDMA queue 0 then (chunk 0: once
+        o's RDY flag here holds o's epoch), per column block q: once TRG[q] holds the chunk epoch, one 2-D copy of
+        the block's columns of the chunk's rows from ``out`` into o's ``landing``, FENCEs storing the epoch as
+        ARR[q] on o and SNT[q] here; a FENCE on the queue's completion word (rule 12)."""
+        W, S = self.WORLD, self.NSPLIT
+        ROW = g["ROW"]
+        BLOCK = 2 * (self.H // S)
+        NBYTES = _os_submit_bytes(S, self.STAMP)
+        assert MAX_CHUNKS * NBYTES <= sdma.RING_BYTES // 2, NBYTES  # a call's submissions (sdma.py rule 1)
+        tid = fx.Int32(gpu.thread_id("x"))
+        lane = tid & 63
+        wave = _uniform(tid >> 6)
+        rank, region, chunk = a.rank, g["region"], g["chunk"]
+        o = 1 - rank
+        base = g["slots"] * (W + 1)
+        drop = fx.Int32(_DROP)
+        own_address = _entry(g["tab"], W, 2, rank)
+        own_flags = _rsrc(own_address, g["flag_bytes"])
+        peer_address = _entry(g["tab"], W, 2, o)
+        peer_flags = _rsrc(peer_address, g["flag_bytes"])
+        land = _entry(g["tab"], W, 0, o)
+        out_address = fx.Int64(_address(a.p_out))
+        stamp_address = fx.Int64(_address(a.p_ctr)) + 4 * ctr_words(True)
+
+        def stamp(slot):
+            if not self.STAMP:
+                return []
+            return sdma.stamp(stamp_address + fx.Int64((chunk * STAMP_SLOTS + slot) * 64))
+
+        def queue():
+            if self.STAMP:
+                _stamp_at(a.p_ctr, chunk * (STAMP_SLOTS * 64), lane == 0)
+            ring = sdma.Ring(_entry(g["tab"], W, 3, 0), 0, lane)
+            wptr = ring.wptr()
+            done = ring.done()
+            # The call's first submission needs the previous call's complete (its final kernel waited for them);
+            # later chunks queue behind it.
+            go = (chunk != 0) | (done == fx.Int32(wptr))
+            stuck = (chunk == 0) & (done != fx.Int32(wptr))
+            offset, pad, new = sdma.place(wptr, NBYTES)
+            at = (region + CEP + o) * 4
+            e = fx.Int32(_uniform(_load(own_flags, at, 0, 1, aux=SYS)[0])) + 1
+            _store(own_flags, [e], (lane == 0).select(at, drop), SYS)
+            mine = fx.Int32(_uniform(_load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0])) + 1
+            mine = mine & _EPOCH_BITS
+            first = chunk == 0
+            _store(peer_flags, [mine], (first & (lane == 0)).select((base + RDY + rank) * 4, drop), SYS)
+            ready = own_address + fx.Int64((base + RDY + o) * 4)
+            words = sdma.select(first, sdma.poll(ready, e & _EPOCH_BITS, _EPOCH_BITS), sdma.nops(6))
+            words += stamp(1)
+            rows = g["t_hi"] - g["t_lo"]
+            start = fx.Int64(g["t_lo"]) * ROW
+            for q in range(S):
+                at_q = start + q * BLOCK
+                words += sdma.poll(own_address + fx.Int64((region + TRG + q) * 4), mine, _EPOCH_BITS)
+                words += stamp(2 + 2 * q)
+                words += sdma.copy2d(out_address + at_q, land + at_q, ROW, BLOCK, rows)
+                words += stamp(3 + 2 * q)
+                words += sdma.fence(peer_address + fx.Int64((region + ARR + q) * 4), mine)
+                words += sdma.fence(own_address + fx.Int64((region + SNT + q) * 4), mine)
+            words += sdma.fence(ring.done_address, fx.Int32(new))
+            words += sdma.nops(NBYTES // 4 - len(words))
+
+            def submit():
+                ring.pad(wptr, pad)
+                ring.store(offset, words, lane == 0)
+                ring.commit(new)
+
+            _when(go, submit)
+            # The previous call's copies are not complete (a wait that gave up): no copies this call.
+            _when(stuck & (lane == 0), lambda: atomic_or_global_at(_address(a.p_err), ERR_TIMEOUT))
+
+        _when(wave == 0, queue)
+
+    def _xdone(self, a, g, q, total):
+        """Every reduce workgroup at its end (``OS``): once its partials are stored, counts itself in the chunk's
+        XCN[q] (``total`` reduce workgroups of block q); the last one zeroes XCN[q] and stores TRG[q] = the chunk
+        epoch, the release of the block's SDMA push (``| POISON`` if a wait of this rank gave up, ``err``: after
+        PSN[rank] = epoch | ``POISON`` on the peer), rule 12."""
+        W = self.WORLD
+        tid = fx.Int32(gpu.thread_id("x"))
+        rank, region = a.rank, g["region"]
+        own_address = _entry(g["tab"], W, 2, rank)
+        own_flags = _rsrc(own_address, g["flag_bytes"])
+        peer_flags = _rsrc(_entry(g["tab"], W, 2, 1 - rank), g["flag_bytes"])
+        drop = fx.Int32(_DROP)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+
+        def count():
+            old = fx.Int32(
+                atomic_add_global_at(
+                    own_address + fx.Int64((region + XCN + q) * 4),
+                    1,
+                    syncscope=fx.rocdl.SyncScope.Agent,
+                )
+            )
+
+            def fire():
+                e = fx.Int32(_load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0]) + 1
+                e = e & _EPOCH_BITS
+                failed = fx.Int32(_load(_rsrc(_address(a.p_err), 4), 0, 0, 1, aux=SYS)[0]) != 0
+                poison = failed.select(fx.Int32(POISON), fx.Int32(0))
+                _store(peer_flags, [e | POISON], failed.select((region + PSN + rank) * 4, drop), SYS)
+                rocdl.s_waitcnt(vmcnt=0)
+                _store(own_flags, [fx.Int32(0)], (region + XCN + q) * 4, SYS)
+                _store(own_flags, [e | poison], (region + TRG + q) * 4, SYS)
+                if self.STAMP:
+                    _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 12 + q) * 64, tid == 0)
+
+            _when(old == total - 1, fire)
+
+        _when(tid == 0, count)
+
 
 @dataclass
 class TPArgs:
@@ -617,12 +875,16 @@ class TPArgs:
     tpq: object
     limit: object
     task_pad: object
+    t_lo: object = None
+    t_hi: object = None
+    chunk: object = None
 
 
 @functools.cache
 def compile_down_tp(*, N, K, TOPK, BLOCK_TILE_SIZE_M, E, XCD_CHUNK, tp):
-    """The streamed prefill Down launcher (``compile_a8w4_gemm2`` with ``TP=tp``): the arguments of the prefill
-    Down up to ``loc``, then ``out``, ``ctr``, ``tab``, ``epoch``, ``err``, M, rank, tpq, limit, task_num, stream."""
+    """The streamed prefill Down launcher (``compile_a8w4_gemm2`` with ``TP=tp``, ``CHUNKED`` with ``tp.OS``): the
+    arguments of the prefill Down up to ``loc``, then ``out``, ``ctr``, ``tab``, ``epoch``, ``err``, M, rank, tpq,
+    limit, task_num, stream."""
     return compile_a8w4_gemm2(
         N=N,
         K=K,
@@ -632,6 +894,7 @@ def compile_down_tp(*, N, K, TOPK, BLOCK_TILE_SIZE_M, E, XCD_CHUNK, tp):
         NSPLIT=tp.NSPLIT,
         XCD_CHUNK=XCD_CHUNK,
         TP=tp,
+        CHUNKED=bool(tp.OS),
     )
 
 
@@ -657,13 +920,220 @@ def compile_down_stream_tp(*, N, K, TOPK, BLOCK_M, E, ATOMIC, R, SHARE, PREFETCH
     )
 
 
+def _sdma_finish_os(W, g, rank, p_err, limit, nags, S):
+    """The one-shot final kernel's workgroup 0 after its items (``OS``), wave 0: waits (bounded) until SDMA queue 0
+    is idle; if it gave up, releases the queue's polls (this rank's TRG flags of each chunk ``< nags`` to the chunk
+    epoch | ``POISON``, its PSN flag on the peer first, and the peer's RDY flag here), waits once more and sets
+    ``ERR_TIMEOUT``. Then thread 0 advances ``CEP[rank]`` of those chunks (rule 12)."""
+    tid = fx.Int32(gpu.thread_id("x"))
+    lane = tid & 63
+    wave = _uniform(tid >> 6)
+    o = 1 - rank
+    own_flags = _rsrc(_entry(g["tab"], W, 2, rank), g["flag_bytes"])
+    peer_flags = _rsrc(_entry(g["tab"], W, 2, o), g["flag_bytes"])
+    base = g["slots"] * (W + 1)
+    drop = fx.Int32(_DROP)
+
+    def queue():
+        ring = sdma.Ring(_entry(g["tab"], W, 3, 0), 0, lane)
+        wptr = fx.Int32(ring.wptr())
+
+        def busy():
+            return ring.done() != wptr
+
+        def release():
+            def chunk(c):
+                region = base + c * CHUNK_WORDS
+                # The chunk epoch: CEP[o] (advanced by this call's _plan_os) = CEP[rank] + 1.
+                e = fx.Int32(_uniform(_load(own_flags, (region + CEP + o) * 4, 0, 1, aux=SYS)[0])) & _EPOCH_BITS
+                _store(peer_flags, [e | POISON], (lane == 0).select((region + PSN + rank) * 4, drop), SYS)
+                rocdl.s_waitcnt(vmcnt=0)
+                _store(own_flags, [e | POISON], (lane < S).select((region + TRG + lane) * 4, drop), SYS)
+                _store(own_flags, [e], ((lane == 0) & (c == 0)).select((base + RDY + o) * 4, drop), SYS)
+
+            _loop(0, nags, 1, chunk)
+            _spin(busy, limit)
+            _when(lane == 0, lambda: atomic_or_global_at(_address(p_err), ERR_TIMEOUT))
+
+        _when(_spin(busy, limit), release)
+
+    _when(wave == 0, queue)
+    gpu.barrier()
+
+    def advance(c):
+        at = (base + c * CHUNK_WORDS + CEP + rank) * 4
+        e = fx.Int32(_uniform(_load(own_flags, at, 0, 1, aux=SYS)[0])) + 1
+        _store(own_flags, [e], (tid == 0).select(at, drop), SYS)
+
+    _loop(0, nags, 1, advance)
+
+
+def _os_gather(spec, G):
+    """The body of the one-shot final kernel (``compile_tp_gather(OS=1)``, rule 12)."""
+    WORLD, TT, NSPLIT = spec.WORLD, spec.TT, spec.NSPLIT
+
+    def body(p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags):
+        tid = fx.Int32(gpu.thread_id("x"))
+        lane = tid & 63
+        first = fx.Int32(gpu.block_id("x"))
+        a = TPArgs(
+            p_loc=None,
+            p_routes=None,
+            p_out=p_out,
+            p_ctr=p_ctr,
+            p_tab=p_tab,
+            p_epoch=p_epoch,
+            p_err=p_err,
+            M=M,
+            rank=rank,
+            tpq=tpq,
+            limit=limit,
+            task_pad=None,
+            t_lo=fx.Int32(0),
+            t_hi=M,
+            chunk=fx.Int32(0),
+        )
+        g = spec._geometry(a)
+        ROW = g["ROW"]
+        own_landing = _rsrc(_entry(g["tab"], WORLD, 0, rank), g["out_bytes"])
+        own_flags = _rsrc(_entry(g["tab"], WORLD, 2, rank), g["flag_bytes"])
+        out_rsrc = _rsrc(_address(p_out), g["out_bytes"])
+        drop = fx.Int32(_DROP)
+        # The Downs have ended: every chunk's block counters restart from zero for the next call.
+        words = ctr_words(True)
+        _store(
+            _rsrc(_address(p_ctr), words * 4),
+            [fx.Int32(0)],
+            ((first == 0) & (tid < words)).select(tid * 4, drop),
+            SYS,
+        )
+        tiles = g["tiles"]
+        total = NSPLIT * tiles
+        base = g["slots"] * (WORLD + 1)
+        o = 1 - rank
+        record = MAX_CHUNKS * STAMP_SLOTS * 64 + first * 32
+        recorded = (tid == 0) & (first < STAMP_WGS)
+        if spec.STAMP:
+            _stamp_at(p_ctr, record, recorded)
+
+        def group(i):
+            # Lane l < G (and 32 + l): ARR (SNT) of item f0 + l's chunk and column block; items f = q * tiles + tile.
+            f0 = i * G
+            arr = lane < 32
+            f = f0 + (lane & 31)
+            q = f // tiles
+            tile = f - q * tiles
+            live = ((lane & 31) < G) & (f < total)
+            c = (
+                (tile >= s1).select(fx.Int32(1), fx.Int32(0))
+                + (tile >= s2).select(fx.Int32(1), fx.Int32(0))
+                + (tile >= s3).select(fx.Int32(1), fx.Int32(0))
+            )
+            region = base + c * CHUNK_WORDS
+            # The chunk epoch: CEP[o], advanced by this call's _plan_os (= CEP[rank] + 1 until this kernel ends).
+            want = fx.Int32(_load(own_flags, live.select((region + CEP + o) * 4, drop), 0, 1, aux=SYS)[0])
+            want = want & _EPOCH_BITS
+            at = live.select((region + arr.select(fx.Int32(ARR), fx.Int32(SNT)) + q) * 4, drop)
+
+            def pending():
+                seen = fx.Int32(_load(own_flags, at, 0, 1, aux=SYS)[0])
+                # Reached: epochs modulo _EPOCH_BITS + 1.
+                return _ballot_any(live & (((seen - want) & _EPOCH_BITS) >= (POISON >> 1)))
+
+            _wait(p_err, limit, pending)
+            if spec.STAMP:
+                _stamp_at(p_ctr, record + 8, recorded)
+            check = live & arr & (tid < 64)
+            psn = fx.Int32(_load(own_flags, check.select((region + PSN + o) * 4, drop), 0, 1, aux=SYS)[0])
+            _when(
+                check & (psn == (want | POISON)),
+                lambda: atomic_or_global_at(_address(p_err), ERR_TIMEOUT),
+            )
+            rows = []
+            for k in range(G):
+                fk = f0 + k
+                qk = fk // tiles
+                tk = fk - qk * tiles
+                inside = fk < total
+                for token, col2, ok in spec._units(tk * TT, qk, M):
+                    offset = (ok & inside).select(token * ROW + col2, drop)
+                    rows.append(
+                        (_load(out_rsrc, offset, 0, 4), _load(own_landing, offset, 0, 4, aux=SYS), offset)
+                    )
+            # Two partials: their f32 sum is that of the ranks' order (one rounding, as the owner's in tp_reduce).
+            for mine, peer, offset in rows:
+                pair = [[fx.Uint32(w) for w in mine], [fx.Uint32(w) for w in peer]]
+                _store(out_rsrc, _sum_bf16(pair), offset)
+
+        if not spec.DRY:
+            _loop(first, (total + (G - 1)) // G, nwg, group)
+            _when(first == 0, lambda: _sdma_finish_os(WORLD, g, rank, p_err, limit, nags, NSPLIT))
+        if spec.STAMP:
+            _stamp_at(p_ctr, record + 16, recorded)
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def a8w4_tp_reduce(
+        p_out: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_err: fx.Pointer,
+        M: fx.Int32,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        nwg: fx.Int32,
+        s1: fx.Int32,
+        s2: fx.Int32,
+        s3: fx.Int32,
+        nags: fx.Int32,
+    ):
+        body(p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags)
+
+    @flyc.jit
+    def launch_os(
+        p_out: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_err: fx.Pointer,
+        M: fx.Int32,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        nwg: fx.Int32,
+        s1: fx.Int32,
+        s2: fx.Int32,
+        s3: fx.Int32,
+        nags: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        a8w4_tp_reduce(
+            p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags
+        ).launch(grid=(nwg, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_os
+
+
 @functools.cache
-def compile_tp_gather(*, WORLD, H, TT, NSPLIT, DRY=0, G=1):
+def compile_tp_gather(*, WORLD, H, TT, NSPLIT, DRY=0, G=1, OS=0, STAMP=0):
     """Launcher ``(out, tab, epoch, ctr, err, M, rank, tpq, limit, nwg, stream)`` of the second kernel (module
     docstring); grid: ``nwg`` (``ceil(NSPLIT * ceil(M / TT) / G)``) workgroups of 256 threads, ``G`` consecutive
     items each (one poll of their ``AG`` flags, lane g of wave 0 the item's g; then the loads of all of their rows
-    before the stores). ``DRY``: ``DownTP.DRY`` (only ``ctr`` is zeroed)."""
-    assert 1 <= G <= 64, G
+    before the stores). ``DRY``: ``DownTP.DRY`` (only ``ctr`` is zeroed).
+
+    ``OS`` (after the one-shot Downs of token chunks, ``DownTP.OS``, rules 11-12; ``tab`` [4, 2]): four arguments
+    follow ``nwg``: ``s1``, ``s2``, ``s3`` (the first tiles of chunks 1 .. 3, the call's tiles for the chunks it does
+    not have) and ``nags`` (its chunks). Every item (all ranks') sums this rank's partial in ``out`` and the peer's
+    in ``landing`` into ``out`` once both SDMA pushes of its chunk and column block are complete (one bounded poll of
+    their ARR and SNT flags for the ``G`` items); workgroup 0 at its end waits for this rank's queue (bounded) and
+    advances the chunks' ``CEP[rank]``. ``STAMP`` (with ``OS``): ``DownTP.STAMP``'s per-workgroup stamps."""
+    assert 1 <= G <= (32 if OS else 64), G
+    assert not STAMP or OS, (STAMP, OS)
+    if OS:
+        spec = DownTP(WORLD=WORLD, H=H, TOPK=1, TT=TT, NSPLIT=NSPLIT, NX=4, NY=0, NYT=0, DRY=DRY, OS=1, STAMP=STAMP)
+        return _os_gather(spec, G)
     spec = DownTP(WORLD=WORLD, H=H, TOPK=1, TT=TT, NSPLIT=NSPLIT, NX=4, NY=4, DRY=DRY)
 
     def body(p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg):

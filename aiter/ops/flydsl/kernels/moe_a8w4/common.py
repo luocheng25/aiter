@@ -129,6 +129,15 @@ def store_vector(buffer, vector, voffset_bytes, soffset_bytes):
     )
 
 
+def chunk_block(p_desc, pos):
+    """``CHUNKED`` prefill kernels: (liveness, sorted block) of position ``pos`` of the current token chunk, whose
+    descriptor row (``chunks`` module docstring) is passed for ``num_valid_ids``: live below its block count
+    ``desc[4]``, the block ``desc[8 + pos]`` (in the row for every launched position; both loads issue together)."""
+    desc = fx.recast_iter(fx.Int32, fxh._as_ptr(p_desc))
+    block = fx.Int32(desc[fx.Int32(pos) + 8])
+    return fx.Int32(pos) < fx.Int32(desc[4]), block
+
+
 def swiglu_clamp(gate, up, limit):
     """SwiGLU limit of DeepSeek-V4.1 on the dequantized f32 gate / up values: ``min(gate, limit)`` and
     ``up`` clamped to ``[-limit, limit]`` (NaN-ignoring min / max). ``limit`` is a compile-time constant;

@@ -73,6 +73,7 @@ def compile_a8w4_gemm1(
     E=None,
     SWIGLU_LIMIT=0.0,
     XCD_CHUNK=0,
+    CHUNKED=False,
 ):
     """Build the A8W4 Gate/Up launcher.
 
@@ -85,6 +86,8 @@ def compile_a8w4_gemm1(
     ``XCD_CHUNK`` > 0: a 1-D grid whose workgroup ``L`` (dispatched to XCD ``L % XCDS``) takes the next
     (sorted block, N tile) of chunks of ``XCD_CHUNK`` consecutive blocks dealt to the XCDs in turn, so the N tiles
     of a block (same activation rows) and neighbouring blocks of an expert (same weights) share an L2.
+    ``CHUNKED``: ``num_valid_ids`` is a token chunk's descriptor row (``chunks``) and the (sorted block, N tile)
+    positions are those of its block list (``common.chunk_block``), task_num its bound (``chunks.chunk_bound``).
     """
     BM, BN = BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N
     assert BN in (128, 256), "BLOCK_TILE_SIZE_N must be 128 or 256"
@@ -650,8 +653,12 @@ def compile_a8w4_gemm1(
         num_valid_buf = fx.make_view(
             fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid_ids)), fx.make_layout(1, 1)
         )
-        max_valid_id = num_valid_buf[0]
-        if e_idx * BM < max_valid_id:
+        if const_expr(CHUNKED):
+            live, e_idx = a8w4.chunk_block(p_num_valid_ids, e_idx)
+        else:
+            max_valid_id = num_valid_buf[0]
+            live = e_idx * BM < max_valid_id
+        if live:
             lds = fx.SharedAllocator().allocate(SharedStorage)
             lds.sorted_lds = lds.sorted_lds.peek()
             lds.gemm = lds.gemm.peek()
