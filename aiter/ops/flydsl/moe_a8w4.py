@@ -5,7 +5,8 @@
 
 ``prepare_moe_a8w4_ptpc_weight`` converts standard MXFP4 MoE weights once (at load time) into the private layout
 of ``kernels/moe_gemm_2stage/gfx9_fp8/common_a8w4.py``. ``flydsl_moe_a8w4_ptpc`` runs the whole MoE. Token counts
-up to ``DECODE_MAX_M`` skip the sorting and use the decode kernels of ``gfx9_fp8/decode_a8w4.py`` when they support
+up to ``DECODE_MAX_M`` (``DECODE_WIDE_MAX_M`` for the ``DECODE_WIDE_HIDDEN`` sizes) skip the sorting and use the decode
+kernels of ``gfx9_fp8/decode_a8w4.py`` when they support
 the shape (Gate/Up per route, Down per token summing its routes in the workgroup and writing BF16; activations
 quantized inside the kernels or by a row kernel). From ``DECODE_DEDUP_MIN_H`` hidden on (padded I a multiple of
 128) and for the ``DECODE_WIDE_HIDDEN`` sizes the decode path reads each expert's weights once per group of its
@@ -108,11 +109,18 @@ DECODE_WIDE_HIDDEN = (5120,)
 # 1.03x / 0.985x / 0.967x / 0.95x the time (8 waves 7-11% slower).
 DECODE_WIDE_DEDUP_MIN_M = 8
 DECODE_WIDE_DEDUP_WAVES = 4
-# Above DECODE_MAX_M tokens those hidden sizes still take the decode path up to DECODE_WIDE_MAX_M tokens (at most
-# DECODE_DEDUP_MAX_M, the plan's limit) while at most 1.5 routes fall on an expert. Measured in one process at H5120
-# E384 topk 6 against the streaming kernels with the hidden-5120 rules below (sorting blocks of 16, ACT_STEPS,
-# non-temporal Down weights): M33 / 40 / 48 / 56 / 64 1.04x / 1.03x / 1.07x / 1.11x / 1.15x the time, so none (32).
-DECODE_WIDE_MAX_M = 32
+# Those hidden sizes take the decode path up to DECODE_WIDE_MAX_M tokens (``_decode_max_m``; above DECODE_MAX_M at most
+# DECODE_DEDUP_MAX_M, the plan's limit, while at most 1.5 routes fall on an expert), the streaming kernels beyond.
+# Measured in one process at H5120 against the streaming kernels (sorting blocks of 16, 16-byte weight loads), streaming
+# / decode: the DeepSeek-V4.1 main TP4 / main TP8 / MTP TP4 / MTP TP8 layers with the folded shared expert (CUDA graph
+# replay of 19-24 routings, up to three runs) at M 9 1.03 / 1.05 / 1.02 / 1.01x, M 10 1.00-1.01 / 0.98-0.99 / 1.00 /
+# 0.98x, M 11 0.98-0.99 / 0.93-0.95 / 0.96-0.97 / 0.95-0.97x, M 16 0.94-0.96 / 0.89-0.92 / 0.89-0.92 / 0.94-0.97x
+# (MTP TP8 M 13 / 14 1.03 / 1.02x), M 32 0.84 / 0.82-0.83 / 0.79-0.81 / 0.79-0.81x; the routed experts alone (E384
+# topk 6) at M 10 / 11 / 16 / 32 1.02 / 0.97-0.98 / 0.95 / 0.84x under graph replay, 1.03 / 1.00-1.02 / 1.01-1.02 /
+# 0.77x by summed kernel times (the original cases' protocol, three routings; 0.97x from M 18), the frozen benchmark's
+# own ds_tp4 M 16 / 32 0.93 / 0.83x (same-GPU ABBA against DECODE_WIDE_MAX_M = 32, three rounds; its decode M 16 is
+# bimodal, 150-171 us, the streaming 151 us).
+DECODE_WIDE_MAX_M = 10
 # From DECODE_DEDUP_MIN_M tokens on, for hidden sizes from DECODE_DEDUP_MIN_H on and padded I a multiple of 128,
 # the decode Down reads each expert's weights once per DECODE_DEDUP_GROUP of its routes and adds into the
 # zeroed output with BF16x2 atomics (``decode_dedup_a8w4``; DECODE_DEDUP_DOWN_BLOCKS 16-channel blocks per
@@ -197,14 +205,16 @@ PREFILL_PREP_MAX_ROUTES = 24576
 # DeepSeek-V4.1-Flash TP4 (hidden 5120, E384, topk 6, I576, swiglu_limit 10), measured in one process against the rules
 # above; they apply from hidden 5120 on:
 # - the streaming kernels run up to STREAM_MAX_ROWS_H5120 mean rows per expert once M * topk reaches
-#   STREAM_H5120_MIN_ROUTES (prefill with the two-pass Down of gemm2_a8w4 vs streaming: 12 / 16 / 20 / 24 rows,
-#   M768 / 1024 / 1280 / 1536, 1.07x / 0.995x / 0.97x / 0.92x the time); fewer routes (not measured) keep
-#   STREAM_MAX_ROWS_WIDE;
-# - the streaming path sorts into blocks of 16 at any route count up to 12 rows per expert (``_stream_block_m``);
+#   STREAM_H5120_MIN_ROUTES; streaming (16-byte weight loads) / prefill (the two-pass Down of gemm2_a8w4): the routed
+#   experts alone by summed kernel times at 17 / 20 / 24 / 26 / 28 / 32 rows, M1088 / 1280 / 1536 / 1664 / 1792 /
+#   2048, 0.92 / 0.94 / 0.97 / 0.99 / 1.04 / 1.03x the time; the main TP4 / TP8 layers (CUDA graph, the shared expert
+#   folded on both paths) at 17 / 24 / 26 / 28 / 30 rows 0.92 / 0.97 / 1.00 / 1.04 / 1.04x and 0.87 / 0.92 / 0.94 /
+#   0.97 / 1.10x; fewer routes keep STREAM_MAX_ROWS_WIDE (the MTP layer, E128 topk 3, up to M1365: at 24 / 27 / 30 /
+#   32 rows 0.96 / 1.00 / 1.02 / 1.02x at TP4, 0.94 / 0.93 / 1.07 / 1.06x at TP8);
 # - the prefill kernels take the streaming prep up to PREFILL_PREP_MAX_ROUTES_H5120 routes (Opus and the row kernel vs
 #   the prep at 7680 / 12288 / 24576 routes, M1280 / 2048 / 4096: 1.003x / 0.998x / 0.988x the time);
 # - the streaming Down's weight loads are non-temporal (M48-1536 2-4% faster).
-STREAM_MAX_ROWS_H5120 = 16
+STREAM_MAX_ROWS_H5120 = 24
 STREAM_H5120_MIN_ROUTES = 4096
 PREFILL_PREP_MAX_ROUTES_H5120 = 12288
 STREAM_DOWN_W_AUX_H5120 = 2
@@ -247,9 +257,12 @@ SHARED_FOLD_DECODE_SIDE_QUANT = 0
 # Down or the streaming Down's atomics add the routes), so the split's input quantization, final add and copies of
 # the routed columns go away (the decode kernels read the routing tensors with the shared expert's column as they are).
 SHARED_FOLD = 1
-# The prefill tier folds the shared expert from this many tokens on (where the DeepSeek-V4.1 layers' prefill tier
-# starts); fewer tokens in the prefill tier (few experts, tile options) keep ATOM's split.
-SHARED_FOLD_PREFILL_MIN_M = 2048
+# The prefill tier folds the shared expert from this many tokens on, where the fold's chain runs on the current stream
+# (above SHARED_FOLD_DUAL_STREAM_MAX_M). Measured in one process at the DeepSeek-V4.1 layers below M 2048 (CUDA graph,
+# PTL on), folded / ATOM's split: main TP4 M1088-1920 0.89-0.93x, main TP8 0.88-0.90x, MTP TP4 / TP8 M1366-1920
+# 0.85-0.86x / 0.77-0.81x the time; fewer tokens in the prefill tier (tile options, other shapes; not measured) keep the
+# split.
+SHARED_FOLD_PREFILL_MIN_M = 1025
 # Most tokens of a call that folds its shared expert: the fold's two GEMMs (``_shared_gemm``, aiter's FlyDSL preshuffle
 # FP8 GEMM ``gemm_kernels.flydsl_preshuffle_gemm_a8``) raise above ``gemm_kernels.PRESHUFFLE_M_MAX`` = 65536 rows (the
 # kernel views A and C through a layout bounded by that many rows, ``kernels/preshuffle_gemm.py``); more tokens take
@@ -976,8 +989,8 @@ def _down_dd_blocks(H, I):
 
 
 def _dedup_beyond_decode(M, H, I, topk, experts):
-    """Whether more than DECODE_MAX_M tokens still take the dedup decode path (see DECODE_DEDUP_MAX_M and, for the
-    DECODE_WIDE_HIDDEN sizes, DECODE_WIDE_MAX_M)."""
+    """Whether more tokens than ``_decode_max_m`` allows still take the dedup decode path (see DECODE_DEDUP_MAX_M; for
+    the DECODE_WIDE_HIDDEN sizes only once DECODE_WIDE_MAX_M exceeds DECODE_MAX_M)."""
     if H in DECODE_WIDE_HIDDEN:
         return (
             M <= min(DECODE_WIDE_MAX_M, DECODE_DEDUP_MAX_M)
@@ -1578,16 +1591,18 @@ def _stream_max_rows(hidden, inter, routes=0):
 
 
 def _stream_block_m(tokens, topk, experts, hidden=0):
-    """Sorting block of the streaming kernels from the mean rows per expert (sub-blocks of 16).
+    """Sorting block of the streaming kernels from the mean rows per expert (sub-blocks of 16): 16 up to 12 rows, 32 up
+    to STREAM_BM32_ROWS, else 64; the same at every hidden size (``hidden`` is not read).
 
-    Block 16 only once 3 * routes >= 4 * experts (chosen when the streaming path still sorted with aiter's Opus
-    moe_sorting, which below that switches block 16 to a separate fused MXFP4 sort); from hidden 5120 on block 16 at
-    any route count (DeepSeek TP4 M48 / M64: 0.89x the time of blocks of 32).
+    Blocks of 16 at any route count, since the streaming path sorts with its own prep: blocks of 32 below 4E/3 routes
+    date from aiter's Opus moe_sorting, which there switched blocks of 16 to a separate fused MXFP4 sort, and with about
+    one route per expert they compute 32-row tiles for one or two rows. Measured in one process against blocks of 32
+    (summed kernel times, three routings): Qwen TP2 / TP4 (E513 topk 11) M33-62 0.76-0.84x / 0.79-0.88x the time (M48
+    0.82x / 0.88x); DeepSeek TP4 M48 / M64 0.89x.
     """
     rows = tokens * topk / experts
     if rows <= 12:
-        own_sort = hidden >= 5120 and hidden % 512 == 0
-        return 16 if 3 * tokens * topk >= 4 * experts or own_sort else 32
+        return 16
     return 32 if rows <= STREAM_BM32_ROWS else 64
 
 
@@ -1886,7 +1901,8 @@ def flydsl_moe_a8w4_ptpc(
     BF16 [M, H] tensor, ``hidden_states`` itself included. Issues no host synchronization; compile a shape
     outside a CUDA graph capture before capturing it. Raises ``RuntimeError`` off gfx942.
 
-    Unless a tile option is given, M <= ``DECODE_MAX_M`` runs the decode kernels (no sorting) when they support the
+    Unless a tile option is given, M <= ``DECODE_MAX_M`` (``DECODE_WIDE_MAX_M`` for the ``DECODE_WIDE_HIDDEN`` sizes)
+    runs the decode kernels (no sorting) when they support the
     shape (H <= 4096 or in ``DECODE_WIDE_HIDDEN``, the intermediate rows fit in LDS; with expert deduplication up to
     ``DECODE_DEDUP_MAX_M`` tokens while at most 1.5 routes fall on an expert), larger M with at most
     ``STREAM_MAX_ROWS`` rows per expert (``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096, ``STREAM_MAX_ROWS_H5120`` for
@@ -2351,15 +2367,24 @@ def _many_rows(M, H, I, topk, E):
     return M * topk > _stream_max_rows(H, I, M * topk) * E
 
 
+def _decode_max_m(H):
+    """Most tokens of the decode tier before its dedup extension (``_dedup_beyond_decode``): DECODE_MAX_M, for the
+    DECODE_WIDE_HIDDEN sizes at most DECODE_WIDE_MAX_M."""
+    if H in DECODE_WIDE_HIDDEN:
+        return min(DECODE_WIDE_MAX_M, DECODE_MAX_M)
+    return DECODE_MAX_M
+
+
 def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
     """Tier of the routed experts of a call (M > 0): "decode", "stream" or "prefill". Chosen before the prefill tile
     defaults are filled in: any tile option selects prefill."""
     if block_m is None and block_n is None and tile_k is None:
+        decode_max = _decode_max_m(H)
         if (
-            M <= DECODE_MAX_M or _dedup_beyond_decode(M, H, I, topk, E)
+            M <= decode_max or _dedup_beyond_decode(M, H, I, topk, E)
         ) and _decode_fits(H, I, topk, False):
             return "decode"
-        if M > DECODE_MAX_M and not _many_rows(M, H, I, topk, E):
+        if M > decode_max and not _many_rows(M, H, I, topk, E):
             return "stream"
     return "prefill"
 
