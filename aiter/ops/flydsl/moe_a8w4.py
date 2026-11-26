@@ -42,7 +42,8 @@ where the fold below is possible too, up to ``DECODE_SHARED_MIXED_MAX_WORK``), t
 of the same two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8 weights feed the MFMA directly,
 ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other
 columns (the tier decided on them alone). Where the routed path allows it (``_shared_fold_tier``: the slot-pair decode
-Down, streaming, prefill from ``SHARED_FOLD_PREFILL_MIN_M``) the shared expert is folded into the routed path's last
+Down, streaming, prefill from ``SHARED_FOLD_PREFILL_MIN_M``, up to ``SHARED_FOLD_MAX_M`` tokens, the row limit of the
+GEMMs below) the shared expert is folded into the routed path's last
 reduction (``_SharedFold``): two FlyDSL FP8 GEMMs (aiter's preshuffle GEMM, ``_shared_gemm``) on the routed path's FP8
 input with ``gfx9_fp8/shared_a8w4.py`` between them, on a side stream up to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens,
 write its weighted output where ``a8w4_route_sum`` / ``sorted_sum`` add it as one more route, or into the output that
@@ -157,8 +158,12 @@ STREAM_BM32_ROWS = 28
 # Whether the streaming Down adds its routes into the output with BF16x2 atomics (``_stream_atomic``): 1 while padded
 # I < 512, 0 never, 2 always (diagnostics).
 STREAM_ATOMIC = 1
-# 16-row weight blocks the streaming Down keeps in flight.
+# 16-row weight blocks the streaming Down keeps in flight (it loads them in pairs: half as many block pairs) with
+# sorting blocks of 64 rows, and with smaller sorting blocks (STREAM_DOWN_PREFETCH_SMALL: one pair ahead, fewer VGPRs;
+# measured against 4 in one process: Qwen TP2 M48 0.81x, MiMo TP8 M512 0.91x, DeepSeek TP4 M64-256 0.98x the Down's
+# time, MiMo TP8 M1024 with blocks of 64 1.05x).
 STREAM_DOWN_PREFETCH = 4
+STREAM_DOWN_PREFETCH_SMALL = 2
 # The shared streaming Down of 32-row blocks reads the activations from LDS at every 64-K step instead of holding
 # them in VGPRs when K % 256 == 0 (no loader scratch slot: LDS and VGPRs then allow 4 workgroups per CU, MiMo TP8
 # M512 94 -> 90 us; with K = 320 or blocks of 64 LDS still bounds the occupancy and the extra reads cost 6-8%).
@@ -245,6 +250,11 @@ SHARED_FOLD = 1
 # The prefill tier folds the shared expert from this many tokens on (where the DeepSeek-V4.1 layers' prefill tier
 # starts); fewer tokens in the prefill tier (few experts, tile options) keep ATOM's split.
 SHARED_FOLD_PREFILL_MIN_M = 2048
+# Most tokens of a call that folds its shared expert: the fold's two GEMMs (``_shared_gemm``, aiter's FlyDSL preshuffle
+# FP8 GEMM ``gemm_kernels.flydsl_preshuffle_gemm_a8``) raise above ``gemm_kernels.PRESHUFFLE_M_MAX`` = 65536 rows (the
+# kernel views A and C through a layout bounded by that many rows, ``kernels/preshuffle_gemm.py``); more tokens take
+# ATOM's split, whose aiter ``gemm_a8w8_bpreshuffle`` has no such limit.
+SHARED_FOLD_MAX_M = 65536
 # Token counts up to this run the shared expert as one more route of the per-route decode kernels (``decode_a8w4``'s
 # mixed Gate/Up and Down: its FP8 weights feed the MFMA directly; two launches, no side stream, no final add) when the
 # routed experts take the per-route decode path (``_mixed_decode``); more tokens run the fold or the split. Measured at
@@ -1508,6 +1518,7 @@ def _stream_down_constants():
     """
     return (
         STREAM_DOWN_PREFETCH,
+        STREAM_DOWN_PREFETCH_SMALL,
         STREAM_DOWN_W_AUX,
         STREAM_DOWN_W_AUX_H5120,
         STREAM_DOWN_LDS_ACTS,
@@ -1528,7 +1539,7 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants)
         BLOCK_M=block_m,
         E=experts,
         ATOMIC=atomic,
-        PREFETCH=STREAM_DOWN_PREFETCH,
+        PREFETCH=STREAM_DOWN_PREFETCH if block_m == 64 else STREAM_DOWN_PREFETCH_SMALL,
         W_AUX=w_aux,
         LDS_ACTS=bool(STREAM_DOWN_LDS_ACTS) and block_m == 32 and K % 256 == 0,
         **tile,
@@ -1905,17 +1916,18 @@ def flydsl_moe_a8w4_ptpc(
     topk times padded I stay within ``DECODE_SHARED_MIXED_MAX_WORK``), it runs as the last route of the mixed decode
     kernels (two launches, every column summed in f32 and rounded to BF16 once). Otherwise, where the routed path
     allows it (``_shared_fold_tier``: the decode tier's slot-pair Down, the streaming tier, the prefill tier from
-    ``SHARED_FOLD_PREFILL_MIN_M`` tokens; an ``output`` 16-byte aligned where the shared expert writes it), it is
-    folded into the routed experts' last reduction (``_SharedFold``): two FP8 GEMMs on the routed path's quantized input
-    with SiLU(gate) * up, the limit, a per-row FP8 quantization and the routing weight between them, on a side stream up
-    to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens, their BF16 output summed with the routes in f32 and rounded to BF16
-    once (onto which the streaming tier's atomic Down adds the routes in BF16). Elsewhere it runs ATOM's split
-    (``_shared_split``: aiter's per-token FP8 quantization of the input, ``gemm_a8w8_bpreshuffle`` for gate / up,
-    ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` for Down) on a side
-    stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its routing weight on another; unless ``output``
-    overlaps ``hidden_states``), else before the routed experts on the current stream, and is added to their output
-    with that weight per token, rounded to BF16 (ATOM's ``addcmul_``). The streams can be captured in a CUDA graph
-    (compile outside the capture first, as above). Tile options apply to the routed experts.
+    ``SHARED_FOLD_PREFILL_MIN_M`` tokens, at most ``SHARED_FOLD_MAX_M`` tokens; an ``output`` 16-byte aligned where the
+    shared expert writes it), it is folded into the routed experts' last reduction (``_SharedFold``): two FP8 GEMMs on
+    the routed path's quantized input with SiLU(gate) * up, the limit, a per-row FP8 quantization and the routing weight
+    between them, on a side stream up to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens, their BF16 output summed with the
+    routes in f32 and rounded to BF16 once (onto which the streaming tier's atomic Down adds the routes in BF16).
+    Elsewhere it runs ATOM's split (``_shared_split``: aiter's per-token FP8 quantization of the input,
+    ``gemm_a8w8_bpreshuffle`` for gate / up, ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization,
+    ``gemm_a8w8_bpreshuffle`` for Down) on a side stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its
+    routing weight on another; unless ``output`` overlaps ``hidden_states``), else before the routed experts on the
+    current stream, and is added to their output with that weight per token, rounded to BF16 (ATOM's ``addcmul_``).
+    The streams can be captured in a CUDA graph (compile outside the capture first, as above). Tile options apply to
+    the routed experts.
 
     ``aiter.fused_moe`` calls this function for the tagged ``w1`` / ``w2`` of a prepared weight (``_fused_moe_route``),
     with its ``swiglu_limit`` normalized as on aiter's other SiLU paths and without tile options: it takes only the
@@ -2217,10 +2229,11 @@ def _shared_fold_tier(M, weight, topk, output, tiles):
     """The routed tier into whose last reduction a call (``topk`` routed columns, M > 0) folds its shared expert
     (``_SharedFold``), or None for ATOM's split: decode while the Down is the slot-pair Down
     (``_decode_slot_pair_down``), streaming and prefill from SHARED_FOLD_PREFILL_MIN_M tokens on; never without
-    SHARED_FOLD. Where the shared Down GEMM writes the output itself (decode, the streaming atomic Down) the output
-    must be 16-byte aligned (its 16-byte stores). The routed columns decide, as they decide the tier.
+    SHARED_FOLD or above SHARED_FOLD_MAX_M tokens (the row limit of the fold's GEMMs). Where the shared Down GEMM writes
+    the output itself (decode, the streaming atomic Down) the output must be 16-byte aligned (its 16-byte stores). The
+    routed columns decide, as they decide the tier.
     """
-    if not SHARED_FOLD:
+    if not SHARED_FOLD or M > SHARED_FOLD_MAX_M:
         return None
     H, I, E = weight.hidden, weight.inter_padded, weight.experts
     tier = _routed_tier(M, H, I, topk, E, *tiles)

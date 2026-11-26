@@ -1093,8 +1093,9 @@ def test_layer_masked_routes():
 # decode limit DECODE_WIDE_MAX_M and the streaming kernels past it (_assert_h5120).
 # The streaming tier (M > 32 with at most STREAM_MAX_ROWS* rows per expert) follows pyhip M17's cases too: the basic
 # tests stream blocks of 16 and 32, the benchmark 16 / 32 / 64 without asserting kernels; here its boundaries with
-# decode and prefill, the bit-exact prep and fused quantization, ACT_STEPS, the prefill Down behind the streaming
-# Gate/Up, grid shrinking, CUDA graph, compile-cache keys, repeated ids, in-place output and the SwiGLU limit.
+# decode and prefill, the bit-exact prep and fused quantization, ACT_STEPS, the Gate/Up and Down tiles (bit-exact), the
+# prefill Down behind the streaming Gate/Up, grid shrinking, CUDA graph, compile-cache keys, repeated ids, in-place
+# output and the SwiGLU limit.
 # The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
 # benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
 # The shared expert (2.10) is covered by the basic layer tests (one case per routed tier, TP8, the MTP layer in the
@@ -2046,12 +2047,14 @@ def test_decode_wide_hidden(monkeypatch, tokens, case):
 
     By default H 5120 deduplicates Gate/Up from M 8 on, so the per-route pre-quantized Gate/Up (two rounds) is only
     reached with the threshold raised; the benchmark's ds_tp4 cases (E 384) run powers of two and 48 without
-    asserting kernels (no M 7, 33); the basic tests and the benchmark have w2 far below 4 GiB. The cases pin their
-    decode kernels within the H 5120 decode limit and the streaming kernels past it (_assert_h5120), and the w2
-    fallback, moot past the limit, is skipped there.
+    asserting kernels (no M 7, 33); the basic tests and the benchmark have w2 far below 4 GiB. The cases pin the H 5120
+    decode limit DECODE_WIDE_MAX_M to pyhip M17's 32 tokens (they test the kernels and the boundary logic, not where
+    the default limit lies), their decode kernels within it and the streaming kernels past it (_assert_h5120), and the
+    w2 fallback, moot past the limit, is skipped there.
     """
     import dataclasses
 
+    monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_MAX_M", 32)
     if case == "e256_past_limit":
         w = make_weights(256, DS_HIDDEN, DS_INTER, seed=280)
         prepared = _a8w4_prepare(w)
@@ -2093,17 +2096,21 @@ def test_grid_shrink_boundary_e513():
     of the streaming Gate/Up and Down, is M * topk once that is <= E): M 46 (506 routes) and M 47 (517).
 
     The basic tests (E 33 / 256) are not on this boundary; the benchmark has only M 48 between 33 and 63 (528 routes
-    > E, not shrunk, the M 47 side). Both M have fewer than 4E/3 routes and sort in blocks of 32, the path of the
-    benchmark's M 48.
+    > E, not shrunk, the M 47 side). Both M sort in the dispatch's block (_stream_block_m, as the benchmark's M 48):
+    the case asserts the kernels of that block and the block capacity on both sides (506 = M * topk; 513 = E for
+    every block size), not which block the dispatch picks.
     """
     w = make_weights(513, HIDDEN, 320, seed=31)
     prepared = _a8w4_prepare(w)
-    for tokens in (46, 47):
+    for tokens, capacity in ((46, 46 * TOPK), (47, 513)):
+        block_m = moe_a8w4._stream_block_m(tokens, TOPK, 513, HIDDEN)
+        assert stream_a8w4.stream_prep_sizes(tokens, TOPK, 513, block_m)[2] == capacity
         x, topk_weight, topk_ids = make_inputs(
             tokens, HIDDEN, 513, TOPK, seed=32 + tokens
         )
         assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
-        _assert_path(["a8w4_stream_prep"] + _stream_path(32, True))
+        fused = moe_a8w4._stream_fused_quant(prepared.inter_padded, block_m, HIDDEN)
+        _assert_path(["a8w4_stream_prep"] + _stream_path(block_m, fused))
 
 
 @pytest.mark.parametrize(
@@ -2463,6 +2470,168 @@ def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
         )
     assert not bool(mids[0].isnan().any())
     assert torch.equal(mids[0].view(torch.int32), mids[1].view(torch.int32))
+
+
+def _spy_build(monkeypatch, name):
+    """Wrap ``stream_a8w4.<name>`` (a kernel builder taking keyword options) so that the options of its last build land
+    in the returned dict; returns ``(original builder, dict)``."""
+    original, seen = getattr(stream_a8w4, name), {}
+
+    def spy(**options):
+        seen.clear()
+        seen.update(options)
+        return original(**options)
+
+    monkeypatch.setattr(stream_a8w4, name, spy)
+    return original, seen
+
+
+@pytest.mark.parametrize(
+    "tokens, block_m, tile",
+    [(64, 32, (8, 4)), (40, 16, (16, 1))],
+    ids=["m64_bm32", "m40_bm16"],
+)
+def test_stream_down_tiles_bitexact(monkeypatch, tokens, block_m, tile):
+    """The streaming Down without atomics writes the same route bits with every tile on one sort and input: a wave takes
+    its 16-channel weight blocks in pairs (one 16-byte load per lane and 64-K step covers two adjacent rows of either
+    block of a pair, four MFMA chains per sub-block), so the pairs per wave (R 16 x W 1, or R 8 x W 4 sharing the
+    block's activation rows through LDS) and the pairs in flight (PREFETCH 2: one pair, STREAM_DOWN_PREFETCH_SMALL for
+    blocks of up to 32 rows; 4: two pairs) change only the order of the loads. DeepSeek H 5120 (E 24, I 576: routes for
+    route_sum, no atomics) with M 64 / 40, which the dispatch sorts in blocks of 32 / 16 with the tiles R8W4 / R16W1
+    and STREAM_DOWN_PREFETCH_SMALL (asserted), compared with the other tile and the other prefetch (2 or 4); with
+    blocks of 32 both one and two live sub-blocks occur (asserted). An odd R fails when the launcher is built (the
+    loads cover block pairs).
+
+    The basic DeepSeek M 64 and the benchmark run one tile per shape and grade end to end, which does not show a few
+    differing elements; no dispatch runs the other tile or prefetch of a shape.
+    """
+    compile_down, seen = _spy_build(monkeypatch, "compile_a8w4_down_stream")
+    _, prepared = _ds_weights()
+    E, inter = prepared.experts, prepared.inter_padded
+    assert moe_a8w4._stream_block_m(tokens, DS_TOPK, E, DS_HIDDEN) == block_m
+    assert not moe_a8w4._stream_atomic(DS_HIDDEN, inter, block_m)
+    device, constants = torch.cuda.current_device(), moe_a8w4._stream_down_constants()
+    args = (DS_HIDDEN, inter, DS_TOPK, block_m, E, False, device, constants)
+    # Builds the dispatch's launcher uncached, only to read its tile (nothing is launched with it).
+    moe_a8w4._stream_down_kernel.__wrapped__(*args)
+    base = dict(seen)
+    assert (base.get("R", 16), base.get("W", 1), base["PREFETCH"]) == (
+        *tile,
+        moe_a8w4.STREAM_DOWN_PREFETCH_SMALL,
+    ), base
+    other = {"R": 16, "W": 1} if tile == (8, 4) else {"R": 8, "W": 4}
+    kernels = [
+        moe_a8w4._stream_down_kernel(*args),
+        compile_down(**{**base, "PREFETCH": 4 if base["PREFETCH"] != 4 else 2}),
+        compile_down(**{**base, **other}),
+    ]
+    with pytest.raises(AssertionError, match="pairs of 16-row blocks"):
+        compile_down(**{**base, "R": 5, "W": 1})
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, DS_HIDDEN, E, DS_TOPK, seed=470 + tokens, shared=False
+    )
+    tail = torch.bincount(topk_ids.flatten().long(), minlength=E) % block_m
+    assert block_m == 16 or (
+        bool(((tail > 0) & (tail <= 16)).any()) and bool((tail > 16).any())
+    ), tail
+    sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, _, _ = (
+        moe_a8w4._stream_prep(
+            x, topk_weight, topk_ids, E, block_m, torch.empty_like(x), zero=False
+        )
+    )
+    gen = torch.Generator(device="cuda").manual_seed(480 + tokens)
+    mid = torch.randn((tokens * DS_TOPK, inter), generator=gen)
+    mq, ms = moe_a8w4._quantize(mid, tokens * DS_TOPK, inter, "f32")
+    task_num = sorted_experts.numel()
+    routes = []
+    for kernel in kernels:
+        routes.append(
+            torch.full(
+                (task_num * block_m, DS_HIDDEN), float("nan"), dtype=torch.bfloat16
+            )
+        )
+        moe_a8w4._launch(
+            "down",
+            kernel,
+            mq,
+            prepared.w2,
+            prepared.w2_delta,
+            routes[-1],
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            num_valid,
+            prepared.w2_scale,
+            ms,
+            tokens,
+            task_num,
+        )
+    live = routes[0][loc_ids.flatten().long()]
+    assert not bool(live.isnan().any()) and bool((live != 0).any())
+    for other_routes in routes[1:]:
+        assert torch.equal(_bits(routes[0]), _bits(other_routes))
+
+
+@pytest.mark.parametrize(
+    "tokens, block_m", [(62, 32), (120, 64)], ids=["m62_bm32", "m120_bm64"]
+)
+def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
+    """The streaming Gate/Up's light waves (one gate and one up block each, W waves sharing the block's activations
+    through an LDS ring) give the intermediate bits of the unshared tile (4 gate blocks per wave, W 1) on one sort and
+    input: in every tile a lane loads two adjacent rows of a gate block (lanes 0-7 of 16) or of its up block (lanes
+    8-15) with one 16-byte load, MFMA chain p takes row p of the pair, and the epilogue swaps the pairs back between
+    lanes l and l ^ 32 (ds_bpermute) into 4 channels of gate and up per lane. H 4096 with I 256 (E 5, topk 2): M 62 /
+    120 sort in blocks of 32 / 64 and take the dispatch's 8 waves (I % 128 == 0, asserted), compared with 4 waves and
+    the unshared tile; up to 2 / 4 live sub-blocks.
+
+    The 4-wave tile of H 5120 is compared with ACT_STEPS 1 by test_stream_act_steps_bitexact, the tail-quantizing tile
+    of 5 gate blocks per wave (TP2, activations not shared) with the unshared tile by test_stream_fused_quant_bitexact;
+    the basic tests and the benchmark (MiMo TP8 M512 / 1024 take 8 waves) only grade end to end, which does not show a
+    few differing elements.
+    """
+    compile_gateup, seen = _spy_build(monkeypatch, "compile_a8w4_gateup_stream")
+    _, prepared = _small_weights(4096, 256)
+    E, inter = prepared.experts, prepared.inter_padded
+    assert moe_a8w4._stream_block_m(tokens, 2, E, 4096) == block_m
+    device, constants = torch.cuda.current_device(), moe_a8w4._stream_gateup_constants()
+    args = (2 * inter, 4096, 2, block_m, E, 0.0, device, constants)
+    # Builds the dispatch's launcher uncached, only to read its tile (nothing is launched with it).
+    moe_a8w4._stream_gateup_kernel.__wrapped__(*args)
+    base = dict(seen)
+    assert (base["G"], base["W"], base.get("QUANT", False)) == (1, 8, False), base
+    kernels = [
+        moe_a8w4._stream_gateup_kernel(*args),
+        compile_gateup(**{**base, "W": 4}),
+        compile_gateup(**{**base, "G": 4, "W": 1}),
+    ]
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, 4096, E, 2, seed=490 + tokens, shared=False
+    )
+    sorted_ids, _, sorted_experts, num_valid, _, xq, xs = moe_a8w4._stream_prep(
+        x, topk_weight, topk_ids, E, block_m, torch.empty_like(x), zero=False
+    )
+    mids = []
+    for kernel in kernels:
+        mids.append(torch.full((tokens, 2, inter), float("nan")))
+        moe_a8w4._launch(
+            "gateup",
+            kernel,
+            xq,
+            prepared.w1,
+            prepared.w1_delta,
+            mids[-1],
+            sorted_ids,
+            sorted_experts,
+            num_valid,
+            prepared.w1_scale,
+            xs,
+            xs,
+            tokens,
+            sorted_experts.numel(),
+        )
+    assert not bool(mids[0].isnan().any())
+    for mid in mids[1:]:
+        assert torch.equal(mids[0].view(torch.int32), mid.view(torch.int32))
 
 
 # case -> (M, tile options, set thresholds, kernels in order, the prefill kernels' (Gate/Up XCD_CHUNK, Down
@@ -3025,10 +3194,11 @@ def test_stream_compile_cache_keys(monkeypatch):
     """The streaming launcher caches are keyed by the device (``_stream_gateup_kernel``, ``_stream_down_kernel``,
     ``_stream_prep_kernel``, ``_stream_sum_kernel``) and, for Gate/Up and Down, by the module constants they read
     while building (``_stream_gateup_constants()``: STREAM_GATEUP_ACT_BYTES_H5120 / PREFETCH / SYNC / W_AUX;
-    ``_stream_down_constants()``: STREAM_DOWN_PREFETCH / W_AUX / W_AUX_H5120 / LDS_ACTS and common_a8w4.LDS_BYTES,
-    which decides the shared tile): another device or constant gets its own launcher, and a call passes its inputs'
-    device and the current constants (H 512, I 1024, M 48: the prep, the light-wave Gate/Up, the shared Down writing
-    the routes and route_sum). Building a launcher does not trace it, so the other device need not exist.
+    ``_stream_down_constants()``: STREAM_DOWN_PREFETCH / PREFETCH_SMALL / W_AUX / W_AUX_H5120 / LDS_ACTS and
+    common_a8w4.LDS_BYTES, which decides the shared tile): another device or constant gets its own launcher, and a call
+    passes its inputs' device and the current constants (H 512, I 1024, M 48: the prep, the light-wave Gate/Up, the
+    shared Down writing the routes and route_sum). Building a launcher does not trace it, so the other device need
+    not exist.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
     passes as well; test_compile_cache_keys covers the prefill launchers.
@@ -3064,6 +3234,7 @@ def test_stream_compile_cache_keys(monkeypatch):
             ), name
     for module, name, value in (
         (moe_a8w4, "STREAM_DOWN_PREFETCH", 2),
+        (moe_a8w4, "STREAM_DOWN_PREFETCH_SMALL", 4),
         (moe_a8w4, "STREAM_DOWN_W_AUX", 2),
         (moe_a8w4, "STREAM_DOWN_W_AUX_H5120", 0),
         (moe_a8w4, "STREAM_DOWN_LDS_ACTS", 0),
@@ -3099,7 +3270,7 @@ def test_stream_compile_cache_keys(monkeypatch):
 @pytest.mark.parametrize(
     "case", ["dedup_m5", "dedup_m24", "wide_m24", "stream_atomic", "stream_route_sum"]
 )
-def test_duplicate_ids_keep_every_route(case):
+def test_duplicate_ids_keep_every_route(monkeypatch, case):
     """Several slots of a token select the same expert on the expert-deduplicated decode (two and four kernels: the
     routes of one token may land in one group; H 5120 deduplicates Gate/Up only, and the two slots of one slot pair
     of the Down may be one expert) and on the streaming path (the prep gives every route its own sorted row; Qwen
@@ -3109,8 +3280,8 @@ def test_duplicate_ids_keep_every_route(case):
     The generated routes never repeat an expert within a token, so the basic tests and the benchmark never get here;
     test_decode_duplicate_and_int64_ids covers the per-route decode, test_prefill_prep_routes_limit the prefill
     sorted by the prep (every slot summed too), test_prefill_duplicate_ids_keep_last_route the Opus-sorted prefill.
-    The H 5120 case pins its kernels within the H 5120 decode limit and the streaming kernels past it
-    (_assert_h5120).
+    The H 5120 case pins the H 5120 decode limit to pyhip M17's 32 tokens (so that M 24 stays on the dedup decode
+    whatever the default limit), its kernels within it and the streaming kernels past it (_assert_h5120).
     """
     shared = False
     if case.startswith("dedup"):
@@ -3122,6 +3293,7 @@ def test_duplicate_ids_keep_every_route(case):
         )
         tokens, path = (5, "dd2") if case == "dedup_m5" else (24, "dd4")
     elif case == "wide_m24":
+        monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_MAX_M", 32)
         (w, prepared), hidden, experts, topk = (
             _ds_weights(),
             DS_HIDDEN,
@@ -4706,7 +4878,7 @@ def test_fused_moe_shared_expert_id():
         ),
     ],
 )
-def test_masked_routes(weights, tokens, topk, fused, options, path, full):
+def test_masked_routes(monkeypatch, weights, tokens, topk, fused, options, path, full):
     """Masked routes on every tier but the basic test's (routed experts only): a random 30% of the ids and the case's
     rows whole, on poisoned weights with NaN weights on the masked routes; graded, the rows without a live route
     bitwise 0, the kernels asserted. The per-route decode Gate/Up and Down (nn) and the pre-quantized Gate/Up (pp) with
@@ -4714,10 +4886,13 @@ def test_masked_routes(weights, tokens, topk, fused, options, path, full):
     3); streaming with route_sum behind the streaming Down and behind the prefill Down (blocks of 64, H 4096: it writes
     loc_ids only for sorted routes); prefill sorted by the prep and by Opus (moe_sorting, which skips ids outside [0, E);
     the input quantization sets loc_ids to -1, which sorted_sum skips). The ``_all`` cases mask every route: the dedup
-    plan has no leader, the sortings no row (num_valid 0), and the output is all zero.
+    plan has no leader, the sortings no row (num_valid 0), and the output is all zero. The H 5120 decode limit is pinned
+    to pyhip M17's 32 tokens, so that the wide case (M 24) masks the H 5120 dedup decode whatever the default limit
+    (the other H 5120 cases run M 3 or more than 32 tokens).
 
     The basic test masks the per-route decode (np) only; the benchmark never masks.
     """
+    monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_MAX_M", 32)
     experts, hidden, inter, seed = weights
     w, prepared = poisoned(*_weights(experts, hidden, inter, seed))
     x, topk_weight, topk_ids = make_inputs(
@@ -5328,7 +5503,8 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, mixed):
 # cases (every folded tier: M 6 the pre-quantized decode, mtp_layer_tp4 M 1280 the streaming blocks of 64; unmasked
 # routing, the last column E with weight 1) grade it without asserting how the shared expert runs. Here: every folded
 # tier with masks and with rows whose last column is a routed expert instead of E, in place and under graph replay; the
-# GEMM tiles' LDS race; the fallback of an output that is not 16-byte aligned; the compile-cache keys.
+# GEMM tiles' LDS race; the fallback of an output that is not 16-byte aligned; the GEMMs' row limit SHARED_FOLD_MAX_M
+# (ATOM's split past it); the compile-cache keys.
 
 # case: (shape, tokens, options, routed tier as _path_tier names it, bit-deterministic). Shape: a LAYER_SHAPES name, or
 # "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus below
@@ -5392,18 +5568,21 @@ def _assert_folded(tier):
 
 
 @pytest.mark.parametrize("case", list(_FOLD_CASES))
-def test_layer_fold_tiers(case):
+def test_layer_fold_tiers(monkeypatch, case):
     """Every folded tier (_FOLD_CASES) on poisoned routed weights with _fold_routing's masks and dropped shared
     experts: graded against reference_layer, the rows without a live routed id bitwise 0 (row 1: the shared expert's
     +0 plus nothing), no final add (_assert_folded; the streaming case of blocks of 64 also asserts the prefill Down,
     the Opus case Opus). The same call with output = hidden_states gives the bits of the separate output (the chain
     writes the output, or the routes buffer, only after the kernel that quantizes the input), and a CUDA graph of the
     call replays other inputs with the masks moved with the bits of an eager call on them (the atomic case: graded).
+    The H 5120 decode limit is pinned to pyhip M17's 32 tokens, so that the wide case (M 16) folds into the H 5120
+    dedup decode whatever the default limit (the other cases run 6 or more than 32 tokens).
 
     The basic tests and the benchmark grade the folded tiers on unmasked routing with E in the last column, eagerly
     (the benchmark replays graphs but grades one replay within the tolerance) into a separate output; neither reaches
     the pre-quantized decode of M 5-7 or the streaming blocks of 64, nor asserts how the shared expert runs.
     """
+    monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_MAX_M", 32)
     shape, tokens, options, tier, exact = _FOLD_CASES[case]
     w, shared, prepared, topk, hidden = _fold_weights(shape)
     w, prepared = poisoned(w, prepared)
@@ -5478,8 +5657,9 @@ def test_layer_fold_gemm_race(monkeypatch):
     when other kernels share the CUs). moe_a8w4._shared_gemm asserts the tile's bytes; here its tile choice is run for
     every M up to the GEMM's 65536 rows at the layers' Gate/Up (K 5120) and Down (K 640 / 384) shapes with the GEMM
     stubbed (no assertion fails; K is a multiple of tile_k, which the GEMM requires), then MTP layer TP8 M 32 (wide
-    decode: the shared Down GEMM of 32 rows on the side stream beside the routed Gate/Up) replays 1000 times with the
-    bits of the eager call, which is graded (four waves with tile (16, 64, 128) there: 14-20 of 1000 replays wrong).
+    decode: the shared Down GEMM of 32 rows on the side stream beside the routed Gate/Up; the H 5120 decode limit
+    pinned to pyhip M17's 32 tokens, whatever the default) replays 1000 times with the bits of the eager call, which
+    is graded (four waves with tile (16, 64, 128) there: 14-20 of 1000 replays wrong).
 
     The basic tests and the benchmark run the GEMMs at a few token counts, eagerly or graded within the tolerance on
     one replay; an intermittent block error passes them.
@@ -5502,6 +5682,7 @@ def test_layer_fold_gemm_race(monkeypatch):
                 moe_a8w4._shared_gemm(xq, wq, None, None, None)
     assert all(k % tile_k == 0 for k, _, _, tile_k in seen), seen
 
+    monkeypatch.setattr(moe_a8w4, "DECODE_WIDE_MAX_M", 32)
     experts, topk, inter = LAYER_SHAPES["mtp_layer_tp8"]
     w, shared, prepared = _layer_weights(experts, inter, 700)
     x, topk_weight, topk_ids = make_layer_inputs(
@@ -5576,6 +5757,37 @@ def test_layer_fold_unaligned_output(case):
         ),
     )
     assert bool(buf[:4].isnan().all())
+
+
+@pytest.mark.parametrize("over", [0, 1], ids=["m65536_fold", "m65537_split"])
+def test_layer_fold_max_m(over):
+    """Both sides of SHARED_FOLD_MAX_M (65536 tokens), the row limit of aiter's FlyDSL preshuffle GEMM that the fold's
+    two GEMMs use (gemm_kernels.PRESHUFFLE_M_MAX; past it the GEMM raises): at the limit the call folds the shared
+    expert into the prefill (shared_fold_*, no final add), one token more takes ATOM's split, whose aiter
+    gemm_a8w8_bpreshuffle has no such limit, and adds it last; both graded against reference_layer. The small shape
+    (E 8, H 512, I 64, routed topk 2) in the per-row format: prepare folds the 32x32-block format into per-row scales,
+    so the runtime path and the limit do not depend on the format.
+
+    The benchmark's largest M is 32768 and the basic tests' 2048, below the limit.
+    """
+    from aiter.ops.flydsl import gemm_kernels
+
+    assert moe_a8w4.SHARED_FOLD_MAX_M <= gemm_kernels.PRESHUFFLE_M_MAX
+    tokens = moe_a8w4.SHARED_FOLD_MAX_M + over
+    w, shared, prepared = _fold_small_weights()
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, 512, 8, 2, seed=910, shared_weight=None
+    )
+    out = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids)
+    path = moe_a8w4.last_path
+    folded = [name for name in path if name.startswith("shared_fold")]
+    if over:
+        _assert_layer_path("prefill")
+        assert not folded and path[-1] == "shared_add", path
+    else:
+        _assert_folded("prefill")
+        assert folded, path
+    assert_close(out, reference_layer(x, w, shared, topk_weight, topk_ids))
 
 
 def test_layer_fold_compile_cache_keys(monkeypatch):
