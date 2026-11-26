@@ -21,7 +21,8 @@ One file, four regions:
      keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit, the
      ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag, and the
      shared expert: prepare's bit-exact conversions, the real checkpoints, errors, the stream-mode threshold, graph,
-     in-place output, TP8 padding): ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
+     in-place output, TP8 padding, and the mixed decode: its threshold, the FP8 bytes of its fast row quantization,
+     masks, reads and other shapes): ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): Qwen3.8 TP2 / TP4 (against aiter's FP8 per-token
      ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48 (85
      cases), then the DeepSeek-V4.1-Flash main and MTP layers with the shared expert, TP4 / TP8, at the same token
@@ -658,9 +659,9 @@ def _assert_shared():
     """The call ran the shared expert: some step of ``moe_a8w4.last_path`` starts with "shared".
 
     Deliberately independent of how the op runs it, so that later milestones can change that without these cases:
-    today ATOM's split (shared_fork, shared_gemm_*, ..., shared_add; _assert_split), later possibly the routed kernels
-    themselves or kernels of its own, which record a "shared..." marker of their own. What a layer case checks is its
-    output against reference_layer.
+    today the mixed decode kernels up to DECODE_SHARED_MIXED_MAX_M tokens (marker shared_mixed), else ATOM's split
+    (shared_fork, shared_gemm_*, ..., shared_add; _assert_split); other ways record a "shared..." marker of their own.
+    What a layer case checks is its output against reference_layer.
     """
     path = moe_a8w4.last_path
     assert any(name.startswith("shared") for name in path), path
@@ -796,10 +797,11 @@ def _layer_check(
 # full E, the bench's shapes): prepare with the shared expert, routing [M, topk + 1] with the shared expert E in the
 # last column and a random weight per token, swiglu_limit 10, inputs scaled by 10 (more than 10% of the shared
 # expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier asserted and the
-# shared expert's run checked independent of how the op runs it (_assert_layer_path: today ATOM's split, which later
-# milestones may replace). One case per routed tier of the main layer TP4 (decode M 1, streaming M 64, prefill M 2048),
-# the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128, topk 3, the official 32x32-block format folded by
-# prepare; decode M 16), and fused_moe on the E385 / topk-7 call (M 8, with shared_expert_id=E).
+# shared expert's run checked independent of how the op runs it (_assert_layer_path: today the mixed decode kernels
+# up to M 4, else ATOM's split; later milestones may change that). One case per routed tier of the main layer TP4
+# (decode M 1, streaming M 64, prefill M 2048), the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128,
+# topk 3, the official 32x32-block format folded by prepare; decode M 16), and fused_moe on the E385 / topk-7 call
+# (M 8, with shared_expert_id=E).
 # =================================================================================================
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -4286,8 +4288,8 @@ def test_layer_graph_replay(tokens):
     """A layer call with the shared expert can be captured in a CUDA graph and replayed: the replay reads newly written
     inputs and gives the bits of an eager call on them (main layer TP4: decode M 1 and 4, prefill M 2048, all without
     atomics). Compiled by an eager call outside the capture first. Independent of how the op runs the shared expert
-    (_assert_shared): today ATOM's split, on a side stream forked from and joined to the capturing stream (M 1, 4) or on
-    the capturing stream (M 2048); later milestones may run it otherwise at some of these token counts.
+    (_assert_shared): today the mixed decode kernels (M 1, 4) or ATOM's split on the capturing stream (M 2048); later
+    milestones may run it otherwise at some of these token counts.
 
     The basic tests call eagerly; the benchmark times graph replays and grades their output within the reference's
     tolerance, not their bits against an eager call.
@@ -4332,8 +4334,8 @@ def test_layer_graph_replay(tokens):
 def test_layer_inplace_output(tokens):
     """output = hidden_states with the shared expert gives the bits of a separate output (main layer TP4 decode M 1
     and 4, no atomics): whatever runs the shared expert reads the input before anything overwrites it. Independent of
-    how the op runs the shared expert (_assert_shared): today ATOM's split, which then runs first on the current stream
-    even below SHARED_DUAL_STREAM_MAX_M; later milestones may run it otherwise at some of these token counts.
+    how the op runs the shared expert (_assert_shared): today the mixed decode kernels, whose Gate/Up reads the input
+    before their Down writes the output; later milestones may run it otherwise at some of these token counts.
 
     The basic tests pass a separate output; test_layer_split_inplace_serial asserts the split's order in place.
     """
@@ -4817,6 +4819,338 @@ def test_entry_checks(monkeypatch):
     assert_close(out, ref)
     monkeypatch.undo()
     flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, repeated)
+
+
+# -- 2.12 mixed decode: the shared expert as one more route of the decode kernels -----------------------------------
+# Up to DECODE_SHARED_MIXED_MAX_M tokens, when the routed experts take the per-route decode, a layer call runs the
+# shared expert inside the two decode kernels (decode_a8w4's mixed Gate/Up and Down; moe_a8w4.last_path then ends with
+# "shared_mixed"). Their row quantizations take one IEEE reciprocal per row and correct each product with FMAs
+# (_quant_fast), which must give the FP8 bytes of the per-route kernels' IEEE division; rows whose abs-max is outside
+# _fast_div_ok divide. The basic tests run the mixed decode at main TP4 M 1 (masked at M 4) and TP8 M 4, the benchmark
+# at every layer shape at M 1, 2 and 4 (graded; shared weight 1, the clamp seldom hit), test_layer_graph_replay and
+# test_layer_inplace_output at main TP4 M 1 and 4; none of them asserts which kernels run the shared expert. Here: the
+# threshold, the FP8 bytes of the fast quantization at the edges of its range and at rounding ties, a shared expert
+# dropped by its last id, the reads of the mixed Gate/Up, and shapes beyond the layers'.
+
+_MIXED_PATH = ["a8w4_gateup_decode_mixed", "a8w4_down_decode_mixed", "shared_mixed"]
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [moe_a8w4.DECODE_SHARED_MIXED_MAX_M, moe_a8w4.DECODE_SHARED_MIXED_MAX_M + 1],
+    ids=["mixed_last", "past_mixed"],
+)
+def test_layer_mixed_decode_boundary(tokens):
+    """The mixed decode ends exactly past DECODE_SHARED_MIXED_MAX_M tokens: at it a layer call runs exactly the mixed
+    Gate/Up and Down, one token more runs the shared expert another way (ATOM's split today) and no mixed kernel. MTP
+    layer TP4 (the official block format), inputs x 10 (the shared expert's clamp hit), a random shared weight per
+    token; both sides graded against reference_layer. Only the threshold is pinned, not what takes over past it.
+
+    The basic tests and the benchmark accept any path for the shared expert; the benchmark has no M 5 and runs the MTP
+    layers with shared weight 1 and the clamp seldom hit.
+    """
+    experts, topk, inter = LAYER_SHAPES["mtp_layer_tp4"]
+    _layer_check(experts, topk, inter, tokens, seed=700, fmt="block", amplify=10.0)
+    path = moe_a8w4.last_path
+    if tokens <= moe_a8w4.DECODE_SHARED_MIXED_MAX_M:
+        assert path == _MIXED_PATH, path
+    else:
+        assert not any("_mixed" in name for name in path), path
+        _assert_shared()
+
+
+def test_layer_mixed_decode_masked():
+    """Masks on the mixed decode beyond the basic test's (main TP4 M 4: random ids, a whole row and a masked first id,
+    the last column E and finite shared weights everywhere): MTP layer TP8 (4 Down waves, I 288 padded to 320) at M 4,
+    a random 30% of the routed ids, every routed id of row 1 and the first id of row 2 masked, row 3's last column
+    another expert than E; ATOM's rule drops the shared expert of rows 1 to 3, whose shared weights are NaN (as the
+    masked routes' are), and keeps row 0's. Poisoned routed weights, inputs x 10; graded against reference_layer, row 1
+    bitwise 0. Then every routed id masked: the output is bitwise 0.
+
+    The mixed Down decides on its own whether a token's shared expert is live: had it taken a dropped one, it would have
+    read the zero row the Gate/Up wrote for it, so only the NaN weight can show it. The benchmark never masks.
+    """
+    experts, topk, inter = LAYER_SHAPES["mtp_layer_tp8"]
+    w, shared, prepared = _layer_weights(experts, inter, 700)
+    w, prepared = poisoned(w, prepared)
+    E = prepared.experts
+    x, topk_weight, topk_ids = make_layer_inputs(
+        4, LAYER_HIDDEN, E, topk, seed=790, shared_weight=None
+    )
+    x = (x.float() * 10.0).to(torch.bfloat16)
+    weights, ids = mask_routes(
+        topk_weight, topk_ids, seed=791, full=(1,), first=(2,), routed=topk
+    )
+    for row in (0, 3):
+        weights[row, 0], ids[row, 0] = topk_weight[row, 0], topk_ids[row, 0]
+    ids[3, -1] = E - 1
+    weights[1:, -1] = float("nan")
+    live = shared_route_weight(weights, ids, E)
+    assert bool(live[0] > 0) and bool((live[1:] == 0).all()), live
+    out = torch.full_like(x, float("nan"))
+    flydsl_moe_a8w4_ptpc(
+        x, prepared, weights, ids, output=out, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert moe_a8w4.last_path == _MIXED_PATH, moe_a8w4.last_path
+    assert_close(
+        out,
+        reference_layer(x, w, shared, weights, ids, swiglu_limit=LAYER_SWIGLU_LIMIT),
+    )
+    assert _zero_rows(out, [1])
+    weights, ids = mask_routes(weights, ids, seed=792, full="all", routed=topk)
+    out = flydsl_moe_a8w4_ptpc(
+        x, prepared, weights, ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert moe_a8w4.last_path == _MIXED_PATH, moe_a8w4.last_path
+    assert _zero_rows(out, range(4))
+
+
+def _fast_quant_rows(cols):
+    """Rows for the mixed decode's fast row quantization, float32 [12, cols], each with its exponent k (the products
+    of a row times 2**k are about those of a random row; 0 for the zero row, |k| <= 120). The abs-max of a row is set
+    exactly (and stays so in BF16): random rows with abs-max 40; 2**-56 (fast), 2**-60 (the smallest fast one), the
+    BF16 value just below it, 2**-68 and 2**-130 (subnormal values; all three divide); all zero (fast); the BF16 value
+    just below 2**127 (fast) and 2**127 (divides). Tie rows: s times every positive E4M3FNUZ value and every midpoint
+    between neighbours (and 0), both signs, for s = 7, 7 * 2**-70 (abs-max 2**-59.3) and 7 * 2**115 (2**125.7), exact
+    in BF16: the abs-max 240 s gives the scale s exactly, so every quotient is an FP8 value or a tie of round to nearest
+    even, and the bare product with RN(1 / 7) rounds 62 of the 508 values the other way.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(798)
+    unit = torch.randn((8, cols), generator=gen)
+    unit = (unit / unit.abs().amax(dim=1, keepdim=True)).to(torch.bfloat16).float()
+    below = 1.0 - 2.0**-8
+    grid = torch.arange(1, 128, dtype=torch.uint8).view(torch.float8_e4m3fnuz).float()
+    ties = torch.cat([grid, (torch.cat([grid.new_zeros(1), grid[:-1]]) + grid) / 2])
+    ties = torch.cat([ties, -ties]).repeat(cols // 508 + 1)[:cols]
+    rows = torch.stack(
+        [
+            unit[0] * 40.0,
+            unit[1] * 2.0**-56,
+            unit[2] * 2.0**-60,
+            unit[3] * (below * 2.0**-60),
+            unit[4] * 2.0**-68,
+            unit[5] * 2.0**-130,
+            torch.zeros(cols),
+            unit[6] * (below * 2.0**127),
+            unit[7] * 2.0**127,
+            ties * 7.0,
+            ties * (7.0 * 2.0**-70),
+            ties * (7.0 * 2.0**115),
+        ]
+    )
+    amax = rows.abs().amax(dim=1).tolist()
+    exps = [
+        0 if a == 0 else max(-120, min(120, round(math.log2(40.0 / a)))) for a in amax
+    ]
+    return rows, exps
+
+
+def test_mixed_decode_quant_bitexact():
+    """The mixed decode's fast row quantization gives the FP8 bytes of the per-route decode's IEEE division
+    (_fast_quant_rows: abs-max on both sides of both ends of the fast range, zero and subnormal rows, rounding ties),
+    shown on the outputs, which change with any byte: the mixed Gate/Up's routed rows (one correction) have the bits of
+    the per-route Gate/Up quantizing x in the kernel, one launch per x row with the routed channel factors times 2**k
+    (so that tiny or huge rows give normal f32 results); the mixed Down (two corrections) has the bits of the
+    single-slot Down quantizing in the kernel, one token per row, each token with one live route (a different column
+    each, weight 2**k), its other routes masked, its shared expert dropped and their intermediate rows NaN.
+    E 8, topk 6, H 5120, I 576 (K padded to 640 for the shared Down), SwiGLU limit 10.
+
+    End to end a few flipped FP8 values stay within the tolerance; the basic tests and the benchmark quantize random
+    rows of ordinary size only.
+    """
+    experts, topk, inter = 8, 6, 576
+    _, _, prepared = _layer_weights(experts, inter, 780)
+    H, I, limit = prepared.hidden, prepared.inter_padded, LAYER_SWIGLU_LIMIT
+    device = torch.cuda.current_device()
+    mixed_gateup, mixed_down = moe_a8w4._decode_mixed_kernels(
+        2 * I, H, I, prepared.shared_w2.shape[1], topk + 1, experts, limit, device
+    )
+    waves = moe_a8w4._decode_waves(topk, False)
+    gateup, down = moe_a8w4._decode_kernels(
+        2 * I, H, I, topk, False, False, limit, waves, device
+    )
+    _, topk_weight, topk_ids = make_layer_inputs(1, H, experts, topk, seed=799)
+    routed_weight, routed_ids = (
+        topk_weight[:, :topk].contiguous(),
+        topk_ids[:, :topk].contiguous(),
+    )
+    rows, exps = _fast_quant_rows(H)
+    for r, k in enumerate(exps):
+        x = rows[r : r + 1].to(torch.bfloat16)
+        factor = prepared.w1_scale * 2.0**k
+        mid = torch.full((1, topk + 1, I), float("nan"))
+        want = torch.full((1, topk, I), float("nan"))
+        moe_a8w4._launch(
+            "a8w4_gateup_decode_mixed",
+            mixed_gateup,
+            x,
+            topk_ids,
+            prepared.w1,
+            prepared.w1_delta,
+            factor,
+            prepared.shared_w1,
+            prepared.shared_w1_scale,
+            mid,
+            1,
+        )
+        moe_a8w4._launch(
+            "a8w4_gateup_decode",
+            gateup,
+            x,
+            routed_weight,
+            routed_ids,
+            prepared.w1,
+            prepared.w1_delta,
+            factor,
+            want,
+            want,
+            want,
+            1,
+        )
+        assert bool(want.isfinite().all()) and bool((want != 0).any()) == (r != 6), r
+        assert torch.equal(mid[:, :topk].view(torch.int32), want.view(torch.int32)), r
+
+    rows, exps = _fast_quant_rows(I)
+    tokens = rows.shape[0]
+    mid = torch.full((tokens, topk + 1, I), float("nan"))
+    ids = torch.full((tokens, topk + 1), -1, dtype=torch.int32)
+    weights = torch.full((tokens, topk + 1), float("nan"))
+    for t, k in enumerate(exps):
+        mid[t, t % topk] = rows[t]
+        ids[t, t % topk] = t % experts
+        weights[t, t % topk] = 2.0**k
+    out = torch.full((tokens, H), float("nan"), dtype=torch.bfloat16)
+    want = torch.full_like(out, float("nan"))
+    moe_a8w4._launch(
+        "a8w4_down_decode_mixed",
+        mixed_down,
+        mid,
+        ids,
+        weights,
+        prepared.w2,
+        prepared.w2_delta,
+        prepared.w2_scale,
+        prepared.shared_w2,
+        prepared.shared_w2_scale,
+        out,
+        tokens,
+    )
+    routed_ids, routed_weight = (
+        ids[:, :topk].contiguous(),
+        weights[:, :topk].contiguous(),
+    )
+    moe_a8w4._launch(
+        "a8w4_down_decode",
+        down,
+        mid[:, :topk].contiguous(),
+        routed_weight,
+        routed_ids,
+        routed_weight,
+        prepared.w2,
+        prepared.w2_delta,
+        prepared.w2_scale,
+        want,
+        tokens,
+    )
+    assert bool(want.isfinite().all())
+    assert (want != 0).any(dim=1).tolist() == [t != 6 for t in range(tokens)]
+    assert torch.equal(_bits(out), _bits(want))
+
+
+def test_mixed_gateup_reads_no_weights():
+    """The mixed decode Gate/Up reads no weights of a masked route nor of a dropped shared expert: launched on poisoned
+    routed weights and a shared Gate/Up weight of NaN bytes (0x80 in E4M3FNUZ), with a random 30% of the routed ids, all
+    of row 1's and row 2's first one masked and row 3's last id another expert than E, every masked route's f32 row and
+    the shared rows of rows 1 to 3 are exactly 0, the other routed rows have the bits of the launch without masks, and
+    row 0's shared row is NaN (the poison shows where it is read). E 8 (7 in the poisoned view), topk 6, H 5120,
+    I 576, M 4, no SwiGLU limit.
+
+    End to end a read would not show: the Down drops masked routes and dropped shared experts by a select.
+    """
+    w, _, prepared = _layer_weights(8, 576, 780)
+    _, view = poisoned(w, prepared)
+    topk, E, H, I = 6, view.experts, view.hidden, view.inter_padded
+    gateup = moe_a8w4._decode_mixed_kernels(
+        2 * I,
+        H,
+        I,
+        view.shared_w2.shape[1],
+        topk + 1,
+        E,
+        0.0,
+        torch.cuda.current_device(),
+    )[0]
+    nan_w1 = torch.full_like(view.shared_w1.view(torch.uint8), 0x80)
+    x, topk_weight, topk_ids = make_layer_inputs(4, H, E, topk, seed=796)
+    _, masked = mask_routes(
+        topk_weight, topk_ids, seed=797, full=(1,), first=(2,), routed=topk
+    )
+    masked[0, 0], masked[3, 0] = topk_ids[0, 0], topk_ids[3, 0]
+    masked[3, -1] = E - 1
+
+    def gateup_mid(ids):
+        mid = torch.full((4, topk + 1, I), float("nan"))
+        moe_a8w4._launch(
+            "a8w4_gateup_decode_mixed",
+            gateup,
+            x,
+            ids,
+            view.w1,
+            view.w1_delta,
+            view.w1_scale,
+            nan_w1.view(view.shared_w1.dtype),
+            view.shared_w1_scale,
+            mid,
+            4,
+        )
+        return mid
+
+    mid0, mid1 = gateup_mid(topk_ids), gateup_mid(masked)
+    live = masked[:, :topk] >= 0
+    assert 0 < int((~live).sum()) < live.numel()
+    routed0, routed1 = mid0[:, :topk], mid1[:, :topk]
+    assert bool((routed1[~live] == 0).all())
+    assert torch.equal(routed1[live].view(torch.int32), routed0[live].view(torch.int32))
+    assert bool((mid1[1:, topk] == 0).all())
+    assert bool(mid1[0, topk].isnan().all()) and bool(mid0[:, topk].isnan().all())
+
+
+@pytest.mark.parametrize(
+    "experts, topk, hidden, inter, mixed",
+    [(16, 15, 2560, 192, True), (8, 1, 512, 64, True), (20, 16, 2560, 192, False)],
+    ids=["topk15_h2560", "topk1_h512", "topk16_not_mixed"],
+)
+def test_mixed_decode_shapes(experts, topk, hidden, inter, mixed):
+    """The mixed decode on shapes beyond the layers' (M 3, a random shared weight per token, inputs x 10, SwiGLU limit
+    10): topk 15 + the shared expert (16 Down waves, the most it takes) at H 2560 (5 x pairs per Gate/Up thread, the
+    last one packed alone) and I 192 (the shared Down's K padded to 256); topk 1 + the shared expert (2 waves) at H 512
+    (one x pair per thread) and I 64; topk 16 + the shared expert (17 columns) does not fit the mixed Down and takes
+    another path. Graded against reference_layer, the mixed kernels asserted or ruled out.
+
+    The basic tests and the benchmark run the mixed decode at H 5120, topk 3 or 6 + 1 and I 320 or 576 only.
+    """
+    w = make_weights(experts, hidden, inter, seed=800 + topk)
+    shared = make_shared_weights(hidden, inter, seed=801 + topk)["row"]
+    prepared = _prepare_shared(w, shared)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        3, hidden, experts, topk, seed=802 + topk, shared_weight=None
+    )
+    x = (x.float() * 10.0).to(torch.bfloat16)
+    out = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    path = list(moe_a8w4.last_path)
+    assert_close(
+        out,
+        reference_layer(
+            x, w, shared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+        ),
+    )
+    if mixed:
+        assert path == _MIXED_PATH, path
+    else:
+        assert not any("_mixed" in name for name in path), path
+        assert any(name.startswith("shared") for name in path), path
 
 
 # =================================================================================================

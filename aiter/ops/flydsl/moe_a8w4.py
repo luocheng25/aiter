@@ -37,9 +37,12 @@ pointing here.
 A shared expert in FP8 with per-row scales (DeepSeek-V4.1-Flash) joins the weight as expert E, after the E routed
 experts (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=..., shared_w1_scale=..., shared_w2=..., shared_w2_scale=...)``,
 the E385 / topk-7 convention of ATOM and aiter's FHMoE): routing tensors then have one more column, the last, that
-holds E. The routed experts run as above on the other columns; the shared expert runs ATOM's split (aiter's per-token
-FP8 quantization, ``gemm_a8w8_bpreshuffle``, ``silu_and_mul`` and ``gemm_a8w8_bpreshuffle`` again, ``_shared_split``),
-on a side stream up to ``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
+holds E. Up to ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels, the
+shared expert runs as one more route of the same two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8
+weights feed the MFMA directly, ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other
+columns and the shared expert runs ATOM's split (aiter's per-token FP8 quantization, ``gemm_a8w8_bpreshuffle``,
+``silu_and_mul`` and ``gemm_a8w8_bpreshuffle`` again, ``_shared_split``), on a side stream up to
+``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
 """
 
 import functools
@@ -203,14 +206,22 @@ DOWN_TWO_PASS_MIN_WGS = 80
 # the routed experts (ATOM's dual-stream MoE, ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1024); more tokens run it on the
 # current stream before the routed experts.
 SHARED_DUAL_STREAM_MAX_M = 1024
+# Token counts up to this run the shared expert as one more route of the per-route decode kernels (``decode_a8w4``'s
+# mixed Gate/Up and Down: its FP8 weights feed the MFMA directly; two launches, no side stream, no final add) when the
+# routed experts take the per-route decode path (``_mixed_decode``); more tokens run the split. Measured at M 4 on the
+# DeepSeek-V4.1 main TP4 / TP8 and MTP TP4 / TP8 layers (CUDA graph, PTL on): 0.94 / 0.77 / 0.64 / 0.50x the time of
+# ATOM's split, although its Down (one wave per routing column of a token) takes 1.2-1.7x the routed experts'
+# slot-pair Down there; from M 8 on, H 5120 deduplicates the routed Gate/Up (DECODE_WIDE_DEDUP_MIN_M).
+DECODE_SHARED_MIXED_MAX_M = 4
 # Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): routed
 # ids in [0, E) or -1 (masked), no id repeated within a token apart from -1 and, with a shared expert, its id E in the
 # last column of every row (``_check_routing``).
 DEBUG_CHECKS = os.environ.get("AITER_MOE_A8W4_DEBUG", "0") == "1"
 
 # Kernels launched by the most recent ``flydsl_moe_a8w4_ptpc`` call, in order (host-side record; tests and the
-# benchmark read it). With a shared expert it also holds its steps (``shared_*``) and, around them, the fork and join
-# of the side streams.
+# benchmark read it). With a shared expert it also holds steps named ``shared*``: the split's (and, around them, the fork
+# and join of the side streams), or ``shared_mixed`` after the two kernels (``*_mixed``) of the mixed decode, which runs
+# the shared expert inside them.
 last_path = []
 
 
@@ -226,7 +237,8 @@ class MoeA8W4PtpcWeight:
     ``shared_w1`` [2 * inter_padded, H] (gate rows first, then up rows, each I zero-padded to ``inter_padded``) and
     ``shared_w2`` [H, inter_padded rounded up to 128] (zero-padded K) in the layout of
     ``aiter.ops.shuffle.shuffle_weight(w, layout=(16, 16))`` that ``aiter.gemm_a8w8_bpreshuffle`` reads,
-    ``shared_w1_scale`` / ``shared_w2_scale`` float32 [N, 1] per-row scales.
+    ``shared_w1_scale`` / ``shared_w2_scale`` float32 [N, 1] per-row scales. For an FP8 [N, K] with K % 64 == 0 that
+    layout is also the mixed decode kernels' 16-row x 64-K blocks (``decode_a8w4``), which read the same tensors.
     """
 
     w1: torch.Tensor
@@ -552,7 +564,8 @@ def _prepare_shared(tensors, fmt, inter, inter_padded):
     """The shared-expert fields of ``MoeA8W4PtpcWeight`` (``_SHARED_NAMES`` order) from checked inputs: per-row FP8
     E4M3FNUZ (``_shared_rows``), I zero-padded to ``inter_padded`` (padded gate / up rows and Down columns are zero,
     their gate / up scales 1), then ``shuffle_weight(layout=(16, 16))`` (the Down with ``pad_k_to=128``) and [N, 1]
-    scales, the operands of ``aiter.gemm_a8w8_bpreshuffle``."""
+    scales, the operands of ``aiter.gemm_a8w8_bpreshuffle`` and, as they are (the shuffle of an FP8 [N, K] with
+    K % 64 == 0 is their 16-row x 64-K block layout), of the mixed decode kernels."""
     from aiter.ops.shuffle import shuffle_weight
 
     w1, s1, w2, s2 = tensors
@@ -788,6 +801,19 @@ def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, waves, device):
     return gateup, decode_a8w4.compile_a8w4_down_decode(
         N=H, K=I, TOPK=topk, WAVES=waves
     )
+
+
+@functools.cache
+def _decode_mixed_kernels(N1, H, I, KP, topk, experts, limit, device):
+    """Mixed decode Gate/Up and Down launchers (a shared FP8 expert, id ``experts``, in the last of ``topk`` columns;
+    its Down weight's K padded to ``KP``). ``device`` only keys the cache."""
+    gateup = decode_a8w4.compile_a8w4_gateup_decode_mixed(
+        N=N1, K=H, TOPK=topk, E=experts, SWIGLU_LIMIT=limit
+    )
+    down = decode_a8w4.compile_a8w4_down_decode_mixed(
+        N=H, K=I, KP=KP, TOPK=topk, E=experts
+    )
+    return gateup, down
 
 
 @functools.cache
@@ -1114,6 +1140,63 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
         output,
         M,
     )
+    return output
+
+
+def _fused_moe_decode_mixed(
+    hidden_states, weight, topk_weight, topk_ids, output, limit
+):
+    """The mixed decode path of a call with a shared expert (``_mixed_decode``): ``topk_ids`` / ``topk_weight`` with
+    the shared expert's column last, its FP8 weights read in place (the (16, 16) shuffle of ``shared_w1`` /
+    ``shared_w2`` is the decode kernels' 16-row x 64-K block layout), Gate/Up into the f32 intermediate, Down per token
+    summing every column into ``output``."""
+    M, H = hidden_states.shape
+    topk = topk_ids.shape[1]
+    I = weight.inter_padded
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+    if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
+        topk_weight = topk_weight.to(torch.float32).contiguous()
+    gateup, down = _decode_mixed_kernels(
+        2 * I,
+        H,
+        I,
+        weight.shared_w2.shape[1],
+        topk,
+        weight.experts,
+        limit,
+        hidden_states.device.index,
+    )
+    mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
+    _launch(
+        "a8w4_gateup_decode_mixed",
+        gateup,
+        hidden_states,
+        topk_ids,
+        weight.w1,
+        weight.w1_delta,
+        weight.w1_scale,
+        weight.shared_w1,
+        weight.shared_w1_scale,
+        mid,
+        M,
+    )
+    _launch(
+        "a8w4_down_decode_mixed",
+        down,
+        mid,
+        topk_ids,
+        topk_weight,
+        weight.w2,
+        weight.w2_delta,
+        weight.w2_scale,
+        weight.shared_w2,
+        weight.shared_w2_scale,
+        output,
+        M,
+    )
+    # The shared expert ran inside the two kernels: a marker as the split's steps are.
+    last_path.append("shared_mixed")
     return output
 
 
@@ -1611,15 +1694,18 @@ def flydsl_moe_a8w4_ptpc(
     With a shared expert in ``weight`` (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=...)``, expert E after the E
     routed ones; ATOM's E385 / topk-7 convention for DeepSeek-V4.1-Flash), ``topk_ids`` / ``topk_weight`` are
     [M, topk + 1]: the routed experts in the first topk columns, run as above, and the shared expert's id E in the last
-    column (``DEBUG_CHECKS`` checks it). The shared expert runs ATOM's split
+    column (``DEBUG_CHECKS`` checks it). Its weight is ``topk_weight[:, -1]`` where ``topk_ids[:, 0] >= 0`` and
+    ``topk_ids[:, -1] == E``, else 0 (ATOM's rule: a masked first routed id drops the row's shared expert too, so ATOM's
+    padding rows, all routed ids -1, get 0; a dropped shared expert reads no weight). Up to
+    ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels (no tile option,
+    decided on the routed columns as the tier is), it runs as the last route of the mixed decode kernels (two launches,
+    every column summed in f32 and rounded to BF16 once). Otherwise it runs ATOM's split
     (``_shared_split``: aiter's per-token FP8 quantization of the input, ``gemm_a8w8_bpreshuffle`` for gate / up,
     ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` for Down) on a side
     stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its routing weight on another; unless ``output``
     overlaps ``hidden_states``), else before the routed experts on the current stream, and is added to their output
-    with the weight ``where(topk_ids[:, 0] >= 0 and topk_ids[:, -1] == E, topk_weight[:, -1], 0)`` per token, rounded
-    to BF16 (ATOM's rule and its ``addcmul_``: a masked first routed id drops the row's shared expert too, so ATOM's
-    padding rows, all routed ids -1, get 0). The streams can be captured in a CUDA graph (compile outside the capture
-    first, as above). Tile options apply to the routed experts.
+    with that weight per token, rounded to BF16 (ATOM's ``addcmul_``). The streams can be captured in a CUDA graph
+    (compile outside the capture first, as above). Tile options apply to the routed experts.
 
     ``aiter.fused_moe`` calls this function for the tagged ``w1`` / ``w2`` of a prepared weight (``_fused_moe_route``),
     with its ``swiglu_limit`` normalized as on aiter's other SiLU paths and without tile options: it takes only the
@@ -1715,12 +1801,37 @@ def _shared_gate(topk_weight, topk_ids, experts):
     return gate.to(torch.bfloat16).unsqueeze(1)
 
 
+def _mixed_decode(M, weight, topk, tiles):
+    """Whether a call with a shared expert (``topk`` routed columns, M > 0) runs the mixed decode kernels
+    (``_fused_moe_decode_mixed``): up to DECODE_SHARED_MIXED_MAX_M tokens, no tile option, the routed experts on the
+    per-route decode path (decode tier, not the expert-deduplicated or the wide-hidden deduplicated Gate/Up, x quantized
+    in the Gate/Up kernel; the routed columns decide it, as they decide the tier) and the mixed Down within its limits.
+    """
+    H, I, E = weight.hidden, weight.inter_padded, weight.experts
+    return (
+        M <= DECODE_SHARED_MIXED_MAX_M
+        and _routed_tier(M, H, I, topk, E, *tiles) == "decode"
+        and not (
+            M >= DECODE_DEDUP_MIN_M
+            and H >= DECODE_DEDUP_MIN_H
+            and _down_dd_blocks(H, I)
+        )
+        and not (H in DECODE_WIDE_HIDDEN and M >= DECODE_WIDE_DEDUP_MIN_M)
+        and M * topk * (I // 16) < DECODE_GATEUP_PREQUANT_MIN_WGS
+        and decode_a8w4.down_decode_mixed_fits(I, topk + 1)
+    )
+
+
 def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, tiles):
-    """``flydsl_moe_a8w4_ptpc`` with a shared expert: the routed experts on the first topk columns (``_moe_routed``),
-    the shared expert (``_shared_split``) and its routing weight (``_shared_gate``) on side streams up to
-    SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream, then ``output += shared * gate`` (BF16
-    operands, one rounding: ATOM's addcmul_)."""
+    """``flydsl_moe_a8w4_ptpc`` with a shared expert: the mixed decode kernels when ``_mixed_decode`` holds, else the
+    routed experts on the first topk columns (``_moe_routed``), the shared expert (``_shared_split``) and its routing
+    weight (``_shared_gate``) on side streams up to SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream,
+    then ``output += shared * gate`` (BF16 operands, one rounding: ATOM's addcmul_)."""
     M = hidden_states.shape[0]
+    if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles):
+        return _fused_moe_decode_mixed(
+            hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
     E = weight.experts
     routed_weight, routed_ids = topk_weight[:, :-1], topk_ids[:, :-1]
     if M <= SHARED_DUAL_STREAM_MAX_M and not _overlaps(output, hidden_states):

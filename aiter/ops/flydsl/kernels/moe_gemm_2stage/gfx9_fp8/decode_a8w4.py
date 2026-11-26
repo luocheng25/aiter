@@ -1043,3 +1043,680 @@ def compile_a8w4_row_quant(*, COLS, BF16):
         )
 
     return launch
+
+
+# -- Mixed decode: a shared FP8 expert (DeepSeek-V4.1) as one more routing column ------------------------------------
+# compile_a8w4_gateup_decode_mixed / compile_a8w4_down_decode_mixed run a shared FP8 expert with per-row scales as one
+# more routing column of the two per-route decode launches. Its weights are FP8 E4M3FNUZ in 16-row x 64-K blocks of 1024
+# bytes ([N / 16][K / 64][4][16 rows][16 B], twice a routed block's bytes, K in order: the layout
+# aiter.ops.shuffle.shuffle_weight(layout=(16, 16)) gives an FP8 [N, K] with K % 64 == 0), so lane 16 g + n of a wave
+# loads K group g of row n with one 16-byte load per block and feeds the bytes to the MFMA with no delta and no LUT; the
+# row scale takes the place of the channel factor. Gate/Up gives the shared expert two workgroups per channel block (8
+# gate and the same 8 up rows each, K split over the 4 waves), so that every workgroup reads as many bytes with as many
+# loads as a routed one; Down gives it the last of its TOPK waves.
+# Both kernels are bound by the VALU work of their waves (with two or more workgroups per CU), a third of which was the
+# IEEE division of the row quantization in the per-route kernels (one per value). The mixed kernels divide once per row
+# (the reciprocal) and correct each product with FMAs (``_quant_fast``): the same FP8 bytes as the division, for the
+# routed columns too (rows outside ``_fast_div_ok`` keep the division).
+
+
+def _silu_mul(gate, up):
+    """``SiLU(gate) * up`` as the Gate/Up decode epilogue computes it (bare v_exp_f32 / v_rcp_f32, see there)."""
+    tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
+    return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
+
+
+# Row abs-max range of the fast row quantization (``_quant_fast``): with it every quotient that can reach the FP8 grid
+# (|v / scale| >= 2**-12) has a normal residual, and the result equals the IEEE division's at the FP8 level.
+_FAST_DIV_MIN = 2.0**-60
+_FAST_DIV_MAX = 2.0**127
+
+
+def _fast_div_ok(amax):
+    """Whether a row with abs-max ``amax`` takes the fast quantization (0 included: the quotients are all 0)."""
+    return (amax < _FAST_DIV_MAX) & ((amax >= _FAST_DIV_MIN) | (amax == 0.0))
+
+
+def _quant_fast(value, scale, inv, steps):
+    """``_quant`` through the reciprocal ``inv = RN(1 / scale)`` (one IEEE division per row instead of one per value):
+    ``q = RN(value * inv)`` and ``steps`` FMA corrections ``q += (value - q * scale) * inv`` (Markstein). Two steps
+    give the correctly rounded quotient (the first makes it faithful, the second exact); one step was checked equal to
+    the IEEE division at the FP8 level for every BF16 value against every BF16 row abs-max in ``_fast_div_ok``.
+    """
+    q = value * inv
+    for _ in range(steps):
+        q = fx.math.fma(fx.math.fma(-q, scale, value), inv, q)
+    return fx.minnumf(fx.maxnumf(q, fx.Float32(-FP8_MAX)), fx.Float32(FP8_MAX))
+
+
+def _fp8_pair_q(q0, q1):
+    """FP8 E4M3FNUZ bytes 0 and 1 of two clamped quotients (``-0`` stored as ``+0``), as ``_fp8_pair``."""
+    packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
+    mag = packed & fx.Uint32(0x7F7F)
+    keep = (mag + fx.Uint32(0x7F7F)) & fx.Uint32(0x8080)
+    return mag | (packed & keep)
+
+
+def _fp8_word_q(q0, q1, q2, q3):
+    """FP8 E4M3FNUZ bytes of four clamped quotients in one dword (``q0`` in byte 0, ``-0`` stored as ``+0``): the
+    second conversion writes the high half of the first one's result, and one ``-0`` fix covers the four bytes (a
+    byte's magnitude plus 0x7F stays below 0x100)."""
+    lo = rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+    packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, q2, q3, lo, True))
+    mag = packed & fx.Uint32(0x7F7F7F7F)
+    keep = (mag + fx.Uint32(0x7F7F7F7F)) & fx.Uint32(0x80808080)
+    return mag | (packed & keep)
+
+
+def _fp8_pair_fast(v0, v1, scale, inv, steps):
+    """``_fp8_pair`` with ``_quant_fast``."""
+    return _fp8_pair_q(
+        _quant_fast(v0, scale, inv, steps), _quant_fast(v1, scale, inv, steps)
+    )
+
+
+def _row_amax_scale(values):
+    """Wave-uniform abs-max of a wave's f32 row (lane ``l`` holds elements ``l + 64 u``) and its FP8 row scale."""
+    amax = _wave_max(_abs_max(values))
+    return amax, _row_scale(amax)
+
+
+def _stage_row(mq_base, base, lane, values, pair_of):
+    """Stores a wave's f32 intermediate row (lane ``l`` holds elements ``l + 64 u``) as FP8 bytes into LDS at byte
+    ``base``; ``pair_of(v0, v1)`` gives the FP8 bytes of two values (``_fp8_pair`` / ``_fp8_pair_fast``)."""
+    count = len(values)
+    padded = values + ([fx.Float32(0.0)] if count % 2 else [])
+    for u in range(0, count, 2):
+        pair = pair_of(padded[u], padded[u + 1])
+        _lds_store(
+            mq_base,
+            base + lane + 64 * u,
+            Vec.from_elements([pair.to(fx.Uint8)], fx.Uint8),
+            fx.Uint8,
+            1,
+        )
+        if u + 1 < count:
+            _lds_store(
+                mq_base,
+                base + lane + 64 * (u + 1),
+                Vec.from_elements([(pair >> 8).to(fx.Uint8)], fx.Uint8),
+                fx.Uint8,
+                1,
+            )
+
+
+def _stage_row_ieee(mq_base, base, lane, values, scale):
+    """``_stage_row`` with the IEEE division of the Down decode kernel (``_fp8_pair``)."""
+    _stage_row(mq_base, base, lane, values, lambda v0, v1: _fp8_pair(v0, v1, scale))
+
+
+def _stage_row_fast(mq_base, base, lane, values, scale, steps):
+    """``_stage_row`` with ``_quant_fast`` (``steps`` corrections; the row's abs-max within ``_fast_div_ok``)."""
+    inv = fx.Float32(1.0) / scale
+    _stage_row(
+        mq_base,
+        base,
+        lane,
+        values,
+        lambda v0, v1: _fp8_pair_fast(v0, v1, scale, inv, steps),
+    )
+
+
+def _stage_x(xq_base, tid, values, quant):
+    """Stores the FP8 bytes of a token row's values (thread ``tid`` holds pairs ``tid + 256 m``) into LDS;
+    ``quant(v)`` gives a value's clamped quotient. Two pairs share a conversion dword (``_fp8_word_q``)."""
+
+    def store(m, half):
+        _lds_store(
+            xq_base,
+            (tid + 256 * m) * 2,
+            Vec.from_elements([half.to(fx.Uint16)], fx.Uint16),
+            fx.Uint16,
+            2,
+        )
+
+    q = [quant(v) for v in values]
+    pairs = len(values) // 2
+    m = 0
+    while m + 1 < pairs:
+        word = _fp8_word_q(q[2 * m], q[2 * m + 1], q[2 * m + 2], q[2 * m + 3])
+        store(m, word)
+        store(m + 1, word >> 16)
+        m += 2
+    for r in range(m, pairs):
+        store(r, _fp8_pair_q(q[2 * r], q[2 * r + 1]))
+
+
+def _stage_x_ieee(xq_base, tid, values, scale):
+    """``_stage_x`` with the IEEE division of the Gate/Up decode kernel (``_quant``)."""
+    _stage_x(xq_base, tid, values, lambda v: _quant(v, scale))
+
+
+def _stage_x_fast(xq_base, tid, values, scale, steps):
+    """``_stage_x`` with ``_quant_fast`` (``steps`` corrections; the row's abs-max within ``_fast_div_ok``)."""
+    inv = fx.Float32(1.0) / scale
+    _stage_x(xq_base, tid, values, lambda v: _quant_fast(v, scale, inv, steps))
+
+
+def _wave_fence():
+    # LDS bytes written by other lanes of the same wave are read next: a wavefront-scope fence keeps the compiler from
+    # moving the reads above the writes and emits no instruction (a wave performs its LDS operations in order).
+    fx.memory_fence(
+        syncscope=rocdl.SyncScope.Wavefront, ordering=fx.AtomicOrdering.AcqRel
+    )
+
+
+def down_decode_mixed_fits(K, TOPK):
+    """Whether ``compile_a8w4_down_decode_mixed`` supports padded I ``K`` with ``TOPK`` routing columns (one wave
+    each, at most 16): every wave's intermediate row, partial sums and LUT copy fit in LDS.
+    """
+    return (
+        K % 64 == 0
+        and 2 <= TOPK <= 16
+        and TOPK * (K + 16 * 4 + _LUT_BYTES) <= a8w4.LDS_BYTES
+    )
+
+
+def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
+    """Launcher ``(x, topk_ids, w, w_delta, w_scale, shared_w, shared_scale, out, M, stream)``: the Gate/Up of
+    ``compile_a8w4_gateup_decode`` (x BF16, quantized in the kernel) with a shared FP8 expert in the last of the
+    ``TOPK`` routing columns (``topk_ids`` / out rows [M, TOPK]).
+
+    The ``TOPK - 1`` routed columns run as there (MXFP4 codes decoded through the LUT; -1 masked, no weight read). The
+    shared expert, id ``E``, is live when the last column holds ``E`` and the token's first id is not -1 (ATOM's rule;
+    otherwise it reads no weight and its out row is 0). It takes two more workgroups per channel block and token, 8 of
+    the 16 channels each, so that every workgroup reads the bytes of a routed one: shared_w FP8 E4M3FNUZ [N, K] in the
+    16-row x 64-K block layout ``[N / 16][K / 64][4][16 rows][16 B]`` (K in order within the 16 bytes;
+    ``aiter.ops.shuffle.shuffle_weight(layout=(16, 16))`` of an FP8 [N, K] with K % 64 == 0) and shared_scale f32 [N]
+    per row, applied in place of the channel factor. Lane ``16 g + n`` loads K group ``g`` of gate row ``8 h + n``
+    (``n < 8``) or up row ``8 h + n - 8`` of the half ``h``, wave ``w`` reduces K quarter ``w`` (the FP8 bytes feed the
+    MFMA directly), and the epilogue writes SiLU(gate) * up (clamped as there) of the 8 channels. The routed
+    workgroups' loads are the same instructions as the shared ones' (the descriptor and offsets selected per
+    workgroup). Grid ``(I / 16, M * (TOPK + 1))``: row ``t * (TOPK + 1) + s`` is the route ``(t, s)`` for
+    ``s < TOPK - 1``, then the shared expert's halves. Every workgroup quantizes its token row with ``_quant_fast``
+    (one correction; the FP8 bytes of the per-route kernel's division).
+    """
+    from .stream_a8w4 import _address, _load, _rsrc
+
+    I = N // 2
+    assert (
+        I % 16 == 0 and K % 512 == 0 and TOPK >= 2
+    ), f"unsupported mixed Gate/Up decode shape N={N} K={K} TOPK={TOPK}"
+    R = TOPK - 1  # routed columns
+    SLOTS = TOPK + 1  # grid rows per token
+    KB = K // 64
+    KQ = a8w4.delta_dwords(K)
+    KB_HALF = KB // 2
+    # 16-byte loads per lane: the routed block pairs of a K half, the shared blocks of a K quarter.
+    PAIRS = KB_HALF // 2
+    NJ = I // 16
+    X_DWORDS = K // 2 // 256  # bf16 pairs per thread
+    W_BYTES = a8w4.weight_bytes(N, K)
+    D_BYTES = a8w4.delta_bytes(N, K)
+    S_BLOCK = 2 * a8w4.W_BLOCK_BYTES  # one 16-row x 64-K FP8 block
+    S_UP = NJ * KB * S_BLOCK  # from a gate row's block to the same up row's block
+
+    @fx.struct
+    class SharedStorage:
+        xq: fx.Array[fx.Uint8, K, 16]
+        part: fx.Array[fx.Float32, 128, 16]
+        red: fx.Array[fx.Float32, 4, 16]
+        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
+
+    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode_mixed", SWIGLU_LIMIT))
+    def a8w4_gateup_decode_mixed(
+        p_x: fx.Pointer,
+        p_ids: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_shared: fx.Pointer,
+        p_shared_scale: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = _wave_index(tid)
+        j = fx.Int32(gpu.block_idx.x)
+        y = fx.Int32(gpu.block_idx.y)
+        token = y // SLOTS
+        s = y - token * SLOTS
+        shared = s >= R
+        half = s - R
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        xq_base = fx.recast_iter(fx.Uint8, lds.xq.ptr)
+        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
+        red_base = fx.recast_iter(fx.Uint8, lds.red.ptr)
+        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
+        _lut_table_init(lut_base, tid)
+
+        # The token row does not depend on the ids: issue it first.
+        x_row = fx.make_view(
+            _global_ptr(p_x, fx.Uint32, 4) + fx.Int64(token) * (K // 2),
+            fx.make_layout(K // 2, 1),
+        )
+        xbits = [fx.Uint32(x_row[tid + 256 * m]) for m in range_constexpr(X_DWORDS)]
+        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
+        row = token * TOPK
+        # The weight, delta and factor bytes of the workgroup's route: the routed expert's codes (the id zero-extended,
+        # as in common_a8w4.expert_bytes) or the shared expert's FP8 rows; zero bytes when masked (the range check
+        # returns 0 without reading memory). A branch per kind, so that a routed workgroup waits for its own id only and
+        # a shared one issues both of its ids before waiting.
+        w_addr = fx.Int64(0)
+        w_records = fx.Int64(0)
+        d_addr = fx.Int64(0)
+        d_records = fx.Int64(0)
+        f_addr = fx.Int64(0)
+        alive = fx.Int32(0)
+        if shared:
+            expert = ids[row + R]
+            first = ids[row]
+            ok = (expert == E) & (first >= 0)
+            w_addr = _address(p_shared)
+            w_records = ok.select(fx.Int64(N * K), fx.Int64(0))
+            f_addr = _address(p_shared_scale) + fx.Int64(j * 16 + half * 8) * 4
+            alive = ok.select(fx.Int32(1), fx.Int32(0))
+        else:
+            expert = ids[row + s]
+            ok = expert >= 0
+            expert64 = fx.Int64(fx.Uint32(expert))
+            w_addr = _address(p_weight) + expert64 * W_BYTES
+            w_records = ok.select(fx.Int64(W_BYTES), fx.Int64(0))
+            d_addr = _address(p_w_delta) + expert64 * D_BYTES
+            d_records = ok.select(fx.Int64(D_BYTES), fx.Int64(0))
+            f_addr = _address(p_w_scale) + (expert64 * N + fx.Int64(j * 16)) * 4
+            alive = ok.select(fx.Int32(1), fx.Int32(0))
+        live = alive != 0
+        w_rsrc = _rsrc(w_addr, w_records)
+        d_rsrc = _rsrc(d_addr, d_records)
+        rb = (wave & 1) * NJ + j
+        kb0 = (wave >> 1) * KB_HALF
+        n = lane % 16
+        w_voff = shared.select(
+            (n >= 8).select(fx.Int32(S_UP), fx.Int32(0))
+            + (lane // 16) * 256
+            + (n % 8) * 16,
+            lane * 16,
+        )
+        w_soff = shared.select(
+            (j * KB + wave * PAIRS) * S_BLOCK + half * 128,
+            (rb * KB + kb0) * a8w4.W_BLOCK_BYTES,
+        )
+        d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
+        d_soff = (rb * KQ + kb0 // 4) * a8w4.D_BLOCK_BYTES
+        # Each delta load right before the two block pairs it covers (see compile_a8w4_gateup_decode).
+        raws, deltas = [], []
+        for p in range_constexpr(PAIRS):
+            if const_expr(p % 2 == 0):
+                rocdl.sched_barrier(0)
+                deltas.append(
+                    _load(d_rsrc, d_voff, d_soff + (p // 2) * a8w4.D_BLOCK_BYTES, 2)
+                )
+            raws.append(_load(w_rsrc, w_voff, w_soff + p * S_BLOCK, 4))
+        rocdl.sched_barrier(0)
+        # Channel factors of the epilogue (thread t < 16 owns channel j * 16 + t), or the shared expert's row scales
+        # (t < 8 owns channel j * 16 + 8 h + t); a masked route skips them (factors 0, its out row 0).
+        ws_gate = fx.Float32(0.0)
+        ws_up = fx.Float32(0.0)
+        if (fx.Int32(tid) < shared.select(fx.Int32(8), fx.Int32(16))) & live:
+            f_rsrc = _rsrc(f_addr, N * 4)
+            ws_gate = _load(f_rsrc, tid * 4, 0, 1)[0].bitcast(fx.Float32)
+            ws_up = _load(f_rsrc, tid * 4, I * 4, 1)[0].bitcast(fx.Float32)
+        rocdl.sched_barrier(0)
+
+        # Quantize the token row: thread `tid` owns bf16 pairs tid + 256 * m.
+        values = []
+        for bits in xbits:
+            values.append((bits << 16).bitcast(fx.Float32))
+            values.append((bits & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
+        amax = _wave_max(_abs_max(values))
+        if lane == 0:
+            _lds_store(
+                red_base, wave * 4, Vec.from_elements([amax], fx.Float32), fx.Float32, 4
+            )
+        gpu.barrier()
+        red = _lds_load(red_base, 0, fx.Float32, 4, 16)
+        row_max = fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
+        scale = _row_scale(row_max)
+        # One correction: exact at the FP8 level for BF16 values (see _quant_fast).
+        if _fast_div_ok(row_max):
+            _stage_x_fast(xq_base, tid, values, scale, 1)
+        else:
+            _stage_x_ieee(xq_base, tid, values, scale)
+        gpu.barrier()
+
+        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
+        if shared:
+            # Every output row holds column n's sum over the K group of all four lane groups.
+            g_off = (lane // 16) * 16
+            for p in range_constexpr(PAIRS):
+                xop = _lds_load(
+                    xq_base, (wave * PAIRS + p) * 64 + g_off, fx.Int64, 2, 16
+                )
+                weight = Vec.from_elements(raws[p], fx.Uint32).bitcast(fx.Int64)
+                for c in range_constexpr(2):
+                    accs[0] = _mfma(xop[c], weight[c], accs[0])
+        else:
+            # The routed loop of compile_a8w4_gateup_decode (block pairs, accs[h] rows 2 m + h).
+            x_off = (lane // 32) * 64 + ((lane % 32) // 8) * 16
+            d_shift = fx.Uint32((lane // 32) * 8)
+            for p in range_constexpr(PAIRS):
+                xop = _lds_load(xq_base, (kb0 + 2 * p) * 64 + x_off, fx.Int64, 2, 16)
+                shift = d_shift + fx.Uint32(16 * (p % 2))
+                ops = [
+                    _decode_block(
+                        Vec.from_elements(
+                            [raws[p][2 * h], raws[p][2 * h + 1]], fx.Uint32
+                        ),
+                        _lut_at(lut_base, deltas[p // 2][h], shift),
+                    )
+                    for h in range_constexpr(2)
+                ]
+                for c in range_constexpr(2):
+                    for h in range_constexpr(2):
+                        accs[h] = _mfma(xop[c], ops[h][c], accs[h])
+
+        if shared:
+            if lane < 16:
+                _lds_store(
+                    part_base,
+                    (wave * 16 + lane) * 4,
+                    Vec.from_elements([Vec(accs[0])[0]], fx.Float32),
+                    fx.Float32,
+                    4,
+                )
+        else:
+            if (lane < 8) | ((lane >= 40) & (lane < 48)):
+                for h in range_constexpr(2):
+                    _lds_store(
+                        part_base,
+                        ((wave * 2 + h) * 16 + lane % 16) * 4,
+                        Vec.from_elements([Vec(accs[h])[0]], fx.Float32),
+                        fx.Float32,
+                        4,
+                    )
+        gpu.barrier()
+        if shared:
+            if tid < 8:
+                # Gate column tid and up column 8 + tid of the four K quarters.
+                gate = _tree_sum(
+                    [
+                        _lds_load(part_base, (w * 16 + tid) * 4, fx.Float32, 1, 4)[0]
+                        for w in range_constexpr(4)
+                    ]
+                )
+                up = _tree_sum(
+                    [
+                        _lds_load(part_base, (w * 16 + 8 + tid) * 4, fx.Float32, 1, 4)[
+                            0
+                        ]
+                        for w in range_constexpr(4)
+                    ]
+                )
+                gate, up = a8w4.swiglu_clamp(
+                    gate * ws_gate * scale, up * ws_up * scale, SWIGLU_LIMIT
+                )
+                out = fx.make_view(
+                    fxh._as_ptr(p_out, fx.Float32) + fx.Int64(row + R) * I,
+                    fx.make_layout(I, 1),
+                )
+                out[j * 16 + half * 8 + tid] = _silu_mul(gate, up)
+        else:
+            if tid < 16:
+                # Channel row tid = 2m + h: columns m and m + 8 of accumulator h.
+                pcol = (tid & 1) * 16 + tid // 2
+                parts = [
+                    _lds_load(part_base, (w * 32 + pcol) * 4, fx.Float32, 1, 4)[0]
+                    + _lds_load(part_base, (w * 32 + pcol + 8) * 4, fx.Float32, 1, 4)[0]
+                    for w in range_constexpr(4)
+                ]
+                gate = (parts[0] + parts[2]) * ws_gate * scale
+                up = (parts[1] + parts[3]) * ws_up * scale
+                gate, up = a8w4.swiglu_clamp(gate, up, SWIGLU_LIMIT)
+                out = fx.make_view(
+                    fxh._as_ptr(p_out, fx.Float32) + fx.Int64(row + s) * I,
+                    fx.make_layout(I, 1),
+                )
+                out[j * 16 + tid] = _silu_mul(gate, up)
+
+    @flyc.jit
+    def launch(
+        p_x: fx.Pointer,
+        p_ids: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_shared: fx.Pointer,
+        p_shared_scale: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        a8w4_gateup_decode_mixed(
+            p_x,
+            p_ids,
+            p_weight,
+            p_w_delta,
+            p_w_scale,
+            p_shared,
+            p_shared_scale,
+            p_out,
+            M,
+        ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
+
+    return launch
+
+
+def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
+    """Launcher ``(mid, topk_ids, topk_weight, w, w_delta, w_scale, shared_w, shared_scale, out, M, stream)``: the Down
+    of ``compile_a8w4_down_decode`` with one wave per routing column (``TOPK`` waves) and a shared FP8 expert in the
+    last column (``compile_a8w4_gateup_decode_mixed``'s rule: it adds only when the last id is ``E`` and the token's
+    first id is not -1).
+
+    The routed columns' waves run as there (mid f32 [M, TOPK, K] quantized per row in the kernel, MXFP4 codes decoded
+    through the LUT, -1 masked); the last wave reads the shared expert's FP8 Down weight directly: shared_w FP8
+    E4M3FNUZ [N, KP] (K zero-padded to ``KP``, a multiple of 64) in the 16-row x 64-K block layout of the Gate/Up
+    (lane ``16 g + n`` holds K group ``g`` of row ``n``), scaled by shared_scale f32 [N] per row. Every wave runs its
+    column on its own (its own LUT copy and LDS row, a wavefront fence between staging and its MFMAs), so all of them
+    issue their weight loads first and the workgroup meets only before the sum of their partials, which is written as
+    BF16 (out [M, N]). The intermediate rows are quantized with ``_quant_fast`` (two corrections: the correctly
+    rounded quotient, the FP8 bytes of the per-route kernel's division).
+    """
+    from .stream_a8w4 import _address, _load, _rsrc
+
+    assert (
+        N % 16 == 0 and KP % 64 == 0 and KP >= K and down_decode_mixed_fits(K, TOPK)
+    ), f"unsupported mixed Down decode shape N={N} K={K} KP={KP} TOPK={TOPK}"
+    KB = K // 64
+    KBP = KP // 64
+    KQ = a8w4.delta_dwords(K)
+    NB = N // 16
+    R = TOPK - 1
+    W_BYTES = a8w4.weight_bytes(N, K)
+    D_BYTES = a8w4.delta_bytes(N, K)
+    S_BLOCK = 2 * a8w4.W_BLOCK_BYTES
+
+    @fx.struct
+    class SharedStorage:
+        mq: fx.Array[fx.Uint8, TOPK * K, 16]
+        part: fx.Array[fx.Float32, TOPK * 16, 16]
+        lut: fx.Array[fx.Uint8, TOPK * _LUT_BYTES, 16]
+
+    @flyc.kernel
+    def a8w4_down_decode_mixed(
+        p_mid: fx.Pointer,
+        p_ids: fx.Pointer,
+        p_topk_weight: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_shared: fx.Pointer,
+        p_shared_scale: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+    ):
+        tid = gpu.thread_idx.x
+        lane = tid % 64
+        wave = _wave_index(tid)
+        j = gpu.block_idx.x
+        token = gpu.block_idx.y
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
+        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
+        lut_base = fx.add_offset(
+            fx.recast_iter(fx.Uint8, lds.lut.ptr),
+            fx.make_int_tuple(wave * _LUT_BYTES),
+        )
+        _lut_table_init(lut_base, lane)
+
+        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
+        tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
+        row = token * TOPK
+        expert = ids[row + wave]
+        weight = tws[row + wave]
+        first = ids[row]
+        x_off = (lane // 16) * 16
+        total = fx.Float32(0.0)
+        # Each branch loads its own intermediate row (first: it does not depend on the expert id) and the shared
+        # expert's wave addresses its row with constants: code common to both branches would be hoisted above the
+        # branch, where its wait for the intermediate row would hold back the weight loads.
+        if wave == R:
+            mid = fx.make_view(
+                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + R) * K,
+                fx.make_layout(K, 1),
+            )
+            mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
+            live = (expert == E) & (first >= 0)
+            w_rsrc = _rsrc(
+                _address(p_shared), live.select(fx.Int64(N * KP), fx.Int64(0))
+            )
+            s_rsrc = _rsrc(
+                _address(p_shared_scale), live.select(fx.Int64(N * 4), fx.Int64(0))
+            )
+            raws = [
+                _load(w_rsrc, lane * 16, (j * KBP + i) * S_BLOCK, 4)
+                for i in range_constexpr(KB)
+            ]
+            factor = _load(s_rsrc, (lane % 16) * 4, j * 64, 1)[0].bitcast(fx.Float32)
+            rocdl.sched_barrier(0)
+            amax, row_scale = _row_amax_scale(mids)
+            if _fast_div_ok(amax):
+                _stage_row_fast(mq_base, R * K, lane, mids, row_scale, 2)
+            else:
+                _stage_row_ieee(mq_base, R * K, lane, mids, row_scale)
+            _wave_fence()
+            acc = fx.full(4, 0.0, fx.Float32)
+            for i in range_constexpr(KB):
+                xop = _lds_load(mq_base, R * K + i * 64 + x_off, fx.Int64, 2, 16)
+                w = Vec.from_elements(raws[i], fx.Uint32).bitcast(fx.Int64)
+                for c in range_constexpr(2):
+                    acc = _mfma(xop[c], w[c], acc)
+            contrib = Vec(acc)[0] * factor * row_scale * weight
+            total = live.select(contrib, fx.Float32(0.0))
+        else:
+            base = wave * K
+            mid = fx.make_view(
+                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + wave) * K,
+                fx.make_layout(K, 1),
+            )
+            mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
+            w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES, masked=True)
+            d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES, masked=True)
+            w_voff = fx.Int32(lane * 8)
+            d_voff = fx.Int32((lane // 32) * 64 + (lane % 16) * 4)
+            # Each delta dword right before the weight blocks it covers.
+            raws, deltas = [], []
+            for i in range_constexpr(KB):
+                if const_expr(i % 4 == 0):
+                    deltas.append(
+                        a8w4.load_dword(
+                            d_buf,
+                            d_voff,
+                            fx.Int32((j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
+                        )[0]
+                    )
+                raws.append(
+                    a8w4.load_dwordx2(
+                        w_buf, w_voff, fx.Int32((j * KB + i) * a8w4.W_BLOCK_BYTES)
+                    )
+                )
+            s_buf = a8w4.expert_bytes(p_w_scale, expert, N * 4, masked=True)
+            factor = a8w4.load_dword(s_buf, fx.Int32((lane % 16) * 4), fx.Int32(j * 64))
+            rocdl.sched_barrier(0)
+            amax, row_scale = _row_amax_scale(mids)
+            if _fast_div_ok(amax):
+                _stage_row_fast(mq_base, base, lane, mids, row_scale, 2)
+            else:
+                _stage_row_ieee(mq_base, base, lane, mids, row_scale)
+            _wave_fence()
+            acc = fx.full(4, 0.0, fx.Float32)
+            for i in range_constexpr(KB):
+                xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
+                ops = _decode_block(
+                    raws[i], _lut_at(lut_base, deltas[i // 4], fx.Uint32(8 * (i % 4)))
+                )
+                for c in range_constexpr(2):
+                    acc = _mfma(xop[c], ops[c], acc)
+            contrib = (
+                Vec(acc)[0]
+                * fx.Uint32(factor[0]).bitcast(fx.Float32)
+                * row_scale
+                * weight
+            )
+            # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
+            total = (expert >= 0).select(contrib, fx.Float32(0.0))
+
+        if lane < 16:
+            _lds_store(
+                part_base,
+                (wave * 16 + lane) * 4,
+                Vec.from_elements([total], fx.Float32),
+                fx.Float32,
+                4,
+            )
+        gpu.barrier()
+        if tid < 16:
+            parts = [
+                _lds_load(part_base, (w * 16 + tid) * 4, fx.Float32, 1, 4)[0]
+                for w in range_constexpr(TOPK)
+            ]
+            y = _tree_sum(parts)
+            out = fx.make_view(
+                fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
+                fx.make_layout(N, 1),
+            )
+            out[j * 16 + tid] = fxh._f32_to_bf16(y)
+
+    @flyc.jit
+    def launch(
+        p_mid: fx.Pointer,
+        p_ids: fx.Pointer,
+        p_topk_weight: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_shared: fx.Pointer,
+        p_shared_scale: fx.Pointer,
+        p_out: fx.Pointer,
+        M: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        a8w4_down_decode_mixed(
+            p_mid,
+            p_ids,
+            p_topk_weight,
+            p_weight,
+            p_w_delta,
+            p_w_scale,
+            p_shared,
+            p_shared_scale,
+            p_out,
+            M,
+        ).launch(grid=(NB, M, 1), block=(64 * TOPK, 1, 1), stream=stream)
+
+    return launch
