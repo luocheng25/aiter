@@ -62,7 +62,9 @@ from .decode_a8w4 import (
     _LUT_BYTES,
     _abs_max,
     _decode_block,
+    _fast_div_ok,
     _fp8_words,
+    _fp8_words_fast,
     _global_ptr,
     _lds_load,
     _lds_store,
@@ -195,7 +197,7 @@ def compile_a8w4_row_quant_plan(
     *, COLS, TOPK, MAX_M, GROUP=2, ZERO_COLS=0, ID_COLS=None
 ):
     """Launcher ``(x, q, scale, topk_ids, plan, out, rows, stream)``: ``decode_a8w4.compile_a8w4_row_quant(BF16=True)``
-    (x BF16 [rows, COLS] -> q FP8 [rows, COLS], scale f32 [rows], same arithmetic) plus the dedup plan
+    (x BF16 [rows, COLS] -> q FP8 [rows, COLS], scale f32 [rows], same bytes) plus the dedup plan
     int32 [rows * TOPK, 4] of the routes in topk_ids int32 [rows, TOPK] (``rows <= MAX_M``; [rows, ID_COLS] with
     ``ID_COLS`` > TOPK, the columns past TOPK unread: a fused shared expert's, ``common_a8w4.id_index``). Four-wave
     workgroups: the first ``rows`` quantize a row each (and with ``ZERO_COLS`` zero that row of out BF16
@@ -276,17 +278,28 @@ def compile_a8w4_row_quant_plan(
                 )
             gpu.barrier()
             red = _lds_load(red_base, 0, fx.Float32, 4, 16)
-            scale = _row_scale(
-                fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
-            )
+            row_max = fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
+            scale = _row_scale(row_max)
             dst = _global_ptr(p_q, fx.Uint32, 8) + fx.Int64(row) * (COLS // 4)
-            for m in range_constexpr(LOADS):
-                stored = _fp8_words(values[m], scale)
-                if const_expr(256 * (m + 1) <= PIECES):
-                    fx.ptr_store(stored, dst + pieces[m] * 2)
-                else:
-                    if tid + 256 * m < PIECES:
+            # One reciprocal per row and one FMA correction per value: the bytes of the IEEE division for BF16 values
+            # (decode_a8w4._quant_fast); rows outside _fast_div_ok divide.
+            if _fast_div_ok(row_max):
+                inv = fx.Float32(1.0) / scale
+                for m in range_constexpr(LOADS):
+                    stored = _fp8_words_fast(values[m], scale, inv, 1)
+                    if const_expr(256 * (m + 1) <= PIECES):
                         fx.ptr_store(stored, dst + pieces[m] * 2)
+                    else:
+                        if tid + 256 * m < PIECES:
+                            fx.ptr_store(stored, dst + pieces[m] * 2)
+            else:
+                for m in range_constexpr(LOADS):
+                    stored = _fp8_words(values[m], scale)
+                    if const_expr(256 * (m + 1) <= PIECES):
+                        fx.ptr_store(stored, dst + pieces[m] * 2)
+                    else:
+                        if tid + 256 * m < PIECES:
+                            fx.ptr_store(stored, dst + pieces[m] * 2)
             if tid == 0:
                 scale_out = fx.make_view(
                     fxh._as_ptr(p_scale, fx.Float32) + fx.Int64(row),
@@ -391,7 +404,9 @@ def _gateup_group(
     d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
     d_shift = fx.Uint32((lane // 32) * 8)
     raws, deltas = [], []
-    for p in range(PAIRS):
+
+    def issue(p):
+        # The loads of block pair p (and of its delta dwords for an even p).
         if p % 2 == 0:
             rocdl.sched_barrier(0)
             deltas.append(
@@ -406,6 +421,12 @@ def _gateup_group(
                 w_buf, w_voff, fx.Int32((rb * KB + kb0 + 2 * p) * a8w4.W_BLOCK_BYTES)
             )
         )
+
+    # The first PREFETCH pairs now (the loads of the group's token rows first), each further one as the MFMA loop
+    # consumes one.
+    PREFETCH = c["PREFETCH"]
+    for p in range(PREFETCH):
+        issue(p)
     rocdl.sched_barrier(0)
     # Epilogue factors: thread t < GROUP * 16 owns channel j * 16 + t % 16 of member t // 16.
     em = tid // 16
@@ -430,6 +451,8 @@ def _gateup_group(
     x_off = ((lane % 8) % G) * XS + (lane // 32) * 64 + ((lane % 32) // 8) * 16
     accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
     for p in range(PAIRS):
+        if 0 < p and p + PREFETCH - 1 < PAIRS:
+            issue(p + PREFETCH - 1)
         xop = _lds_load(xq_base, x_off + (kb0 + 2 * p) * 64, fx.Int64, 2, 16)
         shift = d_shift + fx.Uint32(16 * (p % 2))
         ops = [
@@ -488,7 +511,7 @@ def _gateup_group(
 
 
 def compile_a8w4_gateup_decode_dd(
-    *, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=0.0, ID_COLS=None
+    *, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=0.0, ID_COLS=None, PREFETCH=None
 ):
     """Launcher ``(x, x_scale, topk_ids, plan, w, w_delta, w_scale, out, M, stream)``.
 
@@ -497,7 +520,9 @@ def compile_a8w4_gateup_decode_dd(
     [M, TOPK] ([M, ID_COLS] with ``ID_COLS`` > TOPK, as ``compile_a8w4_row_quant_plan``); out f32 [M, TOPK, I].
     ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K
     (8: a few ulp off the per-route kernel in some outputs, see the module docstring).
-    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
+    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``). ``PREFETCH``: block pairs per
+    wave whose loads go out before the group's token rows are staged, each further one as the MFMA loop consumes one
+    (default all; see ``decode_a8w4.GATEUP_PREFETCH_PAIRS``).
     """
     I = N // 2
     ID_COLS = TOPK if ID_COLS is None else ID_COLS
@@ -520,6 +545,7 @@ def compile_a8w4_gateup_decode_dd(
         KQ=a8w4.delta_dwords(K),
         KB_PART=KB_PART,
         PAIRS=KB_PART // 2,
+        PREFETCH=KB_PART // 2 if PREFETCH is None else min(KB_PART // 2, PREFETCH),
         XS=K + 16,
         X_PIECES=X_PIECES,
         WAVES=WAVES,

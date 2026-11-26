@@ -37,9 +37,10 @@ pointing here.
 A shared expert in FP8 with per-row scales (DeepSeek-V4.1-Flash) joins the weight as expert E, after the E routed
 experts (``prepare_moe_a8w4_ptpc_weight(..., shared_w1=..., shared_w1_scale=..., shared_w2=..., shared_w2_scale=...)``,
 the E385 / topk-7 convention of ATOM and aiter's FHMoE): routing tensors then have one more column, the last, that
-holds E. Up to ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels, the
-shared expert runs as one more route of the same two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8
-weights feed the MFMA directly, ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other
+holds E. Up to ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels (and,
+where the fold below is possible too, up to ``DECODE_SHARED_MIXED_MAX_WORK``), the shared expert runs as one more route
+of the same two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8 weights feed the MFMA directly,
+``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other
 columns (the tier decided on them alone). Where the routed path allows it (``_shared_fold_tier``: the slot-pair decode
 Down, streaming, prefill from ``SHARED_FOLD_PREFILL_MIN_M``) the shared expert is folded into the routed path's last
 reduction (``_SharedFold``): two FlyDSL FP8 GEMMs (aiter's preshuffle GEMM, ``_shared_gemm``) on the routed path's FP8
@@ -130,6 +131,13 @@ DECODE_DEDUP_GATEUP_MIN_MI = 3072
 # The deduplicated Gate/Up splits K over 4 waves per workgroup, over 8 up to DECODE_DEDUP_GATEUP_WIDE_MAX_M
 # tokens (MiMo TP8 M12 / M16 3% faster; with more tokens 3-5% slower).
 DECODE_DEDUP_GATEUP_WIDE_MAX_M = 16
+# From this topk * padded I on the deduplicated Gate/Up issues only its first decode_a8w4.GATEUP_PREFETCH_PAIRS block
+# pairs' loads before staging the token rows (each further pair as the MFMA loop consumes one), below it all of them.
+# Measured in one process against all pairs first: DeepSeek-V4.1 layers under CUDA graph replay (the folded shared
+# expert's chain beside them), main TP4 (6 * 576) M 8 / 16 0.96x / 0.95x the time, but MTP TP8 (3 * 320) M 8 / 16
+# 1.03x / 1.05x, main TP8 (6 * 320) M 8 / 16 1.03x / 0.98x and MTP TP4 (3 * 576) 1.10x / 0.97x; routed alone (eager)
+# main TP4 M 8 / 16 / 32 0.98x, MiMo (8 * 256, 8 * 512) within 1%.
+DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I = 3072
 # Above DECODE_MAX_M tokens the dedup decode path still runs, up to DECODE_DEDUP_MAX_M tokens, while the mean
 # routes per expert (M * topk / E) stay at or below 1.5 (MiMo E256 topk 8: M <= 48; streaming beyond).
 DECODE_DEDUP_MAX_M = 64
@@ -245,6 +253,13 @@ SHARED_FOLD_PREFILL_MIN_M = 2048
 # 1.2-1.7x the routed experts' slot-pair Down there; from M 8 on, H 5120 deduplicates the routed Gate/Up
 # (DECODE_WIDE_DEDUP_MIN_M).
 DECODE_SHARED_MIXED_MAX_M = 4
+# Where the fold is possible as well (``_shared_fold_tier``: the slot-pair decode Down, from DECODE_PREQUANT_MIN_M tokens
+# on), the mixed decode yields to it once M * routed topk * padded I exceeds this: the mixed kernels' per-token waves
+# grow with the routed columns and I, the fold's shared chain runs beside the routed kernels. Measured at M 4 (CUDA
+# graph, PTL on, one process, the decode kernels of this file's rules): DeepSeek-V4.1 main TP4 (4 * 6 * 576 = 13824)
+# folded 0.94x the mixed time; main TP8 (7680), MTP TP4 (6912) and MTP TP8 (3840) mixed 0.82x / 0.76x / 0.55x the
+# fold's.
+DECODE_SHARED_MIXED_MAX_WORK = 10240
 # Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): routed
 # ids in [0, E) or -1 (masked), no id repeated within a token apart from -1 and, with a shared expert, its id E in the
 # last column of every row (``_check_routing``).
@@ -886,7 +901,14 @@ def _gateup_plan_kernel(N1, H, topk, gateup_pq, group, limit, max_m, device):
 
 @functools.cache
 def _gateup_dd_kernel(N1, H, topk, group, waves, limit, device, *, shared=False):
-    """Deduplicated decode Gate/Up launcher. ``device`` only keys the cache; ``shared`` as in ``_decode_kernels``."""
+    """Deduplicated decode Gate/Up launcher. ``device`` only keys the cache; ``shared`` as in ``_decode_kernels``.
+    From DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I (topk times padded I) on it issues only its first
+    decode_a8w4.GATEUP_PREFETCH_PAIRS block pairs' loads up front."""
+    prefetch = (
+        decode_a8w4.GATEUP_PREFETCH_PAIRS
+        if topk * (N1 // 2) >= DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I
+        else None
+    )
     return decode_dedup_a8w4.compile_a8w4_gateup_decode_dd(
         N=N1,
         K=H,
@@ -894,6 +916,7 @@ def _gateup_dd_kernel(N1, H, topk, group, waves, limit, device, *, shared=False)
         GROUP=group,
         WAVES=waves,
         SWIGLU_LIMIT=limit,
+        PREFETCH=prefetch,
         **({"ID_COLS": topk + 1} if shared else {}),
     )
 
@@ -1878,9 +1901,10 @@ def flydsl_moe_a8w4_ptpc(
     ``topk_ids[:, -1] == E``, else 0 (ATOM's rule: a masked first routed id drops the row's shared expert too, so ATOM's
     padding rows, all routed ids -1, get 0; a dropped shared expert reads no weight). Up to
     ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels (no tile option,
-    decided on the routed columns as the tier is), it runs as the last route of the mixed decode kernels (two launches,
-    every column summed in f32 and rounded to BF16 once). Otherwise, where the routed path allows it
-    (``_shared_fold_tier``: the decode tier's slot-pair Down, the streaming tier, the prefill tier from
+    decided on the routed columns as the tier is; where the fold below is possible as well, while tokens times routed
+    topk times padded I stay within ``DECODE_SHARED_MIXED_MAX_WORK``), it runs as the last route of the mixed decode
+    kernels (two launches, every column summed in f32 and rounded to BF16 once). Otherwise, where the routed path
+    allows it (``_shared_fold_tier``: the decode tier's slot-pair Down, the streaming tier, the prefill tier from
     ``SHARED_FOLD_PREFILL_MIN_M`` tokens; an ``output`` 16-byte aligned where the shared expert writes it), it is
     folded into the routed experts' last reduction (``_SharedFold``): two FP8 GEMMs on the routed path's quantized input
     with SiLU(gate) * up, the limit, a per-row FP8 quantization and the routing weight between them, on a side stream up
@@ -2232,15 +2256,18 @@ def _moe_shared_fold(
     )
 
 
-def _mixed_decode(M, weight, topk, tiles):
+def _mixed_decode(M, weight, topk, tiles, fold=None):
     """Whether a call with a shared expert (``topk`` routed columns, M > 0) runs the mixed decode kernels
     (``_fused_moe_decode_mixed``): up to DECODE_SHARED_MIXED_MAX_M tokens, no tile option, the routed experts on the
     per-route decode path (decode tier, not the expert-deduplicated or the wide-hidden deduplicated Gate/Up, x quantized
-    in the Gate/Up kernel; the routed columns decide it, as they decide the tier) and the mixed Down within its limits.
+    in the Gate/Up kernel; the routed columns decide it, as they decide the tier) and the mixed Down within its limits;
+    where the call could fold the shared expert instead (``fold``: ``_shared_fold_tier``'s answer) only up to
+    DECODE_SHARED_MIXED_MAX_WORK.
     """
     H, I, E = weight.hidden, weight.inter_padded, weight.experts
     return (
         M <= DECODE_SHARED_MIXED_MAX_M
+        and not (fold and M * topk * I > DECODE_SHARED_MIXED_MAX_WORK)
         and _routed_tier(M, H, I, topk, E, *tiles) == "decode"
         and not (
             M >= DECODE_DEDUP_MIN_M
@@ -2260,11 +2287,12 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
     weight (``_shared_gate``) on side streams up to SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream,
     then ``output += shared * gate`` (BF16 operands, one rounding: ATOM's addcmul_)."""
     M = hidden_states.shape[0]
-    if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles):
+    fold = _shared_fold_tier(M, weight, topk_ids.shape[1] - 1, output, tiles)
+    if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles, fold):
         return _fused_moe_decode_mixed(
             hidden_states, weight, topk_weight, topk_ids, output, limit
         )
-    if _shared_fold_tier(M, weight, topk_ids.shape[1] - 1, output, tiles):
+    if fold:
         return _moe_shared_fold(
             hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
         )

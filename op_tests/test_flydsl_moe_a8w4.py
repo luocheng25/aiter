@@ -659,7 +659,8 @@ def _assert_shared():
     """The call ran the shared expert: some step of ``moe_a8w4.last_path`` starts with "shared".
 
     Deliberately independent of how the op runs it, so that later milestones can change that without these cases:
-    today the mixed decode kernels up to DECODE_SHARED_MIXED_MAX_M tokens (marker shared_mixed), the fold into the
+    today the mixed decode kernels up to DECODE_SHARED_MIXED_MAX_M tokens (where the fold is possible too, up to
+    DECODE_SHARED_MIXED_MAX_WORK; marker shared_mixed), the fold into the
     routed experts' last reduction where moe_a8w4._shared_fold_tier allows it (shared_fold_*, with a side stream
     shared_fork / shared_join), else ATOM's split (shared_fork, shared_gemm_*, ..., shared_add; _assert_split); other
     ways record a "shared..." marker of their own. What a layer case checks is its output against reference_layer.
@@ -799,8 +800,8 @@ def _layer_check(
 # last column and a random weight per token, swiglu_limit 10, inputs scaled by 10 (more than 10% of the shared
 # expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier asserted and the
 # shared expert's run checked independent of how the op runs it (_assert_layer_path: today the mixed decode kernels
-# up to M 4, else the fold into the routed experts' last reduction, ATOM's split where the routed path does not allow
-# it; later milestones may change that). One case per routed tier of the main layer TP4
+# up to M 4 (main TP4 M 4 folds), else the fold into the routed experts' last reduction, ATOM's split where the routed
+# path does not allow it; later milestones may change that). One case per routed tier of the main layer TP4
 # (decode M 1, streaming M 64, prefill M 2048), the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128,
 # topk 3, the official 32x32-block format folded by prepare; decode M 16), and fused_moe on the E385 / topk-7 call
 # (M 8, with shared_expert_id=E).
@@ -1450,6 +1451,105 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero, masked):
         full += count == group
         partial += 0 < count < group
     assert full and partial
+
+
+def _fast_quant_rows(cols):
+    """Rows for the fast row quantization of the decode kernels (decode_a8w4._quant_fast), float32 [12, cols], each
+    with its exponent k (the products of a row times 2**k are about those of a random row; 0 for the zero row,
+    |k| <= 120). The abs-max of a row is set exactly (and stays so in BF16): random rows with abs-max 40; 2**-56
+    (fast), 2**-60 (the smallest fast one), the BF16 value just below it, 2**-68 and 2**-130 (subnormal values; all
+    three divide); all zero (fast); the BF16 value just below 2**127 (fast) and 2**127 (divides). Tie rows (9 to 11):
+    s times every positive E4M3FNUZ value and every midpoint between neighbours (and 0), both signs, for s = 7,
+    7 * 2**-70 (abs-max 2**-59.3) and 7 * 2**115 (2**125.7), exact in BF16: the abs-max 240 s gives the scale s
+    exactly, so every quotient is an FP8 value or a tie of round to nearest even, and the bare product with RN(1 / 7)
+    rounds 62 of the 508 values the other way.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(798)
+    unit = torch.randn((8, cols), generator=gen)
+    unit = (unit / unit.abs().amax(dim=1, keepdim=True)).to(torch.bfloat16).float()
+    below = 1.0 - 2.0**-8
+    grid = torch.arange(1, 128, dtype=torch.uint8).view(torch.float8_e4m3fnuz).float()
+    ties = torch.cat([grid, (torch.cat([grid.new_zeros(1), grid[:-1]]) + grid) / 2])
+    ties = torch.cat([ties, -ties]).repeat(cols // 508 + 1)[:cols]
+    rows = torch.stack(
+        [
+            unit[0] * 40.0,
+            unit[1] * 2.0**-56,
+            unit[2] * 2.0**-60,
+            unit[3] * (below * 2.0**-60),
+            unit[4] * 2.0**-68,
+            unit[5] * 2.0**-130,
+            torch.zeros(cols),
+            unit[6] * (below * 2.0**127),
+            unit[7] * 2.0**127,
+            ties * 7.0,
+            ties * (7.0 * 2.0**-70),
+            ties * (7.0 * 2.0**115),
+        ]
+    )
+    amax = rows.abs().amax(dim=1).tolist()
+    exps = [
+        0 if a == 0 else max(-120, min(120, round(math.log2(40.0 / a)))) for a in amax
+    ]
+    return rows, exps
+
+
+def _ieee_quant(x):
+    """The reference row quantization by IEEE division: (q FP8 E4M3FNUZ, scale f32 [rows, 1]), scale = amax / 240
+    (1 where that is 0), q = RNE(x / scale)."""
+    xf = x.float()
+    amax = xf.abs().amax(-1, keepdim=True)
+    scale = amax / torch.full_like(amax, 240.0)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return (xf / scale).to(torch.float8_e4m3fnuz), scale
+
+
+@pytest.mark.parametrize("kernel", ["decode_bf16", "decode_f32", "plan_bf16"])
+def test_fast_row_quant_bitexact(kernel):
+    """The decode row-quantization kernels divide once per row (the reciprocal) and correct each product with FMAs
+    (decode_a8w4._quant_fast: one correction for BF16 rows, two for f32; rows outside _fast_div_ok divide per value):
+    their FP8 bytes and scale bits equal the IEEE division's (_ieee_quant) on _fast_quant_rows, i.e. on both sides of
+    both ends of the fast range (2**-60, 2**127), on zero and subnormal rows and on rounding ties, where a bare
+    reciprocal product rounds values of every tie row the other way. a8w4_row_quant_decode on BF16 x (H 5120) and on
+    f32 intermediate rows (I 576), a8w4_row_quant_plan_decode on BF16 x (H 5120, topk 6; its plan is
+    test_decode_plan_quant_bitexact's).
+
+    test_decode_row_quant_bitexact and test_decode_plan_quant_bitexact use random rows with zero, subnormal and -0
+    rows, none at the ends of the fast range or at ties; end to end a few flipped FP8 values stay within the tolerance.
+    """
+    cols = DS_INTER if kernel == "decode_f32" else DS_HIDDEN
+    rows, _ = _fast_quant_rows(cols)
+    x = rows if kernel == "decode_f32" else rows.to(torch.bfloat16)
+    n = x.shape[0]
+    q = torch.full((n, cols), 0x5A, dtype=torch.uint8)
+    scale = torch.full((n,), -1.0)
+    if kernel == "plan_bf16":
+        _, _, topk_ids = make_inputs(n, 512, 40, DS_TOPK, seed=785, shared=False)
+        moe_a8w4._launch(
+            "a8w4_row_quant_plan_decode",
+            moe_a8w4._row_quant_plan(cols, DS_TOPK, 3, 32, False, x.device.index),
+            x,
+            q.view(torch.float8_e4m3fnuz),
+            scale,
+            topk_ids,
+            torch.full((n * DS_TOPK, 4), -1, dtype=torch.int32),
+            torch.empty((n, cols), dtype=torch.bfloat16),
+            n,
+        )
+    else:
+        moe_a8w4._launch(
+            "a8w4_row_quant_decode",
+            moe_a8w4._row_quant_decode(cols, kernel == "decode_bf16", x.device.index),
+            x,
+            q.view(torch.float8_e4m3fnuz),
+            scale,
+            n,
+        )
+    want, want_scale = _ieee_quant(x)
+    assert torch.equal(scale.view(torch.int32), want_scale.view(-1).view(torch.int32))
+    assert torch.equal(q, want.view(torch.uint8))
+    naive = (x.float() * (1.0 / want_scale)).to(torch.float8_e4m3fnuz).view(torch.uint8)
+    assert bool((naive[9:] != q[9:]).any(dim=1).all())
 
 
 @pytest.mark.parametrize(
@@ -2365,10 +2465,11 @@ def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
     assert torch.equal(mids[0].view(torch.int32), mids[1].view(torch.int32))
 
 
-# case -> (M, tile options, lowered thresholds, kernels in order, the prefill kernels' (Gate/Up XCD_CHUNK, Down
+# case -> (M, tile options, set thresholds, kernels in order, the prefill kernels' (Gate/Up XCD_CHUNK, Down
 # TWO_PASS, Down XCD_CHUNK) or None for no prefill kernel); DeepSeek H5120, E24, topk 6, I576, each threshold set to
-# exactly one side of its boundary (M=64: 384 routes, 16 rows per expert; M=65: 390 routes; M=3: 18 routes and
-# 18 x 4 = 72 estimated Down workgroups; M=4: 24 routes and 96).
+# exactly one side of its boundary (M=64: 384 routes, 16 rows per expert; M=65: 390 routes, 16.25 rows; M=3: 18
+# routes and 18 x 4 = 72 estimated Down workgroups; M=4: 24 routes and 96). The streaming cases also pin the
+# H 5120 row limit itself to 16, so that they test the boundary logic and not the constant's current value.
 _H5120_PREFILL_LIMITS = {
     "PREFILL_PREP_MAX_ROUTES_H5120": 18,
     "XCD_MIN_ROUTES_H5120": 24,
@@ -2379,21 +2480,21 @@ _H5120_LIMIT_CASES = {
     "rows16_stream": (
         64,
         {},
-        {"STREAM_H5120_MIN_ROUTES": 384},
+        {"STREAM_H5120_MIN_ROUTES": 384, "STREAM_MAX_ROWS_H5120": 16},
         _H5120_STREAM_BM32,
         None,
     ),
     "rows_over16_prefill": (
         65,
         {},
-        {"STREAM_H5120_MIN_ROUTES": 390},
+        {"STREAM_H5120_MIN_ROUTES": 390, "STREAM_MAX_ROWS_H5120": 16},
         ["a8w4_stream_prep"] + _prefill_path(128),
         (0, True, 0),
     ),
     "routes_below_stream": (
         65,
         {},
-        {"STREAM_H5120_MIN_ROUTES": 391},
+        {"STREAM_H5120_MIN_ROUTES": 391, "STREAM_MAX_ROWS_H5120": 16},
         _H5120_STREAM_BM32,
         None,
     ),
@@ -2418,9 +2519,10 @@ _H5120_LIMIT_CASES = {
 def test_h5120_dispatch_limits(monkeypatch, case):
     """The dispatch thresholds that only apply from hidden 5120 on, on both sides of each boundary, with the kernels,
     the build parameters of the prefill kernels and the end-to-end result: once M * topk reaches
-    ``STREAM_H5120_MIN_ROUTES`` the streaming limit drops from 48 to ``STREAM_MAX_ROWS_H5120`` = 16 rows per expert
-    (M 64 with exactly 16 rows still streams, M 65 with 16.25 takes prefill, and with the threshold one route above
-    M 65 still streams); prefill sorts with the streaming prep up to ``PREFILL_PREP_MAX_ROUTES_H5120`` routes and
+    ``STREAM_H5120_MIN_ROUTES`` the streaming limit drops from ``STREAM_MAX_ROWS_WIDE`` (48) to
+    ``STREAM_MAX_ROWS_H5120`` rows per expert, set to 16 here whatever its default (M 64 with exactly 16 rows still
+    streams, M 65 with 16.25 takes prefill, and with the threshold one route above M 65 still streams, the limit
+    48 again); prefill sorts with the streaming prep up to ``PREFILL_PREP_MAX_ROUTES_H5120`` routes and
     with Opus past it, Gate/Up and Down chunk their grids by XCD from ``XCD_MIN_ROUTES_H5120`` routes on, and Down
     stages its activation tile in two passes when the estimated workgroups (blocks x hidden split) exceed
     ``DOWN_TWO_PASS_MIN_WGS`` (M 3: 72, equal to it, still one pass; M 4: 96).
@@ -2498,6 +2600,28 @@ def test_shape_fallbacks(
         block_m = moe_a8w4._stream_block_m(tokens, 2, 5)
         lds = stream_a8w4.down_stream_lds(inter, block_m, W=4)
         assert (lds <= common_a8w4.LDS_BYTES) == shared, lds
+
+
+def test_decode_down_needs_hidden_multiple_of_32():
+    """The single-slot and the mixed Down decode own 32 output channels per workgroup (decode_a8w4's row-block pairs:
+    one 16-byte load per lane covers two 16-row blocks) and refuse a hidden size H % 32 != 0 when built
+    (AssertionError, before compiling); the decode tier never asks for one, as it needs gateup_decode_fits
+    (H % 512 == 0).
+
+    Every H of the basic tests, the benchmark and the other cases is a multiple of 512.
+    """
+    decode = moe_a8w4.decode_a8w4
+    for hidden in (DS_HIDDEN + 16, MIMO_HIDDEN + 48):
+        assert not decode.gateup_decode_fits(hidden)
+        with pytest.raises(AssertionError, match="unsupported Down decode shape"):
+            decode.compile_a8w4_down_decode(N=hidden, K=DS_INTER, TOPK=DS_TOPK)
+        with pytest.raises(AssertionError, match="unsupported mixed Down decode"):
+            decode.compile_a8w4_down_decode_mixed(
+                N=hidden, K=DS_INTER, KP=640, TOPK=DS_TOPK + 1, E=8
+            )
+    assert all(
+        h % 32 == 0 for h in range(16, 16385, 16) if decode.gateup_decode_fits(h)
+    )
 
 
 # -- 2.5 CUDA graph -------------------------------------------------------------------------------
@@ -4293,8 +4417,9 @@ def test_layer_graph_replay(tokens):
     """A layer call with the shared expert can be captured in a CUDA graph and replayed: the replay reads newly written
     inputs and gives the bits of an eager call on them (main layer TP4: decode M 1 and 4, prefill M 2048, all without
     atomics). Compiled by an eager call outside the capture first. Independent of how the op runs the shared expert
-    (_assert_shared): today the mixed decode kernels (M 1, 4) or the fold into sorted_sum on the capturing stream
-    (M 2048); later milestones may run it otherwise at some of these token counts.
+    (_assert_shared): today the mixed decode kernels (M 1), the fold into the slot-pair decode Down (M 4, past
+    DECODE_SHARED_MIXED_MAX_WORK) or into sorted_sum (M 2048), on the capturing stream; later milestones may run it
+    otherwise at some of these token counts.
 
     The basic tests call eagerly; the benchmark times graph replays and grades their output within the reference's
     tolerance, not their bits against an eager call.
@@ -4339,8 +4464,9 @@ def test_layer_graph_replay(tokens):
 def test_layer_inplace_output(tokens):
     """output = hidden_states with the shared expert gives the bits of a separate output (main layer TP4 decode M 1
     and 4, no atomics): whatever runs the shared expert reads the input before anything overwrites it. Independent of
-    how the op runs the shared expert (_assert_shared): today the mixed decode kernels, whose Gate/Up reads the input
-    before their Down writes the output; later milestones may run it otherwise at some of these token counts.
+    how the op runs the shared expert (_assert_shared): today the mixed decode kernels at M 1, whose Gate/Up reads the
+    input before their Down writes the output, and the fold at M 4 (past DECODE_SHARED_MIXED_MAX_WORK), whose GEMMs
+    read the routed path's quantized input; later milestones may run it otherwise at some of these token counts.
 
     The basic tests pass a separate output; test_layer_split_inplace_serial asserts the split's order in place.
     """
@@ -4828,15 +4954,18 @@ def test_entry_checks(monkeypatch):
 
 
 # -- 2.12 mixed decode: the shared expert as one more route of the decode kernels -----------------------------------
-# Up to DECODE_SHARED_MIXED_MAX_M tokens, when the routed experts take the per-route decode, a layer call runs the
-# shared expert inside the two decode kernels (decode_a8w4's mixed Gate/Up and Down; moe_a8w4.last_path then ends with
-# "shared_mixed"). Their row quantizations take one IEEE reciprocal per row and correct each product with FMAs
-# (_quant_fast), which must give the FP8 bytes of the per-route kernels' IEEE division; rows whose abs-max is outside
-# _fast_div_ok divide. The basic tests run the mixed decode at main TP4 M 1 (masked at M 4) and TP8 M 4, the benchmark
-# at every layer shape at M 1, 2 and 4 (graded; shared weight 1, the clamp seldom hit), test_layer_graph_replay and
-# test_layer_inplace_output at main TP4 M 1 and 4; none of them asserts which kernels run the shared expert. Here: the
-# threshold, the FP8 bytes of the fast quantization at the edges of its range and at rounding ties, a shared expert
-# dropped by its last id, the reads of the mixed Gate/Up, and shapes beyond the layers'.
+# Up to DECODE_SHARED_MIXED_MAX_M tokens, when the routed experts take the per-route decode (and, where the fold is
+# possible as well, from DECODE_PREQUANT_MIN_M tokens on, while M * routed topk * I_pad stays within
+# DECODE_SHARED_MIXED_MAX_WORK: main TP4 M 4 folds), a layer call runs the shared expert inside the two decode kernels
+# (decode_a8w4's mixed Gate/Up and Down; moe_a8w4.last_path then ends with "shared_mixed"). Like the per-route decode
+# kernels quantizing in the kernel, they take one IEEE reciprocal per row and correct each product with FMAs
+# (_quant_fast), which must give the FP8 bytes of the IEEE division; rows whose abs-max is outside _fast_div_ok
+# divide. The basic tests run the mixed decode at main TP4 M 1 and TP8 M 4 (main TP4 M 4, masked, now folds), the
+# benchmark at every layer shape at M 1 and 2 and all but main TP4 at M 4 (graded; shared weight 1, the clamp seldom
+# hit), test_layer_graph_replay and test_layer_inplace_output at main TP4 M 1; none of them asserts which kernels run
+# the shared expert. Here: the thresholds (tokens, work), the FP8 bytes of the fast quantization at the edges of its
+# range and at rounding ties, a shared expert dropped by its last id, the reads of the mixed Gate/Up, and shapes
+# beyond the layers'.
 
 _MIXED_PATH = ["a8w4_gateup_decode_mixed", "a8w4_down_decode_mixed", "shared_mixed"]
 
@@ -4865,9 +4994,43 @@ def test_layer_mixed_decode_boundary(tokens):
         _assert_shared()
 
 
+# case: (layer shape, M, DECODE_SHARED_MIXED_MAX_WORK or None for the default, mixed). Work = M * routed topk * I_pad:
+# main TP4 M 4 13824, main TP8 M 4 7680; main TP4 M 3 10368, where the fold is not possible (single-slot Down).
+_MIXED_WORK_CASES = {
+    "ds_tp4_m4_fold": ("ds_layer_tp4", 4, None, False),
+    "ds_tp4_m4_at_limit": ("ds_layer_tp4", 4, 4 * 6 * 576, True),
+    "ds_tp4_m4_over_limit": ("ds_layer_tp4", 4, 4 * 6 * 576 - 1, False),
+    "ds_tp4_m3_no_fold": ("ds_layer_tp4", 3, None, True),
+    "ds_tp8_m4_mixed": ("ds_layer_tp8", 4, None, True),
+}
+
+
+@pytest.mark.parametrize("case", list(_MIXED_WORK_CASES))
+def test_layer_mixed_decode_work_limit(monkeypatch, case):
+    """Where the fold is possible as well (moe_a8w4._shared_fold_tier: the slot-pair decode Down, from
+    DECODE_PREQUANT_MIN_M tokens on) the mixed decode yields to it once M * routed topk * I_pad exceeds
+    DECODE_SHARED_MIXED_MAX_WORK: with the default, main TP4 M 4 (13824) folds while main TP8 M 4 (7680) mixes, and
+    main TP4 M 3 (10368, past the limit) mixes, having no fold; with the limit set to main TP4 M 4's work it mixes, one
+    below it folds. Graded against reference_layer (inputs x 10, the clamp hit), the mixed kernels asserted or, for the
+    fold, the routed decode tier without a final add (_assert_folded). The MTP layers at M 4 (6912 / 3840) mix in
+    test_layer_mixed_decode_boundary and test_layer_mixed_decode_masked.
+
+    The basic tests and the benchmark accept any path for the shared expert; the benchmark has no M 3.
+    """
+    shape, tokens, limit, mixed = _MIXED_WORK_CASES[case]
+    if limit is not None:
+        monkeypatch.setattr(moe_a8w4, "DECODE_SHARED_MIXED_MAX_WORK", limit)
+    experts, topk, inter = LAYER_SHAPES[shape]
+    _layer_check(experts, topk, inter, tokens, seed=700, amplify=10.0)
+    if mixed:
+        assert moe_a8w4.last_path == _MIXED_PATH, moe_a8w4.last_path
+    else:
+        _assert_folded("decode")
+
+
 def test_layer_mixed_decode_masked():
-    """Masks on the mixed decode beyond the basic test's (main TP4 M 4: random ids, a whole row and a masked first id,
-    the last column E and finite shared weights everywhere): MTP layer TP8 (4 Down waves, I 288 padded to 320) at M 4,
+    """Masks on the mixed decode (the basic masked layer case, main TP4 M 4, folds: DECODE_SHARED_MIXED_MAX_WORK):
+    MTP layer TP8 (4 Down waves, I 288 padded to 320) at M 4,
     a random 30% of the routed ids, every routed id of row 1 and the first id of row 2 masked, row 3's last column
     another expert than E; ATOM's rule drops the shared expert of rows 1 to 3, whose shared weights are NaN (as the
     masked routes' are), and keeps row 0's. Poisoned routed weights, inputs x 10; graded against reference_layer, row 1
@@ -4911,60 +5074,26 @@ def test_layer_mixed_decode_masked():
     assert _zero_rows(out, range(4))
 
 
-def _fast_quant_rows(cols):
-    """Rows for the mixed decode's fast row quantization, float32 [12, cols], each with its exponent k (the products
-    of a row times 2**k are about those of a random row; 0 for the zero row, |k| <= 120). The abs-max of a row is set
-    exactly (and stays so in BF16): random rows with abs-max 40; 2**-56 (fast), 2**-60 (the smallest fast one), the
-    BF16 value just below it, 2**-68 and 2**-130 (subnormal values; all three divide); all zero (fast); the BF16 value
-    just below 2**127 (fast) and 2**127 (divides). Tie rows: s times every positive E4M3FNUZ value and every midpoint
-    between neighbours (and 0), both signs, for s = 7, 7 * 2**-70 (abs-max 2**-59.3) and 7 * 2**115 (2**125.7), exact
-    in BF16: the abs-max 240 s gives the scale s exactly, so every quotient is an FP8 value or a tie of round to nearest
-    even, and the bare product with RN(1 / 7) rounds 62 of the 508 values the other way.
-    """
-    gen = torch.Generator(device="cuda").manual_seed(798)
-    unit = torch.randn((8, cols), generator=gen)
-    unit = (unit / unit.abs().amax(dim=1, keepdim=True)).to(torch.bfloat16).float()
-    below = 1.0 - 2.0**-8
-    grid = torch.arange(1, 128, dtype=torch.uint8).view(torch.float8_e4m3fnuz).float()
-    ties = torch.cat([grid, (torch.cat([grid.new_zeros(1), grid[:-1]]) + grid) / 2])
-    ties = torch.cat([ties, -ties]).repeat(cols // 508 + 1)[:cols]
-    rows = torch.stack(
-        [
-            unit[0] * 40.0,
-            unit[1] * 2.0**-56,
-            unit[2] * 2.0**-60,
-            unit[3] * (below * 2.0**-60),
-            unit[4] * 2.0**-68,
-            unit[5] * 2.0**-130,
-            torch.zeros(cols),
-            unit[6] * (below * 2.0**127),
-            unit[7] * 2.0**127,
-            ties * 7.0,
-            ties * (7.0 * 2.0**-70),
-            ties * (7.0 * 2.0**115),
-        ]
-    )
-    amax = rows.abs().amax(dim=1).tolist()
-    exps = [
-        0 if a == 0 else max(-120, min(120, round(math.log2(40.0 / a)))) for a in amax
-    ]
-    return rows, exps
-
-
 def test_mixed_decode_quant_bitexact():
-    """The mixed decode's fast row quantization gives the FP8 bytes of the per-route decode's IEEE division
-    (_fast_quant_rows: abs-max on both sides of both ends of the fast range, zero and subnormal rows, rounding ties),
-    shown on the outputs, which change with any byte: the mixed Gate/Up's routed rows (one correction) have the bits of
-    the per-route Gate/Up quantizing x in the kernel, one launch per x row with the routed channel factors times 2**k
-    (so that tiny or huge rows give normal f32 results); the mixed Down (two corrections) has the bits of the
-    single-slot Down quantizing in the kernel, one token per row, each token with one live route (a different column
-    each, weight 2**k), its other routes masked, its shared expert dropped and their intermediate rows NaN.
-    E 8, topk 6, H 5120, I 576 (K padded to 640 for the shared Down), SwiGLU limit 10.
+    """The decode kernels that quantize their rows themselves (decode_a8w4._quant_fast: one reciprocal per row, FMA
+    corrections per value) give the FP8 bytes of the IEEE division (_ieee_quant) on _fast_quant_rows (abs-max on both
+    sides of both ends of the fast range, zero and subnormal rows, rounding ties), shown on the outputs, which equal
+    those of launches on the reference's bytes: the per-route Gate/Up quantizing x (one correction) and the mixed
+    Gate/Up's routed rows have the bits of the per-route Gate/Up reading x pre-quantized by _ieee_quant, one launch per
+    x row with the routed channel factors times 2**k (so that tiny or huge rows give normal f32 results); the
+    single-slot Down and the mixed Down quantizing the intermediate (two corrections) have the bits of the single-slot
+    Down on the reference's FP8 values (row abs-max 240: its row scale 1 and its quantization exact; the reference's
+    scale moves into the routing weight, the same product in the same order), one token per row, each with one live
+    route (expert t, a different column each; 2**k split between its channel factors, 2**(k // 2) for k > 0, and its
+    weight, so that every product stays normal), its other routes masked, its shared expert dropped and their
+    intermediate rows NaN.
+    E 12, topk 6, H 5120, I 576 (K padded to 640 for the shared Down), SwiGLU limit 10.
 
-    End to end a few flipped FP8 values stay within the tolerance; the basic tests and the benchmark quantize random
-    rows of ordinary size only.
+    These kernels keep their bytes in LDS (test_fast_row_quant_bitexact reads those of the row kernels), and the Down's
+    BF16 output may hide a flipped byte of a small quotient. End to end a few flipped FP8 values stay within the
+    tolerance; the basic tests and the benchmark quantize random rows of ordinary size only.
     """
-    experts, topk, inter = 8, 6, 576
+    experts, topk, inter = 12, 6, 576
     _, _, prepared = _layer_weights(experts, inter, 780)
     H, I, limit = prepared.hidden, prepared.inter_padded, LAYER_SWIGLU_LIMIT
     device = torch.cuda.current_device()
@@ -4975,6 +5104,9 @@ def test_mixed_decode_quant_bitexact():
     gateup, down = moe_a8w4._decode_kernels(
         2 * I, H, I, topk, False, False, limit, waves, device
     )
+    gateup_pq = moe_a8w4._decode_kernels(
+        2 * I, H, I, topk, True, False, limit, waves, device
+    )[0]
     _, topk_weight, topk_ids = make_layer_inputs(1, H, experts, topk, seed=799)
     routed_weight, routed_ids = (
         topk_weight[:, :topk].contiguous(),
@@ -4983,17 +5115,18 @@ def test_mixed_decode_quant_bitexact():
     rows, exps = _fast_quant_rows(H)
     for r, k in enumerate(exps):
         x = rows[r : r + 1].to(torch.bfloat16)
+        xq, xs = _ieee_quant(x)
         factor = prepared.w1_scale * 2.0**k
+        w = (prepared.w1, prepared.w1_delta, factor)
         mid = torch.full((1, topk + 1, I), float("nan"))
-        want = torch.full((1, topk, I), float("nan"))
+        got = torch.full((1, topk, I), float("nan"))
+        want = torch.full_like(got, float("nan"))
         moe_a8w4._launch(
             "a8w4_gateup_decode_mixed",
             mixed_gateup,
             x,
             topk_ids,
-            prepared.w1,
-            prepared.w1_delta,
-            factor,
+            *w,
             prepared.shared_w1,
             prepared.shared_w1_scale,
             mid,
@@ -5005,62 +5138,87 @@ def test_mixed_decode_quant_bitexact():
             x,
             routed_weight,
             routed_ids,
-            prepared.w1,
-            prepared.w1_delta,
-            factor,
+            *w,
+            got,
+            got,
+            got,
+            1,
+        )
+        moe_a8w4._launch(
+            "a8w4_gateup_decode_pq",
+            gateup_pq,
+            xq,
+            xs.view(-1),
+            routed_ids,
+            *w,
             want,
             want,
             want,
             1,
         )
         assert bool(want.isfinite().all()) and bool((want != 0).any()) == (r != 6), r
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), r
         assert torch.equal(mid[:, :topk].view(torch.int32), want.view(torch.int32)), r
 
     rows, exps = _fast_quant_rows(I)
     tokens = rows.shape[0]
+    assert tokens <= experts
+    q, scale = _ieee_quant(rows)
     mid = torch.full((tokens, topk + 1, I), float("nan"))
+    mid_q = torch.full_like(mid, float("nan"))
     ids = torch.full((tokens, topk + 1), -1, dtype=torch.int32)
     weights = torch.full((tokens, topk + 1), float("nan"))
+    weights_q = torch.full_like(weights, float("nan"))
+    factor = prepared.w2_scale.clone()
     for t, k in enumerate(exps):
-        mid[t, t % topk] = rows[t]
-        ids[t, t % topk] = t % experts
-        weights[t, t % topk] = 2.0**k
-    out = torch.full((tokens, H), float("nan"), dtype=torch.bfloat16)
-    want = torch.full_like(out, float("nan"))
-    moe_a8w4._launch(
-        "a8w4_down_decode_mixed",
-        mixed_down,
-        mid,
-        ids,
-        weights,
-        prepared.w2,
-        prepared.w2_delta,
-        prepared.w2_scale,
-        prepared.shared_w2,
-        prepared.shared_w2_scale,
-        out,
-        tokens,
-    )
-    routed_ids, routed_weight = (
-        ids[:, :topk].contiguous(),
-        weights[:, :topk].contiguous(),
-    )
-    moe_a8w4._launch(
-        "a8w4_down_decode",
-        down,
-        mid[:, :topk].contiguous(),
-        routed_weight,
-        routed_ids,
-        routed_weight,
-        prepared.w2,
-        prepared.w2_delta,
-        prepared.w2_scale,
-        want,
-        tokens,
-    )
+        c = t % topk
+        mid[t, c], mid_q[t, c], ids[t, c] = rows[t], q[t].float(), t
+        j = max(k, 0) // 2
+        factor[t] *= 2.0**j
+        weights[t, c], weights_q[t, c] = 2.0 ** (k - j), scale[t, 0] * 2.0 ** (k - j)
+    assert q.float().abs().amax(dim=1).tolist() == [
+        240.0 * (t != 6) for t in range(tokens)
+    ]
+    w = (prepared.w2, prepared.w2_delta, factor)
+    outs = []
+    for rows_in, w_in, mixed in (
+        (mid, weights, True),
+        (mid, weights, False),
+        (mid_q, weights_q, False),
+    ):
+        out = torch.full((tokens, H), float("nan"), dtype=torch.bfloat16)
+        if mixed:
+            moe_a8w4._launch(
+                "a8w4_down_decode_mixed",
+                mixed_down,
+                rows_in,
+                ids,
+                w_in,
+                *w,
+                prepared.shared_w2,
+                prepared.shared_w2_scale,
+                out,
+                tokens,
+            )
+        else:
+            routed = w_in[:, :topk].contiguous()
+            moe_a8w4._launch(
+                "a8w4_down_decode",
+                down,
+                rows_in[:, :topk].contiguous(),
+                routed,
+                ids[:, :topk].contiguous(),
+                routed,
+                *w,
+                out,
+                tokens,
+            )
+        outs.append(out)
+    want = outs[2]
     assert bool(want.isfinite().all())
     assert (want != 0).any(dim=1).tolist() == [t != 6 for t in range(tokens)]
-    assert torch.equal(_bits(out), _bits(want))
+    assert torch.equal(_bits(outs[1]), _bits(want))
+    assert torch.equal(_bits(outs[0]), _bits(want))
 
 
 def test_mixed_gateup_reads_no_weights():
