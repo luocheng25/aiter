@@ -1,7 +1,7 @@
 # gfx9_fp8 的 A8W4 MoE（FP8 按 token 激活 × MXFP4 routed + FP8 shared expert）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-25 22:11）· 目标：DeepSeek-V4.1-Flash 主干与 MTP 层（TP4 / TP8）整层（routed MXFP4 + shared FP8 逐通道，含量化、排序、规约）每个 M ≤ aiter 融合 FP8 PTPC ×1.02 且不慢于 A8W4 split；moe-a8w4 原 85 例逐例 ≤ 起点 moe-a8w4-M4 ×1.02；完成 pyhip M17 遗留项 1–8（性能项与端到端精度目标随计划确认）（1.1× 相对冻结基线）· 已完成 2 个里程碑（含本提交 M1） · 最佳累计 — · 下一步：M2 decode 档 shared 融合（M1–32）：M1–3 走 A1（shared 作第 7 路、FP8 直读、Down 7 wave），M4–32 用成批 shared（侧流 B/C 或 A2，由原型 P1/P2 定），pq Down 在 K7 改 4 波
+> 由 mf 生成（11-26 00:13）· 目标：DeepSeek-V4.1-Flash 主干与 MTP 层（TP4 / TP8）整层（routed MXFP4 + shared FP8 逐通道，含量化、排序、规约）每个 M ≤ aiter 融合 FP8 PTPC ×1.02 且不慢于 A8W4 split；moe-a8w4 原 85 例逐例 ≤ 起点 moe-a8w4-M4 ×1.02；完成 pyhip M17 遗留项 1–8（性能项与端到端精度目标随计划确认）（1.1× 相对冻结基线）· 已完成 3 个里程碑（含本提交 M1a） · 最佳累计 — · 下一步：M2 decode 档 shared 融合（M1–32）：M1–3 走 A1（shared 作第 7 路、FP8 直读、Down 7 wave），M4–32 用成批 shared（侧流 B/C 或 A2，由原型 P1/P2 定），pq Down 在 K7 改 4 波
 <!-- /mf:summary -->
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
      做什么 · 整体怎么做 · 为什么这样做 · 做到什么程度 · 风险与下一步。
@@ -91,7 +91,7 @@ routed 逐位移植 M17（保留其 raw rocdl / buffer op；ISA 除 decode 的�
 | 2–48 去重 decode | —（只 MiMo / DS） | 1.16–2.43（≤46%） | — | 4.9–15.0 | — | 比全走 prefill 快 1.10–2.67 倍 |
 | 48–2048 流式 | 0.73–0.91 / 0.68–0.87 | 0.98–2.26（≤43%） | 1.55–3.03（≤57%） | 12–151（≤25%） | 9.5–131（≤22%） | 解码 VALU 受限 |
 | ≥ 2048 prefill | 0.84–0.94 / 0.80–0.90 | 0.15–1.11 | 0.21–1.70 | 174–263（≤43%） | 141–248（≤41%） | 算力与功耗墙 |
-- 冻结基线：将是 M1（shared 按 ATOM split、可屏蔽），见生成块第一行；原 85 例对起点 moe-a8w4-M4 只查回退（逐例 ≤ 1.02 倍）。
+- 冻结基线：将是 M1a（代码同 M1：shared 按 ATOM split、可屏蔽），见生成块第一行；原 85 例对起点 moe-a8w4-M4 只查回退（逐例 ≤ 1.02 倍）。
 - aiter_fp8_ptpc 对照：同 worktree（ab0223ec4e）的 `aiter.fused_moe` per_Token，主干 E385/K7、MTP E129/K4，TP8 的 I 补零到 320。
 - 对照所选：无 H5120 调优行，都是 `impl__flydsl_gfx942__` 默认：M ≤ 256 为 BF16 激活的 16_16_16 / 16_128_64，≥ 512 为 64_128_128。
 - a8w4_split 对照：routed-only A8W4 + aiter CK `gemm_a8w8_bpreshuffle` 链，M ≤ 1024 双流，不计最后相加（ATOM 并进 all-reduce）。
@@ -107,13 +107,13 @@ routed 逐位移植 M17（保留其 raw rocdl / buffer op；ISA 除 decode 的�
 三类用例都在 [op_tests/test_flydsl_moe_a8w4.py](../../../../../../op_tests/test_flydsl_moe_a8w4.py)（参考、基本、其他、bench 四个注释区），分派断言与 M17 的最终分派一致。
 
 **基本功能测试**（每次改动先跑：`pytest op_tests/test_flydsl_moe_a8w4.py -m basic`，18 例，约 30–50 秒）
-| 覆盖什么（每例断言误差与恰一个 Gate/Up、一个 Down kernel） | 用例 | 结果 |
+| 覆盖什么（每例断言误差与所走的档 / kernel；整层只断言 routed 档与 shared 已跑） | 用例 | 结果 |
 |---|---|---|
 | Qwen TP2 / TP4（E33，I160 补零到 192）：M3 逐路由 decode、M64 流式、M1031 / 257 prefill | `test_tp2` ×3、`test_tp4_padded` | 通过 |
 | MiMo TP8 / TP4（E256）：M5 去重两个 kernel、M24 去重四个 kernel、M300 流式、M1600 prefill | `test_mimo` ×4 | 通过 |
 | DeepSeek TP4 + swiglu_limit=10（截断大量触发）：M8 只去重 Gate/Up、M64 流式 | `test_deepseek_swiglu` ×2 | 通过 |
 | `aiter.fused_moe`：Qwen M3、整层 E385/K7（`shared_expert_id`=E，M8）与直接调用同 kernel、逐位相同 | `test_fused_moe_entry` 等 2 例 | 通过 |
-| 整层 + shared（全量 E，截断触发）：主干 TP4 M1 / 64 / 2048（串行）、TP8 M4（补零）、MTP 块格式 M16；TP4 M4 屏蔽 −1 | `test_layer` ×5 等 6 例 | 通过 |
+| 整层 + shared（全量 E，截断触发）：主干 TP4 M1 / 64 / 2048、TP8 M4（补零）、MTP 块格式 M16；TP4 M4 屏蔽 −1 | `test_layer` ×5 等 6 例 | 通过 |
 
 **性能测试**（`python op_tests/test_flydsl_moe_a8w4.py`，原 85 例 + 整层 68 例 = 153 例；`--quick` 只跑整层 24 例；每例也校验输出）
 | 覆盖什么（分档 / 形状） | case | 结果 |
@@ -124,7 +124,7 @@ routed 逐位移植 M17（保留其 raw rocdl / buffer op；ISA 除 decode 的�
 | prefill：M2048 由 prep 排序（4 例）、M ≥ 4096 由 Opus 排序（20 例） | `tp2_m2048` 等 | Qwen ÷ aiter 0.80–0.94；≤319 TFLOPS |
 | 整层 + shared（4 形状 × M1…32768、48）：decode M1–4、去重 M8–32、流式 M48–1024、prefill ≥ 2048 | `ds_layer_tp4_m1` 等 68 例 | 待冻结 |
 
-**其他覆盖测试**（只测前两类覆盖不了的；`-m "not basic"`，172 例，约 2–4 分钟）
+**其他覆盖测试**（只测前两类覆盖不了的；`-m "not basic"`，175 例，约 2–4 分钟）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
 | 逐路由 decode 交界：M4、11/12、19/20、32/33（M33 流式）；topk 8/17 | 不在交界、不查 kernel | `test_decode_dispatch_boundaries` 等 2 个 | 通过 |
@@ -138,11 +138,11 @@ routed 逐位移植 M17（保留其 raw rocdl / buffer op；ISA 除 decode 的�
 | prefill 的 tile 参数、半块交界；非目标形状 7 种（含流式 Down 共享 tile 的 LDS 上限） | 只跑默认 tile 与目标形状 | `test_shape_fallbacks` 等 3 个 | 通过 |
 | graph（流式、prep / Opus + prefill）、报错、三个入口的 gfx942 门禁、prefill 与流式缓存键 | 只 eager、合法输入、单卡 | `test_graph_replay` 等 5 个 | 通过 |
 | Opus 排序重复 expert 留后一槽、原地输出、路由 dtype、M=0；各类 Gate/Up 的截断 | 输入规整、另给 out；bench 几乎不截断 | `test_inplace_output` 等 7 个 | 通过 |
-| fused_moe 各档（逐位 / 对参考）、graph、参数透传与报错、未标记权重下传、标记生命周期 | 基本只测 decode、带标记的默认调用 | `test_fused_moe_matches_api` 等 7 个 | 通过 |
-| shared 折叠 / fnuz / 补零逐位（含全零行）；真实权重与 FP4PTPC@97cc9b32 逐字节、精度 ≤1.5× 模型参考 | 合成权重、容差内 | `test_shared_fold_*` 等 4 个 | 通过 |
-| shared 报错、双流阈值两侧、graph、原地、TP8 补零逐位、`shared_expert_id` | 合法输入、M 远离阈值、eager、另给 out | `test_shared_rejects` 等 6 个 | 通过 |
+| fused_moe 各档（逐位 / 对参考）、graph、参数透传与报错、未标记权重下传、标记生命周期 | 基本只测 decode、带标记的默认调用 | `test_fused_moe_matches_api` 等 8 个 | 通过 |
+| shared 折叠 / fnuz / 补零逐位与报错；真实权重同 FP4PTPC@97cc9b32 逐字节、误差 ≤1.5× 模型 | 合成权重、容差内、合法输入 | `test_shared_fold_*` 等 5 个 | 通过 |
+| split 自身：双流阈值 M1024 / 1025、相加逐位、原地时也串行、TP8 补零不改一位 | 整层例不钉实现；容差内 | `test_layer_stream_mode_boundary` 等 3 个 | 通过 |
 | 屏蔽各档（随机 / 整行 / 全部）：逐路由两种 Down、去重三种、流式两种 Down、prefill 两种排序 | 基本只测一种 decode；bench 不屏蔽 | `test_masked_routes` ×13 | 通过 |
-| 整层屏蔽：TP8 流式原子加、TP4 prefill（shared 串行）；graph 重放换屏蔽（去重、流式） | 同上；其余 graph 都不屏蔽 | `test_masked_graph_replay` 等 2 个 | 通过 |
+| 整层：graph 重放（含换屏蔽）、原地与 eager 逐位同；屏蔽 TP8 流式原子加、TP4 prefill | 只 eager、另给 out、不屏蔽 | `test_layer_graph_replay` 等 4 个 | 通过 |
 | 白盒：逐路由 Gate/Up 不读屏蔽路由的权重（mid 行为 0）、计划不收它 | Down 丢弃它，端到端看不出 | `test_masked_gateup_reads_no_weights` ×2 | 通过 |
 | 入口校验：会建 prefill Down 的 I_pad 1088（含流式 BM64、带 shared）、BM128 报错；调试开关查 id | 基本与 bench 只给合法输入 | `test_entry_checks` | 通过 |
 
@@ -151,8 +151,8 @@ routed 逐位移植 M17（保留其 raw rocdl / buffer op；ISA 除 decode 的�
 
 ## 6. 风险与待定
 <!-- ≤5 条：风险 → 影响 → 打算。 -->
-shared 已按 ATOM split 接上，屏蔽路由与入口校验已补齐，整层功能与精度达标；性能基线等 PTL 恢复后冻结；下一步调研 shared 融合并定计划。
-- PTL 自整机 reset 起一直 Disabled（计时慢 30–40%）→ 数字只作功能参考、不能冻结 → 恢复后以 M1 冻结，同卡 ABBA 量 M1 对 M0（不屏蔽）。
+shared 已按 ATOM split 接上，屏蔽路由与入口校验已补齐，整层功能与精度达标；性能基线等 PTL 恢复后冻结；下一步把 decode 档的 shared 融进 routed。
+- PTL 自整机 reset 起一直 Disabled（计时慢 30–40%）→ 数字只作功能参考、不能冻结 → 恢复后以 M1a 冻结，同卡 ABBA 量 M1 对 M0（不屏蔽）。
 - shared 比 split 对照多一次相加与 routed 列拷贝 → 小 M 难做到“不慢于 split” → 融合时把 shared 并进 routed 的规约。
 - FP4PTPC@main 的 MTP shared 已用非 2 的幂 scale 重量化（对块反量化差 2.5–2.8%）→ prepare 照收但更不准 → MTP 用块格式权重。
 - fused_moe 按 Python 属性认权重：view / 拷贝 / 新 `nn.Parameter` 丢标记，torch.compile 追进 FlyDSL → 现只支持 eager 与 graph。
@@ -165,8 +165,9 @@ shared 已按 ATOM split 接上，屏蔽路由与入口校验已补齐，整层�
 
 <!-- mf:roadmap -->
 - M0 ✅ 已推送 · 功能 · 功能版：shared expert（E385/K7 约定）接口、prepare… · 预期 1× · [提交](https://github.com/luocheng25/aiter/commit/6691a4c18710340ff335d0c1490aa6e389f34f45)
-- M1 ✅ 本提交 · 功能 · 功能：入口校验与屏蔽路由（topk_ids=-1 各档不读权重、整行屏蔽含 s… · 预期 1×
+- M1 ✅ 已推送 · 功能 · 功能：入口校验与屏蔽路由（topk_ids=-1 各档不读权重、整行屏蔽含 s… · 预期 1× · [提交](https://github.com/luocheng25/aiter/commit/1a4fc5731eaad077e99a43d08406c026000d974c)
 - M2 · 暂定 · 性能 · decode 档 shared 融合（M1–32）：M1–3 走 A1（sha… · 预期 1.06×
+- M1a ✅ 本提交 · 功能 · 用例：整层 shared 的路径断言改为与实现无关（split / 融合都接受… · 预期 1×
 
 下一步（本提交的承诺）：M2 decode 档 shared 融合（M1–32）：M1–3 走 A1（shared 作第 7 路、FP8 直读、Down 7 wave），M4–32 用成批 shared（侧流 B/C 或 A2，由原型 P1/P2 定），pq Down 在 K7 改 4 波
 <!-- /mf:roadmap -->

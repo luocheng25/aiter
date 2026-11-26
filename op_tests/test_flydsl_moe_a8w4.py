@@ -644,7 +644,7 @@ def _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options):
     return out, ref
 
 
-# The shared expert's steps in moe_a8w4.last_path (ATOM's split with aiter's dense ops).
+# The shared expert's steps in moe_a8w4.last_path when the op runs ATOM's split (aiter's dense ops; _assert_split).
 _SHARED_SPLIT = [
     "shared_quant_x",
     "shared_gemm_gateup",
@@ -654,13 +654,35 @@ _SHARED_SPLIT = [
 ]
 
 
-def _assert_shared(tokens):
-    """The shared expert ran ATOM's split and was added last: up to SHARED_DUAL_STREAM_MAX_M tokens on the side stream
-    (fork, the split, the routed kernels on the current stream, join), beyond it on the current stream before the
-    routed kernels."""
+def _assert_shared():
+    """The call ran the shared expert: some step of ``moe_a8w4.last_path`` starts with "shared".
+
+    Deliberately independent of how the op runs it, so that later milestones can change that without these cases:
+    today ATOM's split (shared_fork, shared_gemm_*, ..., shared_add; _assert_split), later possibly the routed kernels
+    themselves or kernels of its own, which record a "shared..." marker of their own. What a layer case checks is its
+    output against reference_layer.
+    """
+    path = moe_a8w4.last_path
+    assert any(name.startswith("shared") for name in path), path
+
+
+def _assert_layer_path(tier):
+    """Path check of a layer call (routed experts plus the shared expert), as independent of the shared expert's
+    implementation as _assert_shared: the routed experts took ``tier`` ("decode", "dedup", "stream" or "prefill",
+    _path_tier: told by the first A8W4 Gate/Up kernel) and the shared expert ran."""
+    assert _path_tier(moe_a8w4.last_path) == tier, (tier, moe_a8w4.last_path)
+    _assert_shared()
+
+
+def _assert_split(tokens, inplace=False):
+    """The shared expert ran ATOM's split and was added last: up to SHARED_DUAL_STREAM_MAX_M tokens with a separate
+    output on the side stream (fork, the split, the routed kernels on the current stream, join), beyond it or in place
+    (``inplace``: the output is the input) on the current stream before the routed kernels. Only for the cases about
+    the split itself, at token counts where the op runs the split.
+    """
     path = moe_a8w4.last_path
     assert path[-1] == "shared_add", path
-    if tokens <= moe_a8w4.SHARED_DUAL_STREAM_MAX_M:
+    if tokens <= moe_a8w4.SHARED_DUAL_STREAM_MAX_M and not inplace:
         _assert_path(["shared_fork"] + _SHARED_SPLIT + ["shared_join", "shared_add"])
         fork, join = path.index("shared_fork"), path.index("shared_join")
         assert any(name.startswith("a8w4_gateup") for name in path[fork:join]), path
@@ -773,11 +795,11 @@ def _layer_check(
 # DeepSeek-V4.1-Flash layers with the shared expert (test_layer, test_fused_moe_shared_entry; LAYER_SHAPES with their
 # full E, the bench's shapes): prepare with the shared expert, routing [M, topk + 1] with the shared expert E in the
 # last column and a random weight per token, swiglu_limit 10, inputs scaled by 10 (more than 10% of the shared
-# expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier and the shared
-# expert's steps asserted (_assert_shared: the side stream up to SHARED_DUAL_STREAM_MAX_M tokens, else serial). One
-# case per routed tier of the main layer TP4 (decode M 1, streaming M 64, prefill M 2048 with the serial shared
-# expert), the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128, topk 3, the official 32x32-block
-# format folded by prepare; decode M 16), and fused_moe on the E385 / topk-7 call (M 8, with shared_expert_id=E).
+# expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier asserted and the
+# shared expert's run checked independent of how the op runs it (_assert_layer_path: today ATOM's split, which later
+# milestones may replace). One case per routed tier of the main layer TP4 (decode M 1, streaming M 64, prefill M 2048),
+# the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128, topk 3, the official 32x32-block format folded by
+# prepare; decode M 16), and fused_moe on the E385 / topk-7 call (M 8, with shared_expert_id=E).
 # =================================================================================================
 
 HIDDEN, EXPERTS, TOPK = 2560, 33, 11
@@ -960,40 +982,34 @@ def test_fused_moe_entry():
     assert_close(out, ref)
 
 
-# (shape, tokens, routed tier, shared-expert format): see the region header; the routed tier is a kernel path of the
-# full-E shape (asserted) and the H 5120 decode limit DECODE_WIDE_MAX_M decides the MTP M 16 case (_assert_h5120).
+# (shape, tokens, routed tier, shared-expert format): see the region header; the routed tier of the full-E shape
+# (_path_tier, asserted by _assert_layer_path); the MTP M 16 case would take the streaming tier past the H 5120 decode
+# limit DECODE_WIDE_MAX_M (as _assert_h5120). Only the tier is asserted, not the kernels: how the shared expert runs
+# (and so which kernels a layer call launches) is left to later milestones.
 _LAYER_CASES = [
-    ("ds_layer_tp4", 1, _DECODE_PATHS["nn"], "row"),
-    (
-        "ds_layer_tp4",
-        64,
-        ["a8w4_stream_prep"] + _stream_path(16, False) + ["a8w4_route_sum"],
-        "row",
-    ),
-    ("ds_layer_tp4", 2048, ["a8w4_stream_prep"] + _prefill_path(128), "row"),
-    ("ds_layer_tp8", 4, _DECODE_PATHS["np"], "row"),
-    ("mtp_layer_tp4", 16, _DEDUP_PATHS["wide"], "block"),
+    ("ds_layer_tp4", 1, "decode", "row"),
+    ("ds_layer_tp4", 64, "stream", "row"),
+    ("ds_layer_tp4", 2048, "prefill", "row"),
+    ("ds_layer_tp8", 4, "decode", "row"),
+    ("mtp_layer_tp4", 16, "dedup", "block"),
 ]
 
 
 @pytest.mark.basic
 @pytest.mark.parametrize(
-    "shape, tokens, path, fmt",
+    "shape, tokens, tier, fmt",
     _LAYER_CASES,
     ids=[f"{shape}_m{m}" for shape, m, _, _ in _LAYER_CASES],
 )
-def test_layer(shape, tokens, path, fmt):
+def test_layer(shape, tokens, tier, fmt):
     experts, topk, inter = LAYER_SHAPES[shape]
     prepared = _layer_check(
         experts, topk, inter, tokens, seed=700, fmt=fmt, amplify=10.0
     )[0]
     assert (prepared.experts, prepared.inter) == (experts, inter)
-    _assert_kernels()
-    if shape.startswith("mtp"):
-        _assert_h5120(tokens, path)
-    else:
-        _assert_path(path)
-    _assert_shared(tokens)
+    if shape.startswith("mtp") and tokens > moe_a8w4.DECODE_WIDE_MAX_M:
+        tier = "stream"  # past the H 5120 decode limit, as in _assert_h5120
+    _assert_layer_path(tier)
 
 
 @pytest.mark.basic
@@ -1020,7 +1036,7 @@ def test_fused_moe_shared_entry():
     )
     assert result is out
     assert moe_a8w4.last_path == path
-    _assert_shared(8)
+    _assert_shared()
     assert torch.equal(_bits(out), _bits(want))
 
 
@@ -1031,11 +1047,11 @@ def _zero_rows(out, rows):
 
 @pytest.mark.basic
 def test_layer_masked_routes():
-    """Masked routes (id -1, ATOM's padding) in a layer call, main layer TP4 decode M 4 (per-route Gate/Up, slot-pair
-    Down, the shared expert on the side stream): a random 30% of the routed ids, every routed id of row 1 and the
-    first id of row 2 are -1, with weight NaN, on the ``poisoned`` view (expert -1 is real data). Graded against
-    reference_layer: a masked route adds nothing, and a masked first id also drops the row's shared expert (ATOM's
-    rule), so row 1 is bitwise 0.
+    """Masked routes (id -1, ATOM's padding) in a layer call, main layer TP4 M 4 (the routed experts on the decode
+    tier, the shared expert however the op runs it: _assert_layer_path): a random 30% of the routed ids, every routed id
+    of row 1 and the first id of row 2 are -1, with weight NaN, on the ``poisoned`` view (expert -1 is real data).
+    Graded against reference_layer: a masked route adds nothing, and a masked first id also drops the row's shared
+    expert (ATOM's rule), so row 1 is bitwise 0.
     """
     experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
     *_, topk_ids, out = _layer_check(
@@ -1049,8 +1065,7 @@ def test_layer_masked_routes():
     )
     assert int((topk_ids[:, :-1] < 0).sum()) > topk + 1
     assert _zero_rows(out, [1])
-    _assert_path(_DECODE_PATHS["np"])
-    _assert_shared(4)
+    _assert_layer_path("decode")
 
 
 # =================================================================================================
@@ -1081,9 +1096,12 @@ def test_layer_masked_routes():
 # 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 68 layer cases (graded); here what they
 # cannot show: the bit-exact conversions of prepare (E4M3FN -> FNUZ, -0, the block folding, the I padding), the
 # folding of the real checkpoints (byte-identical to FP4PTPC@97cc9b32; needs AITER_MOE_A8W4_DSV41_DIR, else skipped)
-# and the accuracy on real weights, input errors and the debug checks, the stream-mode threshold, CUDA graph of both
-# stream modes, in-place output, the exactness of the TP8 padding, and fused_moe's shared_expert_id and raw shared
-# tensors.
+# and the accuracy on real weights, input errors and the debug checks, CUDA graph replays, in-place output, the
+# exactness of the TP8 padding through the split's chain, ATOM's split's own stream-mode threshold, add and in-place
+# order, and fused_moe's shared_expert_id and raw shared tensors. The layer cases check that the shared expert ran and
+# grade the output, but not how it ran (_assert_shared / _assert_layer_path): later milestones replace ATOM's split at
+# some token counts. The cases about the split itself (_assert_split, moe_a8w4._shared_split) run it where the op still
+# does.
 # =================================================================================================
 
 
@@ -4199,7 +4217,7 @@ def test_shared_rejects(monkeypatch):
         flydsl_moe_a8w4_ptpc(x, wide, topk_weight, topk_ids)
     monkeypatch.setattr(moe_a8w4, "_MAX_BYTES", limit + 1)
     flydsl_moe_a8w4_ptpc(x, wide, topk_weight, topk_ids)
-    _assert_shared(4)
+    _assert_shared()
 
 
 @pytest.mark.parametrize(
@@ -4208,25 +4226,68 @@ def test_shared_rejects(monkeypatch):
     ids=["side_stream_last", "serial_first"],
 )
 def test_layer_stream_mode_boundary(tokens):
-    """The shared expert's stream mode switches exactly past SHARED_DUAL_STREAM_MAX_M tokens (ATOM's dual-stream
+    """ATOM's split switches its stream mode exactly past SHARED_DUAL_STREAM_MAX_M tokens (ATOM's dual-stream
     threshold): at it the split runs on the side stream, one token more on the current stream before the routed
     experts; both graded against reference_layer (E 8, topk 6, I 576: the routed experts take the prefill tier on
-    both sides, so only the stream mode differs).
+    both sides, so only the stream mode differs). In both modes the output has the bits of the routed experts alone
+    plus the split's output added as ATOM adds it (addcmul_ with the weight in BF16, one rounding). A case about the
+    split itself (_assert_split), at token counts where the op runs the split; the other layer cases do not depend on
+    how the shared expert runs.
 
-    The basic and graph cases take M 64 / 4 and 2048, far from the threshold; the benchmark does not assert the mode.
+    The basic and graph cases are far from the threshold and do not assert the mode; neither does the benchmark. The
+    layer cases grade the sum within the reference's tolerance, which another rounding of the add could pass.
     """
-    _layer_check(8, 6, 576, tokens, seed=780)
+    prepared, x, topk_weight, topk_ids, out = _layer_check(8, 6, 576, tokens, seed=780)
     _assert_kernels("_prefill")
-    _assert_shared(tokens)
+    _assert_split(tokens)
+    routed = flydsl_moe_a8w4_ptpc(
+        x,
+        _routed_only(prepared),
+        topk_weight[:, :-1],
+        topk_ids[:, :-1],
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+    )
+    shared = moe_a8w4._shared_split(x, prepared, LAYER_SWIGLU_LIMIT)
+    gate = shared_route_weight(topk_weight, topk_ids, prepared.experts)
+    routed.addcmul_(shared, gate.to(torch.bfloat16)[:, None])
+    assert torch.equal(_bits(out), _bits(routed))
 
 
-@pytest.mark.parametrize("tokens", [4, 2048], ids=["m4_side_stream", "m2048_serial"])
+def test_layer_split_inplace_serial():
+    """With output = hidden_states ATOM's split runs first on the current stream even at SHARED_DUAL_STREAM_MAX_M
+    tokens, where a separate output puts it on the side stream: it reads the input before the routed experts overwrite
+    it (no fork, its Down GEMM before the first A8W4 kernel), and the output has the bits of the separate one (E 8,
+    topk 6, I 576, M 1024 as in test_layer_stream_mode_boundary, which grades it: the routed experts take the prefill
+    tier, no atomics). A case about the split itself (_assert_split), at a token count where the op runs the split.
+
+    test_layer_inplace_output compares bits only, independent of how the op runs the shared expert; a side stream
+    reading the input while the routed kernels overwrite it would seldom change them. The benchmark passes a separate
+    output.
+    """
+    tokens = moe_a8w4.SHARED_DUAL_STREAM_MAX_M
+    _, _, prepared = _layer_weights(8, 576, 780)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, LAYER_HIDDEN, 8, 6, seed=787, shared_weight=None
+    )
+    want = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    _assert_split(tokens)
+    result = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, output=x, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert result is x
+    _assert_split(tokens, inplace=True)
+    assert torch.equal(_bits(x), _bits(want))
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 2048], ids=["m1", "m4", "m2048"])
 def test_layer_graph_replay(tokens):
-    """A layer call with the shared expert can be captured in a CUDA graph and replayed in both stream modes: up to
-    SHARED_DUAL_STREAM_MAX_M tokens the side stream forks from the capturing stream and joins it inside the capture,
-    beyond it everything runs on the capturing stream. The replay reads newly written inputs and gives the bits of an
-    eager call on them (main layer TP4: decode M 4 and prefill M 2048, both without atomics). Compiled by an eager call
-    outside the capture first.
+    """A layer call with the shared expert can be captured in a CUDA graph and replayed: the replay reads newly written
+    inputs and gives the bits of an eager call on them (main layer TP4: decode M 1 and 4, prefill M 2048, all without
+    atomics). Compiled by an eager call outside the capture first. Independent of how the op runs the shared expert
+    (_assert_shared): today ATOM's split, on a side stream forked from and joined to the capturing stream (M 1, 4) or on
+    the capturing stream (M 2048); later milestones may run it otherwise at some of these token counts.
 
     The basic tests call eagerly; the benchmark times graph replays and grades their output within the reference's
     tolerance, not their bits against an eager call.
@@ -4251,7 +4312,7 @@ def test_layer_graph_replay(tokens):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    _assert_shared(tokens)
+    _assert_shared()
     x2, topk_weight2, topk_ids2 = make_layer_inputs(
         tokens, LAYER_HIDDEN, experts, topk, seed=751, shared_weight=None
     )
@@ -4267,35 +4328,37 @@ def test_layer_graph_replay(tokens):
     assert torch.equal(_bits(out), _bits(want))
 
 
-def test_layer_inplace_output():
-    """output = hidden_states with the shared expert: the shared expert reads the input before the routed experts
-    overwrite it, so it runs first on the current stream even below SHARED_DUAL_STREAM_MAX_M (no fork), and the result
-    has the bits of a separate output (main layer TP4 decode M 4, no atomics).
+@pytest.mark.parametrize("tokens", [1, 4], ids=["m1", "m4"])
+def test_layer_inplace_output(tokens):
+    """output = hidden_states with the shared expert gives the bits of a separate output (main layer TP4 decode M 1
+    and 4, no atomics): whatever runs the shared expert reads the input before anything overwrites it. Independent of
+    how the op runs the shared expert (_assert_shared): today ATOM's split, which then runs first on the current stream
+    even below SHARED_DUAL_STREAM_MAX_M; later milestones may run it otherwise at some of these token counts.
 
-    The basic tests pass a separate output.
+    The basic tests pass a separate output; test_layer_split_inplace_serial asserts the split's order in place.
     """
     experts, topk, inter = LAYER_SHAPES["ds_layer_tp4"]
     _, _, prepared = _layer_weights(experts, inter, 700)
     x, topk_weight, topk_ids = make_layer_inputs(
-        4, LAYER_HIDDEN, experts, topk, seed=760, shared_weight=None
+        tokens, LAYER_HIDDEN, experts, topk, seed=760, shared_weight=None
     )
     want = flydsl_moe_a8w4_ptpc(
         x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
     )
-    assert "shared_fork" in moe_a8w4.last_path
     result = flydsl_moe_a8w4_ptpc(
         x, prepared, topk_weight, topk_ids, output=x, swiglu_limit=LAYER_SWIGLU_LIMIT
     )
     assert result is x
-    _assert_shared(moe_a8w4.SHARED_DUAL_STREAM_MAX_M + 1)
+    _assert_shared()
     assert torch.equal(_bits(x), _bits(want))
 
 
 def test_layer_tp8_padding_exact():
-    """TP8's shared I 288, zero-padded to the routed experts' 320 by prepare, changes no bit: the layer's output equals
-    the routed experts alone (the prepared weight without its shared expert, the first topk columns) plus aiter's dense
-    chain on the unpadded shared expert (gate / up [576, 5120], Down [5120, 288] with K padded to 384 by
-    shuffle_weight), added as the op adds it (ATOM's addcmul_ with the weight in BF16; decode M 4, no atomics).
+    """TP8's shared I 288, zero-padded to the routed experts' 320 by prepare, changes no bit of ATOM's split: the op's
+    split (moe_a8w4._shared_split) on prepare's padded shared fields gives the bits of aiter's dense chain on the
+    unpadded shared expert (gate / up [576, 5120], Down [5120, 288] with K padded to 384 by shuffle_weight), M 4. The
+    split's own function is called, not the op, so that the case does not depend on the token counts at which the op
+    runs the split (later milestones run the shared expert otherwise at some of them; the layer cases grade that).
 
     The basic tests and the benchmark grade TP8 within the reference's tolerance, which a small padding error could
     pass.
@@ -4305,19 +4368,10 @@ def test_layer_tp8_padding_exact():
     experts, topk, inter = LAYER_SHAPES["ds_layer_tp8"]
     _, shared, prepared = _layer_weights(experts, inter, 700)
     assert prepared.shared_w1.shape[0] == 2 * prepared.inter_padded == 640
-    x, topk_weight, topk_ids = make_layer_inputs(
+    x, _, _ = make_layer_inputs(
         4, LAYER_HIDDEN, experts, topk, seed=770, shared_weight=None
     )
-    got = flydsl_moe_a8w4_ptpc(
-        x, prepared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
-    )
-    routed = flydsl_moe_a8w4_ptpc(
-        x,
-        _routed_only(prepared),
-        topk_weight[:, :-1],
-        topk_ids[:, :-1],
-        swiglu_limit=LAYER_SWIGLU_LIMIT,
-    )
+    got = moe_a8w4._shared_split(x, prepared, LAYER_SWIGLU_LIMIT)
     w1, s1, w2, s2 = shared
     fnuz = [
         q.view(torch.uint8)
@@ -4333,9 +4387,7 @@ def test_layer_tp8_padding_exact():
         s2 * 2,
         LAYER_SWIGLU_LIMIT,
     )
-    gate = shared_route_weight(topk_weight, topk_ids, experts).to(torch.bfloat16)
-    routed.addcmul_(unpadded, gate[:, None])
-    assert torch.equal(_bits(got), _bits(routed))
+    assert torch.equal(_bits(got), _bits(unpadded))
 
 
 def test_fused_moe_shared_expert_id():
@@ -4377,10 +4429,10 @@ def test_fused_moe_shared_expert_id():
 
 # -- 2.11 masked routes (id -1) and entry checks ------------------------------------------------------------------
 # A routing id of -1 masks its route (ATOM's padding rows): no tier reads its weights or adds it, whatever its weight.
-# The basic test covers the main layer's per-route decode (np) with the shared expert on the side stream and the
-# benchmark never masks; here the other tiers, whole rows and whole calls masked (the sortings left without a route,
-# the dedup plan without a leader), the shared expert of masked rows in both stream modes, CUDA graph replays that move
-# the masks, the reads of the per-route Gate/Up, and the entry checks. Masked cases run on ``poisoned`` weights (the
+# The basic test covers the main layer's per-route decode with the shared expert and the benchmark never masks; here
+# the other tiers, whole rows and whole calls masked (the sortings left without a route, the dedup plan without a
+# leader), the shared expert of masked rows on the streaming and prefill tiers, CUDA graph replays that move the masks,
+# the reads of the per-route Gate/Up, and the entry checks. Masked cases run on ``poisoned`` weights (the
 # bytes before every routed tensor are real weights, where a masked route's expert -1 would read) with NaN weights on
 # the masked routes, graded against the reference (masked routes add nothing); a row without a live route is bitwise 0.
 
@@ -4548,21 +4600,18 @@ def test_masked_routes(weights, tokens, topk, fused, options, path, full):
 
 
 @pytest.mark.parametrize(
-    "shape, tokens, path",
-    [
-        ("ds_layer_tp8", 64, ["a8w4_stream_prep"] + _stream_path(16, False)),
-        ("ds_layer_tp4", 2048, ["a8w4_stream_prep"] + _prefill_path(128)),
-    ],
-    ids=["tp8_m64_stream_atomic", "tp4_m2048_prefill_serial"],
+    "shape, tokens, tier",
+    [("ds_layer_tp8", 64, "stream"), ("ds_layer_tp4", 2048, "prefill")],
+    ids=["tp8_m64_stream_atomic", "tp4_m2048_prefill"],
 )
-def test_layer_masked_routes_tiers(shape, tokens, path):
-    """Masked routes in layer calls beyond the basic test's decode: TP8 streaming (I 320: the atomic Down adds only the
-    sorted routes into the output the prep zeroed) with the shared expert on the side stream, and TP4 prefill with the
-    shared expert serial (M 2048 > SHARED_DUAL_STREAM_MAX_M). A random 30% of the routed ids, rows 1 and 5 whole and
-    row 2's first id masked: ATOM's rule drops the shared expert of every row whose first id is -1, so rows 1 and 5 are
-    bitwise 0. Poisoned weights, graded against reference_layer.
+def test_layer_masked_routes_tiers(shape, tokens, tier):
+    """Masked routes in layer calls beyond the basic test's decode: TP8 streaming (I 320: the routed experts' atomic
+    Down adds only the sorted routes into the output the prep zeroed) and TP4 prefill, with the shared expert however
+    the op runs it (_assert_layer_path; today ATOM's split, on the side stream at M 64 and serial at M 2048). A random
+    30% of the routed ids, rows 1 and 5 whole and row 2's first id masked: ATOM's rule drops the shared expert of every
+    row whose first id is -1, so rows 1 and 5 are bitwise 0. Poisoned weights, graded against reference_layer.
 
-    The basic test masks the per-route decode with the side stream only; the benchmark never masks.
+    The basic test masks the per-route decode only; the benchmark never masks.
     """
     experts, topk, inter = LAYER_SHAPES[shape]
     *_, topk_ids, out = _layer_check(
@@ -4575,16 +4624,16 @@ def test_layer_masked_routes_tiers(shape, tokens, path):
     )
     assert int((topk_ids[:, 0] < 0).sum()) > 3
     assert _zero_rows(out, [1, 5])
-    _assert_path(path)
-    _assert_shared(tokens)
+    _assert_layer_path(tier)
 
 
 @pytest.mark.parametrize("tokens", [8, 64], ids=["m8_wide", "m64_stream"])
 def test_masked_graph_replay(tokens):
-    """One CUDA graph of a layer call replays with the masks moved (main layer TP4 with the shared expert on the side
-    stream: decode wide-dd M 8, the plan in the graph; streaming M 64, the prep in the graph): the routing tensors are
-    rewritten with another random mask plus whole rows, with no mask and with every routed id masked, and each replay
-    gives the bits of an eager call on the same inputs (all zero when every row is masked). Poisoned weights.
+    """One CUDA graph of a layer call replays with the masks moved (main layer TP4: decode wide-dd M 8, the plan in the
+    graph; streaming M 64, the prep in the graph; the shared expert however the op runs it, _assert_shared): the
+    routing tensors are rewritten with another random mask plus whole rows, with no mask and with every routed id
+    masked, and each replay gives the bits of an eager call on the same inputs (all zero when every row is masked).
+    Poisoned weights.
 
     The other graph cases replay unmasked routing; the masked eager cases capture nothing.
     """
@@ -4613,7 +4662,7 @@ def test_masked_graph_replay(tokens):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    _assert_shared(tokens)
+    _assert_shared()
     for seed, full in ((762, (0, 3)), (None, ()), (763, "all")):
         weights, ids = (
             original
