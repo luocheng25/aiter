@@ -26,8 +26,8 @@ One file, four regions:
   3. benchmark (``main``, not collected by pytest): Qwen3.8 TP2 / TP4 (against aiter's FP8 per-token
      ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48 (85
      cases), then the DeepSeek-V4.1-Flash main and MTP layers with the shared expert, TP4 / TP8, at the same token
-     counts (68 cases, against aiter's FP8 per-token ``fused_moe`` and ATOM's split): ``python
-     op_tests/test_flydsl_moe_a8w4.py`` (``--quick``: the layers at 6 token counts).
+     counts and M = 6, the MTP TP4 layer also at M = 1280 (73 cases, against aiter's FP8 per-token ``fused_moe`` and
+     ATOM's split): ``python op_tests/test_flydsl_moe_a8w4.py`` (``--quick``: the layers at 6 token counts).
 ``MF_SEED`` seeds the benchmark's weights and inputs.
 """
 
@@ -1097,7 +1097,7 @@ def test_layer_masked_routes():
 # The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
 # benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
 # The shared expert (2.10) is covered by the basic layer tests (one case per routed tier, TP8, the MTP layer in the
-# 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 68 layer cases (graded); here what they
+# 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 73 layer cases (graded); here what they
 # cannot show: the bit-exact conversions of prepare (E4M3FN -> FNUZ, -0, the block folding, the I padding), the
 # folding of the real checkpoints (byte-identical to FP4PTPC@97cc9b32; needs AITER_MOE_A8W4_DSV41_DIR, else skipped)
 # and the accuracy on real weights, input errors and the debug checks, CUDA graph replays, in-place output, the
@@ -5167,10 +5167,10 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, mixed):
 # (the decode slot-pair Down then adds the routes in f32, the streaming atomic Down in BF16) or M more rows of the
 # routes buffer that route_sum / sorted_sum add as one more column; on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M
 # tokens. The basic layer tests (streaming M 64, prefill M 2048, wide decode M 8 and 16) and the benchmark's layer
-# cases (every folded tier but the pre-quantized decode of M 5-7 and the streaming blocks of 64; unmasked routing, the
-# last column E with weight 1) grade it without asserting how the shared expert runs. Here: every folded tier with
-# masks and with rows whose last column is a routed expert instead of E, in place and under graph replay; the GEMM
-# tiles' LDS race; the fallback of an output that is not 16-byte aligned; the compile-cache keys.
+# cases (every folded tier: M 6 the pre-quantized decode, mtp_layer_tp4 M 1280 the streaming blocks of 64; unmasked
+# routing, the last column E with weight 1) grade it without asserting how the shared expert runs. Here: every folded
+# tier with masks and with rows whose last column is a routed expert instead of E, in place and under graph replay; the
+# GEMM tiles' LDS race; the fallback of an output that is not 16-byte aligned; the compile-cache keys.
 
 # case: (shape, tokens, options, routed tier as _path_tier names it, bit-deterministic). Shape: a LAYER_SHAPES name, or
 # "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus below
@@ -5487,7 +5487,8 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
 
 # =================================================================================================
 # Region 3: benchmark (script entry, not collected by pytest)
-# 153 cases, named <shape>_m<M> with M = 1, 2, 4, ..., 32768 and 48; SiLU, BF16 in and out. First the 85 cases of
+# 158 cases, named <shape>_m<M> with M = 1, 2, 4, ..., 32768 and 48 (the layer cases also M 6, and 1280 for
+# mtp_layer_tp4; see BENCH_LAYER_EXTRA_CASES); SiLU, BF16 in and out. First the 85 cases of
 # moe-a8w4 (unchanged: names, seeds, timing, output), 5 shapes:
 #   tp2 / tp4: Qwen3.8-Flash-Next, H 2560, E 513 (512 routed + a fused shared expert that every token's last slot
 #     selects), topk 11, I 320 / 160 (padded to 192 by prepare; aiter gets the same BF16 weights padded to 192);
@@ -5501,7 +5502,7 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
 # output is graded against the fp32 reference, aiter's must be finite. Per case: MF_METRIC (A8W4) and, for Qwen,
 # MF_REF (aiter) with flops = 6 * M * topk * I_pad * H and each implementation's minimal bytes (the selected
 # experts' weights and scales, the input read and the output write), and an INFO line with the launched kernels.
-# Then 68 whole-layer cases of DeepSeek-V4.1-Flash with its shared expert (bench_moe_a8w4_layer): LAYER_SHAPES (main
+# Then 73 whole-layer cases of DeepSeek-V4.1-Flash with its shared expert (bench_moe_a8w4_layer): LAYER_SHAPES (main
 # layer E 384 + shared, topk 6 + 1; MTP layer E 128 + shared, topk 3 + 1; TP4 I 576, TP8 I 288 padded to 320), H 5120,
 # swiglu_limit 10, synthetic weights (routed MXFP4, shared FP8 per row), uniform routing with routed weights normalized
 # and times 1.5, the shared expert E in the last column with weight 1 (ATOM's routing); seeds MF_SEED * 1000 + 500 +
@@ -5567,10 +5568,16 @@ BENCH_WARMUP_MS = 18.0
 # The ROCm profiler records no GPU event for ~0.1 s while another process initializes HIP on the same GPU: an
 # empty record is retried after these pauses (seconds).
 BENCH_RETRY_S = (0.05, 0.1, 0.2, 0.4)
+# Layer cases of the folded tiers that the token counts above skip, appended so that the earlier cases keep their
+# seeds: M 6 (the pre-quantized per-route decode of M 5-7) at every layer shape, and the MTP TP4 layer at M 1280
+# (streaming in blocks of 64 into the prefill Down: M 1195-1365 there; no other layer shape reaches that tier).
+BENCH_LAYER_EXTRA_CASES = [f"{shape}_m6" for shape in LAYER_SHAPES] + [
+    "mtp_layer_tp4_m1280"
+]
 # The layer cases, after the 85 above; the order gives each case's input seed.
 BENCH_LAYER_CASES = [
     f"{shape}_m{m}" for shape in LAYER_SHAPES for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS
-]
+] + BENCH_LAYER_EXTRA_CASES
 # --quick (bench_quick): the layer shapes at these token counts only.
 BENCH_QUICK_TOKENS = (1, 4, 16, 64, 512, 4096)
 # bench_graph_us: at most this many argument sets (run_perftest's num_iters) and at least this many timed replays.
@@ -6283,14 +6290,18 @@ def main():
             for name, dims in LAYER_SHAPES.items()
         ),
     )
-    tokens = sorted(BENCH_TOKENS + BENCH_EXTRA_TOKENS)
+    tokens = sorted(
+        set(BENCH_TOKENS + BENCH_EXTRA_TOKENS)
+        | {int(c.rsplit("_m", 1)[1]) for c in BENCH_LAYER_EXTRA_CASES}
+    )
     parser.add_argument(
         "-m",
         type=int,
         nargs="*",
         choices=tokens,
         default=None,
-        help="token counts M (default 1, 2, 4, ..., 32768, 48)",
+        help="token counts M (default 1, 2, 4, ..., 32768, 48; the layer shapes also 6, mtp_layer_tp4 also 1280; "
+        "a shape runs only the counts of its cases)",
     )
     parser.add_argument(
         "--quick",
@@ -6329,6 +6340,7 @@ def main():
             for shape, m in itertools.product(
                 [s for s in args.shape if s in BENCH_SHAPES], args.m
             )
+            if f"{shape}_m{m}" in BENCH_CASES
         ]
         layers = [s for s in args.shape if s in LAYER_SHAPES]
         if layers:
@@ -6340,6 +6352,7 @@ def main():
         rows += [
             bench_moe_a8w4_layer(shape, m)
             for shape, m in itertools.product(layers, args.m)
+            if f"{shape}_m{m}" in BENCH_LAYER_CASES
         ]
     df = pd.DataFrame(rows)
     aiter.logger.info(
