@@ -706,8 +706,8 @@ def pool():
 # =====================================================================================================================
 # Region 1: basic tests (-m basic): one case per dispatch tier x shape. Each pins the tier -- the Gate/Up kernel of
 # the unfused kernel sequence listed -- and the communication segment: FUSED_COMM (the cross-rank sum fused into the
-# Down decode kernel up to 16 rows, into tp_reduce from 2 MiB (TP2) / 1 MiB (TP4) of BF16 output) or CA (the custom
-# all-reduce in between). Not pinned: the kernels after Gate/Up.
+# Down decode kernel up to 16 rows, from 2 MiB (TP2) / 1 MiB (TP4) of BF16 output into tp_reduce or streamed out of
+# the Down kernel) or CA (the custom all-reduce in between). Not pinned: the kernels after Gate/Up.
 # =====================================================================================================================
 BASIC = [
     # decode: one workgroup per route / token
@@ -720,8 +720,8 @@ BASIC = [
     ("tp2", 256, ST16, CA),
     ("ds_tp4", 512, ST16_RS, FUSED_COMM),  # Down writes routes, tp_reduce sums them
     ("tp4", 48, ST32Q, CA),  # Gate/Up quantizes the intermediate itself
-    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),
-    ("tp4", 2048, ST64Q, FUSED_COMM),  # atomic Down, tp_reduce sums the ranks' outputs
+    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),  # Down writes routes and streams their sum out
+    ("tp4", 2048, ST64Q, FUSED_COMM),  # atomic Down, then streams the ranks' sum out
     # prefill: sorted 64-row blocks
     ("tp2", 2048, PF_PREP, FUSED_COMM),  # sorting by the streaming prep
     ("tp4", 4096, PF_SORT, FUSED_COMM),  # Opus moe_sorting
@@ -753,16 +753,31 @@ def test_basic(pool, shape, M, path, comm):
 # DeepSeek's XCD chunking, the fused communication below); these are the M on the other side, and odd M (partial
 # blocks / tiles). The benchmark does not check paths and the basic tests do not pin the fused kernel, so the
 # communication kernel of every M is pinned here: decode_tp single-slot at 1 row / slot pairs at 2-16 rows, the
-# custom all-reduce from 17 rows, tp_reduce from the byte threshold (1023 / 1024: its 1- / 2-token tiles at H2560).
+# custom all-reduce from 17 rows, tp_reduce from the byte threshold, and from STREAM_FROM_M the Down kernel that
+# streams the sum out (down_tp) before its gather (TP4 384 / 385, DeepSeek-V4.1 TP4 512 / 513: STREAM_TIER_SPEC).
 BOUNDARY_TOKENS = {
     "tp2": (1, 2, 3, 11, 12, 16, 17, 33, 62, 63, 409, 410, 559, 560, 1023, 1024)
     + (1026, 1027, 2234, 2235),
-    "tp4": (1, 2, 3, 16, 17, 19, 20, 33, 62, 63, 204, 205, 559, 560, 1023, 1024)
-    + (1305, 1306, 2611, 2612),
-    "ds_tp4": (1, 2, 3, 7, 16, 17, 33, 102, 103, 768, 769, 1025, 2049, 2730, 2731),
+    "tp4": (1, 2, 3, 16, 17, 19, 20, 33, 62, 63, 204, 205, 384, 385, 559, 560)
+    + (1023, 1024, 1305, 1306, 2611, 2612),
+    "ds_tp4": (1, 2, 3, 7, 16, 17, 33, 102, 103, 512, 513, 768, 769, 1025, 2049)
+    + (2730, 2731),
 }
 # First M whose cross-rank sum is fused into tp_reduce: FUSED_MIN_BYTES of BF16 output (TP2 2 MiB, TP4 1 MiB).
 FUSED_FROM_M = {"tp2": 410, "tp4": 205, "ds_tp4": 103}
+# First M whose Down kernel streams that sum out (down_tp: a8w4_down_*_tp, then a8w4_tp_reduce only gathers): every
+# fused batch of TP2 and of the prefill path, the streaming path's from STREAM_TIER_SPEC's bounds.
+STREAM_FROM_M = {"tp2": 410, "tp4": 385, "ds_tp4": 513}
+
+
+def streams_down(path):
+    """Whether the kernel before the last one of a path is a Down kernel streaming the cross-rank sum (down_tp)."""
+    kernels = path.split(">")
+    return (
+        len(kernels) > 1
+        and kernels[-2].startswith("a8w4_down_")
+        and kernels[-2].endswith("_tp")
+    )
 
 
 def expected_comm_kernel(shape, M):
@@ -785,12 +800,16 @@ def test_dispatch_boundaries(pool, shape):
         assert (
             _known_path(r["path"]) and r["path"].split(">")[-1] == last
         ), f"M={r['M']} rank {r['rank']}: expected a known path ending in {last}, path {r['path']}"
+        streamed = r["M"] >= STREAM_FROM_M[shape]
+        assert (
+            streams_down(r["path"]) == streamed
+        ), f"M={r['M']} rank {r['rank']}: expected a streamed Down {streamed}, path {r['path']}"
 
 
 # --- 2.2 out=, M = 0 ----------------------------------------------------------------------------------------------
 # Why: the benchmark and the basic tests never pass ``out`` and never send M = 0. ``out`` (NaN-filled) is written
-# by the fused decode Down (8 rows), copied back from the custom all-reduce (48) and written by tp_reduce after the
-# atomic streaming Down accumulated into it (2048).
+# by the fused decode Down (8 rows), copied back from the custom all-reduce (48) and, after the atomic streaming Down
+# accumulated into it, written by its owner workgroups and the gather (2048).
 OUT_ARG_TOKENS = (8, 48, 2048)
 
 
@@ -976,13 +995,17 @@ def test_set_weights(pool):
 
 # --- 2.6 CUDA graph capture and replay --------------------------------------------------------------------------
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
-# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups.
+# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups. The
+# streamed Down (its counters reset by its own kernels) is replayed on the prefill path at DeepSeek-V4.1 TP4 8192
+# (10 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048.
 GRAPH_CASES = [
     ("tp2", 8),
     ("ds_tp4", 1),
     ("ds_tp4", 16),
     ("ds_tp4", 48),
     ("ds_tp4", 8192),
+    ("tp4", 2048),
+    ("tp2", 4096),
 ]
 
 
@@ -1254,13 +1277,21 @@ def test_path_checks():
 
 # --- 2.10 waits on peers: a late rank, a rank that skips a call, reset(), prepare()'s retry ----------------------
 # Why: the benchmark and the basic tests start every rank's fused kernel together and never time out. Here the fused
-# decode Down (8 rows) and tp_reduce (256 rows) wait for a rank that starts 0.5 s late (right sums, no error bits);
-# with the wait bound cut to 50 ms, for a rank that skips the call: the others give up within the bound with their
-# kernel's error bit, check_errors() raises once and clears it, the skipping rank's call after that is right or has
-# its error bit too, and reset() restores right sums. prepare() resets every rank and warms up again when one rank's
-# watchdog reports an error, and raises on every rank when it reports one again.
-PEER_WAIT_CASES = (("tp4", 8), ("tp4", 256))
-# error_flag() bit of a wait that gave up, by fused kernel (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT)
+# decode Down (8 rows), tp_reduce (256 rows) and the streamed Down with its gather (TP4 1024 / TP2 512: streaming
+# path, BF16 atomics; DeepSeek-V4.1 TP4 4096: prefill path) wait for a rank that starts 0.5 s late (right sums, no
+# error bits); with the wait bound cut to 50 ms, for a rank that skips the call: the others give up within the bound
+# with their kernel's error bit, check_errors() raises once and clears it, the skipping rank's call after that is
+# right or has its error bit too, and reset() restores right sums. prepare() resets every rank and warms up again
+# when one rank's watchdog reports an error, and raises on every rank when it reports one again.
+PEER_WAIT_CASES = (
+    ("tp4", 8),
+    ("tp4", 256),
+    ("tp4", 1024),
+    ("tp2", 512),
+    ("ds_tp4", 4096),
+)
+# error_flag() bit of a wait that gave up, by fused kernel (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT; down_tp
+# and its gather a8w4_tp_reduce set tp_reduce's)
 TIMEOUT_BIT = {
     "a8w4_tp_reduce": 1,
     "a8w4_down_decode_tp": 2,
@@ -1399,8 +1430,8 @@ def test_peer_waits_and_timeouts(pool, shape, M):
 # Why: the benchmark and the basic tests run one instance eagerly, and 2.6 replays one graph by itself; serving
 # replays decode graphs between eager calls of other sizes, and the instances of one communicator, hidden size and
 # batch bound (layers of a model) share the fused sums' buffers and their epochs / parities (advanced by the kernels).
-# Two TP4 instances with different weights run in graphs of 8 / 256 / 1024 rows (decode_tp, tp_reduce with 1- / 2-
-# token tiles) replayed between eager calls of both (fused sizes and the custom all-reduce).
+# Two TP4 instances with different weights run in graphs of 8 / 256 / 1024 rows (decode_tp, tp_reduce, the streamed
+# Down) replayed between eager calls of both (fused sizes and the custom all-reduce).
 GRAPH_EAGER_TOKENS = (8, 256, 1024)
 GRAPH_EAGER_STEPS = (
     ("replay", 256),
@@ -1516,6 +1547,61 @@ def test_single_slot_decode_fallback(pool):
                 and kernels[-1] == "a8w4_down_decode_tp"
                 and kernels[-2].startswith(GATEUP_PREFIX)
             ), r
+
+
+# --- 2.13 the streamed Down against the Down kernel and tp_reduce, bitwise ----------------------------------------
+# Why: the benchmark and the tests above check each output against the FP32 reference within the tolerance only, and
+# their batch sizes leave the streamed Down's gather at 1 item per workgroup or in full groups. Where the routes and
+# the ranks are summed in f32 (prefill path, DeepSeek-V4.1's streaming path) the streamed Down must equal the
+# unstreamed path (STREAM_DOWN off: Down kernel, tp_reduce) bitwise: TP4 3272 / 3273 (2045 / 2050 tiles of 8 tokens
+# over the column blocks: 1 / 4 per gather workgroup, the last group partial), TP4 / TP2 8193 (a 1-token last tile,
+# rank 0 owning one tile more), DeepSeek-V4.1 TP4 4097 (10 column blocks) and 513 (its first streamed batch). Not
+# here: Qwen's streaming path, whose BF16 atomics add the routes in a different order every call.
+STREAM_BITWISE_CASES = (
+    ("tp4", 3272),
+    ("tp4", 3273),
+    ("tp4", 8193),
+    ("tp2", 8193),
+    ("ds_tp4", 513),
+    ("ds_tp4", 4097),
+)
+
+
+def _job_stream_bitwise(state, shape, M):
+    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
+
+    if not state.member(shape):
+        return None
+    layer, raw = state.get(shape)
+    inputs = state.inputs(shape, M, 1)
+    y = layer.forward(*inputs)
+    row = dict(
+        M=M, path=">".join(layer.last_path), **_verify(state, shape, raw, inputs, y)
+    )
+    saved = mod.STREAM_DOWN
+    mod.STREAM_DOWN = False
+    try:
+        y_off = layer.forward(*inputs)
+    finally:
+        mod.STREAM_DOWN = saved
+    row.update(
+        off_path=">".join(layer.last_path),
+        same=torch.equal(y, y_off),
+        bits=layer.poll_errors(),
+    )
+    return [row]
+
+
+@pytest.mark.parametrize(
+    "shape,M", STREAM_BITWISE_CASES, ids=[f"{s}_m{m}" for s, m in STREAM_BITWISE_CASES]
+)
+def test_streamed_down_bitwise(pool, shape, M):
+    rows = _member_rows(pool.run("stream_bitwise", shape=shape, M=M), shape)
+    _assert_verified(rows)
+    for r in rows:
+        assert streams_down(r["path"]) and not streams_down(r["off_path"]), r
+        assert r["off_path"].split(">")[-1] == "a8w4_tp_reduce", r
+        assert r["same"] and r["bits"] == 0, r
 
 
 # =====================================================================================================================

@@ -651,7 +651,7 @@ def _quantize(x, rows, cols, dtype, fill=None):
 
 
 def _fused_moe_stream(
-    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce, stream_down=None
 ):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -709,6 +709,12 @@ def _fused_moe_stream(
         M,
         task_num,
     )
+    if stream_down is not None:
+        routes = None
+        if not atomic:
+            routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=device)
+        stream_down(mq, ms, down_args[:4], loc_ids, routes, output, weights, block_m, task_num)
+        return output
     down = _stream_down_kernel(H, I, topk, block_m, E, atomic)
     if atomic:
         # The prep zeroed output: Down adds every route into its token's row with BF16 atomics.
@@ -801,7 +807,7 @@ def _down_prefill_kernel(N, K, topk, experts, nsplit, xcd_chunk):
 
 
 def _fused_moe_prefill(
-    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce, down=None
 ):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -847,13 +853,12 @@ def _fused_moe_prefill(
     )
     mq, ms = _quantize(mid, routes_n, I, "f32")
     routes = torch.empty((grid * block_m, H), dtype=torch.bfloat16, device=device)
+    xcd_chunk = _xcd_chunk(DOWN_XCD_CHUNK_H5120, H, routes_n)
+    if down is not None:
+        down(mq, ms, routing, loc_ids, routes, output, weights, grid, xcd_chunk)
+        return output
     down = _down_prefill_kernel(
-        H,
-        I,
-        topk,
-        E,
-        _down_split(M, topk, E, H, I, block_m),
-        _xcd_chunk(DOWN_XCD_CHUNK_H5120, H, routes_n),
+        H, I, topk, E, _down_split(M, topk, E, H, I, block_m), xcd_chunk
     )
     _launch(
         f"a8w4_down_prefill_bm{block_m}",
@@ -903,6 +908,8 @@ def fused_moe_a8w4(
     swiglu_limit=0.0,
     reduce=None,
     decode_down=None,
+    prefill_down=None,
+    stream_down=None,
 ):
     """A8W4 MoE forward of one rank: BF16 ``hidden_states`` [M, H] -> BF16 [M, H] (``output`` if given).
 
@@ -931,6 +938,20 @@ def fused_moe_a8w4(
     ``paired``: the slot-pair kernel, ``mid`` FP8 [M * topk, I] with its row scales ``mid_scale``; else the
     single-slot kernel, ``mid`` f32 [M, topk, I] and ``mid_scale`` the (unused) ``topk_weight`` -- and must launch on
     the current stream and leave the route sum in ``output``. The other paths never call it.
+
+    ``prefill_down`` (default None) likewise replaces the Down kernel and ``reduce`` of the prefill path: it is called
+    as ``prefill_down(mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd_chunk)`` -- ``mid`` FP8
+    [M * topk, I] with its row scales ``mid_scale``, ``routing`` the sorted (ids, weights, experts, valid count),
+    ``loc_ids`` as for ``reduce`` (not yet stored by Down), ``routes`` the uninitialized BF16 [grid * 64, H] route
+    rows, ``grid`` the sorted blocks and ``xcd_chunk`` the Down kernel's XCD_CHUNK -- and must launch on the current
+    stream and leave the result in ``output``. The other paths never call it.
+
+    ``stream_down`` (default None) likewise replaces the Down kernel and ``reduce`` of the stream path: it is called
+    as ``stream_down(mid, mid_scale, routing, loc_ids, routes, output, weights, block_m, task_num)`` -- ``mid`` FP8
+    [M * topk, I] with its row scales ``mid_scale``, ``routing`` the sorted (ids, weights, experts, valid count) of
+    ``block_m``-row blocks (``task_num`` of them), ``loc_ids`` as for ``reduce`` (stored), ``routes`` the
+    uninitialized BF16 [task_num * block_m, H] route rows, or None for the atomic Down (``output`` zeroed) -- and must
+    launch on the current stream and leave the result in ``output``. The other paths never call it.
     """
     if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
         raise TypeError("hidden_states must be a 2-D bfloat16 tensor")
@@ -971,8 +992,22 @@ def fused_moe_a8w4(
         )
     if M > DECODE_MAX_M and M * topk <= _stream_max_rows(H, I, M * topk) * E:
         return _fused_moe_stream(
-            hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+            hidden_states,
+            weights,
+            topk_weight,
+            topk_ids,
+            output,
+            limit,
+            reduce,
+            stream_down,
         )
     return _fused_moe_prefill(
-        hidden_states, weights, topk_weight, topk_ids, output, limit, reduce
+        hidden_states,
+        weights,
+        topk_weight,
+        topk_ids,
+        output,
+        limit,
+        reduce,
+        prefill_down,
     )

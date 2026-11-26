@@ -13,7 +13,11 @@ per-token activations, MXFP4 weights) and sums the partial outputs over the rank
 * TP2 / TP4 batches of more than ``FUSED_MIN_M - 1`` rows (the streaming and prefill paths) whose BF16 output
   has at least ``FUSED_MIN_BYTES[world_size]`` bytes: the sum is fused into the last kernel
   (``kernels/mega_moe_tp_gfx942/tp_reduce.py``, ``a8w4_tp_reduce``: route sum, reduce-scatter of token tiles to
-  their owner rank over hipIpc symmetric memory, f32 sum in rank order, all-gather of the BF16 rows);
+  their owner rank over hipIpc symmetric memory, f32 sum in rank order, all-gather of the BF16 rows); on the
+  prefill path of the shapes in ``STREAM_SPEC`` (``STREAM_DOWN``) the same sum streams out of the Down kernel
+  instead (``kernels/mega_moe_tp_gfx942/down_tp.py``, ``a8w4_down_prefill_bm64_tp``: workgroups of the Down launch
+  reduce, scatter and gather each column block of the output while the next ones compute), and ``a8w4_tp_reduce``
+  only copies the rows the other ranks summed into the output;
 * otherwise: the BF16 partials are all-reduced: aiter ``CustomAllreduce`` when its ``should_custom_ar`` accepts
   the tensor, RCCL (``torch.distributed.all_reduce`` on ``group``) otherwise.
 
@@ -44,6 +48,7 @@ Contract (as ``MegaMoeTP``):
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -52,7 +57,7 @@ from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from . import moe_a8w4
-from .kernels.mega_moe_tp_gfx942 import decode_tp, tp_reduce
+from .kernels.mega_moe_tp_gfx942 import decode_tp, down_tp, tp_reduce
 from .mega_moe_tp import MegaMoeTPConfig
 
 __all__ = ["MegaMoeTPConfig", "MegaMoeTPGfx942", "mega_moe_tp_gfx942_supported"]
@@ -203,6 +208,69 @@ DECODE_TP_MAX_M = 16
 # on pre-quantized rows (paired timing on MI308X, slot-pair / single-slot fused at 2 / 3 rows: TP2 0.94 / 0.88,
 # TP4 0.96 / 0.87, DeepSeek-V4.1 TP4 0.97 / 0.98; 1 row: 1.06-1.14).
 DECODE_TP_PREQUANT_MIN_M = 2
+# Fused batches on the prefill path stream the sum out of the Down kernel (down_tp); 0 in the environment variable
+# keeps the Down kernel and tp_reduce of the other fused batches.
+STREAM_DOWN = os.environ.get("AITER_MEGA_MOE_TP_STREAM_DOWN", "1") != "0"
+# The same for the fused batches on the stream path (the streaming Down, four waves of STREAM_TP_R row blocks).
+STREAM_TIER = True
+STREAM_TP_R = 8
+
+
+# The streamed Down of a fused prefill batch by (world size, hidden size): (column blocks, reduce workgroups, owner
+# workgroups per block, tokens per tile[, DownTP.DRY[, DownTP.ROUTE_AUX]][, {other DownTP fields}]), or pairs
+# (largest batch, that tuple) in increasing order, the first one the batch fits (None: any). Shapes without an
+# entry keep the Down kernel and tp_reduce. Paired timing on MI308X against those (20261126-084336-p1-run-ce23):
+# TP2 0.87-0.90 (M 2048-32768), TP4 0.96-0.99 (M 4096-32768), DeepSeek-V4.1 TP4 0.93-0.95 (M 2048-32768; 10
+# column blocks 0.97 at M 2048).
+STREAM_SPEC = {
+    (2, 2560): (5, 32, 16, 8, {"UX": 1}),
+    (4, 2560): (5, 64, 32, 8, {"UX": 1}),
+    (4, 5120): ((2048, (5, 64, 32, 8)), (None, (10, 32, 16, 8))),
+}
+# The same for the fused batches on the stream path (the streaming Down's own column blocks, DownTP.COPY set by the
+# caller). Paired timing on MI308X against the Down kernel and tp_reduce (20261126-100503-p1-run-aaf7): TP2 0.94 /
+# 0.89 (M 512 / 1024), TP4 0.97 / 0.93 / 0.92 (M 512 / 1024 / 2048) but 1.05 at M 256; DeepSeek-V4.1 TP4 1.01-1.04
+# (M 128-512, 20261126-092445-p1-run-d2d3) and 0.98 (M 1024, 20261126-102139-p1-run-d3d7).
+_STREAM_TIER_TP = (5, 16, 8, 8, {"UX": 1, "NXT": 128, "NYT": 64})
+STREAM_TIER_SPEC = {
+    (2, 2560): _STREAM_TIER_TP,
+    (4, 2560): ((384, None), (None, _STREAM_TIER_TP)),
+    (4, 5120): ((512, None), (None, (5, 16, 8, 8, {"NXT": 128, "NYT": 64}))),
+}
+# Items (tiles of a column block) per workgroup of the gather kernel (down_tp.compile_tp_gather, G) of a call
+# with at least GATHER_FROM items, else 1. Paired timing on MI308X (20261126-112217-p1-run-090b), 4 against 1
+# item: 0.5-1.0 % faster at TP2 / TP4 M 8192 and 32768 and DeepSeek-V4.1 TP4 M 4096 and 16384, unchanged at
+# 640-1280 items.
+GATHER_ITEMS = 4
+GATHER_FROM = 2048
+# Timing analysis (DownTP.TRACE): room for this many workgroups' timestamps after the counters.
+TRACE_WGS = 0
+
+
+def _stream_spec(world, H, topk, M, table=None, **over):
+    """The ``down_tp.DownTP`` of an M-row batch of a shape (``table``, default ``STREAM_SPEC``; ``over``: more
+    fields), None if it does not stream."""
+    spec = (STREAM_SPEC if table is None else table).get((world, H))
+    if spec and isinstance(spec[0], tuple):
+        spec = next((t for up_to, t in spec if up_to is None or M <= up_to), None)
+    if spec is None:
+        return None
+    nsplit, nx, ny, tt, *extra = spec
+    fields = extra.pop() if extra and isinstance(extra[-1], dict) else {}
+    return down_tp.DownTP(
+        WORLD=world,
+        H=H,
+        TOPK=topk,
+        TT=tt,
+        NSPLIT=nsplit,
+        NX=nx,
+        NY=ny,
+        **dict(zip(("DRY", "ROUTE_AUX"), extra)),
+        **fields,
+        **over,
+    )
+
+
 # Wait bounds of the fused kernels in seconds: every forward, and an instance's first forward of a batch size.
 WAIT_S = 10.0
 FIRST_WAIT_S = 300.0
@@ -228,8 +296,10 @@ def _wait_limit(seconds):
 class _Workspace:
     """Buffers of the fused sums (their module docstrings) of one communicator, hidden size and batch bound
     ``m_max``. tp_reduce: symmetric ``landing`` / ``inbox`` / ``flags`` (hipIpc, uncached, zeroed), their address
-    table ``tab`` and this rank's ``epoch``; decode_tp: the symmetric ``dinbox`` (uncached, 0xFF), its address table
-    ``dtab`` and this rank's ``parity``. Creation and ``close`` are collective over the communicator's gloo group.
+    table ``tab`` and this rank's ``epoch``; down_tp: ``landing`` / ``inbox`` and its own symmetric ``flags2``, their
+    table ``tab2``, this rank's ``epoch2`` and block counters ``ctr``; decode_tp: the symmetric ``dinbox`` (uncached,
+    0xFF), its address table ``dtab`` and this rank's ``parity``. Creation and ``close`` are collective over the
+    communicator's gloo group.
     """
 
     def __init__(self, comm, rank, world, H, m_max):
@@ -240,6 +310,12 @@ class _Workspace:
         self.slots = max(-(-m // tt) for m, tt in tiers)
         # Rows per owner rank: an owner's share of the tiles (tile i -> rank i % world), in tokens.
         rps = max((-(-m // tt) + world - 1) // world * tt for m, tt in tiers)
+        # down_tp: tiles of its smallest tile size bound the slots; an owner keeps its own partials in its inbox.
+        self.tpq = -(-m_max // min(down_tp.TILE_TOKENS))
+        self.slots2 = down_tp.NSPLIT_MAX * self.tpq
+        rps2 = max(
+            (-(-m_max // tt) + world - 1) // world * tt for tt in down_tp.TILE_TOKENS
+        )
         self.comm, self.refs = comm, 0
         self.heap = IpcSymmetricHeap(
             rank=rank,
@@ -251,9 +327,14 @@ class _Workspace:
         error = None
         try:
             self.landing = self.heap.create_tensor((m_max, H), torch.bfloat16)
-            self.inbox = self.heap.create_tensor(((world - 1) * rps, H), torch.bfloat16)
+            self.inbox = self.heap.create_tensor(
+                (max((world - 1) * rps, world * rps2), H), torch.bfloat16
+            )
             self.flags = self.heap.create_tensor(
                 (self.slots * (world + 1),), torch.int32
+            )
+            self.flags2 = self.heap.create_tensor(
+                (self.slots2 * (world + 1),), torch.int32
             )
             self.dinbox = self.heap.create_tensor(
                 (decode_tp.inbox_words(H, world, DECODE_TP_MAX_M),), torch.int32
@@ -269,6 +350,13 @@ class _Workspace:
             [self.heap.p2p_table(t) for t in (self.landing, self.inbox, self.flags)]
         ).view(torch.int32)
         self.epoch = torch.zeros(self.slots, dtype=torch.int32, device=comm.device)
+        self.tab2 = torch.stack(
+            [self.heap.p2p_table(t) for t in (self.landing, self.inbox, self.flags2)]
+        ).view(torch.int32)
+        self.epoch2 = torch.zeros(self.slots2, dtype=torch.int32, device=comm.device)
+        self.ctr = torch.zeros(
+            down_tp.NSPLIT_MAX + 4 * TRACE_WGS, dtype=torch.int32, device=comm.device
+        )
         self.dtab = self.heap.p2p_table(self.dinbox).view(torch.int32)
         self.parity = torch.zeros(
             DECODE_TP_MAX_M * (H // 16), dtype=torch.int32, device=comm.device
@@ -281,6 +369,9 @@ class _Workspace:
         dist.barrier(group=self.comm.cpu_group)
         self.flags.zero_()
         self.epoch.zero_()
+        self.flags2.zero_()
+        self.epoch2.zero_()
+        self.ctr.zero_()
         self.dinbox.fill_(decode_tp.SENTINEL)
         self.parity.zero_()
         torch.cuda.synchronize(self.comm.device)
@@ -290,6 +381,7 @@ class _Workspace:
         """Collective (``IpcSymmetricHeap.close``)."""
         self.heap.close()
         self.landing = self.inbox = self.flags = self.tab = self.epoch = None
+        self.flags2 = self.tab2 = self.epoch2 = self.ctr = None
         self.dinbox = self.dtab = self.parity = None
 
 
@@ -536,6 +628,8 @@ class MegaMoeTPGfx942:
             swiglu_limit=self._limit,
             reduce=self._reducer(M, fused) if self._fuses(M) else None,
             decode_down=self._decode_down(M, fused) if self._decode_fuses(M) else None,
+            prefill_down=self._prefill_down(M, fused) if self._fuses(M) else None,
+            stream_down=self._stream_down(M, fused) if self._fuses(M) else None,
         )
         if fused:
             self._seen.add(M)
@@ -607,6 +701,158 @@ class MegaMoeTPGfx942:
                 self._err,
                 cfg.rank,
                 limit,
+            )
+            fused.append(M)
+
+        return down
+
+    def _prefill_down(self, M, fused):
+        """The ``prefill_down`` hook of ``fused_moe_a8w4``: the Down kernel with the cross-rank sum streamed out of
+        it (down_tp), then ``a8w4_tp_reduce`` copying the other ranks' rows (appends to ``fused``); None if the
+        batch does not stream (``STREAM_DOWN``, ``STREAM_SPEC``)."""
+        cfg, ws = self.cfg, self._ws
+        spec = _stream_spec(cfg.world_size, cfg.model_dim, cfg.topk, M)
+        if not STREAM_DOWN or spec is None:
+            return None
+        limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
+
+        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd):
+            launch = down_tp.compile_down_tp(
+                N=cfg.model_dim,
+                K=weights.inter_padded,
+                TOPK=loc_ids.shape[1],
+                BLOCK_TILE_SIZE_M=moe_a8w4.PREFILL_BLOCK_M,
+                E=weights.experts,
+                XCD_CHUNK=xcd,
+                tp=spec,
+            )
+            moe_a8w4._launch(
+                f"a8w4_down_prefill_bm{moe_a8w4.PREFILL_BLOCK_M}_tp",
+                launch,
+                mid,
+                weights.w2,
+                weights.w2_delta,
+                routes,
+                *routing,
+                weights.w2_scale,
+                mid_scale,
+                loc_ids,
+                output,
+                ws.ctr,
+                ws.tab2,
+                ws.epoch2,
+                self._err,
+                M,
+                cfg.rank,
+                ws.tpq,
+                limit,
+                grid,
+            )
+            items = spec.NSPLIT * -(-M // spec.TT)
+            per_wg = GATHER_ITEMS if items >= GATHER_FROM else 1
+            gather = down_tp.compile_tp_gather(
+                WORLD=cfg.world_size,
+                H=cfg.model_dim,
+                TT=spec.TT,
+                NSPLIT=spec.NSPLIT,
+                DRY=spec.DRY,
+                G=per_wg,
+            )
+            moe_a8w4._launch(
+                "a8w4_tp_reduce",
+                gather,
+                output,
+                ws.tab2,
+                ws.epoch2,
+                ws.ctr,
+                self._err,
+                M,
+                cfg.rank,
+                ws.tpq,
+                limit,
+                -(-items // per_wg),
+            )
+            fused.append(M)
+
+        return down
+
+    def _stream_down(self, M, fused):
+        """The ``stream_down`` hook of ``fused_moe_a8w4``: the streaming Down kernel with the cross-rank sum streamed
+        out of it (down_tp, four waves of ``STREAM_TP_R`` row blocks), then ``a8w4_tp_reduce`` copying the other
+        ranks' rows (appends to ``fused``); None if the batch does not stream (``STREAM_DOWN``, ``STREAM_TIER``,
+        ``STREAM_TIER_SPEC``)."""
+        cfg, ws = self.cfg, self._ws
+        atomic = moe_a8w4._stream_atomic(self._weights.inter_padded)
+        tp = _stream_spec(cfg.world_size, cfg.model_dim, cfg.topk, M, STREAM_TIER_SPEC, COPY=int(atomic))
+        if not (STREAM_DOWN and STREAM_TIER) or tp is None:
+            return None
+        limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
+
+        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, block_m, task_num):
+            H, K = cfg.model_dim, weights.inter_padded
+            assert (routes is None) == atomic, (routes is None, atomic)
+            launch = down_tp.compile_down_stream_tp(
+                N=H,
+                K=K,
+                TOPK=loc_ids.shape[1],
+                BLOCK_M=block_m,
+                E=weights.experts,
+                ATOMIC=atomic,
+                R=STREAM_TP_R,
+                SHARE=moe_a8w4._stream_down_shared(H, K, block_m),
+                PREFETCH=moe_a8w4.STREAM_DOWN_PREFETCH,
+                W_AUX=(
+                    moe_a8w4.STREAM_DOWN_W_AUX_H5120
+                    if H >= 5120
+                    else moe_a8w4.STREAM_DOWN_W_AUX
+                ),
+                tp=tp,
+            )
+            moe_a8w4._launch(
+                f"a8w4_down_stream_bm{block_m}_tp",
+                launch,
+                mid,
+                weights.w2,
+                weights.w2_delta,
+                output if atomic else routes,
+                *routing,
+                weights.w2_scale,
+                mid_scale,
+                M,
+                task_num,
+                loc_ids,
+                output,
+                ws.ctr,
+                ws.tab2,
+                ws.epoch2,
+                self._err,
+                cfg.rank,
+                ws.tpq,
+                limit,
+            )
+            items = tp.NSPLIT * -(-M // tp.TT)
+            per_wg = GATHER_ITEMS if items >= GATHER_FROM else 1
+            gather = down_tp.compile_tp_gather(
+                WORLD=cfg.world_size,
+                H=H,
+                TT=tp.TT,
+                NSPLIT=tp.NSPLIT,
+                DRY=tp.DRY,
+                G=per_wg,
+            )
+            moe_a8w4._launch(
+                "a8w4_tp_reduce",
+                gather,
+                output,
+                ws.tab2,
+                ws.epoch2,
+                ws.ctr,
+                self._err,
+                M,
+                cfg.rank,
+                ws.tpq,
+                limit,
+                -(-items // per_wg),
             )
             fused.append(M)
 

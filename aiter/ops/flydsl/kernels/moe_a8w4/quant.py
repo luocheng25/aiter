@@ -50,15 +50,15 @@ def _buffer_rsrc(ptr, nbytes):
     return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
 
 
-def _store(rsrc, value, offset):
-    """Raw buffer store; bytes past the buffer end are dropped."""
+def _store(rsrc, value, offset, aux=0):
+    """Raw buffer store (``aux``: cache policy bits); bytes past the buffer end are dropped."""
     # Raw ROCDL op: FlyDSL has no buffer store at a byte offset into a raw resource (fx.copy takes coordinates).
     rocdl_dialect.RawPtrBufferStoreOp(
         _raw(value),
         rsrc,
         offset.ir_value(),
         fx.Int32(0).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+        aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
     )
 
 

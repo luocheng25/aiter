@@ -14,6 +14,11 @@ route of its block into ``loc`` [M, TOPK] (the sort's own inverse output costs m
 (``gemm2_8x1``): measured 1–2.5% faster there, 1–3% slower at ``K`` = 192. With ``NSPLIT`` > 1 the
 hidden dimension is split over ``NSPLIT`` workgroups per sorted block (grid x; each gathers the
 block's activations again): few sorted blocks then still fill the machine in several rounds.
+
+``TP`` (a ``mega_moe_tp_gfx942.down_tp.DownTP``): the streamed Down of ``MegaMoeTPGfx942`` -- a 1-D grid that
+computes the ``NSPLIT`` column blocks one after the other (part-major) and runs the cross-rank sum of the finished
+blocks in workgroups of the same launch inserted between the compute workgroups (``DownTP.segments``, ``down_tp``
+docstring); route and ``loc`` stores take its cache policy.
 """
 
 import flydsl.compiler as flyc
@@ -33,7 +38,7 @@ A_TWO_PASS_MIN_K = 512
 
 
 def compile_a8w4_gemm2(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, XCD_CHUNK=0
+    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, XCD_CHUNK=0, TP=None
 ):
     """Build the A8W4 Down launcher.
 
@@ -46,6 +51,8 @@ def compile_a8w4_gemm2(
     value), then M, task_num, stream.
     ``XCD_CHUNK`` > 0: a 1-D grid ordered as in ``gemm1`` (chunks of ``XCD_CHUNK`` consecutive sorted blocks,
     all their hidden-dimension parts, dealt to the XCDs in turn, so blocks of one expert share its weights in L2).
+    ``TP``: the streamed Down (module docstring); the launcher then takes ``out``, ``ctr``, ``tab``, ``epoch``,
+    ``err``, M, rank, tpq, limit, task_num, stream after ``loc`` (``down_tp.compile_down_tp``).
     """
     BM = BLOCK_TILE_SIZE_M
     assert (N // 64) % (
@@ -84,8 +91,12 @@ def compile_a8w4_gemm2(
     CHUNK = XCD_CHUNK * NSPLIT  # workgroups of one XCD chunk
 
     def _part(part):
-        """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK)."""
-        return part if XCD_CHUNK > 0 else fx.Int32(fx.gpu.block_idx.x)
+        """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK and TP)."""
+        return (
+            part
+            if XCD_CHUNK > 0 or TP is not None
+            else fx.Int32(fx.gpu.block_idx.x)
+        )
 
     def _rne_bits(value):
         bits = value.bitcast(fx.Uint32)
@@ -101,7 +112,7 @@ def compile_a8w4_gemm2(
         ]
         return Vec.from_elements(words, fx.Uint32).bitcast(fx.BFloat16)
 
-    @flyc.kernel
+    @(flyc.kernel if TP is None else flyc.kernel(name="a8w4_down_prefill_tp"))
     def a8w4_down_prefill(
         p_input: fx.Pointer,
         p_weight: fx.Pointer,
@@ -115,9 +126,30 @@ def compile_a8w4_gemm2(
         p_a_scale: fx.Pointer,
         p_loc: fx.Pointer,
         M: fx.Int32,
+        p_out: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_err: fx.Pointer,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        task_pad: fx.Int32,
     ):
+        # p_out .. task_pad: arguments of TP only.
         tid = fx.gpu.thread_idx.x
-        if const_expr(XCD_CHUNK > 0):
+        if const_expr(TP is not None):
+            if const_expr(TP.TRACE):
+                TP.trace(p_ctr, task_pad, 0)
+            role, idx, part = TP.roles(fx.Int32(fx.gpu.block_idx.x), task_pad)
+            if const_expr(XCD_CHUNK > 0):
+                step = idx // a8w4.XCDS
+                e_idx = (
+                    (step // XCD_CHUNK) * a8w4.XCDS + idx % a8w4.XCDS
+                ) * XCD_CHUNK + step % XCD_CHUNK
+            else:
+                e_idx = idx
+        elif const_expr(XCD_CHUNK > 0):
             wg = fx.Int32(fx.gpu.block_idx.x)
             step = wg // a8w4.XCDS
             work = ((step // CHUNK) * a8w4.XCDS + wg % a8w4.XCDS) * CHUNK + step % CHUNK
@@ -127,8 +159,11 @@ def compile_a8w4_gemm2(
             e_idx = fx.gpu.block_idx.y
             part = e_idx  # unused: _part reads grid x
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
+        active = e_idx * BM < max_valid_id
+        if const_expr(TP is not None):
+            active = (role == 0) & active
 
-        if e_idx * BM < max_valid_id:
+        if active:
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), fp8)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16) + fx.Int64(e_idx) * (BM * N), (BM, N)
@@ -378,7 +413,12 @@ def compile_a8w4_gemm2(
                     )
 
                 out_tiles = fx.flat_divide(arg_p_output, (bm, BLOCK_N))
-                cp_atom_out_128b = ops.get_buffer_copy_atom(fx.BFloat16, 128)
+                if const_expr(TP is not None):
+                    cp_atom_out_128b = fx.make_copy_atom(
+                        fx.rocdl.BufferCopy(128, TP.ROUTE_AUX), fx.BFloat16
+                    )
+                else:
+                    cp_atom_out_128b = ops.get_buffer_copy_atom(fx.BFloat16, 128)
                 thrv_out = tcopyLDS.partition_D(out_tiles)
                 fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
@@ -438,6 +478,28 @@ def compile_a8w4_gemm2(
                 _buffer_rsrc(p_loc, fx.Int64(M) * (TOPK * 4)),
                 fx.Int32(e_idx) * BM + row,
                 first.select((token < M).select(route, past), past),
+                0 if TP is None else TP.ROUTE_AUX,
+            )
+
+        if const_expr(TP is not None):
+            TP.finish(
+                role,
+                idx,
+                part,
+                TP.args(
+                    p_loc=p_loc,
+                    p_routes=p_output,
+                    p_out=p_out,
+                    p_ctr=p_ctr,
+                    p_tab=p_tab,
+                    p_epoch=p_epoch,
+                    p_err=p_err,
+                    M=M,
+                    rank=rank,
+                    tpq=tpq,
+                    limit=limit,
+                    task_pad=task_pad,
+                ),
             )
 
     @flyc.jit
@@ -479,9 +541,76 @@ def compile_a8w4_gemm2(
             p_a_scale,
             p_loc,
             M,
+            p_loc,
+            p_loc,
+            p_loc,
+            p_loc,
+            p_loc,
+            M,
+            M,
+            M,
+            M,
             value_attrs={"llvm.target_features": features},
         ).launch(grid=grid, block=(256, 1, 1), stream=stream)
 
+    @flyc.jit
+    def launch_tp(
+        p_input: fx.Pointer,
+        p_weight: fx.Pointer,
+        p_w_delta: fx.Pointer,
+        p_output: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_expert_ids: fx.Pointer,
+        p_num_valid_ids: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_a_scale: fx.Pointer,
+        p_loc: fx.Pointer,
+        p_out: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_err: fx.Pointer,
+        M: fx.Int32,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        task_num: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        features = ir.Attribute.parse(features_text)
+        # Compute workgroups per stage: whole XCD chunks (the stage bases stay multiples of the XCD count).
+        per = a8w4.XCDS * max(XCD_CHUNK, 1)
+        task_pad = (task_num + (per - 1)) // per * per
+        a8w4_down_prefill(
+            p_input,
+            p_weight,
+            p_w_delta,
+            p_output,
+            p_sorted_ids,
+            p_sorted_weights,
+            p_sorted_expert_ids,
+            p_num_valid_ids,
+            p_w_scale,
+            p_a_scale,
+            p_loc,
+            M,
+            p_out,
+            p_ctr,
+            p_tab,
+            p_epoch,
+            p_err,
+            rank,
+            tpq,
+            limit,
+            task_pad,
+            value_attrs={"llvm.target_features": features},
+        ).launch(grid=(TP.grid(task_pad), 1, 1), block=(256, 1, 1), stream=stream)
+
     if no_packed:
         launch.compile_hints["target_features"] = "-packed-fp32-ops"
-    return launch
+        launch_tp.compile_hints["target_features"] = "-packed-fp32-ops"
+    if TP is not None and TP.WPE:
+        launch_tp.compile_hints["waves_per_eu"] = TP.WPE
+    return launch if TP is None else launch_tp
