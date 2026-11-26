@@ -33,7 +33,16 @@ A_TWO_PASS_MIN_K = 512
 
 
 def compile_a8w4_gemm2(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, TWO_PASS=True, XCD_CHUNK=0
+    *,
+    N,
+    K,
+    TOPK,
+    BLOCK_TILE_SIZE_M=64,
+    E=None,
+    NSPLIT=1,
+    TWO_PASS=True,
+    XCD_CHUNK=0,
+    LOC_TOPK=None,
 ):
     """Build the A8W4 Down launcher.
 
@@ -46,9 +55,13 @@ def compile_a8w4_gemm2(
     value), then M, task_num, stream. ``TWO_PASS=False`` keeps the one-pass activation staging for any K.
     ``XCD_CHUNK`` > 0: a 1-D grid ordered as in ``a8w4_gemm1`` (chunks of ``XCD_CHUNK`` consecutive sorted blocks,
     all their hidden-dimension parts, dealt to the XCDs in turn, so blocks of one expert share its weights in L2).
+    ``LOC_TOPK`` (default ``TOPK``): the columns of ``loc``, [M, LOC_TOPK] (a fused shared expert's column after the
+    routed ones, which this kernel leaves alone).
     Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     BM = BLOCK_TILE_SIZE_M
+    LOC_TOPK = TOPK if LOC_TOPK is None else LOC_TOPK
+    assert LOC_TOPK >= TOPK
     assert (N // 64) % (
         2 * NSPLIT
     ) == 0, f"Down N={N} must split into {NSPLIT} parts of an even number of 64 rows"
@@ -436,13 +449,13 @@ def compile_a8w4_gemm2(
             row = fx.Int32(tid) % BM
             sid = arg_p_sorted_ids[row].bitcast(fx.Uint32)
             token = fx.Int32(sid & fx.Uint32(0xFFFFFF))
-            route = (token * TOPK + fx.Int32(sid >> 24)) * 4
+            route = (token * LOC_TOPK + fx.Int32(sid >> 24)) * 4
             past = fx.Int32(0x7FFF0000)
             first = fx.Int32(tid) < BM
             if const_expr(NSPLIT > 1):
                 first = (_part(part) == 0).select(fx.Int32(tid), fx.Int32(BM)) < BM
             _store(
-                _buffer_rsrc(p_loc, fx.Int64(M) * (TOPK * 4)),
+                _buffer_rsrc(p_loc, fx.Int64(M) * (LOC_TOPK * 4)),
                 fx.Int32(e_idx) * BM + row,
                 first.select((token < M).select(route, past), past),
             )

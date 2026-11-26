@@ -659,9 +659,10 @@ def _assert_shared():
     """The call ran the shared expert: some step of ``moe_a8w4.last_path`` starts with "shared".
 
     Deliberately independent of how the op runs it, so that later milestones can change that without these cases:
-    today the mixed decode kernels up to DECODE_SHARED_MIXED_MAX_M tokens (marker shared_mixed), else ATOM's split
-    (shared_fork, shared_gemm_*, ..., shared_add; _assert_split); other ways record a "shared..." marker of their own.
-    What a layer case checks is its output against reference_layer.
+    today the mixed decode kernels up to DECODE_SHARED_MIXED_MAX_M tokens (marker shared_mixed), the fold into the
+    routed experts' last reduction where moe_a8w4._shared_fold_tier allows it (shared_fold_*, with a side stream
+    shared_fork / shared_join), else ATOM's split (shared_fork, shared_gemm_*, ..., shared_add; _assert_split); other
+    ways record a "shared..." marker of their own. What a layer case checks is its output against reference_layer.
     """
     path = moe_a8w4.last_path
     assert any(name.startswith("shared") for name in path), path
@@ -679,7 +680,7 @@ def _assert_split(tokens, inplace=False):
     """The shared expert ran ATOM's split and was added last: up to SHARED_DUAL_STREAM_MAX_M tokens with a separate
     output on the side stream (fork, the split, the routed kernels on the current stream, join), beyond it or in place
     (``inplace``: the output is the input) on the current stream before the routed kernels. Only for the cases about
-    the split itself, at token counts where the op runs the split.
+    the split itself, which pin it with SHARED_FOLD = 0.
     """
     path = moe_a8w4.last_path
     assert path[-1] == "shared_add", path
@@ -798,7 +799,8 @@ def _layer_check(
 # last column and a random weight per token, swiglu_limit 10, inputs scaled by 10 (more than 10% of the shared
 # expert's gate and up values exceed the limit), graded against reference_layer, with the routed tier asserted and the
 # shared expert's run checked independent of how the op runs it (_assert_layer_path: today the mixed decode kernels
-# up to M 4, else ATOM's split; later milestones may change that). One case per routed tier of the main layer TP4
+# up to M 4, else the fold into the routed experts' last reduction, ATOM's split where the routed path does not allow
+# it; later milestones may change that). One case per routed tier of the main layer TP4
 # (decode M 1, streaming M 64, prefill M 2048), the TP8 I 288 -> 320 padding (decode M 4) and the MTP layer (E 128,
 # topk 3, the official 32x32-block format folded by prepare; decode M 16), and fused_moe on the E385 / topk-7 call
 # (M 8, with shared_expert_id=E).
@@ -1101,9 +1103,9 @@ def test_layer_masked_routes():
 # and the accuracy on real weights, input errors and the debug checks, CUDA graph replays, in-place output, the
 # exactness of the TP8 padding through the split's chain, ATOM's split's own stream-mode threshold, add and in-place
 # order, and fused_moe's shared_expert_id and raw shared tensors. The layer cases check that the shared expert ran and
-# grade the output, but not how it ran (_assert_shared / _assert_layer_path): later milestones replace ATOM's split at
-# some token counts. The cases about the split itself (_assert_split, moe_a8w4._shared_split) run it where the op still
-# does.
+# grade the output, but not how it ran (_assert_shared / _assert_layer_path): later milestones change where the op
+# folds it. The cases about the split itself (_assert_split, moe_a8w4._shared_split) pin it with SHARED_FOLD = 0; the
+# mixed decode (2.12) and the fold (2.13) have their own sections.
 # =================================================================================================
 
 
@@ -4227,18 +4229,20 @@ def test_shared_rejects(monkeypatch):
     [moe_a8w4.SHARED_DUAL_STREAM_MAX_M, moe_a8w4.SHARED_DUAL_STREAM_MAX_M + 1],
     ids=["side_stream_last", "serial_first"],
 )
-def test_layer_stream_mode_boundary(tokens):
+def test_layer_stream_mode_boundary(monkeypatch, tokens):
     """ATOM's split switches its stream mode exactly past SHARED_DUAL_STREAM_MAX_M tokens (ATOM's dual-stream
     threshold): at it the split runs on the side stream, one token more on the current stream before the routed
     experts; both graded against reference_layer (E 8, topk 6, I 576: the routed experts take the prefill tier on
     both sides, so only the stream mode differs). In both modes the output has the bits of the routed experts alone
     plus the split's output added as ATOM adds it (addcmul_ with the weight in BF16, one rounding). A case about the
-    split itself (_assert_split), at token counts where the op runs the split; the other layer cases do not depend on
-    how the shared expert runs.
+    split itself (_assert_split): SHARED_FOLD = 0 (the op's switch: the split wherever the mixed decode does not run)
+    pins it, so the case holds whatever token counts the op folds the shared expert at; the other layer cases do not
+    depend on how the shared expert runs.
 
     The basic and graph cases are far from the threshold and do not assert the mode; neither does the benchmark. The
     layer cases grade the sum within the reference's tolerance, which another rounding of the add could pass.
     """
+    monkeypatch.setattr(moe_a8w4, "SHARED_FOLD", 0)
     prepared, x, topk_weight, topk_ids, out = _layer_check(8, 6, 576, tokens, seed=780)
     _assert_kernels("_prefill")
     _assert_split(tokens)
@@ -4255,17 +4259,18 @@ def test_layer_stream_mode_boundary(tokens):
     assert torch.equal(_bits(out), _bits(routed))
 
 
-def test_layer_split_inplace_serial():
+def test_layer_split_inplace_serial(monkeypatch):
     """With output = hidden_states ATOM's split runs first on the current stream even at SHARED_DUAL_STREAM_MAX_M
     tokens, where a separate output puts it on the side stream: it reads the input before the routed experts overwrite
     it (no fork, its Down GEMM before the first A8W4 kernel), and the output has the bits of the separate one (E 8,
     topk 6, I 576, M 1024 as in test_layer_stream_mode_boundary, which grades it: the routed experts take the prefill
-    tier, no atomics). A case about the split itself (_assert_split), at a token count where the op runs the split.
+    tier, no atomics). A case about the split itself (_assert_split), pinned by SHARED_FOLD = 0 as there.
 
-    test_layer_inplace_output compares bits only, independent of how the op runs the shared expert; a side stream
-    reading the input while the routed kernels overwrite it would seldom change them. The benchmark passes a separate
-    output.
+    test_layer_inplace_output and test_layer_fold_tiers compare bits only, independent of how the op runs the shared
+    expert; a side stream reading the input while the routed kernels overwrite it would seldom change them. The
+    benchmark passes a separate output.
     """
+    monkeypatch.setattr(moe_a8w4, "SHARED_FOLD", 0)
     tokens = moe_a8w4.SHARED_DUAL_STREAM_MAX_M
     _, _, prepared = _layer_weights(8, 576, 780)
     x, topk_weight, topk_ids = make_layer_inputs(
@@ -4288,8 +4293,8 @@ def test_layer_graph_replay(tokens):
     """A layer call with the shared expert can be captured in a CUDA graph and replayed: the replay reads newly written
     inputs and gives the bits of an eager call on them (main layer TP4: decode M 1 and 4, prefill M 2048, all without
     atomics). Compiled by an eager call outside the capture first. Independent of how the op runs the shared expert
-    (_assert_shared): today the mixed decode kernels (M 1, 4) or ATOM's split on the capturing stream (M 2048); later
-    milestones may run it otherwise at some of these token counts.
+    (_assert_shared): today the mixed decode kernels (M 1, 4) or the fold into sorted_sum on the capturing stream
+    (M 2048); later milestones may run it otherwise at some of these token counts.
 
     The basic tests call eagerly; the benchmark times graph replays and grades their output within the reference's
     tolerance, not their bits against an eager call.
@@ -4608,10 +4613,11 @@ def test_masked_routes(weights, tokens, topk, fused, options, path, full):
 )
 def test_layer_masked_routes_tiers(shape, tokens, tier):
     """Masked routes in layer calls beyond the basic test's decode: TP8 streaming (I 320: the routed experts' atomic
-    Down adds only the sorted routes into the output the prep zeroed) and TP4 prefill, with the shared expert however
-    the op runs it (_assert_layer_path; today ATOM's split, on the side stream at M 64 and serial at M 2048). A random
-    30% of the routed ids, rows 1 and 5 whole and row 2's first id masked: ATOM's rule drops the shared expert of every
-    row whose first id is -1, so rows 1 and 5 are bitwise 0. Poisoned weights, graded against reference_layer.
+    Down adds only the sorted routes into the output) and TP4 prefill, with the shared expert however the op runs it
+    (_assert_layer_path; today folded: at M 64 its Down writes the output the atomic Down adds onto, at M 2048 it is
+    sorted_sum's last column). A random 30% of the routed ids, rows 1 and 5 whole and row 2's first id masked: ATOM's
+    rule drops the shared expert of every row whose first id is -1, so rows 1 and 5 are bitwise 0. Poisoned weights,
+    graded against reference_layer.
 
     The basic test masks the per-route decode only; the benchmark never masks.
     """
@@ -4842,7 +4848,7 @@ _MIXED_PATH = ["a8w4_gateup_decode_mixed", "a8w4_down_decode_mixed", "shared_mix
 )
 def test_layer_mixed_decode_boundary(tokens):
     """The mixed decode ends exactly past DECODE_SHARED_MIXED_MAX_M tokens: at it a layer call runs exactly the mixed
-    Gate/Up and Down, one token more runs the shared expert another way (ATOM's split today) and no mixed kernel. MTP
+    Gate/Up and Down, one token more runs the shared expert another way (the fold today) and no mixed kernel. MTP
     layer TP4 (the official block format), inputs x 10 (the shared expert's clamp hit), a random shared weight per
     token; both sides graded against reference_layer. Only the threshold is pinned, not what takes over past it.
 
@@ -5151,6 +5157,332 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, mixed):
     else:
         assert not any("_mixed" in name for name in path), path
         assert any(name.startswith("shared") for name in path), path
+
+
+# -- 2.13 shared fold: the shared expert in the routed experts' last reduction --------------------------------------
+# Past the mixed decode, where the routed tier allows it (moe_a8w4._shared_fold_tier: the decode tier's slot-pair Down,
+# streaming, prefill from SHARED_FOLD_PREFILL_MIN_M tokens; an output 16-byte aligned where the shared expert writes
+# it), a layer call folds the shared expert into the routed experts' last reduction: two FP8 GEMMs (aiter's FlyDSL
+# preshuffle GEMM) on the routed path's quantized input with shared_a8w4's mid kernel between them write the output
+# (the decode slot-pair Down then adds the routes in f32, the streaming atomic Down in BF16) or M more rows of the
+# routes buffer that route_sum / sorted_sum add as one more column; on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M
+# tokens. The basic layer tests (streaming M 64, prefill M 2048, wide decode M 8 and 16) and the benchmark's layer
+# cases (every folded tier but the pre-quantized decode of M 5-7 and the streaming blocks of 64; unmasked routing, the
+# last column E with weight 1) grade it without asserting how the shared expert runs. Here: every folded tier with
+# masks and with rows whose last column is a routed expert instead of E, in place and under graph replay; the GEMM
+# tiles' LDS race; the fallback of an output that is not 16-byte aligned; the compile-cache keys.
+
+# case: (shape, tokens, options, routed tier as _path_tier names it, bit-deterministic). Shape: a LAYER_SHAPES name, or
+# "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus below
+# H 2560). The tiers reached today: the pre-quantized per-route Gate/Up with the slot-pair Down (M 6), the wide decode
+# (deduplicated Gate/Up, M 16), streaming with route_sum behind the streaming Down (blocks of 16) and behind the
+# prefill Down (blocks of 64, which also writes loc_ids), streaming with the atomic Down (I 320), prefill sorted by
+# the prep and by Opus. The atomic Down's order of adds changes from run to run: that case is graded, not compared.
+_FOLD_CASES = {
+    "decode_pq_ds_tp8_m6": ("ds_layer_tp8", 6, {}, "decode", True),
+    "wide_dd_mtp_tp8_m16": ("mtp_layer_tp8", 16, {}, "dedup", True),
+    "stream_sum_mtp_tp4_m128": ("mtp_layer_tp4", 128, {}, "stream", True),
+    "stream_prefill_down_mtp_tp4_m1280": ("mtp_layer_tp4", 1280, {}, "stream", True),
+    "stream_atomic_mtp_tp8_m64": ("mtp_layer_tp8", 64, {}, "stream", False),
+    "prefill_prep_mtp_tp8_m2048": ("mtp_layer_tp8", 2048, {}, "prefill", True),
+    "prefill_opus_small_m2048": ("small", 2048, {"block_m": 64}, "prefill", True),
+}
+
+
+@functools.cache
+def _fold_small_weights():
+    """E 8, H 512, I 64 MXFP4 routed experts with a shared expert (per-row format): ``(w, shared, prepared)``."""
+    w = make_weights(8, 512, 64, seed=870)
+    shared = make_shared_weights(512, 64, seed=871)["row"]
+    return w, shared, _prepare_shared(w, shared)
+
+
+def _fold_weights(shape):
+    """``(w, shared, prepared, topk, hidden)`` of a _FOLD_CASES shape (layer weights of _layer_weights(seed 700))."""
+    if shape == "small":
+        return (*_fold_small_weights(), 2, 512)
+    experts, topk, inter = LAYER_SHAPES[shape]
+    return (*_layer_weights(experts, inter, 700), topk, LAYER_HIDDEN)
+
+
+def _fold_routing(tokens, hidden, experts, topk, seed):
+    """Layer inputs (make_layer_inputs, a random shared weight per token) with a random 30% of the routed ids, every
+    routed id of row 1 and the first id of row 2 masked (mask_routes), and in every fourth row from row 3 the last
+    column a routed expert the row does not select instead of E: ATOM's rule drops the shared expert of rows 1, 2 and
+    those, and a kernel or sorting that took the last column for a routed one would add that expert with its weight.
+    """
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, hidden, experts, topk, seed=seed, shared_weight=None
+    )
+    topk_weight, topk_ids = mask_routes(
+        topk_weight, topk_ids, seed=seed + 1, full=(1,), first=(2,), routed=topk
+    )
+    ids = topk_ids.cpu()
+    for row in range(3, tokens, 4):
+        taken = set(ids[row, :-1].tolist())
+        ids[row, -1] = next(e for e in range(experts) if e not in taken)
+    return x, topk_weight, ids.to(topk_ids.device).contiguous()
+
+
+def _assert_folded(tier):
+    """The last call ran the routed experts on ``tier`` (_path_tier) and the shared expert without a final add: what
+    ran it, the fold today, wrote where the routed experts' last reduction adds it."""
+    path = moe_a8w4.last_path
+    assert _path_tier(path) == tier, (tier, path)
+    _assert_shared()
+    assert "shared_add" not in path, path
+
+
+@pytest.mark.parametrize("case", list(_FOLD_CASES))
+def test_layer_fold_tiers(case):
+    """Every folded tier (_FOLD_CASES) on poisoned routed weights with _fold_routing's masks and dropped shared
+    experts: graded against reference_layer, the rows without a live routed id bitwise 0 (row 1: the shared expert's
+    +0 plus nothing), no final add (_assert_folded; the streaming case of blocks of 64 also asserts the prefill Down,
+    the Opus case Opus). The same call with output = hidden_states gives the bits of the separate output (the chain
+    writes the output, or the routes buffer, only after the kernel that quantizes the input), and a CUDA graph of the
+    call replays other inputs with the masks moved with the bits of an eager call on them (the atomic case: graded).
+
+    The basic tests and the benchmark grade the folded tiers on unmasked routing with E in the last column, eagerly
+    (the benchmark replays graphs but grades one replay within the tolerance) into a separate output; neither reaches
+    the pre-quantized decode of M 5-7 or the streaming blocks of 64, nor asserts how the shared expert runs.
+    """
+    shape, tokens, options, tier, exact = _FOLD_CASES[case]
+    w, shared, prepared, topk, hidden = _fold_weights(shape)
+    w, prepared = poisoned(w, prepared)
+    E = prepared.experts
+
+    def call(x, topk_weight, topk_ids, out):
+        return flydsl_moe_a8w4_ptpc(
+            x,
+            prepared,
+            topk_weight,
+            topk_ids,
+            output=out,
+            swiglu_limit=LAYER_SWIGLU_LIMIT,
+            **options,
+        )
+
+    def ref(x, topk_weight, topk_ids):
+        return reference_layer(
+            x, w, shared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+        )
+
+    x, topk_weight, topk_ids = _fold_routing(tokens, hidden, E, topk, seed=880)
+    dropped = shared_route_weight(topk_weight, topk_ids, E) == 0
+    assert int(dropped.sum()) >= 2 + len(range(3, tokens, 4))
+    out = torch.full_like(x, float("nan"))
+    assert call(x, topk_weight, topk_ids, out) is out
+    _assert_folded(tier)
+    if case.startswith("stream_prefill_down"):
+        assert any(n.startswith("a8w4_down_prefill") for n in moe_a8w4.last_path)
+    if case.startswith("prefill_opus"):
+        assert "moe_sorting_opus" in moe_a8w4.last_path, moe_a8w4.last_path
+    assert_close(out, ref(x, topk_weight, topk_ids))
+    dead = (topk_ids[:, :-1] < 0).all(dim=1).nonzero().flatten().tolist()
+    assert 1 in dead and _zero_rows(out, dead)
+
+    inplace = x.clone()
+    assert call(inplace, topk_weight, topk_ids, inplace) is inplace
+    _assert_folded(tier)
+    if exact:
+        assert torch.equal(_bits(inplace), _bits(out))
+    else:
+        assert_close(inplace, ref(x, topk_weight, topk_ids))
+
+    static = [t.clone() for t in (x, topk_weight, topk_ids)]
+    graph_out = torch.empty_like(x)
+    call(*static, graph_out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call(*static, graph_out)
+    _assert_folded(tier)
+    other = _fold_routing(tokens, hidden, E, topk, seed=890)
+    for t, value in zip(static, other):
+        t.copy_(value)
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    if exact:
+        want = call(*other, None)
+        assert torch.equal(_bits(graph_out), _bits(want))
+    else:
+        assert_close(graph_out, ref(*other))
+
+
+def test_layer_fold_gemm_race(monkeypatch):
+    """The folded shared expert's GEMMs never take a tile that races in LDS, and graph replays of a call with the
+    shared GEMMs beside the routed kernels keep the bits of an eager call.
+
+    aiter's preshuffle GEMM copies each A tile into LDS with one 16-byte load per thread (128 threads with tile_n 32,
+    else 256): a tile of fewer bytes makes the copy cover rows past tile_m, which land in the other LDS stage while
+    other waves may still read it (four waves with tile_m 16 and tile_k 128: wrong 8 x 16 output blocks now and then
+    when other kernels share the CUs). moe_a8w4._shared_gemm asserts the tile's bytes; here its tile choice is run for
+    every M up to the GEMM's 65536 rows at the layers' Gate/Up (K 5120) and Down (K 640 / 384) shapes with the GEMM
+    stubbed (no assertion fails; K is a multiple of tile_k, which the GEMM requires), then MTP layer TP8 M 32 (wide
+    decode: the shared Down GEMM of 32 rows on the side stream beside the routed Gate/Up) replays 1000 times with the
+    bits of the eager call, which is graded (four waves with tile (16, 64, 128) there: 14-20 of 1000 replays wrong).
+
+    The basic tests and the benchmark run the GEMMs at a few token counts, eagerly or graded within the tolerance on
+    one replay; an intermittent block error passes them.
+    """
+    import types
+
+    from aiter.ops.flydsl import gemm_kernels
+
+    seen = set()
+
+    def stub(xq, wq, x_scale, w_scale, out, tile_m, tile_n, tile_k):
+        seen.add((xq.shape[1], tile_m, tile_n, tile_k))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gemm_kernels, "flydsl_preshuffle_gemm_a8", stub)
+        for n, k in ((1152, 5120), (640, 5120), (5120, 640), (5120, 384)):
+            wq = types.SimpleNamespace(shape=(n, k))
+            for m in range(1, 65537):
+                xq = types.SimpleNamespace(shape=(m, k))
+                moe_a8w4._shared_gemm(xq, wq, None, None, None)
+    assert all(k % tile_k == 0 for k, _, _, tile_k in seen), seen
+
+    experts, topk, inter = LAYER_SHAPES["mtp_layer_tp8"]
+    w, shared, prepared = _layer_weights(experts, inter, 700)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        32, LAYER_HIDDEN, experts, topk, seed=895, shared_weight=None
+    )
+    out = torch.empty_like(x)
+    run = functools.partial(
+        flydsl_moe_a8w4_ptpc,
+        x,
+        prepared,
+        topk_weight,
+        topk_ids,
+        output=out,
+        swiglu_limit=LAYER_SWIGLU_LIMIT,
+    )
+    run()
+    torch.cuda.synchronize()
+    _assert_folded("dedup")
+    want = out.clone()
+    assert_close(
+        want,
+        reference_layer(
+            x, w, shared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+        ),
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    wrong = 0
+    for _ in range(1000):
+        out.fill_(float("nan"))
+        graph.replay()
+        wrong += int(not torch.equal(_bits(out), _bits(want)))
+    assert wrong == 0, f"{wrong} of 1000 replays differ from the eager call"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["decode_pq_ds_tp8_m6", "stream_atomic_mtp_tp8_m64", "stream_sum_mtp_tp4_m128"],
+)
+def test_layer_fold_unaligned_output(case):
+    """An output 8 bytes past a 16-byte boundary (a view into a larger buffer): where the folded shared expert would
+    write the output with its Down GEMM's 16-byte stores (the slot-pair decode, the streaming atomic Down) the call
+    takes ATOM's split (final add); with route_sum the shared expert writes the routes buffer, the output is aligned
+    or not. Graded against reference_layer; the buffer before the view stays untouched.
+
+    The basic tests and the benchmark pass outputs from torch.empty, always aligned.
+    """
+    shape, tokens, options, tier, _ = _FOLD_CASES[case]
+    w, shared, prepared, topk, hidden = _fold_weights(shape)
+    x, topk_weight, topk_ids = make_layer_inputs(
+        tokens, hidden, prepared.experts, topk, seed=900, shared_weight=None
+    )
+    buf = torch.full(
+        (tokens * hidden + 4,), float("nan"), dtype=torch.bfloat16, device=x.device
+    )
+    out = buf[4:].view(tokens, hidden)
+    assert out.data_ptr() % 16 == 8
+    result = flydsl_moe_a8w4_ptpc(
+        x, prepared, topk_weight, topk_ids, output=out, swiglu_limit=LAYER_SWIGLU_LIMIT
+    )
+    assert result is out
+    path = moe_a8w4.last_path
+    assert _path_tier(path) == tier, path
+    _assert_shared()
+    if not case.startswith("stream_sum"):
+        assert path[-1] == "shared_add", path
+    assert_close(
+        out,
+        reference_layer(
+            x, w, shared, topk_weight, topk_ids, swiglu_limit=LAYER_SWIGLU_LIMIT
+        ),
+    )
+    assert bool(buf[:4].isnan().all())
+
+
+def test_layer_fold_compile_cache_keys(monkeypatch):
+    """The fold's launcher caches: ``_shared_mid_kernel`` is keyed by the device, the routing columns, E, the SwiGLU
+    limit and whether it writes loc_ids; the routed launchers' fold variants (routing tensors of topk + 1 columns, the
+    slot-pair Down adding the output it finds, the prep never sorting the last column, the prefill Down's loc_ids of
+    topk + 1 columns) are cached apart from the plain ones; and a call passes its inputs' device and whether it writes
+    loc_ids (the small shape's pre-quantized decode M 6: no; its Opus prefill M 2048: yes). Building a launcher does not
+    trace it, so the other device need not exist.
+
+    The basic tests and the benchmark run one GPU, and a cache keyed by shape alone could hand a call with the shared
+    expert the launcher of one without (or the reverse) only on a shape that both run.
+    """
+    mid = (576, 640, 7, 384, LAYER_SWIGLU_LIMIT)
+    first = moe_a8w4._shared_mid_kernel(*mid, False, 0)
+    assert moe_a8w4._shared_mid_kernel(*mid, False, 0) is first
+    for args in (
+        (*mid, True, 0),
+        (*mid, False, 1),
+        (576, 640, 4, 128, LAYER_SWIGLU_LIMIT, False, 0),
+        (576, 640, 7, 384, 0.0, False, 0),
+    ):
+        assert moe_a8w4._shared_mid_kernel(*args) is not first, args
+    variants = (
+        (
+            "_decode_kernels",
+            (1152, 5120, 576, 6, True, True, 10.0, 3, 0),
+            "shared",
+            True,
+        ),
+        ("_gateup_dd_kernel", (1152, 5120, 6, 2, 4, 10.0, 0), "shared", True),
+        ("_row_quant_plan", (5120, 6, 2, 32, False, 0), "shared", True),
+        ("_down_pq_kernel", (5120, 576, 6, 3, 0), "shared", True),
+        ("_stream_prep_kernel", (5120, 7, 128, 16, False, 4, 0), "shared", True),
+        (
+            "_down_kernel",
+            (5120, 576, 3, 64, 128, 1, True, 0, 0, moe_a8w4._trace_constants()),
+            "loc_topk",
+            4,
+        ),
+    )
+    for name, args, key, value in variants:
+        build = getattr(moe_a8w4, name)
+        assert build(*args, **{key: value}) is build(*args, **{key: value}), name
+        assert build(*args, **{key: value}) is not build(*args), name
+    built = []
+    original = moe_a8w4._shared_mid_kernel
+
+    def spy(*args, **kwargs):
+        built.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(moe_a8w4, "_shared_mid_kernel", spy)
+    w, shared, prepared = _fold_small_weights()
+    for tokens, options in ((6, {}), (2048, {"block_m": 64})):
+        x, topk_weight, topk_ids = make_layer_inputs(
+            tokens, 512, 8, 2, seed=905, shared_weight=None
+        )
+        out = flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids, **options)
+        assert_close(out, reference_layer(x, w, shared, topk_weight, topk_ids))
+    device = x.device.index
+    assert [(args[-2], args[-1]) for args in built] == [
+        (False, device),
+        (True, device),
+    ], built
 
 
 # =================================================================================================

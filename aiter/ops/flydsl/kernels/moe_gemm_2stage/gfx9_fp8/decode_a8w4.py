@@ -135,6 +135,12 @@ def _abs_max(values):
     return amax
 
 
+def _plus_shared(value, shared):
+    """``value`` plus the BF16 ``shared`` in f32, or ``value`` for None (no shared expert; trace-time choice outside the
+    AST rewriting of a kernel's dynamic branches)."""
+    return value if shared is None else value + shared.to(fx.Float32)
+
+
 def _tree_sum(values):
     """Pairwise sum ``((v0 + v1) + (v2 + v3)) + ...`` (trace-time recursion)."""
     if len(values) == 1:
@@ -252,14 +258,16 @@ def _wave_index(tid):
 
 
 def compile_a8w4_gateup_decode(
-    *, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_LIMIT=0.0
+    *, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_LIMIT=0.0, ID_COLS=None
 ):
     """Launcher ``(x, x_scale, topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``.
 
     ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``).
     x BF16 [M, K] quantized per row inside the kernel (``x_scale`` unused), or with ``PREQUANT``
     FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK] (-1: a masked route, its out row 0, no weight
-    read); w / w_delta in the ``common_a8w4`` layout; w_scale f32 [E, N]; out f32 [M, TOPK, I].
+    read; [M, ID_COLS] with ``ID_COLS`` > TOPK, the columns past TOPK unread: a fused shared expert's, see
+    ``common_a8w4.id_index``); w / w_delta in the ``common_a8w4`` layout; w_scale f32 [E, N]; out f32
+    [M, TOPK, I].
     ``PLAN = (GROUP, MAX_M, ZERO_COLS)``: the workgroups of channel block 0 also write the expert-dedup plan entry of
     their route (``decode_dedup_a8w4``, plan int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its
     share of its token's row of y BF16 [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without
@@ -267,6 +275,8 @@ def compile_a8w4_gateup_decode(
     ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
     """
     I = N // 2
+    ID_COLS = TOPK if ID_COLS is None else ID_COLS
+    assert ID_COLS >= TOPK and (PLAN is None or ID_COLS == TOPK)
     assert I % 16 == 0 and K % 512 == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
     KB = K // 64
     KQ = a8w4.delta_dwords(K)
@@ -324,7 +334,9 @@ def compile_a8w4_gateup_decode(
         lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
         _lut_table_init(lut_base, tid)
 
-        expert = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))[route]
+        expert = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))[
+            a8w4.id_index(route, TOPK, ID_COLS)
+        ]
         rb = (wave & 1) * NJ + j
         kb0 = (wave >> 1) * KB_HALF
         # 16-byte loads of block pairs (see "Block pairs" in the module docstring): lane l holds rows
@@ -725,15 +737,21 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
     return launch
 
 
-def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
+def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None, SHARED=False, ID_COLS=None):
     """Launcher ``(mid, mid_scale, topk_ids, topk_weight, w, w_delta, w_scale, out, M, stream)``.
 
     Down of ``compile_a8w4_down_decode`` for pre-quantized rows (mid FP8 [M, TOPK, K], mid_scale
     f32 [M, TOPK]) with 16-byte loads of slot pairs (see "Slot pairs" in the module docstring).
     ``WAVES`` waves per workgroup (default one per slot pair), pairs in rounds. Every expert's w2 bytes plus one
-    expert's must fit in 2**32 (32-bit offsets, the range check ending below expert -1's).
+    expert's must fit in 2**32 (32-bit offsets, the range check ending below expert -1's). With ``SHARED`` ``out``
+    holds BF16 values on entry (a fused shared expert's output, ``moe_a8w4._SharedFold``) and each output element is
+    the f32 sum of the routes plus that value, rounded to BF16 once (each workgroup reads its 16 elements with its
+    first loads). topk_ids / topk_weight have ``ID_COLS`` (default TOPK) columns per token, those past TOPK unread
+    (``common_a8w4.id_index``).
     """
     assert N % 16 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
+    ID_COLS = TOPK if ID_COLS is None else ID_COLS
+    assert ID_COLS >= TOPK
     KB = K // 64
     KQ = a8w4.delta_dwords(K)
     NB = N // 16
@@ -796,10 +814,10 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
         # Raw readfirstlane (no typed wave-uniform broadcast in FlyDSL 0.5.3, see _wave_index): the expert ids
         # stay scalar for the per-expert channel-factor offsets.
         experts = [
-            fx.Int32(rocdl.readfirstlane(T.i32, _raw(ids[token * TOPK + slots[q]])))
+            fx.Int32(rocdl.readfirstlane(T.i32, _raw(ids[token * ID_COLS + slots[q]])))
             for q in range_constexpr(2 * ROUNDS)
         ]
-        weights = [tws[token * TOPK + slots[q]] for q in range_constexpr(2 * ROUNDS)]
+        weights = [tws[token * ID_COLS + slots[q]] for q in range_constexpr(2 * ROUNDS)]
         # Intermediate rows do not depend on the expert ids: issue them first.
         pieces, row_scale = [], []
         for r in range_constexpr(ROUNDS):
@@ -858,6 +876,14 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
                 chan_scale.append(
                     [fx.Uint32(ws[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
                 )
+        shared_value = None
+        if const_expr(SHARED):
+            # The shared expert's value of this thread's output channel (threads from 16 on load a duplicate).
+            shared_row = fx.make_view(
+                fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
+                fx.make_layout(N, 1),
+            )
+            shared_value = shared_row[j * 16 + tid % 16]
         rocdl.sched_barrier(0)
 
         for r in range_constexpr(ROUNDS):
@@ -927,7 +953,7 @@ def compile_a8w4_down_decode_pq(*, N, K, TOPK, WAVES=None):
                 + _lds_load(part_base, (w * 32 + col + 8) * 4, fx.Float32, 1, 4)[0]
                 for w in range_constexpr(WAVES)
             ]
-            y = _tree_sum(parts)
+            y = _plus_shared(_tree_sum(parts), shared_value)
             out = fx.make_view(
                 fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
                 fx.make_layout(N, 1),

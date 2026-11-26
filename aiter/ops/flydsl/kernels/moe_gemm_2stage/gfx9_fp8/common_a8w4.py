@@ -171,6 +171,15 @@ def swiglu_kernel_name(base, limit):
     return f"{base}_swiglu" if limit > 0 else None
 
 
+def id_index(route, topk, id_cols):
+    """Element of route ``route`` (= token * topk + slot) in routing tensors of ``id_cols`` columns per token
+    (``id_cols`` > topk: a fused shared expert's column follows the topk routed ones, ``moe_a8w4._SharedFold``, and
+    the decode kernels leave it unread); trace-time identity for ``id_cols == topk``."""
+    if id_cols == topk:
+        return route
+    return (route // topk) * id_cols + route % topk
+
+
 def lane_offsets(tid, K):
     """Loop-invariant per-lane byte offsets ``(weight, delta)`` of a wave's 16-row block.
 

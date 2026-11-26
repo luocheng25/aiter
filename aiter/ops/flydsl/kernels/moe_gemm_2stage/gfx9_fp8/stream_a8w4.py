@@ -962,7 +962,7 @@ def _lds_inc(address):
     )
 
 
-def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
+def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
     """Build the streaming path's prep launcher: the moe_sorting of ``BM``-row blocks and the FP8 input rows (with
     ``ZERO`` also a zeroed output) in one launch.
 
@@ -981,7 +981,8 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
     repeated expert ids included. Quantization (the other workgroups), the arithmetic of ``quant_a8w4``: with
     ``QW == 4`` one row per workgroup, the four waves splitting its 512-column chunks and exchanging the amax
     through LDS (``_fp8_bytes``); with ``QW == 1`` one row per wave (IEEE division per element; fewer workgroups
-    for many rows). With ``ZERO`` the waves also zero their rows of out.
+    for many rows). With ``ZERO`` the waves also zero their rows of out. With ``SHARED`` the last of the TOPK columns
+    is a fused shared expert's (``moe_a8w4._SharedFold``): it is never sorted, whatever its id, and its loc_ids is -1.
     """
     assert H % 512 == 0, f"H={H} must be a multiple of 512"
     assert BM & (BM - 1) == 0, f"BM={BM} must be a power of two"
@@ -1005,6 +1006,8 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
                 i = i0 + v
                 e = fx.Int32(w4[v])
                 ok = (i < R) & (e >= 0) & (e < E)
+                if const_expr(SHARED):
+                    ok = ok & (i % TOPK != TOPK - 1)
                 _lds_inc(lds + ok.select(CNT + e, CNT + ES + lane) * 4)
                 _lds_inc(lds + (ok & (i < start)).select(BEF + e, BEF + ES + lane) * 4)
 
@@ -1038,6 +1041,8 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4):
         i = start + tid
         e = fx.Int32(ids)
         ok = (i < R) & (e >= 0) & (e < E)
+        if const_expr(SHARED):
+            ok = ok & (i % TOPK != TOPK - 1)
         pos = _lds_inc(lds + ok.select(CUR + e, CUR + ES + lane) * 4)
         token = i // TOPK
         row = ok.select(pos * 4, fx.Int32(_DROP))

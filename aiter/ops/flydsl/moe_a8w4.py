@@ -40,9 +40,14 @@ the E385 / topk-7 convention of ATOM and aiter's FHMoE): routing tensors then ha
 holds E. Up to ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels, the
 shared expert runs as one more route of the same two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8
 weights feed the MFMA directly, ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other
-columns and the shared expert runs ATOM's split (aiter's per-token FP8 quantization, ``gemm_a8w8_bpreshuffle``,
-``silu_and_mul`` and ``gemm_a8w8_bpreshuffle`` again, ``_shared_split``), on a side stream up to
-``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
+columns (the tier decided on them alone). Where the routed path allows it (``_shared_fold_tier``: the slot-pair decode
+Down, streaming, prefill from ``SHARED_FOLD_PREFILL_MIN_M``) the shared expert is folded into the routed path's last
+reduction (``_SharedFold``): two FlyDSL FP8 GEMMs (aiter's preshuffle GEMM, ``_shared_gemm``) on the routed path's FP8
+input with ``gfx9_fp8/shared_a8w4.py`` between them, on a side stream up to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens,
+write its weighted output where ``a8w4_route_sum`` / ``sorted_sum`` add it as one more route, or into the output that
+the routed Down then adds onto. Elsewhere it runs ATOM's split (aiter's per-token FP8 quantization,
+``gemm_a8w8_bpreshuffle``, ``silu_and_mul`` and ``gemm_a8w8_bpreshuffle`` again, ``_shared_split``), on a side stream up
+to ``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
 """
 
 import functools
@@ -62,6 +67,7 @@ from .kernels.moe_gemm_2stage.gfx9_fp8 import (
     decode_a8w4,
     decode_dedup_a8w4,
     gemm2_a8w4,
+    shared_a8w4,
     stream_a8w4,
 )
 from .kernels.moe_gemm_2stage.gfx9_fp8.common import _TORCH_TO_FX
@@ -206,12 +212,38 @@ DOWN_TWO_PASS_MIN_WGS = 80
 # the routed experts (ATOM's dual-stream MoE, ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1024); more tokens run it on the
 # current stream before the routed experts.
 SHARED_DUAL_STREAM_MAX_M = 1024
+# The same for the folded shared expert (``_SharedFold``; ATOM's threshold too). Under graph replay the side stream's
+# kernels run beside the routed ones only where these leave the CUs room, and a fork / join costs about 8 us: measured
+# in one process at the DeepSeek-V4.1 layers (PTL on) against the chain on the current stream, M4-1024 0.97-1.03x the
+# time, prefill M2048 / 4096 1.00-1.02x.
+SHARED_FOLD_DUAL_STREAM_MAX_M = 1024
+# With the side stream: 1 issues its chain right after the routed path's next kernel (the Gate/Up) instead of before
+# it (0), with the same dependencies (it still waits for the kernel that quantizes the input only), so that the
+# routed Gate/Up does not start behind the fork under graph replay (measured in one process at the DeepSeek-V4.1
+# layers, PTL on: decode M4-32 0.89-0.98x the time, streaming M64 / 256 0.97-1.00x; MTP TP8 M4, where the chain is
+# longer than the routed Gate/Up, 1.06x).
+SHARED_FOLD_FORK_AFTER = 1
+# Decode tier without the deduplicated Gate/Up (few tokens) with a folded shared expert: 0 quantizes x once on the
+# current stream for the pre-quantized routed Gate/Up and the shared chain; 1 leaves the routed Gate/Up quantizing
+# its own rows and the shared chain quantizes x first (measured at the DeepSeek-V4.1 layers' M4: 1.01-1.03x the time).
+SHARED_FOLD_DECODE_SIDE_QUANT = 0
+# Whether a call with a shared expert folds it into the routed experts' last reduction where the routed path allows it
+# (``_shared_fold_tier``; 0: ATOM's split at every token count, for diagnostics): its dense chain takes the routed
+# path's FP8 input and writes its output, routing weight applied, where that reduction adds it (rows of the routes
+# buffer that a8w4_route_sum / sorted_sum sum as one more column, or the output itself, onto which the slot-pair decode
+# Down or the streaming Down's atomics add the routes), so the split's input quantization, final add and copies of
+# the routed columns go away (the decode kernels read the routing tensors with the shared expert's column as they are).
+SHARED_FOLD = 1
+# The prefill tier folds the shared expert from this many tokens on (where the DeepSeek-V4.1 layers' prefill tier
+# starts); fewer tokens in the prefill tier (few experts, tile options) keep ATOM's split.
+SHARED_FOLD_PREFILL_MIN_M = 2048
 # Token counts up to this run the shared expert as one more route of the per-route decode kernels (``decode_a8w4``'s
 # mixed Gate/Up and Down: its FP8 weights feed the MFMA directly; two launches, no side stream, no final add) when the
-# routed experts take the per-route decode path (``_mixed_decode``); more tokens run the split. Measured at M 4 on the
-# DeepSeek-V4.1 main TP4 / TP8 and MTP TP4 / TP8 layers (CUDA graph, PTL on): 0.94 / 0.77 / 0.64 / 0.50x the time of
-# ATOM's split, although its Down (one wave per routing column of a token) takes 1.2-1.7x the routed experts'
-# slot-pair Down there; from M 8 on, H 5120 deduplicates the routed Gate/Up (DECODE_WIDE_DEDUP_MIN_M).
+# routed experts take the per-route decode path (``_mixed_decode``); more tokens run the fold or the split. Measured at
+# M 4 on the DeepSeek-V4.1 main TP4 / TP8 and MTP TP4 / TP8 layers (CUDA graph, PTL on, same-GPU ABBA):
+# 0.96 / 0.77 / 0.64 / 0.48x the time of ATOM's split, although its Down (one wave per routing column of a token) takes
+# 1.2-1.7x the routed experts' slot-pair Down there; from M 8 on, H 5120 deduplicates the routed Gate/Up
+# (DECODE_WIDE_DEDUP_MIN_M).
 DECODE_SHARED_MIXED_MAX_M = 4
 # Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): routed
 # ids in [0, E) or -1 (masked), no id repeated within a token apart from -1 and, with a shared expert, its id E in the
@@ -706,9 +738,21 @@ def _gateup_kernel(
 
 @functools.cache
 def _down_kernel(
-    N, K, topk, block_m, experts, nsplit, two_pass, xcd_chunk, device, constants
+    N,
+    K,
+    topk,
+    block_m,
+    experts,
+    nsplit,
+    two_pass,
+    xcd_chunk,
+    device,
+    constants,
+    *,
+    loc_topk=None,
 ):
-    """Prefill Down launcher. ``device`` and ``constants`` (``_trace_constants()``) only key the cache."""
+    """Prefill Down launcher. ``device`` and ``constants`` (``_trace_constants()``) only key the cache; ``loc_topk``:
+    the columns of loc_ids (default topk; one more with a folded shared expert)."""
     return gemm2_a8w4.compile_a8w4_gemm2(
         N=N,
         K=K,
@@ -718,6 +762,7 @@ def _down_kernel(
         NSPLIT=nsplit,
         TWO_PASS=two_pass,
         XCD_CHUNK=xcd_chunk,
+        LOC_TOPK=loc_topk,
     )
 
 
@@ -727,10 +772,12 @@ def _row_quant_kernel(cols, dtype, fill, device):
     return compile_row_quant_fp8(cols, dtype, fill)
 
 
-def _prefill_down(tokens, topk, experts, hidden, inter, block_m, device):
-    """Prefill Down kernel of a call: ``_down_split``, DOWN_TWO_PASS_MIN_WGS, DOWN_XCD_CHUNK_H5120."""
+def _prefill_down(tokens, topk, experts, hidden, inter, block_m, device, loc_topk=None):
+    """Prefill Down kernel of a call: ``_down_split``, DOWN_TWO_PASS_MIN_WGS, DOWN_XCD_CHUNK_H5120 (``loc_topk``: the
+    columns of loc_ids when a folded shared expert adds one)."""
     nsplit = _down_split(tokens, topk, experts, hidden, inter, block_m)
     blocks = min(tokens * topk, experts * -(-tokens * topk // (experts * block_m)))
+    extra = {} if loc_topk is None else {"loc_topk": loc_topk}
     return _down_kernel(
         hidden,
         inter,
@@ -742,6 +789,7 @@ def _prefill_down(tokens, topk, experts, hidden, inter, block_m, device):
         _xcd_chunk(DOWN_XCD_CHUNK_H5120, hidden, tokens * topk),
         device,
         _trace_constants(),
+        **extra,
     )
 
 
@@ -786,18 +834,24 @@ def _decode_fits(H, I, topk, paired):
 
 
 @functools.cache
-def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, waves, device):
+def _decode_kernels(
+    N1, H, I, topk, gateup_pq, down_pq, limit, waves, device, *, shared=False
+):
     """Decode Gate/Up and Down launchers. ``waves`` (``_decode_waves(topk, down_pq)``, it reads
-    DECODE_DOWN_PQ_WAVES) and ``device`` (a compiled handle runs on one GPU) key the cache.
+    DECODE_DOWN_PQ_WAVES) and ``device`` (a compiled handle runs on one GPU) key the cache; with ``shared`` both
+    read routing tensors of topk + 1 columns (the folded shared expert's last, unread) and the slot-pair Down adds the
+    shared expert's output it finds in ``out`` (``_SharedFold``).
     """
+    extra = {"ID_COLS": topk + 1} if shared else {}
     gateup = decode_a8w4.compile_a8w4_gateup_decode(
-        N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, SWIGLU_LIMIT=limit
+        N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, SWIGLU_LIMIT=limit, **extra
     )
     if down_pq:
         # More tokens: 16-byte loads of slot pairs.
         return gateup, decode_a8w4.compile_a8w4_down_decode_pq(
-            N=H, K=I, TOPK=topk, WAVES=waves
+            N=H, K=I, TOPK=topk, WAVES=waves, SHARED=shared, **extra
         )
+    assert not shared
     return gateup, decode_a8w4.compile_a8w4_down_decode(
         N=H, K=I, TOPK=topk, WAVES=waves
     )
@@ -831,28 +885,47 @@ def _gateup_plan_kernel(N1, H, topk, gateup_pq, group, limit, max_m, device):
 
 
 @functools.cache
-def _gateup_dd_kernel(N1, H, topk, group, waves, limit, device):
-    """Deduplicated decode Gate/Up launcher. ``device`` only keys the cache."""
+def _gateup_dd_kernel(N1, H, topk, group, waves, limit, device, *, shared=False):
+    """Deduplicated decode Gate/Up launcher. ``device`` only keys the cache; ``shared`` as in ``_decode_kernels``."""
     return decode_dedup_a8w4.compile_a8w4_gateup_decode_dd(
-        N=N1, K=H, TOPK=topk, GROUP=group, WAVES=waves, SWIGLU_LIMIT=limit
+        N=N1,
+        K=H,
+        TOPK=topk,
+        GROUP=group,
+        WAVES=waves,
+        SWIGLU_LIMIT=limit,
+        **({"ID_COLS": topk + 1} if shared else {}),
     )
 
 
 @functools.cache
-def _row_quant_plan(cols, topk, group, max_m, zero, device):
+def _row_quant_plan(cols, topk, group, max_m, zero, device, *, shared=False):
     """Row quantization of x that also writes the dedup plan (and with ``zero`` zeroes the output). ``device`` only
-    keys the cache."""
+    keys the cache; ``shared`` as in ``_decode_kernels``."""
     return decode_dedup_a8w4.compile_a8w4_row_quant_plan(
-        COLS=cols, TOPK=topk, MAX_M=max_m, GROUP=group, ZERO_COLS=cols if zero else 0
+        COLS=cols,
+        TOPK=topk,
+        MAX_M=max_m,
+        GROUP=group,
+        ZERO_COLS=cols if zero else 0,
+        **({"ID_COLS": topk + 1} if shared else {}),
     )
 
 
 @functools.cache
-def _down_pq_kernel(H, I, topk, waves, device):
+def _down_pq_kernel(H, I, topk, waves, device, *, shared=False):
     """Slot-pair decode Down of the deduplicated Gate/Up of the DECODE_WIDE_HIDDEN sizes. ``waves``
-    (``_decode_waves(topk, True)``, it reads DECODE_DOWN_PQ_WAVES) and ``device`` key the cache.
+    (``_decode_waves(topk, True)``, it reads DECODE_DOWN_PQ_WAVES) and ``device`` key the cache; ``shared`` as in
+    ``_decode_kernels``.
     """
-    return decode_a8w4.compile_a8w4_down_decode_pq(N=H, K=I, TOPK=topk, WAVES=waves)
+    return decode_a8w4.compile_a8w4_down_decode_pq(
+        N=H,
+        K=I,
+        TOPK=topk,
+        WAVES=waves,
+        SHARED=shared,
+        **({"ID_COLS": topk + 1} if shared else {}),
+    )
 
 
 @functools.cache
@@ -990,15 +1063,18 @@ def _fused_moe_decode_dd(
 
 
 def _fused_moe_decode_wide_dd(
-    hidden_states, weight, topk_weight, topk_ids, output, limit
+    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
 ):
     """Decode of the DECODE_WIDE_HIDDEN sizes from DECODE_WIDE_DEDUP_MIN_M tokens: one kernel quantizes x and writes
     the plan, Gate/Up is deduplicated by expert (``decode_dedup_a8w4``), the row kernel quantizes the intermediate and
-    the slot-pair Down sums each token's routes (padded I not a multiple of 128: no dedup Down).
+    the slot-pair Down sums each token's routes (padded I not a multiple of 128: no dedup Down). A folded shared
+    expert (``shared``, ``_SharedFold``) starts on the plan kernel's FP8 input, writes ``output`` and the Down adds the
+    routes onto it; the kernels read the routing tensors with its column (the last) as they are.
     """
     M, H = hidden_states.shape
-    topk = topk_ids.shape[1]
+    topk = topk_ids.shape[1] - (shared is not None)
     I = weight.inter_padded
+    on = {} if shared is None else {"shared": True}
     group = 2 if M <= DECODE_DEDUP_PAIR_MAX_M else DECODE_DEDUP_GROUP
     device = hidden_states.device
     plan = torch.empty((M * topk, 4), dtype=torch.int32, device=device)
@@ -1014,6 +1090,7 @@ def _fused_moe_decode_wide_dd(
             DECODE_MAX_M if M <= DECODE_MAX_M else DECODE_DEDUP_MAX_M,
             False,
             device.index,
+            **on,
         ),
         hidden_states,
         xq,
@@ -1023,10 +1100,12 @@ def _fused_moe_decode_wide_dd(
         output,
         M,
     )
+    if shared is not None:
+        shared.start(xq, xs, output)
     _launch(
         "a8w4_gateup_decode_dd",
         _gateup_dd_kernel(
-            2 * I, H, topk, group, DECODE_WIDE_DEDUP_WAVES, limit, device.index
+            2 * I, H, topk, group, DECODE_WIDE_DEDUP_WAVES, limit, device.index, **on
         ),
         xq,
         xs,
@@ -1038,10 +1117,14 @@ def _fused_moe_decode_wide_dd(
         mid,
         M,
     )
+    if shared is not None:
+        shared.fork()
     mq, ms = _quantize_decode(mid, M * topk, I, False)
+    if shared is not None:
+        shared.join()
     _launch(
-        "a8w4_down_decode_pq",
-        _down_pq_kernel(H, I, topk, _decode_waves(topk, True), device.index),
+        "a8w4_down_decode_pq" + ("" if shared is None else "_shared"),
+        _down_pq_kernel(H, I, topk, _decode_waves(topk, True), device.index, **on),
         mq,
         ms,
         topk_ids,
@@ -1063,29 +1146,40 @@ def _slot_pair_offsets_fit(weight):
     return w2_bytes + layout.weight_bytes(weight.hidden, weight.inter_padded) <= 2**32
 
 
-def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limit):
+def _fused_moe_decode(
+    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
+):
     """The decode path: Gate/Up per route into the f32 intermediate, Down per token summing its routes into
     ``output`` (or the expert-deduplicated variants); ``topk_ids`` / ``topk_weight`` are contiguous int32 /
-    float32."""
+    float32. A folded shared expert (``shared``, ``_SharedFold``; only where ``_decode_slot_pair_down`` holds) keeps
+    its column in them, the last, which the decode kernels skip; its chain takes the FP8 input of the routed Gate/Up
+    (from the plan kernel of the deduplicated Gate/Up, else from the row kernel, the per-route Gate/Up then
+    pre-quantized at any M) or, with SHARED_FOLD_DECODE_SIDE_QUANT, quantizes x itself first, writes ``output`` and the
+    slot-pair Down adds the routes onto it."""
     M, H = hidden_states.shape
-    topk = topk_ids.shape[1]
+    topk = topk_ids.shape[1] - (shared is not None)
     I = weight.inter_padded
     down_cb = _down_dd_blocks(H, I)
     if M >= DECODE_DEDUP_MIN_M and H >= DECODE_DEDUP_MIN_H and down_cb:
+        assert shared is None
         return _fused_moe_decode_dd(
             hidden_states, weight, topk_weight, topk_ids, output, down_cb, limit
         )
-    if (
+    wide = (
         H in DECODE_WIDE_HIDDEN
         and M >= DECODE_WIDE_DEDUP_MIN_M
         and _slot_pair_offsets_fit(weight)
         and _decode_fits(H, I, topk, True)
-    ):
+    )
+    if wide:
         return _fused_moe_decode_wide_dd(
-            hidden_states, weight, topk_weight, topk_ids, output, limit
+            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
         )
-    # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
-    gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
+    # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once (a folded shared
+    # expert's chain takes those rows, unless it quantizes x itself).
+    gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS or (
+        shared is not None and not SHARED_FOLD_DECODE_SIDE_QUANT
+    )
     # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets; larger weights or
     # shapes the slot-pair kernel does not support take the single-slot Down.
     down_pq = (
@@ -1093,6 +1187,7 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
         and _slot_pair_offsets_fit(weight)
         and _decode_fits(H, I, topk, True)
     )
+    assert shared is None or down_pq
     gateup, down = _decode_kernels(
         2 * I,
         H,
@@ -1103,12 +1198,22 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
         limit,
         _decode_waves(topk, down_pq),
         hidden_states.device.index,
+        **({} if shared is None else {"shared": True}),
     )
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
     if gateup_pq:
         xq, xs = _quantize_decode(hidden_states, M, H, True)
     else:
         xq, xs = hidden_states, topk_weight
+    if shared is not None:
+        # The per-route Gate/Up without pre-quantized rows reads x: an output in place waits for it before the
+        # shared expert writes there.
+        shared.start(
+            xq if gateup_pq else None,
+            xs if gateup_pq else None,
+            output,
+            hold=not gateup_pq and _overlaps(output, hidden_states),
+        )
     _launch(
         "a8w4_gateup_decode" + ("_pq" if gateup_pq else ""),
         gateup,
@@ -1123,12 +1228,18 @@ def _fused_moe_decode(hidden_states, weight, topk_weight, topk_ids, output, limi
         mid,
         M,
     )
+    if shared is not None:
+        shared.release()
     if down_pq:
         mq, ms = _quantize_decode(mid, M * topk, I, False)
     else:
         mq, ms = mid, topk_weight
+    if shared is not None:
+        shared.join()
     _launch(
-        "a8w4_down_decode" + ("_pq" if down_pq else ""),
+        "a8w4_down_decode"
+        + ("_pq" if down_pq else "")
+        + ("" if shared is None else "_shared"),
         down,
         mq,
         ms,
@@ -1275,23 +1386,39 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants
 
 
 @functools.cache
-def _stream_prep_kernel(hidden, topk, experts, block_m, zero, qw, device):
-    """Streaming prep launcher (``compile_stream_prep``). ``device`` only keys the cache."""
+def _stream_prep_kernel(
+    hidden, topk, experts, block_m, zero, qw, device, *, shared=False
+):
+    """Streaming prep launcher (``compile_stream_prep``). ``device`` only keys the cache; ``shared``: the last of the
+    ``topk`` columns is a folded shared expert's, never sorted."""
     return stream_a8w4.compile_stream_prep(
-        H=hidden, TOPK=topk, E=experts, BM=block_m, ZERO=zero, QW=qw
+        H=hidden, TOPK=topk, E=experts, BM=block_m, ZERO=zero, QW=qw, SHARED=shared
     )
 
 
 def _stream_prep(
-    hidden_states, topk_weight, topk_ids, experts, block_m, output, zero=True
+    hidden_states,
+    topk_weight,
+    topk_ids,
+    experts,
+    block_m,
+    output,
+    zero=True,
+    routed=None,
 ):
     """Sorting and input quantization of the streaming path in one launch (``compile_stream_prep``); with
     ``zero`` the same launch zeroes ``output`` for the atomic Down. ``topk_ids`` / ``topk_weight`` are the
-    contiguous int32 / float32 routing of the entry point."""
+    contiguous int32 / float32 routing of the entry point; with ``routed`` = topk - 1 the last column is a folded
+    shared expert's (``_SharedFold``): the prep never sorts it (its loc_ids -1) and sizes the sorted rows and blocks
+    for the routed columns."""
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     device = hidden_states.device
+    shared = routed is not None and routed < topk
     n_sort, rows, blocks = stream_a8w4.stream_prep_sizes(M, topk, experts, block_m)
+    if shared:
+        assert routed == topk - 1
+        _, rows, blocks = stream_a8w4.stream_prep_sizes(M, routed, experts, block_m)
     sorted_ids = torch.empty((rows,), dtype=torch.int32, device=device)
     sorted_weights = torch.empty((rows,), dtype=torch.float32, device=device)
     sorted_experts = torch.empty((blocks,), dtype=torch.int32, device=device)
@@ -1304,7 +1431,16 @@ def _stream_prep(
     qw = 4 if H % 2048 == 0 or M <= 256 else 1
     _launch(
         "a8w4_stream_prep",
-        _stream_prep_kernel(H, topk, experts, block_m, zero, qw, device.index),
+        _stream_prep_kernel(
+            H,
+            topk,
+            experts,
+            block_m,
+            zero,
+            qw,
+            device.index,
+            **({"shared": True} if shared else {}),
+        ),
         topk_ids,
         topk_weight,
         hidden_states,
@@ -1450,23 +1586,48 @@ def _launch(name, kernel, *args):
     last_path.append(name)
 
 
-def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limit):
+def _fused_moe_stream(
+    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
+):
     """Streaming path (``stream_a8w4``): the prep sorts the routes into blocks of ``_stream_block_m`` rows,
     quantizes the input and, for the atomic Down, zeroes ``output``; the streaming Gate/Up writes SiLU(gate) * up
     (quantized to FP8 in its epilogue when ``_stream_fused_quant``, else by the row kernel); the Down either adds
     every route into ``output`` with BF16x2 atomics (``_stream_atomic``) or writes the routes by sorted row for
     ``a8w4_route_sum`` (blocks of 64 from hidden 4096 on: the prefill Down, ``STREAM_PREFILL_DOWN``).
+
+    With a folded shared expert (``shared``, ``_SharedFold``) the routing tensors keep its column (the last; the prep
+    reads them as they are and drops it), its chain starts on the prep's FP8 input and writes either M more rows of
+    the routes buffer, which route_sum adds as one more column of loc_ids, or (atomic Down) the whole output, which the
+    prep then leaves alone and the Down adds the routes onto.
     """
     M, H = hidden_states.shape
-    topk = topk_ids.shape[1]
+    cols = topk_ids.shape[1]
+    topk = cols - (shared is not None)
     E, I = weight.experts, weight.inter_padded
     block_m = _stream_block_m(M, topk, E, H)
     device = hidden_states.device
     atomic = _stream_atomic(H, I, block_m)
     sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
-        _stream_prep(hidden_states, topk_weight, topk_ids, E, block_m, output, atomic)
+        _stream_prep(
+            hidden_states,
+            topk_weight,
+            topk_ids,
+            E,
+            block_m,
+            output,
+            atomic and shared is None,
+            routed=topk,
+        )
     )
     task_num = sorted_experts.numel()
+    rows = task_num * block_m
+    routes = None
+    if shared is not None:
+        if atomic:
+            shared.start(xq, xs, output)
+        else:
+            routes = torch.empty((rows + M, H), dtype=torch.bfloat16, device=device)
+            shared.start(xq, xs, routes[rows:], loc_ids, rows)
     gateup = _stream_gateup_kernel(
         2 * I, H, topk, block_m, E, limit, device.index, _stream_gateup_constants()
     )
@@ -1487,6 +1648,8 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
             M,
             task_num,
         )
+        if shared is not None:
+            shared.fork()
         mq, ms = _quantize(mid, M * topk, I, "f32")
     else:
         mq = torch.empty((M * topk, I), dtype=torch.float8_e4m3fnuz, device=device)
@@ -1505,6 +1668,8 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
             M,
             task_num,
         )
+        if shared is not None:
+            shared.fork()
     down_args = (
         sorted_ids,
         sorted_weights,
@@ -1516,7 +1681,10 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
         task_num,
     )
     if atomic:
-        # The prep zeroed output: Down adds every route into its token's row with BF16 atomics.
+        # The prep zeroed output (or the shared expert wrote it): Down adds every route into its token's row with
+        # BF16 atomics.
+        if shared is not None:
+            shared.join()
         _launch(
             f"a8w4_down_stream_bm{block_m}",
             _stream_down_kernel(
@@ -1529,12 +1697,22 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
             *down_args,
         )
         return output
-    routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=device)
+    if routes is None:
+        routes = torch.empty((rows, H), dtype=torch.bfloat16, device=device)
     if _stream_prefill_down(H, I, block_m):
         # The prefill Down also stores each route's sorted row into loc_ids, the same values the prep wrote.
         _launch(
             f"a8w4_down_prefill_bm{block_m}",
-            _prefill_down(M, topk, E, H, I, block_m, device.index),
+            _prefill_down(
+                M,
+                topk,
+                E,
+                H,
+                I,
+                block_m,
+                device.index,
+                loc_topk=None if shared is None else cols,
+            ),
             mq,
             weight.w2,
             weight.w2_delta,
@@ -1556,14 +1734,16 @@ def _fused_moe_stream(hidden_states, weight, topk_weight, topk_ids, output, limi
             routes,
             *down_args,
         )
+    if shared is not None:
+        shared.join()
     _launch(
         "a8w4_route_sum",
-        _stream_sum_kernel(topk, H, device.index),
+        _stream_sum_kernel(cols, H, device.index),
         loc_ids,
         routes,
         output,
         M,
-        task_num * block_m,
+        routes.shape[0],
     )
     return output
 
@@ -1699,7 +1879,13 @@ def flydsl_moe_a8w4_ptpc(
     padding rows, all routed ids -1, get 0; a dropped shared expert reads no weight). Up to
     ``DECODE_SHARED_MIXED_MAX_M`` tokens, when the routed experts take the per-route decode kernels (no tile option,
     decided on the routed columns as the tier is), it runs as the last route of the mixed decode kernels (two launches,
-    every column summed in f32 and rounded to BF16 once). Otherwise it runs ATOM's split
+    every column summed in f32 and rounded to BF16 once). Otherwise, where the routed path allows it
+    (``_shared_fold_tier``: the decode tier's slot-pair Down, the streaming tier, the prefill tier from
+    ``SHARED_FOLD_PREFILL_MIN_M`` tokens; an ``output`` 16-byte aligned where the shared expert writes it), it is
+    folded into the routed experts' last reduction (``_SharedFold``): two FP8 GEMMs on the routed path's quantized input
+    with SiLU(gate) * up, the limit, a per-row FP8 quantization and the routing weight between them, on a side stream up
+    to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens, their BF16 output summed with the routes in f32 and rounded to BF16
+    once (onto which the streaming tier's atomic Down adds the routes in BF16). Elsewhere it runs ATOM's split
     (``_shared_split``: aiter's per-token FP8 quantization of the input, ``gemm_a8w8_bpreshuffle`` for gate / up,
     ``silu_and_mul`` with ``swiglu_limit``, per-token FP8 quantization, ``gemm_a8w8_bpreshuffle`` for Down) on a side
     stream of the device up to ``SHARED_DUAL_STREAM_MAX_M`` tokens (its routing weight on another; unless ``output``
@@ -1801,6 +1987,251 @@ def _shared_gate(topk_weight, topk_ids, experts):
     return gate.to(torch.bfloat16).unsqueeze(1)
 
 
+@functools.cache
+def _shared_mid_kernel(inter, kp, cols, experts, limit, loc, device):
+    """``shared_a8w4.compile_shared_mid`` launcher. ``device`` only keys the cache."""
+    return shared_a8w4.compile_shared_mid(
+        I=inter, KP=kp, COLS=cols, E=experts, SWIGLU_LIMIT=limit, LOC=loc
+    )
+
+
+def _shared_gemm_tiles(M, N, K):
+    """``(tile_m, tile_n, tile_k)`` of aiter's FlyDSL preshuffle FP8 GEMM (``flydsl_preshuffle_gemm_a8``) for the folded
+    shared expert's Gate/Up (K = hidden) and Down (K = its weight's padded I) GEMMs of M rows and N columns.
+
+    gfx942 has no tuned FP8 rows for these shapes, where ``gemm_a8w8_bpreshuffle`` runs CK's default kernels. Measured
+    at the DeepSeek-V4.1 shapes (H5120, shared I 576 / 320; graph replay, PTL on), us, these tiles against CK:
+    Gate/Up N1152: M4 5.5 vs 6.8, M64 7.9 vs 7.3, M128 9.2 vs 11.7, M256 13.0 vs 22.2, M512 17.7 vs 27.0, M4096 118 vs
+    151 (N640 M96 / 128: tile_m 16 5.7 vs 32 8.1); Down K640: M4 3.3 vs 3.4, M64 4.2 vs 6.9, M256 8.4 vs 10.2, M512
+    13.4 vs 21.8, M4096 80 vs 123 (K384 M4 2.9 vs 5.9; up to M48 now two waves of tile_n 32, as fast, see
+    ``_shared_gemm``). The split's Down pads its input to K and runs CKTile: M4 22 us, M512 33 (PTL off).
+    """
+    if K >= 2048:
+        if M <= 64 or (M <= 128 and N <= 640):
+            return 16, 64, 512
+        if M <= 256:
+            return 32, 64, 512
+        return (64, 128, 512) if M <= 512 else (64, 128, 256)
+    if M <= 48:
+        # Two waves (tile_n 32): a 16 x 128 FP8 A tile is 2 KiB, one 16-byte load per thread of 128 (see _shared_gemm).
+        # Measured against (32, 64, 128) at the layers' M4-48: 0.98-1.00x the layer time.
+        return 16, 32, 128
+    return (32, 64, 128) if M <= 192 else (64, 128, 128)
+
+
+def _shared_gemm(xq, wq, x_scale, w_scale, out):
+    """``out`` = BF16 (xq @ wq.T) * x_scale * w_scale.T with aiter's FlyDSL preshuffle FP8 GEMM (the operands of
+    ``gemm_a8w8_bpreshuffle``: wq in ``shuffle_weight(layout=(16, 16))``, scales [M, 1] / [N, 1]; tiles of
+    ``_shared_gemm_tiles``, no split-K) on the current stream."""
+    from .gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    M, K = xq.shape
+    tile_m, tile_n, tile_k = _shared_gemm_tiles(M, wq.shape[0], K)
+    # The GEMM stages each A tile in LDS with one tiled copy of 16-byte loads, one per thread (128 threads with
+    # tile_n 32, else 256) and row: a tile of fewer bytes makes the copy cover rows past tile_m, which land in the
+    # other LDS stage while other waves may still read it (kernels/preshuffle_gemm.py, four waves, tile_m 16 with
+    # tile_k 128: wrong 8 x 16 output blocks now and then when other kernels share the CUs).
+    assert tile_m * tile_k >= (128 if tile_n == 32 else 256) * 16
+    flydsl_preshuffle_gemm_a8(xq, wq, x_scale, w_scale, out, tile_m, tile_n, tile_k)
+
+
+class _SharedFold:
+    """The shared expert of a call that folds it into the routed experts' last reduction (``_moe_shared_fold``).
+
+    Its chain: the Gate/Up GEMM (``_shared_gemm``) on the routed path's FP8 input and per-row scale (the stream prep's,
+    the row kernel's of prefill and of the decode tier, the plan kernel's of the deduplicated decode Gate/Up, or with
+    ``start(None, None, ...)`` its own row quantization of x), then
+    ``shared_a8w4.compile_shared_mid`` (SiLU(gate) * up with the SwiGLU limit, per-row FP8 for Down with the shared
+    expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM
+    (``_shared_gemm``) into ``out``: M rows of the routes buffer that ``a8w4_route_sum`` /
+    ``sorted_sum`` add as the last column of loc_ids, or the output itself, onto which the slot-pair decode Down or the
+    streaming Down's BF16x2 atomics add the routes. A token whose shared expert is dropped (ATOM's rule, as
+    ``_shared_gate``) gets +0 there. With a side stream (``side``) the side stream waits for the current stream where
+    the routed path calls ``start`` (after the kernel that quantizes the input) and its kernels are issued by ``fork``
+    (SHARED_FOLD_FORK_AFTER: right after the routed path's next launch) and joined by ``join`` (before the kernel that
+    reads ``out``); without one the chain runs on the current stream at ``start``. ``hold`` keeps the Down GEMM back
+    until ``release`` (an output in place that a routed kernel still reads).
+    """
+
+    def __init__(self, hidden_states, weight, topk_weight, topk_ids, limit, side):
+        self.hidden_states = hidden_states
+        self.weight = weight
+        self.topk_weight = topk_weight
+        self.topk_ids = topk_ids
+        self.limit = limit
+        self.side = side
+        self.current = torch.cuda.current_stream(hidden_states.device)
+        self.held = None
+        self.pending = None
+
+    def _front(self, xq, xs, loc, base):
+        w = self.weight
+        if xq is None:
+            x = self.hidden_states
+            xq = torch.empty(x.shape, dtype=torch.float8_e4m3fnuz, device=x.device)
+            xs = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
+            _launch(
+                "shared_fold_quant_x",
+                _row_quant_decode(x.shape[1], True, x.device.index),
+                x,
+                xq,
+                xs,
+                x.shape[0],
+            )
+        M = xq.shape[0]
+        device = xq.device
+        gate_up = torch.empty(
+            (M, w.shared_w1.shape[0]), dtype=torch.bfloat16, device=device
+        )
+        _shared_gemm(xq, w.shared_w1, xs.view(M, 1), w.shared_w1_scale, gate_up)
+        last_path.append("shared_fold_gemm_gateup")
+        kp = w.shared_w2.shape[1]
+        mq = torch.empty((M, kp), dtype=torch.float8_e4m3fnuz, device=device)
+        ms = torch.empty((M, 1), dtype=torch.float32, device=device)
+        _launch(
+            "shared_fold_mid",
+            _shared_mid_kernel(
+                w.inter_padded,
+                kp,
+                self.topk_ids.shape[1],
+                w.experts,
+                self.limit,
+                loc is not None,
+                device.index,
+            ),
+            gate_up,
+            self.topk_ids,
+            self.topk_weight,
+            mq,
+            ms,
+            ms if loc is None else loc,
+            M,
+            base,
+        )
+        return mq, ms
+
+    def _down(self, mq, ms, out):
+        w = self.weight
+        _shared_gemm(mq, w.shared_w2, ms, w.shared_w2_scale, out)
+        last_path.append("shared_fold_gemm_down")
+
+    def start(self, xq, xs, out, loc=None, base=0, hold=False):
+        """Run (or fork) the chain: ``xq`` / ``xs`` FP8 [M, H] / f32 [M] (the routed path's quantized input; None: the
+        chain quantizes x first), ``out`` BF16 [M, H] (contiguous, 16-byte aligned), ``loc`` int32 [M, topk + 1] whose
+        last column gets ``base + t`` (or -1). With a side stream and SHARED_FOLD_FORK_AFTER the side stream waits for the current stream's kernels
+        so far but its kernels are issued by ``fork``, which the routed path calls right after its next launch.
+        """
+        if self.side is None:
+            mq, ms = self._front(xq, xs, loc, base)
+            if hold:
+                self.held = (mq, ms, out)
+            else:
+                self._down(mq, ms, out)
+            return
+        ready = torch.cuda.Event()
+        ready.record(self.current)
+        self.pending = (ready, xq, xs, out, loc, base, hold)
+        if not SHARED_FOLD_FORK_AFTER:
+            self.fork()
+
+    def fork(self):
+        """Issue the side stream's chain held by ``start`` (no-op without one)."""
+        if self.pending is None:
+            return
+        ready, xq, xs, out, loc, base, hold = self.pending
+        self.pending = None
+        self.side.wait_event(ready)
+        last_path.append("shared_fork")
+        with torch.cuda.stream(self.side):
+            mq, ms = self._front(xq, xs, loc, base)
+            if hold:
+                self.held = (mq, ms, out)
+            else:
+                self._down(mq, ms, out)
+        # Tensors of the current stream that the side stream uses (as _moe_shared records them).
+        x = self.hidden_states if xq is None else None
+        for t in (x, xq, xs, self.topk_weight, self.topk_ids, out, loc):
+            if t is not None:
+                t.record_stream(self.side)
+
+    def release(self):
+        """Run a held Down GEMM once the current stream's kernels so far are done."""
+        self.fork()
+        if self.held is None:
+            return
+        if self.side is None:
+            self._down(*self.held)
+        else:
+            self.side.wait_stream(self.current)
+            with torch.cuda.stream(self.side):
+                self._down(*self.held)
+        self.held = None
+
+    def join(self):
+        """The current stream waits for the chain."""
+        self.release()
+        if self.side is not None:
+            self.current.wait_stream(self.side)
+            last_path.append("shared_join")
+
+
+def _decode_slot_pair_down(M, weight, topk):
+    """Whether the decode tier's Down of M tokens is the slot-pair Down (``compile_a8w4_down_decode_pq``: the per-route
+    path from DECODE_PREQUANT_MIN_M tokens, the DECODE_WIDE_HIDDEN sizes' deduplicated Gate/Up), as
+    ``_fused_moe_decode`` chooses it, and not the single-slot or the deduplicated Down.
+    """
+    H, I = weight.hidden, weight.inter_padded
+    if M >= DECODE_DEDUP_MIN_M and H >= DECODE_DEDUP_MIN_H and _down_dd_blocks(H, I):
+        return False
+    pairs = _slot_pair_offsets_fit(weight) and _decode_fits(H, I, topk, True)
+    if H in DECODE_WIDE_HIDDEN and M >= DECODE_WIDE_DEDUP_MIN_M and pairs:
+        return True
+    return M >= DECODE_PREQUANT_MIN_M and pairs
+
+
+def _shared_fold_tier(M, weight, topk, output, tiles):
+    """The routed tier into whose last reduction a call (``topk`` routed columns, M > 0) folds its shared expert
+    (``_SharedFold``), or None for ATOM's split: decode while the Down is the slot-pair Down
+    (``_decode_slot_pair_down``), streaming and prefill from SHARED_FOLD_PREFILL_MIN_M tokens on; never without
+    SHARED_FOLD. Where the shared Down GEMM writes the output itself (decode, the streaming atomic Down) the output
+    must be 16-byte aligned (its 16-byte stores). The routed columns decide, as they decide the tier.
+    """
+    if not SHARED_FOLD:
+        return None
+    H, I, E = weight.hidden, weight.inter_padded, weight.experts
+    tier = _routed_tier(M, H, I, topk, E, *tiles)
+    aligned = output.data_ptr() % 16 == 0
+    if tier == "decode":
+        return tier if aligned and _decode_slot_pair_down(M, weight, topk) else None
+    if tier == "stream":
+        atomic = _stream_atomic(H, I, _stream_block_m(M, topk, E, H))
+        return tier if aligned or not atomic else None
+    return tier if M >= SHARED_FOLD_PREFILL_MIN_M else None
+
+
+def _moe_shared_fold(
+    hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
+):
+    """``flydsl_moe_a8w4_ptpc`` with a shared expert folded into the routed experts' last reduction (``_SharedFold``):
+    the routed tier runs on the full routing tensors and the chain on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M
+    tokens (an output in place included: the chain writes the output only after the routed kernels that read x),
+    else on the current stream."""
+    M = hidden_states.shape[0]
+    if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+    if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
+        topk_weight = topk_weight.to(torch.float32).contiguous()
+    side = (
+        _side_streams(hidden_states.device)[0]
+        if M <= SHARED_FOLD_DUAL_STREAM_MAX_M
+        else None
+    )
+    fold = _SharedFold(hidden_states, weight, topk_weight, topk_ids, limit, side)
+    return _moe_routed(
+        hidden_states, weight, topk_weight, topk_ids, output, limit, *tiles, fold
+    )
+
+
 def _mixed_decode(M, weight, topk, tiles):
     """Whether a call with a shared expert (``topk`` routed columns, M > 0) runs the mixed decode kernels
     (``_fused_moe_decode_mixed``): up to DECODE_SHARED_MIXED_MAX_M tokens, no tile option, the routed experts on the
@@ -1823,7 +2254,8 @@ def _mixed_decode(M, weight, topk, tiles):
 
 
 def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, tiles):
-    """``flydsl_moe_a8w4_ptpc`` with a shared expert: the mixed decode kernels when ``_mixed_decode`` holds, else the
+    """``flydsl_moe_a8w4_ptpc`` with a shared expert: the mixed decode kernels when ``_mixed_decode`` holds, else folded
+    into the routed experts' last reduction where ``_shared_fold_tier`` allows it (``_moe_shared_fold``), else the
     routed experts on the first topk columns (``_moe_routed``), the shared expert (``_shared_split``) and its routing
     weight (``_shared_gate``) on side streams up to SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream,
     then ``output += shared * gate`` (BF16 operands, one rounding: ATOM's addcmul_)."""
@@ -1831,6 +2263,10 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
     if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles):
         return _fused_moe_decode_mixed(
             hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
+    if _shared_fold_tier(M, weight, topk_ids.shape[1] - 1, output, tiles):
+        return _moe_shared_fold(
+            hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
         )
     E = weight.experts
     routed_weight, routed_ids = topk_weight[:, :-1], topk_ids[:, :-1]
@@ -1949,12 +2385,17 @@ def _moe_routed(
     block_m,
     block_n,
     tile_k,
+    shared=None,
 ):
-    """The routed experts of ``flydsl_moe_a8w4_ptpc`` (M > 0) into ``output``: the tier and its kernels."""
+    """The routed experts of ``flydsl_moe_a8w4_ptpc`` (M > 0) into ``output``: the tier and its kernels. With a folded
+    shared expert (``shared``, ``_SharedFold``) the routing tensors keep its column, the last: the routed experts take
+    the others, and each tier starts the shared expert's chain on its FP8 input and joins it before its last
+    reduction."""
     from aiter.fused_moe import moe_sorting
 
     M, H = hidden_states.shape
-    topk = topk_ids.shape[1]
+    cols = topk_ids.shape[1]
+    topk = cols - (shared is not None)
     E, I = weight.experts, weight.inter_padded
     device = hidden_states.device
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
@@ -1964,11 +2405,11 @@ def _moe_routed(
     tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
     if tier == "decode":
         return _fused_moe_decode(
-            hidden_states, weight, topk_weight, topk_ids, output, limit
+            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
         )
     if tier == "stream":
         return _fused_moe_stream(
-            hidden_states, weight, topk_weight, topk_ids, output, limit
+            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
         )
     if block_m is None and block_n is None and tile_k is None:
         tile_k = 128 if _many_rows(M, H, I, topk, E) else 256
@@ -1982,20 +2423,37 @@ def _moe_routed(
     if H >= 2560 and H % 512 == 0 and M * topk <= prep_routes:
         sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
             _stream_prep(
-                hidden_states, topk_weight, topk_ids, E, block_m, output, zero=False
+                hidden_states,
+                topk_weight,
+                topk_ids,
+                E,
+                block_m,
+                output,
+                zero=False,
+                routed=topk,
             )
         )
     else:
+        sort_weight, sort_ids = topk_weight, topk_ids
+        if shared is not None:
+            sort_weight = topk_weight[:, :topk].contiguous()
+            sort_ids = topk_ids[:, :topk].contiguous()
         sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
-            topk_ids, topk_weight, E, H, hidden_states.dtype, block_m, accumulate=False
+            sort_ids, sort_weight, E, H, hidden_states.dtype, block_m, accumulate=False
         )[:4]
         last_path.append("moe_sorting_opus")
         # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
         # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
-        loc_ids = torch.empty((M, topk), dtype=torch.int32, device=device)
+        loc_ids = torch.empty((M, cols), dtype=torch.int32, device=device)
         xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
+    rows = grid * block_m
+    routes = torch.empty(
+        (rows + (0 if shared is None else M), H), dtype=torch.bfloat16, device=device
+    )
+    if shared is not None:
+        shared.start(xq, xs, routes[rows:], loc_ids, rows)
 
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
     gateup = _gateup_kernel(
@@ -2024,9 +2482,19 @@ def _moe_routed(
         M,
         grid,
     )
+    if shared is not None:
+        shared.fork()
     mq, ms = _quantize(mid, M * topk, I, "f32")
-    routes = torch.empty((grid * block_m, H), dtype=torch.bfloat16, device=device)
-    down = _prefill_down(M, topk, E, H, I, block_m, device.index)
+    down = _prefill_down(
+        M,
+        topk,
+        E,
+        H,
+        I,
+        block_m,
+        device.index,
+        loc_topk=None if shared is None else cols,
+    )
     _launch(
         f"a8w4_down_prefill_bm{block_m}",
         down,
@@ -2041,7 +2509,9 @@ def _moe_routed(
         M,
         grid,
     )
-    sorted_sum(topk, H)(loc_ids, routes, output, M)
+    if shared is not None:
+        shared.join()
+    sorted_sum(cols, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
     return output
 
