@@ -1,7 +1,7 @@
 # mega_moe_tp_gfx942（gfx942 TP MoE 层：FP8 激活（按 token）× MXFP4 routed + FP8 shared expert，all-reduce 与 DP（ag_rs）两种模式）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-27 14:08）· 目标：让 aiter 的 MegaMoeTPGfx942（gfx942 / MI308X，A8W4：FP8 按 token × MXFP4）在带 shared expert 的整层上更快：以 mega-tp-a8w4-M7 为起点叠加 moe-a8w4-shared-M6（只留一套 kernel）。AR 模式：Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash 主干整层 TP4（E384+1 FP8 shared），M=1…32768 与 48，对冻结基线（每卡 shared-M6 + 单独 AR）几何平均 ≥1.10×；DP4+TP4 模式（comm_mode=ag_rs，只 DeepSeek 主干，每卡 M_r=1…8192 与 12）对冻结基线（AG + 每卡 shared-M6 + RS）几何平均 ≥1.20×；两者分别考核，逐 case 不慢于基线，routed-only 形状不慢于 mega-tp-a8w4-M7（1.122× 相对冻结基线）· 已完成 3 个里程碑（含本提交 M1） · 最佳累计 1.074× · 下一步：M2 DP 入口 FP8 AG 并进量化 kernel：各卡只量化本卡 token（FP8 + 每 token scale），连同路由推给其余 3 卡并置旗；GateUp 先算只含本卡 token 的排序块，把入口 AG 藏到计算下面
+> 由 mf 生成（11-27 15:29）· 目标：让 aiter 的 MegaMoeTPGfx942（gfx942 / MI308X，A8W4：FP8 按 token × MXFP4）在带 shared expert 的整层上更快：以 mega-tp-a8w4-M7 为起点叠加 moe-a8w4-shared-M6（只留一套 kernel）。AR 模式：Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash 主干整层 TP4（E384+1 FP8 shared），M=1…32768 与 48，对冻结基线（每卡 shared-M6 + 单独 AR）几何平均 ≥1.10×；DP4+TP4 模式（comm_mode=ag_rs，只 DeepSeek 主干，每卡 M_r=1…8192 与 12）对冻结基线（AG + 每卡 shared-M6 + RS）几何平均 ≥1.20×；两者分别考核，逐 case 不慢于基线，routed-only 形状不慢于 mega-tp-a8w4-M7（1.122× 相对冻结基线）· 已完成 4 个里程碑（含本提交 M1a） · 最佳累计 1.074× · 下一步：M2 DP 入口 FP8 AG 并进量化 kernel：各卡只量化本卡 token（FP8 + 每 token scale），连同路由推给其余 3 卡并置旗；GateUp 先算只含本卡 token 的排序块，把入口 AG 藏到计算下面；之后：M3 tp2 的两处：M≥8192 两块 token 分块 + device SDMA one-shot（M7 移植，L4 已做）；TP2 decode 档上限 6（I/tp=320 时 stream 档 + CA 在 M≥7 更快）（承诺）
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -172,7 +172,7 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 
 ## 5. 测试覆盖
 三类用例都在 [test_mega_moe_tp_gfx942.py](../../../../../op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py)，62 例全过；多卡用例共用一个 4 进程常驻池。
-有输出的用例都按 FP32 参考判据校验（AR 另查各卡逐位相同），并按模块常量推出的规则（`_want`）断言末个融合 kernel 与通信段。
+有输出的用例都按 FP32 参考判据校验（AR 另查各卡逐位相同），按模块常量推出的规则（`_want`）断言融合 kernel 与通信段，DP 入口按层的 `_entry_fuses` 期望融合 kernel（无此判定即单独 AG）。
 单卡入口自己的分档交界由 [test_flydsl_moe_a8w4.py](../../../../../op_tests/test_flydsl_moe_a8w4.py) 覆盖，两个用例命令都带上它。
 
 **基本功能测试**（`commands.correctness` = `pytest <文件> -m basic`，20 例约 50 s；另跑单卡文件 `-m basic` 18 例）
@@ -237,8 +237,10 @@ TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时
 <!-- mf:roadmap -->
 - M0 ✅ 已推送 · 功能 · 新基线（功能版）：在 M7 上带进 moe-a8w4-shared-M6，只留… · [提交](https://github.com/luocheng25/aiter/commit/fc629c8636db597d1f799699f027f94892c9d65f)
 - M0b ✅ 已推送 · 功能 · DP 模式功能版（冻结前）：MegaMoeTPGfx942 实现 comm_m… · [提交](https://github.com/luocheng25/aiter/commit/d1446320b73ecfda0c13f98b8e2d922c02b814de)
-- M1 ✅ 本提交 · 性能 · 通信融合移植回 gfx9_fp8（AR / DP 通用）：AR 的 decod… · 1.074× 对基线（预期 1.077×）
+- M1 ✅ 已推送 · 性能 · 通信融合移植回 gfx9_fp8（AR / DP 通用）：AR 的 decod… · 1.074× 对基线（预期 1.077×） · [提交](https://github.com/luocheng25/aiter/commit/b8630f8007e089eca4ecf7a91f77f36c29facebb)
 - M2 ⏳ 承诺 · 性能 · DP 入口 FP8 AG 并进量化 kernel：各卡只量化本卡 token（… · 预期 1.02×
+- M1a ✅ 本提交 · 维护 · 用例维护：DP 分档期望路径（_want）认 M2 的入口融合 kernel …
+- M3 ⏳ 承诺 · 性能 · tp2 的两处：M≥8192 两块 token 分块 + device SDM… · 预期 1.008×
 
-下一步（本提交的承诺）：M2 DP 入口 FP8 AG 并进量化 kernel：各卡只量化本卡 token（FP8 + 每 token scale），连同路由推给其余 3 卡并置旗；GateUp 先算只含本卡 token 的排序块，把入口 AG 藏到计算下面
+下一步（本提交的承诺）：M2 DP 入口 FP8 AG 并进量化 kernel：各卡只量化本卡 token（FP8 + 每 token scale），连同路由推给其余 3 卡并置旗；GateUp 先算只含本卡 token 的排序块，把入口 AG 藏到计算下面；之后：M3 tp2 的两处：M≥8192 两块 token 分块 + device SDMA one-shot（M7 移植，L4 已做）；TP2 decode 档上限 6（I/tp=320 时 stream 档 + CA 在 M≥7 更快）（承诺）
 <!-- /mf:roadmap -->

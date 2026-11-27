@@ -764,11 +764,12 @@ def _verify(state, shape, raw, shared, inputs, y):
     return res
 
 
-def _want(layer, M, dp=False):
+def _want_op(layer, M, dp=False):
     """What the rules of the op (moe_a8w4) and of the layer give an M-row batch of ``layer`` (dp: the ag_rs mode,
-    M = world * M_r): (the tier family of its first Gate/Up kernel, its fused communication kernels in order), from
-    the modules' constants and dispatch functions (DECODE_TIER_MAX_M, DECODE_TP_MAX_M, FUSED_MIN_*, the workspace's
-    mid_m, STREAM_*SPEC*, the op's tier rules). Building the hooks launches nothing."""
+    M = world * M_r) from its first Gate/Up kernel on: (the tier family of that kernel, the fused communication
+    kernels after it in order), from the modules' constants and dispatch functions (DECODE_TIER_MAX_M,
+    DECODE_TP_MAX_M, FUSED_MIN_*, the workspace's mid_m, STREAM_*SPEC*, the op's tier rules). Building the hooks
+    launches nothing."""
     from aiter.ops.flydsl import mega_moe_tp_gfx942 as tp
     from aiter.ops.flydsl import moe_a8w4 as op
 
@@ -814,6 +815,20 @@ def _want(layer, M, dp=False):
     if layer._mid_fuses(M) and not atomic:
         return tier, (f"a8w4_route_sum_tp{rs}",)
     return tier, ()
+
+
+def _want(layer, M, dp=False):
+    """What the rules give an M-row batch of ``layer`` (dp: the ag_rs mode, M = world * M_r): _want_op's (tier
+    family, fused communication kernels), in the ag_rs mode after the fused entry (``a8w4_quant_ag_tp``: the rows
+    gathered quantized) where the layer's own rule (``_entry_fuses``) takes it; a layer without that rule all-gathers
+    its input (no fused entry). Evaluating the rule launches nothing."""
+    tier, kernels = _want_op(layer, M, dp)
+    entry = getattr(layer, "_entry_fuses", None) if dp else None
+    # the routing's width (a shared expert's column last) and a 16-byte aligned output (the layer's partial sums)
+    width = layer.cfg.topk + (1 if layer._shared else 0)
+    if entry is not None and entry(M, width, torch.empty(8, device=layer.device)):
+        kernels = ("a8w4_quant_ag_tp",) + kernels
+    return tier, kernels
 
 
 def _job_check(state, shape, tokens):
@@ -2052,11 +2067,12 @@ def test_peer_waits_and_timeouts(pool, shape, M):
 # rank checks its output against its rows of the FP32 reference summed over the group (the acceptance of region 1);
 # the outputs differ across ranks, so instead of their cross-rank identity a second call on the same inputs must give
 # bitwise the same output. D.1 holds the basic tests (-m basic), the rest is other coverage. Pinned: a Gate/Up kernel
-# ran, the shared expert ran, and the communication (dp_comm): one all-gather before the first Gate/Up kernel and,
-# after it, fused communication kernels (the word "tp" in their names, as in region 1) or one reduce-scatter that sums
-# in rank order (never RCCL's ring reduce-scatter), no all-reduce; in D.1 and D.10 also the tier family and the fused
-# kernels the rules give that M (_want, as in region 1). Not pinned here: which all-gather an M_r takes, and the
-# ordered reduce-scatter (on no forward path of ds_dp4): D.2 tests both on the communicator.
+# ran, the shared expert ran, and the communication (dp_comm): before the first Gate/Up kernel one all-gather or a
+# fused communication kernel (the rows gathered quantized), after it fused communication kernels (the word "tp" in
+# their names, as in region 1) or one reduce-scatter that sums in rank order (never RCCL's ring reduce-scatter), no
+# all-reduce; in D.1 and D.10 also the tier family and the fused kernels the rules give that M (_want, as in region 1,
+# the fused entry by the layer's own rule). Not pinned here: which all-gather an M_r takes, and the ordered
+# reduce-scatter (on no forward path of ds_dp4): D.2 tests both on the communicator.
 # =====================================================================================================================
 DP_SHAPE = "ds_dp4"
 AG_CA, AG_RCCL = "custom_all_gather", "rccl_all_gather"
@@ -2699,8 +2715,9 @@ def test_dp_routing_dtypes(pool):
 # between two of them on both sides. Here every M_r where the rules (_want of world * M_r rows) change below
 # DP_BOUNDARY_MAX_M runs on both sides (M_r - 1 and M_r), each called twice, against the FP32 reference and the
 # rules: the fused decode's limits, sum_tp's rows (the workspace's mid_m), tp_reduce from FUSED_MIN_M /
-# FUSED_MIN_BYTES and the sum streamed out of the prefill Down (STREAM_SPEC with the home-rank owners). The
-# boundaries come from the modules' constants (_boundaries), so changing a limit moves the cases with it.
+# FUSED_MIN_BYTES, the sum streamed out of the prefill Down (STREAM_SPEC with the home-rank owners) and, where the
+# layer has that rule, the fused entry (_entry_fuses). The boundaries come from the modules' constants (_boundaries),
+# so changing a limit moves the cases with it.
 DP_BOUNDARY_MAX_M = 512
 
 
