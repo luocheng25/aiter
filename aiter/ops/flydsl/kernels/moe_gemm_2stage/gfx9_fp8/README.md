@@ -1,7 +1,7 @@
 # gfx9_fp8 的 A8W4 MoE（FP8 按 token 激活 × MXFP4 routed + FP8 shared expert）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-27 17:39）· 目标：在 moe-a8w4-shared-M6（0ccb573229）上：①MoE 链路逐 kernel（含 kernel 间空隙）的 roofline 与差距分解，各项合计对上实测（误差≤10%），给出每个 kernel 的可达上限；②按结论优化：可改的 kernel 达到 4 TB/s 或 450 TFLOPS，做不到的达到可达上限；③显著减少 bench 的 kernel 序列数与 kernel 家族数，删去诊断开关与死代码；始终保持整层 73 例逐例 ≤ min(1.02×aiter 融合 FP8 PTPC, A8W4 split)、158 例逐例 ≤ 起点 M6 ×1.02（具体阈值与目标数随第一次计划确认）（1.05× 相对冻结基线）· 已完成 1 个里程碑（含本提交 M0） · 最佳累计 — · 下一步：M1 目标一：MoE 链路逐 kernel roofline 与差距分解（含 kernel 间空隙与侧流 fork/join），给出每个 kernel 的可达上限；盘点分派路径（survey.md）
+> 由 mf 生成（11-27 19:58）· 目标：在 moe-a8w4-shared-M6（0ccb573229）上：①MoE 链路逐 kernel（含 kernel 间空隙）的 roofline 与差距分解，各项合计对上实测（误差≤10%），给出每个 kernel 的可达上限；②按结论优化：可改的 kernel 达到 4 TB/s 或 450 TFLOPS，做不到的达到可达上限；③显著减少 bench 的 kernel 序列数与 kernel 家族数，删去诊断开关与死代码；始终保持整层 73 例逐例 ≤ min(1.02×aiter 融合 FP8 PTPC, A8W4 split)、158 例逐例 ≤ 起点 M6 ×1.02（具体阈值与目标数随第一次计划确认）（1.05× 相对冻结基线）· 已完成 2 个里程碑（含本提交 M1） · 最佳累计 — · 下一步：M2 方向 C：shared 收敛为混合 + 折叠两种——混合 decode 按实测按形状放宽到 M5–10，折叠 GEMM 按 65536 行分块（M>65536 不再 split），未对齐输出与带 tile 参数也走折叠，删去 split 回退与 shared 诊断开关
 <!-- /mf:summary -->
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
      做什么 · 整体怎么做 · 为什么这样做 · 做到什么程度 · 风险与下一步。
@@ -52,20 +52,10 @@ flydsl_moe_a8w4_ptpc（bf16 x[M,H] → bf16 out[M,H]；无 host 同步，可被 
 | 带 shared：M ≤ 4、逐路由 decode 核内量化、≤ 16 列；可折叠时 M·topk·I ≤ 10240 | 混合：shared 作末路 | 省 split 链与相加；M1 为 split 的 0.27–0.39 |
 | 带 shared、M ≥ 5 或 M·topk·I > 10240：decode 槽对 Down、流式、prefill 1025–65536 | 折叠进末次规约；否则 split | 省量化与相加；主干 TP4 M4 快 6% |
 - 屏蔽（id −1，ATOM 的 padding 行）：decode 经越界 buffer 视图读 0（不访存）、Down 用 select 丢弃，去重计划与排序不收；首列 −1 或末列非 E 时 shared 也丢。
-- 核心 kernel 骨架（完整的 Gluon 风格写法、任务划分与逐拍流水线见 [kernels.md](kernels.md)）：
-```text
-Gate/Up prefill：grid (2I/128, 排序块)，4 wave 管 TILE_M 行 × 64 gate + 64 up；权重每 lane 16 B 读两行、提前 2 tile，x 经 LDS 双缓冲
-Down prefill：grid (切分 1/2/4, 排序块)，mq 经 LDS（I>512 分两段）装入后驻留 VGPR；逐 64 列块解码 → MFMA → bf16 写 routes 与 loc_ids
-Gate/Up decode：grid (I/16, M·topk)，4 wave = gate / up × K 前后半，每 lane 16 B 读两个 64-K 块、先发 6 对；x 经 LDS 广播
-Down decode：grid (H/32, M)，wave 按槽取 mid 行，每 lane 16 B 读两个 16 行块（槽对版 H/16、读两槽）→ MFMA → LDS 树形相加 → out
-混合 Gate/Up / Down：shared 作末路，Gate/Up 拆 2 个 WG（各 8 个 gate 与同号 up 行）、Down 用末 wave；FP8 块直进 MFMA，行量化每行一次倒数
-去重 Gate/Up：grid 同逐路由版，只有组首 WG 计算：组员的 x 行进 LDS（A 的行 m、8+m 取组员 m），本 expert 的权重只读一次
-去重 Down：grid (H/128, M·topk)，组首 WG 读 8 个 16 通道块，各组员 × 通道因子 × 行 scale × 路由权重 → bf16x2 原子加进 out
-流式 Gate/Up：grid (I/(16·G·W), 排序块)，wave 管 G 个 gate 块与同号 up 块；权重直读 VGPR：lane 0–7 / 8–15 各 16 B 读 gate / up 块相邻两行
-  提前 P 个 64-K 步；链 p 取行对第 p 行，收尾 lane l↔l^32 换回；W > 1 时激活经 LDS 环共享（H5120 一次 16 B 跨 4 / 2 步）；尾部量化时 4 wave 管全部 I
-流式 Down：grid (H/(16·R·W), 排序块)，wave 管 R/2 个 16 通道块对 × 全部 I；激活驻留 VGPR，每 lane 16 B 读块对的相邻两行
-  权重提前 1–2 个块对（BM ≤ 32 时 1 对）→ 每子块 4 条 MFMA 链 → bf16 routes，或每 lane 一对通道 bf16x2 原子加
-```
+- 核心 kernel 骨架（完整的 Gluon 风格写法、任务划分、逐拍流水线与 roofline 分解见 [kernels.md](kernels.md)）：
+  - decode：Gate/Up 每 WG 管一条路由的 16 个通道（去重时组首 WG 连算组员），每 lane 16 B 读两个 64-K 块；Down 每 WG 管一个 token 的 32 个（槽对版 16 个）通道
+  - 流式：Gate/Up 每 wave 管 G 对 gate / up 块，权重直读 VGPR、提前 P 个 64-K 步，激活经 LDS 环共享；Down 激活驻留 VGPR，权重提前 1–2 对
+  - prefill：Gate/Up 4 wave 管 TILE_M 行 × 64 gate + 64 up，权重提前 2 tile、x 经 LDS 双缓冲；Down 的 mq 驻留 VGPR，逐 64 列块写 routes
 
 ## 3. 关键决策
 <!-- 3–6 条；“为什么”给一个关键数字。 -->
@@ -96,7 +86,20 @@ routed 输出与 M17 逐位相同（只改读取宽度、解码、量化算法�
 - 计时：整层例的四个实现同进程、CUDA graph 重放墙钟（计入双流并发）；原 85 例 `run_perftest`；都过 PTL 门禁。
 - 精度参考：独立 FP32 参考（MXFP4 / FP8 精确反量化，x 与 mid 逐 token FP8）；整层最大误差 ≤ 3.9%·max|ref|（混合 M1–4 ≤ 0.3%）、calc_diff ≤ 1.1e-4。
 - shared 真实权重（官方 layer 2 / 37 的 TP4 切片）：误差是模型参考（1×32 UE8M0 激活 + 32×32 块权重）的 0.69–0.99 倍。
+
+逐 kernel roofline（官方 = 冻结基线 bench 中位数，分解见 [kernels.md](kernels.md)）：到 95% 线的只有 route_sum 与 shared Gate/Up GEMM 的大 M 例。
+本机校准：冷读 ≥1 GiB 3.83–3.88 TB/s（64–512 MiB 4.0–4.3，写比读贵 1.7×）、FP8 持续 451 TF（PTL 下即上限）；每 kernel ≥2.3 µs。
+核对（对官方 ≤10%）：代表例 decode 18/24、流式 27/27、prefill 13/14（M4096 Down 时钟差）；模型 decode 146/176、流式链 71/76；整层 92/95（decode 27/28）。
+| 档 | 主要 kernel 占线 | 主瓶颈 | Σ①（单 kernel 上限）÷ 同组实测 | ②（合并后的链路上限）÷ 实测 |
+|---|---|---|---|---|
+| 混合 decode（整层 M ≤ 4） | GU / Down 28–58%（带宽） | 固定开销 44–60%，VALU / shared 列等待 | 0.57–0.79 | 0.51–0.69（÷ bench 计时） |
+| decode（M1–48、折叠 M4–10） | GU / Down 17–70%，行量化 ≤5% | VALU 发射（至 81%）、固定开销 17–66% | 0.49–0.79 | 0.34–0.66（÷ bench 计时） |
+| 流式（M11–2048） | GU 44–73%、Down 20–64%（族中位） | 解码 8–24%、激活环 ≤41%、收尾 ≤56% | 0.42–0.79 | 0.40–0.77（÷ routed kernel 和） |
+| prefill（M ≥ 2048） | GU 50–94.8%、Down 28–75%（算力） | GU 读没藏住，Down VALU 与占用 | 0.55–0.89 | 0.50–0.75（÷ routed kernel 和） |
+| shared 链（串行、split） | GEMM 29–99%（算力），mid ≤16% | Down 收尾不重叠 + K 补零，mid VALU | 0.46–0.78 | 0.27–0.71（÷ shared 增量） |
 <!-- mf:perf -->
+基线来源（mf 记录）：11-27 18:05 冻结于提交 `1caee9d284`（里程碑 M0，tag `moe-a8w4-roofline-M0`），bench 跑 3 次取中位数，GPU1，噪声 ±0.60%；bench 命令 `/root/.myflow/tasks/moe-a8w4/venv-fly053/bin/python op_tests/test_flydsl_moe_a8w4.py`。对照实现与精度参考的来源见本节手写部分。
+
 （尚无复核数据）
 <!-- /mf:perf -->
 
@@ -137,14 +140,14 @@ routed 输出与 M17 逐位相同（只改读取宽度、解码、量化算法�
 | Opus 排序重复 expert 留后一槽、原地输出、路由 dtype、M=0；各类 Gate/Up 的截断 | 输入规整、另给 out；bench 几乎不截断 | `test_inplace_output` 等 7 个 | 通过 |
 | fused_moe 各档（逐位 / 对参考）、graph、参数透传与报错、未标记权重下传、标记生命周期 | 基本只测 decode、带标记的默认调用 | `test_fused_moe_matches_api` 等 8 个 | 通过 |
 | shared 的 prepare（块 scale、fnuz、补零）逐位与报错；真实权重同 FP4PTPC 逐字节、误差 ≤1.5× 模型 | 合成权重、容差内 | `test_shared_fold_*` 等 5 个 | 通过 |
-| split 自身（`SHARED_FOLD=0` 钉住）：双流阈值两侧、相加逐位、原地串行、TP8 补零逐位 | 整层例不查实现；容差内 | `test_layer_stream_mode_boundary` 等 3 个 | 通过 |
+| split 自身（`SHARED_FOLD=0`，删后跳过）：双流阈值两侧、相加逐位、原地串行、TP8 补零逐位 | 整层例不查实现；容差内 | `test_layer_tp8_padding_exact` 等 3 个 | 通过 |
 | 屏蔽各档（随机 / 整行 / 全部）：逐路由两种 Down、去重三种、流式两种 Down、prefill 两种排序 | 基本只测一种 decode；bench 不屏蔽 | `test_masked_routes` ×13 | 通过 |
 | 整层：graph 重放（含换屏蔽）、原地与 eager 逐位同；屏蔽 TP8 流式原子加、TP4 prefill | 只 eager、另给 out、不屏蔽 | `test_layer_graph_replay` 等 4 个 | 通过 |
 | 白盒：逐路由与混合 Gate/Up 不读屏蔽路由与丢弃 shared 的权重、计划不收它 | Down 丢弃它，端到端看不出 | `test_masked_gateup_reads_no_weights` 等 3 例 | 通过 |
-| 混合 decode：M5 与 M·topk·I 交界、末列非 E、整批屏蔽、topk 1/15/16 + 1 | 不查谁算 shared | `test_mixed_decode_shapes` 等 4 个 | 通过 |
+| 混合 decode：M4 混合、M5 不限路径、M·topk·I 上限、末列非 E、整批屏蔽、topk 1/15/16+1 | 不查谁算 shared | `test_mixed_decode_shapes` 等 4 个 | 通过 |
 | 折叠 7 档（含 M5–7、流式接 prefill Down、prefill M1366）：屏蔽、末列非 E、原地、graph | 不屏蔽、末列恒 E、另给 out | `test_layer_fold_tiers` ×7 | 通过 |
 | 折叠 GEMM：各 M 的 tile 不越 LDS stage；graph 重放 1000 次逐位同 eager | 竞争偶发，块错在容差内 | `test_layer_fold_gemm_race` | 通过 |
-| 折叠交界：prefill 起点 M1025、M65536；out 未对齐退回 split；变体缓存 | bench 不在交界、out 对齐、单卡 | `test_layer_fold_max_m` 等 4 个 | 通过 |
+| 折叠交界：prefill M1024/1025、M65536/65537（外侧只判分）；out 未对齐；变体缓存 | bench 不在交界、out 对齐、单卡 | `test_layer_fold_max_m` 等 4 个 | 通过 |
 | 逐 kernel 登记（各档与 shared 各跑法的条数对 profiler、运算量、字节、graph）与 bench 的事件对齐 | bench 只打印 | `test_launch_records` 等 25 例 | 通过 |
 
 未覆盖 / 跳过：端到端精度（本任务不做）；真实权重缺数据目录时跳过；H4096 去重到 M64（要 E ≥ 342）；去重 Down 的 WG 内量化只靠端到端；快速除法只抽样；CK 排序的 −1；逐 kernel 字节只查合计下界；
@@ -152,20 +155,20 @@ routed 输出与 M17 逐位相同（只改读取宽度、解码、量化算法�
 
 ## 6. 风险与待定
 <!-- ≤5 条：风险 → 影响 → 打算。 -->
-新增交界例中 3 例未达整层约束（权重 0、只查回退），修复放进第一次计划；原 73 例无阻塞，但单次 bench 有贴线。
-- MTP TP8 M5 ÷FP8 1.11–1.15：混合 decode 止于 M4，M5 折叠多 x / mid 两次行量化，侧流 fork / join 留约 13 µs 空隙 → 第一次计划。
-- M98304 两例 ÷FP8 1.04 / 1.16、÷split 1.04 / 1.11：超过折叠 GEMM 的 65536 行，shared 走 split 并最后相加 → 拟按 65536 行分块折叠。
-- 贴线：ds_layer_tp4 M16 / 48 / 64、ds_layer_tp8 M64 / 512 / 1024 单次 ÷split 达 1.00–1.02，MTP TP8 M6 ÷FP8 0.98–1.02 → 按多次中位数判。
-- 外部 kernel：preshuffle GEMM 偶发 LDS 块错（已限 tile 并断言）→ 达不到上限就重写；登记按 aiter 当前派发建模 → 派发变了由 mismatch 行与用例暴露。
-- 测量与接口：reset 后 PTL 变 Disabled、别的容器占卡 → 门禁拒绝；fused_moe 认 Python 属性 → 只支持 eager 与 graph；登记开关非线程安全。
+到 95% 线的只有 route_sum 与 shared Gate/Up GEMM 的大 M 例，其余差距都拆到了项（第 4 节）；原 73 例单次 bench 有贴线、按中位数判；下一步见计划。
+- 测量：450 TF 即 PTL 下 FP8 的持续上限（短时 577、降频 410 TF），层内 kernel 比隔离慢 0–25%；reset 后 PTL 变 Disabled、他人占卡 → 门禁拒绝。
+- 固定开销：每 kernel ≥2.3–3 µs，decode M ≤ 2 占 45–65%、行量化几乎全是它；fork/join 层内中位 4–5 µs → 少 kernel、少跨流只能靠合并。
+- 新增 3 例未达整层约束（权重 0）：MTP TP8 M5 ÷FP8 1.11–1.15（折叠多两个行量化、侧流露出 13.5 µs）；M98304 ÷FP8 1.04 / 1.16（走 split）。
+- 外部 kernel 与接口：shared Down GEMM 大 M 隔离时是 ① 的 1.5–2.2×（收尾不重叠）、偶发 LDS 块错（已限 tile）；fused_moe 认 Python 属性；登记开关非线程安全。
 
 ## 7. 进一步阅读
 - 代码入口：[moe_a8w4.py](../../../moe_a8w4.py)（各入口的 docstring 写明接口、报错与数值约定，`recording_launches` 为逐 kernel 登记）、[fused_moe.py](../../../../../fused_moe.py)（首行按标记转调）。
 - kernel（任务划分见 [kernels.md](kernels.md)）：[gemm1_a8w4.py](gemm1_a8w4.py)、[gemm2_a8w4.py](gemm2_a8w4.py)、[decode_a8w4.py](decode_a8w4.py)（含混合 decode）、[decode_dedup_a8w4.py](decode_dedup_a8w4.py)（去重）、
   [stream_a8w4.py](stream_a8w4.py)（流式）、[shared_a8w4.py](shared_a8w4.py)（折叠的 shared_mid）、[quant_a8w4.py](quant_a8w4.py)、[common_a8w4.py](common_a8w4.py)（私有布局）；移植源：[pyhip M17 README](https://github.com/luocheng25/pyhip/blob/moe-ptpc-a8w4-r2-M17/src/pyhip/ops/moe/flydsl/moe_gemm_2stage/README.md)。
 <!-- mf:roadmap -->
-- M0 ✅ 本提交 · 功能 · bench 扩展：整层 22 个交界 / M>65536 case 与逐 ke… · 预期 1×
-- M1 ⏳ 承诺 · 分析 · 目标一：MoE 链路逐 kernel roofline 与差距分解（含 ker… · 预期 1×
+- M0 ✅ 已推送 · 功能 · bench 扩展：整层 22 个交界 / M>65536 case 与逐 ke… · 预期 1× · [提交](https://github.com/luocheng25/aiter/commit/1caee9d2843017994fa691f0be2b9d16fc3f8f5a)
+- M1 ✅ 本提交 · 分析 · 目标一：MoE 链路逐 kernel roofline 与差距分解（含 ker… · 预期 1×
+- M2 ⏳ 承诺 · 维护 · 方向 C：shared 收敛为混合 + 折叠两种——混合 decode 按实测… · 预期 1.01×
 
-下一步（本提交的承诺）：M1 目标一：MoE 链路逐 kernel roofline 与差距分解（含 kernel 间空隙与侧流 fork/join），给出每个 kernel 的可达上限；盘点分派路径（survey.md）
+下一步（本提交的承诺）：M2 方向 C：shared 收敛为混合 + 折叠两种——混合 decode 按实测按形状放宽到 M5–10，折叠 GEMM 按 65536 行分块（M>65536 不再 split），未对齐输出与带 tile 参数也走折叠，删去 split 回退与 shared 诊断开关
 <!-- /mf:roadmap -->

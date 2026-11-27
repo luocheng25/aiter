@@ -2,7 +2,11 @@
 
 <!-- 入口文档第 2 节只放骨架；这里给每个核心 kernel 的完整任务划分与逐拍流水线，写给要读 / 改 kernel 的人。
      只写当前实现，不写过程（哪个里程碑、谁定的、试过什么）；关键行链接到代码；与代码对不上就改这里。
-     本目录的其他 kernel（gemm1.py、gemm2*.py、quant.py、moe_reduce.py）是 FP8 / BF16 底座，不在本文范围。 -->
+     本目录的其他 kernel（gemm1.py、gemm2*.py、quant.py、moe_reduce.py）是 FP8 / BF16 底座，不在本文范围（链上用到的
+     sorted_sum 与 aiter 的外部 kernel 只给 roofline 短节）。每节末尾的「roofline 与分解」只写数字与结论，口径与方法在文首一节。 -->
+
+每个 kernel 一节：Gluon 风格写法、任务划分与流水线，末尾的「roofline 与分解」给占线、分解与两级可达上限
+（口径、本机校准与分解方法见「逐 kernel 的 roofline 口径」一节）；整条链的墙钟、空隙与 fork/join 见末节「链路与空隙」。
 
 A8W4 的 GEMM kernel（prefill、decode 与流式的 Gate/Up、Down）共用 [common_a8w4.py](common_a8w4.py) 的私有权重布局与解码（字节级定义见该文件 docstring）：
 - 权重 q：每 16 行 × 64-K 一个 512 B 块；布局上 lane `16b + r` 对应第 r 行 K `16b … 16b+15` 的 8 B，dword c 即第 c 条 MFMA 16x16x32
@@ -98,13 +102,88 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #   带 shared expert（expert E 在路由最后一列，见 moe_a8w4.py 的 _moe_shared）：M ≤ 4、routed 列走核内量化的逐路由 decode
 #     且 TOPK ≤ 16（含 shared 列）时 gateup_decode_mixed → down_decode_mixed（shared 作末路，不另 launch、不相加；能折叠时
 #     还要 M·routed topk·I ≤ DECODE_SHARED_MIXED_MAX_WORK，主干 TP4 的 M4 因此折叠）；
-#     其余 M 在 decode 槽对 Down、流式、prefill M > 1024 处折叠（末节；shared 写 out 的档还要 out 16 B 对齐）：上面各档的
+#     其余 M 在 decode 槽对 Down、流式、prefill M > 1024 处折叠（shared 折叠一节；shared 写 out 的档还要 out 16 B 对齐）：上面各档的
 #     kernel 以 TOPK+1 列的路由编译、跳过末列；x 量化之后 preshuffle GEMM(gate / up) → shared_mid → preshuffle GEMM(Down)
 #     写 out 或 routes 末尾 M 行（M ≤ 1024 在 side stream 上、routed Gate/Up 之后发出），最后一次规约前 join；
 #     再其余（单槽 / 去重 Down、prefill M ≤ 1024、out 未对齐）按 ATOM split：per_token_quant_hip(x) → gemm_a8w8_bpreshuffle
 #     (gate / up) → silu_and_mul(L) → per_token_quant_hip(mid) → gemm_a8w8_bpreshuffle(Down)；M ≤ 1024 且 out 与 x 不重叠时
 #     在 side stream 上与 routed 并发（路由权重另一条 side stream），join 后 out.addcmul_(shared, bf16(权重))；否则当前流上先跑
 ```
+
+## 逐 kernel 的 roofline 口径（[moe_a8w4.py](../../../moe_a8w4.py) 的 `KernelLaunch`）
+在 `moe_a8w4.recording_launches()` 里（默认关闭）调用时，发射的每个 device kernel 在 host 侧登记一条 `KernelLaunch`
+（`moe_a8w4.last_launches`，与 `last_path` 并列；每次调用都清空它，只有开关内的调用写入）：名字、stream、最少字节的三项与有用
+运算量；不读 GPU 数据、不同步（graph 捕获时照样登记）。关闭时发射点只多一次 `if _recording` 判断，不求字节与运算量（eager
+调用的 host 时间不变）；打开时每个 kernel 多约 4–9 µs host 时间。kernel 改名 / 合并时随代码改登记与本节，bench 不用改。
+外部 kernel 也逐个登记：Opus 排序的各相、底座 sorted_sum、preshuffle GEMM、split 链（含 Down 输入补零的 fill + copy）、
+`_shared_gate` 的小 kernel、`addcmul_`、路由张量的转换拷贝（`routing_copy/*`）；fork / join / mixed 标记与 `DEBUG_CHECKS`
+的 host 检查不登记。
+
+**字节** = 唯一 routed expert 数 × 每 expert 字节 + shared 字节 + 固定字节（唯一 expert 数由调用方在 host 上从路由列数出）。
+按 kernel 接口的必需流量，每个不同字节算一次，不扣 cache 命中：权重、delta、通道因子按存储格式（含 I 补零）；激活、中间量、
+输出按存储 dtype（x bf16、xq fp8 + xs f32、mid f32、mq fp8 + ms f32、routes bf16、out bf16）；先读后写的 out 算读 + 写，
+原子加算一次写；排序元数据取最少（每条路由的 sorted id、sorted weight 各 4 B，num_valid 8 B，每个 expert 一个块的 expert 号
+4 B，不计填充行）。**运算量**只算 GEMM 的有用部分 2·行数·N·K：routed 的行数为 M·topk，含屏蔽的路由（host 不读 ids），
+shared 为 M；MXFP4 按解码后的 FP8 MFMA 算；N、K 用 I_pad，shared 用它自己的 I_pad，Down 的 K 补到 128 的部分不算；不计排序块
+与 MFMA 列的填充；其余 kernel 为 0。一次调用合计 6·M·H·(topk·I_pad + I_s)（I_s 为 shared 的 I_pad，无 shared 时为 0）。
+两种 shared I 口径：登记用 I_pad（TP8 为 320），bench 整层例的 MF_METRIC flops 仍用 shared 的原始 I（TP8 为 288），所以 TP8
+层例的登记合计比 MF_METRIC 的 flops 多 6·M·H·32。
+
+记号：R = M·topk 条 routed 路由，C 为路由张量列数（带 shared 时 topk+1），W1 / W2 = 一个 expert 的 w1 / w2 及其 delta、通道因子，
+S1 / S2 = shared_w1 / shared_w2 及其行 scale，B = 4 B（块的 expert 号）。每个家族：每 expert 字节；shared 字节；固定字节；运算量。
+- Gate/Up（decode、去重、流式、prefill）：W1（流式、prefill 加 B）；0；读 x 2MH 或 xq MH + xs 4M、ids 4R（去重加 plan 16R，
+  流式与 prefill 换成 sorted id 4R + num_valid 8），写 mid 4RI 或尾部量化的 mq RI + ms 4R（计划版另写 plan、清零 out 2MH）；4·R·I·H。
+- Down（decode、去重、流式、prefill）：W2（流式、prefill 加 B）；0；读 mq + ms 或 mid 4RI、ids 与 weights 各 4R（流式与 prefill 为
+  sorted 8R + 8，去重加 plan），写 out 2MH（SHARED 版先读后写，计 2 份）或 routes 2RH（prefill Down 另写 loc 4R）；2·R·H·I。
+- 混合 Gate/Up / Down：W1 / W2；S1 / S2；x 2MH + ids 4MC + 写 mid 4MCI / 读 mid、ids、weights + 写 out；routed 部分 +
+  4·M·I_s·H / 2·M·H·I_s。
+- 行量化（decode、prefill、计划）：0；0；输入 + q + scale，fill 版加 loc，计划版加 ids 4R、plan 16R（H4096 去重另清零 out 2MH）；0。
+- 流式 prep：B；0；读 ids、weights 8R 与 x 2MH，写 sorted 8R + 8、loc 4MC、xq + xs，清零时加 out 2MH；0。
+- route_sum、sorted_sum：0；0；loc 4MC + 它指向的 routes 2MCH（含 shared 行）+ out 2MH；0。
+- Opus 排序（无 workspace 时 1 个 kernel；有时 P0 + P23，≥ 2048 token 再加清零与 P1）：末个 B；0；单 kernel 16R + 8，分相时
+  每相 + workspace 一次，P0 + ids 4R，末相 + 16R + 8；0。
+- shared 折叠（GEMM、shared_mid、GEMM）：0；S1 / 0 / S2；xq + xs + gate_up、gate_up + mq + ms + 12M（+ loc 4M）、mq + ms + out；
+  2·M·2I_s·H / 0 / 2·M·H·I_s。split 链同样逐步算（补零：fill M·K_w、copy 2M·I_s）。
+- 小 kernel（routing_copy、shared_gate、addcmul_）：0；0；读 + 写（addcmul_ 读 out、shared、gate，写 out）；0。
+
+bench 计时的调用都不登记：计时之后在开关内再调一次 a8w4 取登记（`_recorded_launches`；kernel 只取决于形状、选项与模块常量，
+与计时的调用相同）。`_kernel_us` 把它与 run_perftest 那一遍的 profiler 事件对齐：每个 stream 的事件按 profile 的顺序
+（对不上再按开始时间），登记的 main / side / aux 各取一个 stream，每次调用的条数相同、kernel 名序列与多数调用相同才算对上；
+几种取法都对得上时，最后结束的 stream 为 main（调用在末个 kernel 之前 join 侧流）。profiler 停止时丢了末尾几次调用的记录、
+或个别调用的记录错位时，这些调用不用（`INFO kernel_map ... dropped_calls`），能用的不到一半就打印 `mismatch`；时间取能用的
+调用去掉首次（多于 30 次时再去掉总时间的 IQR 离群）后的均值。bound：运算量 / 字节 < 112.5（450 TF ÷ 4 TB/s）为 mem。
+
+### 本机校准（MI308X，PTL Enabled、VECTOR,F8；诊断：HIP / FlyDSL 微基准，3 轮中位）
+| 项 | 本机值 | 在分解里的用法 |
+|---|---|---|
+| HBM 冷读（每次换缓冲，16 B nontemporal 读） | ≥ 1 GiB 3.83–3.88 TB/s（线的 96–97%）；64–512 MiB 4.0–4.3；1–16 MiB 0.4–2.8 | 「包络」= 同字节量的最快冷读时长（含 T0） |
+| 读写混合（拷贝，按读 + 写计） | ≥ 1 GiB 2.84 TB/s、64–256 MiB 3.0–3.1：写比读贵 κ ≈ 1.7 | 读写包络 BW_mix = BW_读·(R+W)/(R+1.7W) |
+| FP8 MFMA | 持续（> 0.5 s）451 TF（纯 MFMA）/ 447 TF（GEMM 8192³）；短时（< 0.2 s）577 / 495 TF | PTL 约 1 s 一周期在 578 与 410 TF 间摆：450 TF 即持续上限 |
+| 单 kernel 固定开销 T0 | 2.3–2.5 µs（eager profiler 时长；1–2 MiB 的冷读 2.6–3.2 µs） | 每个 kernel 的下限 |
+| graph 发射 | 空 kernel 1.8 µs（1 WG），连续重放后 2.8 / 3.1 µs（80 / 1280 WG）；spin kernel 之间空隙 0.78 µs | 真实 kernel 的 graph 槽 ≈ 它的 eager 时长（见末节） |
+| 侧流 fork/join（graph） | fork 与 join 之间两条流都有 kernel 时 11–12 µs/次；只有侧流有 kernel 时 2–3 µs；eager 24–36 µs | 层内实测另算（中位 4–5 µs，见末节） |
+| profiler 的扰动 | graph 重放里 < 4.4 µs 的 kernel 被拉长到 4.2–5.6 µs、空隙记 0 | 小 kernel 与空隙用无 profiler 的 graph 墙钟差 |
+
+### 分解方法
+- 官方数字 = 冻结基线（M0）bench 三份日志逐 kernel 的中位数（eager `run_perftest`：每次调用轮换 32 GiB 深拷贝，L2 / MALL 冷；整层墙钟是
+  CUDA graph 重放）。分解实验是诊断，用同一 kernel 与同一协议（或注明），只用来拆分，合计再对官方核对（≤ 10% 算对上，超出的逐例写原因）。
+- 回归（sweep）：合成形状扫 K 或 N（专家循环平移，权重恒冷），T = T0 + n·t_step；每步字节或运算 ÷ t_step = 主循环自身的 TB/s / TFLOPS；
+  台阶形的 N 扫描给每 CU 吞吐与尾效应。每次读 0.3–1.6 GB 的流式 Gate/Up 正处在带宽随字节量变化的区间，截距不可辨，改用消融。
+- 消融：kernel 副本加编译期开关——主循环 0 步、去行量化、去 FP4 解码（权重直接当 MFMA 操作数）、MFMA 换成 VALU、去激活装载、
+  去收尾写回、同几何的空 kernel——逐级加回（decode，各项之和 = lab 实测）或取单项 Δ（流式，加「访存余量」使之相加）。
+  消融会改寄存器分配与占用，prefill 只拿它作上界与方向核对。
+- ATT（rocprofv3 线程跟踪，单 CU，不降频）：每 wave 的序言 / 主循环 / 收尾、MFMA 忙比例、停顿归因、驻留与尾段、运行时钟。
+  prefill 以它锚定：实测 = 有用 MFMA@450 TF + 补零 + 时钟修正 + MFMA 空闲（访存 / VALU / LDS / barrier）+ 尾 / 不均 / 时钟差。
+- ISA 与编译元数据：VGPR / LDS → 每 SIMD 的 wave 数；主循环每步的 MFMA / VALU / VMEM 条数 → 发射上限。
+- 链路：graph 消融（跳过某 kernel、侧流只留一个 kernel、侧流改串行）的无 profiler 墙钟差，拆出空隙、fork/join 与侧流链露出（末节）。
+- 跨 case 模型：每个家族一组参数（如 T = c0 + c1·WG/80 + c2·字节/80、T = a + W_pad/R）拟合全部 bench case，对官方逐例核对。
+- 可达上限两级：① 单 kernel（保持 kernel 边界与块结构）= max(包络(最少字节), T0 + 有用运算 / 450 TF) 再加不可消除的依赖或发射上限
+  （各节写明）；② 链路 = 合并 / 融合后（少 launch、少中间量）整条链的上限，只靠少 kernel 才能拿到的归这一级。
+- 已知的系统偏差：
+  - 整层例的 eager 逐 kernel 时长与 graph 墙钟对不齐：routed 链的 graph 墙钟是 eager 主流和的 0.99–1.13 倍，整层 M11–1024 的主流和只有
+    routed-only 墙钟的 0.86–0.96（疑为双流时 eager profile 少记主流 kernel，机理未核实），所以整层以 graph 墙钟为准；
+  - 层内 kernel 比隔离慢 0–25%：routed 的大写回把整卡带进慢态，PTL 让紧跟大 GEMM 的 kernel 降频；
+  - HBM 有两个带宽态（约 50 ms 切换），访存 kernel 单次 ±6%；2–5 µs 的行量化在 run 之间双峰（≈ 2.3 / 3.9 µs）。
 
 ## A8W4 Gate/Up prefill（[gemm1_a8w4.py](gemm1_a8w4.py#L629)）
 按排序块算 mid[token, slot, :] = swiglu(x·w1_gate, x·w1_up)，f32 写出；结构同底座 `gemm1.py` 的 prefill_1x4，权重换成 mxfp4。
@@ -182,9 +261,25 @@ epilogue  ds_bpermute 交换偶 / 奇行累加器 → × 通道因子 × xs → 
 
 **资源**：LDS 2·BM·TILE_K（BM64 时 TILE_K128 为 16 KiB、TILE_K256 为 32 KiB，排序行号的 1 KiB 与之复用）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：ATT 锚定、sweep、占用 / 消融）
+- compute bound（W_pad = 每块有效行向上取 16 后实际算的 MFMA 量）；官方约 225–427 TF（50–94.8% 线，未到 95%），最好 mtp_layer_tp8 M98304，
+  M2048 只有 50–64%。
+- 分解（DS TP4 M32768，7084 µs，各项合计 = 官方）：有用 MFMA@450 TF 5154 + 补零 78 + 时钟修正 −972（ATT 时钟 1.69 GHz 高于 450 TF 对应的
+  1.37 GHz）+ MFMA 空闲（访存 910、LDS 545、VALU 487、barrier 252、其他 270）+ 尾 / 不均 / 时钟差 360；ATT 推算对官方 −5.1%。
+- 主循环：K 扫描 mimo_tp4 M16384 459 TF（102%）、tp2 388 TF（86%）；DS（H5120·E384）的 K 扫描超线性（335 → 226 TF：A 块与 9 个 N tile
+  的工作集超出 L2）。去掉全部 global 读后 DS M32768 为 5223 µs，正好落到 W_pad/450 TF 的地板 5233；去解码只省 1–9%。
+- 瓶颈是 global 读没藏住，按形状分两类（VGPR 128 → 4 wave/SIMD，LDS 加垫改每 CU 的 wave 数）：
+  - 延迟受限（mimo、mtp、小 M）：16 → 12 / 8 wave 慢 2.6–6% / 16–20%，每 wave 在途字节不够（权重只提前 2 个 tile、A 1–2 个）；
+  - DS 类大 M 受 L2 局部性限制：16 → 12 wave 反快 2.7–11%，再叠 XCD chunk 2（每 XCD 连拿同一 expert 的 2 个 M 块）共 −3.5…−12%。
+- 尾效应：末段驻留不到稳态一半的时间 5–13 µs（≤ 3%）；mimo_tp8 M2048 只有 4.7 轮（1496 WG / 320 槽），37.6% 的时间驻留低于稳态 75%。
+- 可达上限：① = W_pad/450 TF + 2.4 µs：DS M32768 5234（①/实测 0.74）、DS M4096 721（0.70）、tp2 M32768 2656（0.76）、mimo_tp4 M32768 4925
+  （0.90），46 例 0.62–0.95；② 计算不变，Gate/Up 直接写 FP8 mid 后行量化与 f32 mid 往返消失（末节）。
+- 核对：ATT 推算对官方 8/8 ≤ 7.2%；每形状 T = a + W_pad/R（R 301–415 TF，M8192–32768 拟合）≤ 2.1%，M98304 样本外 −3.2% / +6.3%；
+  全形状 T = a + max(W_pad/R_形状, B_w/1.92 TB/s)（M2048–4096 每 expert 只有 1–2 块，走权重流）46/46 ≤ 9.1%。
+
 ## A8W4 Down prefill（[gemm2_a8w4.py](gemm2_a8w4.py#L118)）
 按排序块算 routes[排序行, :] = (mq 行 · w2ᵀ) × 通道因子 × ms × 路由权重，bf16 写出给 `sorted_sum`；结构同底座 `gemm2.py` 的默认 prefill Down。
-loc 的列数是 LOC_TOPK（默认 TOPK；折叠 shared expert 时多一列，见末节，本 kernel 不写那一列）。
+loc 的列数是 LOC_TOPK（默认 TOPK；折叠 shared expert 时多一列，见「shared expert 折叠」一节，本 kernel 不写那一列）。
 
 **Gluon 风格**
 ```python
@@ -242,6 +337,22 @@ compute  每个 64-K 块：delta 字节 → LUT → 16 个 fp8；MFMA × bm/8；
 **资源**：LDS = max(64·I B 激活, 2 × 64 × 64 × 2 B 输出)；TWO_PASS 时激活只占较大的一段（I576：20 KiB，不分段 36 KiB）。
 64·I 须 ≤ 64 KiB 且每段 64·列数是 4096 的倍数，所以 BM32 配 I320 / 192 不可用，I_pad > 1024 时 prefill 不可用。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：ATT 锚定、sweep、占用 / 消融）
+- compute bound；官方约 126–338 TF（28–75% 线），最好 ds_layer_tp4 M98304；流式接的 BM64（MiMo TP4 M1024、MTP TP4 M1195–1365）135–140 TF（31%）。
+- 分解（DS TP4 M32768，3701 µs）：有用 MFMA@450 TF 2577 + 补零 79 + 时钟修正 −494 + MFMA 空闲（VALU 688、访存 480、LDS 126、
+  barrier 88、其他 120）+ 尾 / 时钟差 36；ATT 推算对官方 −1.0%。大 M 的 MFMA 只忙 46–59%。
+- 主循环（N 扫描，变 H）：DS M16384 330 TF（73%）、mimo_tp4 298 TF（66%）、tp2 262 TF（58%）。
+- 次级上限：每条 MFMA 配 14–20 拍 VALU（FP4 解码 + 每 64 列块的缩放 / 打包），按 MFMA 占一个 VALU 发射槽估计，发射上限 88% / 86% / 74% /
+  68% / 66%（K576 / 512 / 320 / 256 / 192）；K ≤ 320 时它先于 450 TF 线（K192 只到 358 TF）。
+- 占用：A 块常驻 VGPR（116–238）→ 2–4 wave/SIMD，对 wave 数强敏感：少一个 wave 慢 9%（K192 4→3）、15%（K320 3→2）、30–37%（K576 / 512 2→1）。
+- 消融（单项上界，不可叠加）：去解码 0…−10%，去权重读 −6…−28%，去写回 −4…−21%；M2048–4096 的补零效率 0.68–0.81（32 行粒度）。
+- LDS bank conflict：C 转置写的 swizzle (3,4,3) 已消掉绝大部分（去掉 swizzle 慢 12–40%）；换 (3,3,3) 只省 0.6–2%（K192 反慢 1%）；
+  C 经 LDS 的整条往返在 K ≥ 320 占 4–10%，K192 直写反而慢 10%。LDS 不在关键路径上（MFMA 空闲里 LDS 只占 7–10%）。
+- 可达上限：① = max(W_pad / min(450 TF, 发射上限), 字节/4 TB/s) + 2.4 µs：DS M32768 2659（①/实测 0.72）、tp2 M32768 1505（0.69）、
+  tp4 M32768 1014（0.64）、DS M4096 400（0.53），46 例 0.45–0.76；② 原子累加进 out 后 sorted_sum 与 routes 往返消失（末节）。
+- 核对：ATT 推算对官方 5/6 ≤ 4.6%；例外 DS M4096 +18.1% 是时钟：6 个 CU 的周期数一致，计时隐含 1.48 GHz 而 ATT 运行 1.67–1.81 GHz
+  （疑 PTL：紧跟约 1 ms 的 Gate/Up）。全形状 T = 8.1 + W_pad/415 TF + B_w/2.80 TB/s + B_o/2.85 TB/s 45/46，加每 expert 63 ns 后 46/46 ≤ 9.0%。
+
 ## 行量化 prefill（[quant_a8w4.py](quant_a8w4.py#L76)）
 把 bf16 输入 [M, H] 与 f32 中间 [M·topk, I] 按行量化成 fp8 与每行 scale，结果与参考（IEEE 除法）逐位一致。
 
@@ -263,6 +374,37 @@ lane 数 L 从 64 起减半，直到整除每行的 16 B 片数且每 lane 至�
 [倒数与修正](quant_a8w4.py#L162)、[打包与 -0](quant_a8w4.py#L65)、[写回](quant_a8w4.py#L146)。
 
 **资源**：不用 LDS。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；本机读写包络见文首校准）
+- memory bound。prefill：x（bf16，顺带置 loc −1）53–85% 线、mid（f32）49–94%；流式量化 mid：2.8–27 µs，族中位 0.40 TB/s（10%）。
+- 大 M 已在本机读写包络上：写比读贵约 1.7 倍，按读写比混合的包络 3.4–3.5 TB/s，M ≥ 16384 实测 3.4–3.5 TB/s（包络的 95–104%），
+  与 4 TB/s 线的差就是写的代价。例：x DS M32768 148.8 µs 在包络 142–160 内，mid 166.4 µs 在 148–166 的上沿。
+- 模型：x T = 5.78 µs + 字节/3.35 TB/s（36/36 ≤ 5%）；mid T = 2.39 µs + max(字节/3.59 TB/s, 行数 × 0.29 ns)（46/46 ≤ 8.6%：TP4 的 I192
+  每行 768 B，受行速率限制只到 75% 线）；流式 mid T ≈ 4.67 + 0.142 µs/MB（无侧流 27/35 ≤ 10%）。小 M 是固定项（x 5.8、mid 2.4 µs）。
+- 可达上限：① = 2.4 µs + 字节/读写包络（x DS M32768 142、M4096 22；mid DS M32768 147）；流式 ① ≈ 2.8–4.5 µs。
+  ② mid 量化并进 Gate/Up 收尾（流式已有尾部量化版）、x 量化并进前端 kernel，本 kernel 在链上消失（末节）。
+- 核对例外：流式 3–6 µs 的 mid 量化三份官方的极差中位 6.7%（p90 12%）；整层 M512–1024 与侧流 shared GEMM 并发时 9–27 µs，
+  侧流例按整层墙钟核对（末节）。
+
+## Opus 排序与路由拷贝（aiter 外部 kernel，prefill 前端）
+M·topk 超过 prep 上限的 prefill 用 aiter 的 Opus `moe_sorting` 排序（有 workspace 时 4 个 kernel：clear_ws / p0 / p1 / p23），
+整层例还先把路由张量的 routed 列拷成连续张量（`routing_copy` ×2）；本仓库不改这些 kernel。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数）
+- 同步 / 延迟受限：每相 ≥ 4.5 µs，4 相合计 17–21 µs + 每条路由 0.23–0.43 ns（几乎全在 p23；Qwen 的 E513 每个 token 都选 shared expert（单个 expert M 行），
+  p23 按 expert 串行）；按登记字节（含 workspace）只到 4–25% 线。DS TP4 M32768：clear_ws 7.0 + p0 11.5 + p1 8.9 + p23 45.1 = 72.5 µs。
+- 模型：每个 E 一组 T = a + b·路由数（a 17.3–20.5 µs）36/36 ≤ 5.6%；routing_copy 各 4.7–5.8 µs，T = 4.81 + 字节/6.66 TB/s 32/32 ≤ 4.9%
+  （几乎全是发射）。
+- 可达上限：① 保持 4 相 = 4 × 2.4 µs + 字节/4 TB/s ≈ 12–25 µs，routing_copy 2.4 µs；② 与 x 的行量化、路由拷贝并成一个 O(R) 的前端 kernel
+  （排序约 3–6 µs）。
+
+## sorted_sum（底座 [moe_reduce.py](moe_reduce.py)，prefill 的末步）
+prefill 的 Down 写 routes 后，out[t, :] = Σ_slot routes[loc[t, slot], :]（f32 按槽顺序相加后转 bf16）；折叠 shared 时多加一列。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数）
+- memory bound（读 topk 行写 1 行）；78–92% 线，已在本机读写包络上：DS TP4 M32768 646.5 µs ≈ 2.4 + 读 514（3.92 TB/s）+ 写 145（κ 1.7）= 661 µs。
+- 模型 T = 1.23 µs + 字节/3.54 TB/s，46/46 ≤ 9.6%；M2048 比包络多约 6 µs（小尺寸带宽不到 4 TB/s）。
+- 可达上限：① = 包络（已达）；② Down 直接原子累加进 out 后，它与 routes 的写读一起消失（DS M32768 646 µs，routed 链的 5–6%）。
 
 ## A8W4 Gate/Up decode（[decode_a8w4.py](decode_a8w4.py#L290)）
 逐路由 decode（M ≤ 32、形状受支持：H%512 = 0，见 [gateup_decode_fits](decode_a8w4.py#L96)；host 只放行 H ≤ 4096 与 H5120）不排序：
@@ -374,6 +516,22 @@ x 行 → LDS xq
 **资源**：LDS 约 3.2 KiB（xq H B、part 512 B、red 16 B、LUT 96 B；H5120 多 2.5 KiB）；同时在途的权重：核内量化版至多 6 个块对
 （每 lane 6 条 16 B；H5120 87 VGPR、每 SIMD 5 个 wave，全部先发时是 153 VGPR、3 个 wave），预量化版全部（H2560 10 条、H5120 20 条）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound（FLOP/B 3.7–5.3）：核内量化版 0.95–2.40 TB/s（24–60% 线）、预量化版 1.92–2.57（48–64%）、PLAN 版 1.51–2.45（38–61%）。
+- 分解（消融逐级加回：空 kernel → 序言 / 收尾 → 核内量化 → 权重流 → MFMA 与 A 读 → FP4 解码；按 官方/lab 缩放后合计 = 官方，
+  括号末项为 lab 合计对官方）：
+  - DS TP4 M1（10.19 µs）：固定 1.60 + 2.39 + 0.60 = 4.58（45%），主循环 3.47 + 0.30 + 1.83 = 5.61（3.37 TB/s）（+13%）；
+  - DS TP4 M4（31.40 µs）：固定 9.43（30%，其中每个 WG 重复量化同一行 x 2.5 µs），主循环 21.97（3.43 TB/s）（−5%）；
+  - Qwen TP2 M16 预量化版（49.00 µs）：固定 8.48（17%，3520 个 WG 的派发 4.6），主循环 40.52（3.03 TB/s）（+1%）。
+- 主循环：K 扫描 T0 5.0–6.6 µs（M1–4）、2.5–3.5 TB/s；N 扫描是台阶，T ≈ 5.4 + 1.95·⌈WG/80⌉ µs（H5120，每个 WG 在一个 CU 上 1.95 µs）：
+  瓶颈是每 CU 的 VALU 发射（ATT：M1 64%、M4 81%；FP4 解码占 kernel 11–21%），纯 VALU 的上限约 4.3 TB/s，只比线高 8%。
+- 尾效应 ≤ 0.6 µs（M1 的 216 个 WG 末波 70% 满）；VGPR 87 → 5 wave/SIMD（预量化版全部块对先发，128 → 4）。M1 的网格只给每 SIMD
+  1.6–2.8 个 wave，但每 CU 吞吐在约 3 WG/CU 已饱和，占用不是主瓶颈；H5120 的整层 M5–6（300–360 WG、VGPR 128）落在延迟区间。
+- 可达上限：① = 包络（同字节冷读）+ 0.8 µs（ids 读出后才知权重地址）：DS M1 7.31（①/实测 0.72）、M4 19.25（0.61）、TP2 M16 预量化
+  30.12（0.61）、mtp_layer_tp8 M5 预量化 8.50（0.67）、PLAN 版 mimo_tp8 M4 10.25（0.64）；②（Gate/Up + Down 一个 kernel）见末节。
+- 核对：跨 case 模型 T = c0 + c1·WG/80 + c2·字节/80：核内量化版 14/14 ≤ 8.9%、PLAN 版 5/5 ≤ 3.0%、预量化版 9/11（mtp_layer_tp8 M5 / M6
+  +12%，即上述延迟区间）；消融合计超 10% 的 TP2 M1 +17%、DS M1 +13%、PLAN mimo_tp8 M4 +10.3% 是进程 / 卡状态（同卡单独跑 bench 已慢 3–6%）。
+
 ## A8W4 Down decode（核内量化，[decode_a8w4.py](decode_a8w4.py#L621)）
 M ≤ 3、w2 加一个 expert 超过 4 GiB 或槽对版放不下时用：每个 WG 算一个 token 的 32 个输出通道（相邻两个 16 行块，行块对），
 在 LDS 里把 topk 个 expert 相加后直接写 bf16 out。它的 LDS 放不下时（[down_decode_fits](decode_a8w4.py#L102)）decode 整体不用，M ≤ 32 走 prefill。
@@ -462,6 +620,17 @@ PREFETCH = min(R·I/64, DOWN_PREFETCH_BLOCKS)。
 
 **资源**：LDS = W·⌈topk/W⌉·I B（mq）+ 128·W B（part）+ 96 B，TP2 topk11 约 4.9 KiB；VGPR：DS TP4 60（单块读法 56）、TP2 58。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound；17–45% 线（0.67–1.80 TB/s），M1–3 的 4.6–10.8 µs 小 kernel。
+- 分解（同 Gate/Up decode 的消融链，括号末项为 lab 合计对官方）：DS TP4 M1（7.72 µs）固定 1.69 + 1.35 + 0.76 = 3.81（49%），
+  主循环 1.84 + 0.79 + 1.29 = 3.91（2.49 TB/s）（+5%）；TP2 M1（5.30 µs）固定 65%（+6%）。常说的「空 Down 约 3 µs」= 同几何空 kernel 1.78 + 序言 / 收尾 1.42。
+- 主循环：K 扫描 T = 3.68 + n·0.449 µs（DS TP4 M1，n = 64-K 步）→ 2.2–2.3 TB/s（55–58%）；N 扫描是台阶：≤ 80 个 WG 5.0–5.5 µs，
+  每 CU 第二个 WG 再加 2.1 µs。
+- 占用 / 次级：VGPR 60 → 7.5 wave/SIMD；ATT 的 VALU 发射只有 51%，停顿以 barrier 28% + waitcnt 27% 为主——每个 wave 量化自己的
+  mid 行后在规约前的 barrier 等最慢的那个。
+- 可达上限：① = 包络 + 0.8 µs：DS M1 5.34（①/实测 0.69）、TP2 M1 4.25（0.80）。
+- 核对：跨 case 模型 8/8 ≤ 5.3%（R² 0.986）。
+
 ## A8W4 Down decode 槽对（预量化，[decode_a8w4.py](decode_a8w4.py#L815)）
 M ≥ 4、w2 加一个 expert ≤ 4 GiB 且放得下（每行 I/16 个 16 B 片 ≤ 64·W 个线程，全零行由每线程写一片；LDS 够）时用（H5120 只去重 Gate/Up 的
 路径也用它）：读预量化的 mq fp8 与 ms；一条 16 B 加载覆盖两个路由槽的同一 64-K 块，其余同核内量化版。
@@ -509,7 +678,7 @@ def a8w4_down_decode_pq(mq, ms, topk_ids, topk_weight, w2, w2_delta, w2_scale, o
     part = gl.allocate_shared_memory(f32, [W, 2, 16], …)
     part.index(w).store(vals 的行 0/1 列 0–7 与行 8/9 列 8–15); gl.barrier()
     y = tree_sum(part[:, h, m] + part[:, h, m + 8])
-    if SHARED: y += sh.to(f32)    # sh = out[token, n]：序言里与权重一起发出的读，out 先由折叠的 shared 写好（见末节）
+    if SHARED: y += sh.to(f32)    # sh = out[token, n]：序言里与权重一起发出的读，out 先由折叠的 shared 写好（见 shared 折叠一节）
     out[token, 16 * j + 2 * m + h] = y.to(bf16)   # RTE，同 a8w4_down_decode
 ```
 
@@ -558,6 +727,16 @@ mq 片 → LDS 行 [w, r, 半]（只写有效片）；barrier
 **资源**：LDS = (2·W·轮数 + 1)·I B + 128·W B + 96 B，TP2 topk11 约 4.5 KiB；
 每 lane 偏移是 32 位，w2 总字节数加一个 expert 须 ≤ 4 GiB（否则 host 改用核内量化版）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound；1.41–2.62 TB/s（35–66% 线）；SHARED 变体（整层折叠 M4–10，先读 out 再相加）1.39–2.57（35–64%）。
+- 分解（缩放后合计 = 官方，括号末项为 lab 合计对官方）：DS TP4 M4（15.87 µs）固定 2.64 + 2.08 = 4.73（30%），主循环 8.16 + 1.70 + 1.28
+  = 11.14（3.49 TB/s）（0%）；TP2 M16（28.84 µs）固定 8.84（30%：2560 个 WG 的派发 3.8 + 序言 5.1）（+2%）；mtp_layer_tp8 M5 的 SHARED
+  变体（9.37 µs）固定 4.44（47%），主循环 4.93（2.64 TB/s）（+4%）。
+- 主循环：DS TP4 M4 扫 I 3.31 TB/s（T0 3.8 µs）、扫 H 3.74 TB/s（94%，T0 4.6，WG 足够多时无台阶）；ATT VALU 发射 78%，VGPR 62 → 7.5 wave/SIMD。
+- 可达上限：① = 包络 + 0.8 µs：DS M4 11.43（①/实测 0.72）、TP2 M16 16.81（0.58）、SHARED mtp_layer_tp8 M5 6.09（0.65）。
+- 核对：跨 case 模型只有 4/10 ≤ 10%——M4–8 网格小（640–1280 个 WG 同时常驻），时间是单个 WG 的串行链（每 wave 2 轮槽对、每轮先把行搬进
+  LDS），吞吐模型低估 13–29%；M16–32 轮次重叠，又高估 10–13%，一个线性模型盖不住两个区间。SHARED 变体 15/16（mtp_layer_tp4 M5 +10.1%）。
+
 ## 行量化 decode（[decode_a8w4.py](decode_a8w4.py#L1082)）
 槽对 Down 与去重的四个 kernel 路径量化 mid（f32 [M·topk, I]），M·topk·I/16 ≥ 2560 时量化 x（bf16 [M, H]）；每行一次倒数加 FMA
 修正（quant_fast：bf16 一次、f32 两次，fast_ok 之外逐元素 IEEE 除法），字节与 [quant_a8w4.py](quant_a8w4.py) 逐位一致。
@@ -595,6 +774,14 @@ q clamp ±240 → cvt_pk_fp8（RNE；两次转换写同一 dword）→ -0 改 +0
 关键代码：[读片](decode_a8w4.py#L1107)、[scale](decode_a8w4.py#L1130)、[写回](decode_a8w4.py#L1132)、[-0 处理](decode_a8w4.py#L193)。
 
 **资源**：不用 LDS。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：ISA、同几何空 kernel）
+- memory bound；0.01–0.19 TB/s（0–5% 线），2.1–5.2 µs：一行一个 wave，同几何的空 kernel 已 1.1–1.3 µs，其余是单 wave 的串行延迟。
+- x（bf16，H2560 / 5120）每 wave 911 / 1763 条 VALU 串行，加行装载与写回两次访存，在 2.3 µs 之上再多 1–2.5 µs；mid（f32，I 192–576）
+  每 wave 151–327 条 VALU，通常 2.3–2.6 µs，已到包络下限 2.56 µs。
+- 可达上限：① = 包络 ≈ 2.56 µs（x：mtp_layer_tp8 M5 3.90 µs，①/实测 0.66；mid 2.44 µs，已达）；② 并进相邻 kernel 后为 0（末节）。
+- 核对例外（接受）：时长在 run 之间双峰（≈ 2.3 / 3.9 µs；三份官方日志之间差到 49%，如 TP4 M16 的 mid 2.73 / 3.87 / 4.07 µs），跨 case 模型
+  mid 22/33、x 8/11 ≤ 10%；整层例在 fork 之后为 2.3–2.8 µs，routed 例紧跟预量化或去重 Gate/Up 时 3.9–5.2 µs（未采 PMC，机理未证实）。
 
 ## 混合 Gate/Up decode：shared FP8 作末路（[decode_a8w4.py](decode_a8w4.py#L1359)）
 带 shared 的调用在 M ≤ `DECODE_SHARED_MIXED_MAX_M`（4）、routed 列走核内量化的逐路由 decode、TOPK ≤ 16 时用；能折叠时（M ≥ 4 的
@@ -694,6 +881,15 @@ Gate/Up 一次（BF16 x 对全部 BF16 行最大值穷举，FP8 字节与除法�
 （xq 5120、part 512、red 16、LUT 96）。shared 拆两半让每个 WG 的字节数相同；代价是 WG 数从 R·I/16·M 增到 (R+2)·I/16·M
 （DS TP4 M1：288 个，超过每 CU 3 个 WG 的 240 个槽）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound；1.13–2.32 TB/s（28–58% 线；routed + shared 的最少字节，整层 M1–4）。
+- 分解（缩放后合计 = 官方，括号末项为 lab 合计对官方）：ds_layer_tp4 M1（11.59 µs）固定 1.68 + 2.83 + 0.75 = 5.26（45%），
+  主循环 5.37 − 0.13 + 1.08 = 6.33（3.91 TB/s）（+11%）；mtp_layer_tp8 M4（13.84 µs）固定 44%，含每个 WG 量化同一行 x（+10%）。
+- 主循环：扫 H，T = 5.30 + n·0.0935 µs → 2.51 TB/s（63%）；ATT VALU 发射 68%；VGPR 102 → 4 wave/SIMD，DS TP4 M1 的 288 个 WG 超过
+  240 个常驻槽。
+- 可达上限：① = 包络 + 0.8 µs：ds_layer_tp4 M1 8.56（①/实测 0.74）；整层（Gate/Up + Down）的 ② 见末节。
+- 核对：跨 case 模型 12/12 ≤ 8.5%；消融合计对官方 ds_layer_tp4 M1 +11% 超 10%（进程 / 卡状态，同 Gate/Up decode）。
+
 ## 混合 Down decode：shared FP8 作末 wave（[decode_a8w4.py](decode_a8w4.py#L1667)）
 混合 Gate/Up 之后的 Down：每个 WG 算一个 token 的 32 个输出通道（行块对），每个路由列一个 wave（DS 7 个、MTP 4 个，与 M 无关），
 最后一个 wave 读 shared 的 FP8 Down。每个 wave 独立跑完自己那一列（自己的 LUT 副本与 LDS 行，量化与 MFMA 之间只有 wave 级
@@ -773,6 +969,16 @@ wave 内量化本列 mid 行
 **资源**：LDS = TOPK·(I + 128 + 96) B（DS TP4 5600 B、MTP TP8 2176 B）；VGPR MTP TP8 62（8 B 单块读法时 44）。主干 TP4 的 M4 改走折叠（见混合 Gate/Up 一节的
 DECODE_SHARED_MIXED_MAX_WORK）；M8 起 H5120 的 routed Gate/Up 去重，不走混合。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound；1.12–1.84 TB/s（28–46% 线）。
+- 分解（缩放后合计 = 官方，括号末项为 lab 合计对官方）：ds_layer_tp4 M1（7.58 µs）固定 1.77 + 1.51 + 0.71 = 3.99（53%），
+  主循环 2.35 + 0.56 + 0.68 = 3.59（3.63 TB/s）（+3%）；mtp_layer_tp8 M4（8.19 µs）固定 60%（+4%）。
+- 主循环：扫 I，T = 3.11 + n·0.514 µs → 2.03 TB/s（51%）；VGPR 98 → 3.5 wave/SIMD。
+- 次级：静态计数 VALU 273 拍对 MFMA 128 拍，但不是 VALU 受限（ATT 发射只有 50%）：停顿 VMEM 36% + barrier 25%——shared 列那个 wave
+  读 FP8（2 倍字节），其余 wave 在求和前的 barrier 等它。
+- 可达上限：① = 包络 + 0.8 µs：ds_layer_tp4 M1 6.09（①/实测 0.80）。
+- 核对：跨 case 模型 12/12 ≤ 9.7%。
+
 ## 去重计划与 x 行量化（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L196)）
 按 expert 去重的四个 kernel 的路径与只去重 Gate/Up 的 H5120 路径的第一步：一次 launch 量化 x 的每一行（与 row_quant_decode
 同算术、逐位一致）、把 out 清零（给 down_decode_dd 原子加；H5120 路径编译成 ZERO_COLS = 0、不清零，其槽对 Down 直接写），
@@ -830,6 +1036,11 @@ def a8w4_row_quant_plan(x, xq, xs, topk_ids, plan, out):
 3. SEGS 编译期固定（MAX_M 由 host 按 M ≤ 32 / ≤ 64 选）：M > MAX_M 时 ballot 段不够，计划出错。
 
 **资源**：LDS 16 B（4 个 wave 的 amax）；不用 MFMA。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：ISA、同几何空 kernel）
+- memory bound；0.04–0.21 TB/s（1–5% 线），2.8–5.4 µs：x 行量化（同行量化 decode）加每条路由的 ballot 排名（每 wave 462–617 条 VALU），单 wave 串行。
+- 可达上限：① = 包络 ≈ 2.56 µs（mimo_tp4 M32 5.28 µs，①/实测 0.49）；② 并进相邻 kernel（末节）。
+- 核对例外：跨 case 模型 11/16 ≤ 10%，同行量化 decode 的 run 间双峰（mtp_layer_tp4 M10 三份官方 3.38 / 4.39 / 3.68 µs）。
 
 ## A8W4 Gate/Up decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L513)）
 按 expert 去重的四个 kernel 的路径与 H5120 只去重 Gate/Up 的路径里代替逐路由 Gate/Up：grid 与逐路由版相同，但只有组首路由的
@@ -909,6 +1120,16 @@ em = t//16、cr = t%16 收尾线程的组员与通道行 2m'+h。
 **资源**：LDS = GROUP·(H+16) B + 128·WAVES·GROUP B + 96 B LUT（H4096：GROUP2·8 wave 约 10.1 KiB，GROUP3·4 wave 约 13.6 KiB；
 H5120 GROUP3·4 wave 约 16.6 KiB）；每 lane PAIRS 条 16 B 权重加载同时在途（4 wave 为 16 条）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound（字节按唯一 expert 计）；55–70% 线（2.21–2.78 TB/s），decode 里离线最近的家族。
+- 分解（缩放后合计 = 官方，括号末项为 lab 合计对官方）：mimo_tp4 M32（150.12 µs）固定 9.97 + 20.90 + 0.44 = 31.31（21%），主循环
+  94.26 + 11.20 + 13.35 = 118.81（3.14 TB/s）（−11%）；空 kernel 已 8.9 µs：一条路由一个 WG（8192 个），非组首读完 plan 就退出，但都要派发。
+  DS TP4 M8（4 wave 版，51.61 µs）固定 17%，主循环 3.26 TB/s，FP4 解码 13%（+1%）。
+- 主循环：mimo_tp4 M32 扫 H，T = 4.96 + n·1.909 µs → 2.96 TB/s（74%）；ATT VALU 发射 62%，停顿 VMEM 30% + VALU 27% + waitcnt 23%。
+- 占用：VGPR 80 → 4 wave/SIMD；mtp_layer_tp8 M8–10（topk·I = 960 < 3072，全部块对先发）VGPR 146 → 3 wave，落在延迟区间。
+- 可达上限：① = 包络 + 0.8 µs：mimo_tp4 M32 85.88（①/实测 0.57）、DS TP4 M8 34.45（0.67）。
+- 核对：跨 case 模型 14/16 ≤ 10%（mtp_layer_tp8 M8 / M10 +13%，即上述延迟区间）；消融合计对官方 mimo_tp4 M32 −11%（lab 比冻结快）。
+
 ## A8W4 Down decode 去重（[decode_dedup_a8w4.py](decode_dedup_a8w4.py#L846)）
 按 expert 去重的两种路径（两个 / 四个 kernel）都用它：组首的 CTA 一次读 expert 的 4·CB 个 16 通道块，算组内各路由，结果乘路由权重后用 bf16x2
 原子加进已清零的 out（求和顺序不定，输出不逐位确定）。
@@ -981,6 +1202,15 @@ for 本 wave 的 CB 个块：
 3. 每个组员 g 只由 lane 0–7 原子加（g < 条数），每 lane 一条 bf16x2；out 须先由计划 kernel 或 PLAN 版 Gate/Up 清零。
 
 **资源**：LDS = ROWS·(I+16) B + 16 B scale + 96 B LUT（I256 约 1.2 KiB）；Down 要求 I%128 = 0、QUANT 时 I%256 = 0。
+
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
+- memory bound；1.09–2.48 TB/s（27–62% 线；字节按唯一 expert 计；消融口径的主循环 4.1–4.4 TB/s 已过线，差距全在固定开销）。
+- 分解（缩放后合计 = 官方，括号末项为 lab 合计对官方）：mimo_tp8 M16（27.12 µs）固定 50%（4096 个 WG 的派发 5.1 + 序言 8.7），
+  主循环 13.8 µs（4.35 TB/s）（+2%）；WG 内量化版 mimo_tp8 M4（12.13 µs）固定 66%（序言 3.8 + 逐值除法的 WG 内量化 2.0）（+2%）。
+- 主循环：mimo_tp8 M16 扫 I 2.36 TB/s，但 VGPR 随 I 从 57 涨到 137（8 → 3 wave/SIMD），I1024 掉到 2.27，模型只在 I 256–768 可用；
+  ATT VALU 发射 81%。
+- 可达上限：① = 包络 + 0.8 µs：mimo_tp8 M4 6.95（①/实测 0.57）、M16 15.84（0.58）。
+- 核对：跨 case 模型 7/7 ≤ 7.9%（WG 内量化版 5/5 ≤ 1.1%）；消融合计对官方 mimo_tp4 M32 −16%（lab 比冻结快）。
 
 ## A8W4 Gate/Up 流式（[stream_a8w4.py](stream_a8w4.py#L450)）
 流式档（M > 32、每个 expert 平均不超过流式上限且不走去重 decode）按排序块（同一 expert 的 16 / 32 / 64 行）
@@ -1100,6 +1330,22 @@ LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
 SYNC = A，BM16 / 32 都是 8 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时 BM·W·4 B amax；累加器 8·G·S 个 VGPR，
 分派只在它 ≤ 96 时让一个 WG 管全部 I 并尾部量化（TP2 BM32 为 80，BM64 为 160 故不量化）。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数，分区 76 例；诊断：消融（单项 Δ）、ATT、合成访存）
+- memory bound（BM64 的 AI 109–116 贴着 compute 线）。族中位：BM16 73% 线（单例 2.26–3.37 TB/s）、BM32 58–62%、BM64 44–49%
+  （按运算也只 44–50%）、尾部量化版 36–49%。
+- 骨架（同一 kernel 只留权重流、块头与 MFMA）中位 3.5–4.0 TB/s、快态 4.0–4.4：权重流本身已在线附近，差距是叠在上面的三项。
+- 分解（加法：T0 2.5 + 理想 = 字节/4 TB/s + 各项单项消融 Δ + 访存余量 = lab 实测；括号为对官方的误差）：
+  - DS TP4 M64 BM16（254.0 µs）：2.5 + 191.7 + 解码 54.1 + 激活环 −4.1 + 收尾 0.5 + 余量 4.7 = 249.4（−1.8%）；
+  - DS TP4 M1024 BM32（474.6 µs）：2.5 + 306.1 + 解码 52.6 + 激活环 69.7 + 收尾 22.3 + 余量 33.5 = 486.7（+2.6%）；
+  - mtp_layer_tp4 M1280 BM64（231.2 µs）：2.5 + 104.3 + 解码 22.8 + 激活环 87.0 + 收尾 6.2 + 余量 7.5 = 230.3（−0.4%）。
+  FP4 解码占 12–22%；激活 LDS 环在 BM32 / 64 占 14–41%（H5120 的 act4 几乎为 0，H ≤ 4096 的 act1 每步装载、每 2 步 barrier，4–19 µs）。
+- ATT：BM16 每 wave 序言 11.7–17.8 µs，是在饱和的访存队列里排队（去掉空 WG 不提速，不是独立的固定开销）；尾段空闲占 CU 跨度 1–18%
+  （小 M 最大）；占用 BM16 7 wave/SIMD（LDS 8320 B）、BM32 5–6、BM64 3–4；停顿以 VMEM 发射为主（BM16 51–65%），VALU 平均只忙约 60%。
+- 可达上限：① = max(骨架中位, T0 + 运算/450 TF)，①/实测 BM16 0.68–0.81、BM32 0.60–0.64、BM64 与尾部量化版 0.46–0.53；
+  ② 再把 mid 量化并进收尾（省行量化 3–8 µs 与一个边界，末节）。
+- 核对：分解合计对官方 14/14 在 −7.1…+2.6%；族模型 T = 2.5 + 字节·r / BW_族（r = 每 expert 的重读系数；BM16 三种 H 都是 2.98–3.01 TB/s）
+  70/76 ≤ 10%，超出的是极小 M 与侧流 shared GEMM 并发（+10…+16%）、双流 eager profile 少记（DS 整层 M64 −12%）、块近满（TP2 / TP4 M512 +15% / +11%）。
+
 ## A8W4 Down 流式（[stream_a8w4.py](stream_a8w4.py#L1351)）
 流式档按排序块算 (mq 行 · w2ᵀ) × 通道因子 × ms × 路由权重：I < 512 时（`ATOMIC`）用 bf16x2 原子加直接累加进 prep 清零过的 out，
 否则按排序行 bf16 写 routes 给 route_sum。
@@ -1203,10 +1449,24 @@ for u in 0 … R/2−1：
 8·S，块对多 8·S：DS BM16 R16W1 149→158 VGPR，仍 3 wave/SIMD；BM32 的 R8W4 掉一档，但更快）；ATOMIC 另占 8·S 个（行 token
 与行 scale），I = 512 时加上 K512 的激活反而更慢，所以分派只在 I < 512 时用。
 
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数，分区 76 例；诊断：消融（单项 Δ）、ATT、合成访存）
+- memory bound（BM64 H2560 的 AI 141 为 compute）。族中位：BM16 59–64% 线（单例 1.78–3.00 TB/s）、BM32 36–53%、BM64 原子 20–27%。
+- 骨架中位 BM16 3.5–4.2 TB/s、BM32 / 64 2.3–3.6；差距是 FP4 解码（8–24%）与收尾（bf16 写 routes 或 bf16x2 原子，BM32 / 64 占 25–56%）。
+- 分解（同 Gate/Up 流式；括号为对官方的误差）：
+  - DS TP4 M64 BM16 routes（155.8 µs）：2.5 + 99.7 + 解码 26.6 + 写回 21.0 + 余量 −7.1 = 142.7（−8.4%）；
+  - mimo_tp8 M1024 BM64 原子（147.3 µs）：2.5 + 39.3 + 解码 10.0 + 原子 49.9 + 余量 32.9 = 134.6（−8.6%）；
+  - mtp_layer_tp8 M1365 BM64 原子（149.1 µs）：2.5 + 33.3 + 解码 20.4 + 原子 82.2 + 余量 7.3 = 145.6（−2.4%）。
+- 占用：R16W1 3 wave/SIMD（VGPR 130；I320 为 91 → 5）、R8W4 的 BM32 2–4、BM64 2；mtp_layer_tp8 的 BM64 原子（I320）VGPR 267 + AGPR 11
+  → 每 SIMD 1 wave，去掉收尾的变体 VGPR 225 → 2 wave、63 µs 对 146 µs：这一例的「原子」项大半是占用。停顿以 waitcnt / VMEM 为主。
+- 可达上限：① = max(骨架中位, T0 + 运算/450 TF)，①/实测 BM16 0.57–0.77、BM32 0.54–0.59、BM64 0.34–0.47；② 同 ①
+  （I ≥ 512 时原子比 routes + route_sum 慢，route_sum 保留）。
+- 核对：分解合计对官方 13/13 在 −9.1…+5.0%（lab 的 Down 输入激活常驻缓存而 bench 冷，lab 偏快）；族模型 61/73 ≤ 10%（无侧流 32/35），
+  超出的原因同 Gate/Up 流式（侧流并发 +17…+19%、双流计时 −10…−14%、块近满 +11…+20%）。
+
 ## 流式 prep（排序 + 输入量化 + 清零）与 route_sum（[stream_a8w4.py](stream_a8w4.py#L1066)）
 流式档（以及 H ≥ 2560、M·topk ≤ 24576（H5120 为 12288）的 prefill 档）用一次 launch 的 prep 代替 aiter moe_sorting 与输入量化：
 排序结果格式相同（但同一 token 重复的 expert 每条路由都保留），量化与 quant_row 逐位一致；Down 原子累加时同一次 launch 顺带把
-out 清零。I ≥ 512 时 Down 写 routes，route_sum 代替底座 sorted_sum（同顺序同舍入）。折叠 shared expert 时（末节）prep 直接读
+out 清零。I ≥ 512 时 Down 写 routes，route_sum 代替底座 sorted_sum（同顺序同舍入）。折叠 shared expert 时（「shared expert 折叠」一节）prep 直接读
 [M, topk+1] 的路由、按 SHARED 编译：末列一律不排序（不论 id），其 loc = −1，排序行与块的容量按 routed 列计。
 
 **Gluon 风格**
@@ -1289,6 +1549,22 @@ route_sum：lane < topk 读 loc_ids[token] → readlane 逐槽广播 → topk �
 **资源**：prep 的 LDS 约 3·(256·⌈E/256⌉ + 64) 个字（E256 约 3.8 KiB、E513 约 9.8 KiB）；route_sum 不用 LDS。
 排序容量按每个 expert 至多多出 BM−1 个填充行估上界（[stream_prep_sizes](stream_a8w4.py#L1032)），grid 按它发射，多出的块 CTA 退出。
 
+**roofline 与分解：prep**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（只发排序 WG / 只发量化 WG，暖态与冷态）、ATT）
+- memory bound；流式 5.1–37 µs，族中位 0.30 TB/s（7%）；作 prefill 前端（DS M ≤ 2048、MTP M ≤ 4096、TP2 / MiMo M2048）27–70 µs。
+- 结构：整体 ≈ max(排序段, 量化段)（暖态 19 例中 18 例在 8% 内）。M ≤ 64 排序段（4.5–5.5 µs）主导；M ≥ 128 量化段主导、∝ M·H：
+  QW=1 每 wave 一行、逐元素 IEEE 除（每 wave 约 2300 条指令），grid 只有排序 WG + M/4（DS M1024 为 280 个 WG），x 量化只跑约 1 TB/s。
+- 分解（DS TP4 M1024，26.9 µs）：T0 2.5 + 量化段 19.1 + 两段交叠余量 0.2 + 冷输入 5.2 = 26.9（排序段 5.8 µs 被量化段盖住）。bench 每次调用
+  轮换深拷贝、输入全冷：官方 = 暖态的 1.06–1.46 倍，冷包络（每次发射前 1 GiB memset）= 暖态的 1.55–1.65 倍。
+- 可达上限：① ≈ T0 + 字节/4 TB/s + 2 µs ≈ 4–11 µs（流式）、10–25 µs（prefill 前端），把握中；② 同 ①。
+- 核对：结构模型 T = max(5.54 + 0.87·R/1000, 5.38 + 17.91·M·H/5120/1000) µs 46/76 ≤ 10%：DS 型 +12…+31%、MTP 层 −11…−16%，
+  即冷输入的程度随形状族不同（上一次调用末尾留下的缓存 / 写回状态，机理未核实）；prefill 前端 T = −4.2 + 1.18 µs/MB × 3MH + 2.7 µs/百 expert
+  10/10 ≤ 9.9%（排序随 expert 数而不是 R² 增长）。
+
+**roofline 与分解：route_sum**（官方 = 冻结基线（M0）bench 中位数）
+- memory bound；2.8–31 µs，族中位 1.66 TB/s（41%）；大 M 已到线：mimo_tp4 M1024 3.93 TB/s（98%）、ds_layer_tp4 M1536 4.09（102%）。
+- 模型 T ≈ 4.15 µs + 0.209 µs/MB（边际 4.8 TB/s，R² 0.995），无侧流 14/17 ≤ 10%（DS M16–48 的 2.8–5.5 µs 例 ±11–13%，三份官方极差中位 5.8%）。
+- 可达上限：① = T0 + 字节/4 TB/s（小 M 就是 T0）；② 只能由原子 Down 去掉，而 I ≥ 512 时原子更慢，保留。
+
 ## shared expert 折叠（[shared_a8w4.py](shared_a8w4.py)，入口 `moe_a8w4._SharedFold`）
 带 FP8 shared expert（DeepSeek-V4.1，路由末列 = E）的调用，在 routed 路径允许处（`_shared_fold_tier`）不再单独相加：shared
 的两次稠密 GEMM（aiter 的 FlyDSL preshuffle FP8 GEMM，`_shared_gemm` 按 M 选 tile；gfx942 上比 CK 默认配置快）吃 routed
@@ -1339,45 +1615,76 @@ M8–32 为 0.89–0.99 倍）；读 shared 结果的 kernel 之前 join。输�
 **不变量**：丢弃 shared 的行 mq 全 0、ms = 0 → Down 输出 +0，整行屏蔽仍逐位 +0；route_sum / sorted_sum 对 shared 行的 f32
 求和顺序在 routed 之后、只舍入一次；除原子 Down 外结果逐位确定（graph 重放 = eager）。
 
-## 逐 kernel 的 roofline 口径（[moe_a8w4.py](../../../moe_a8w4.py) 的 `KernelLaunch`）
-在 `moe_a8w4.recording_launches()` 里（默认关闭）调用时，发射的每个 device kernel 在 host 侧登记一条 `KernelLaunch`
-（`moe_a8w4.last_launches`，与 `last_path` 并列；每次调用都清空它，只有开关内的调用写入）：名字、stream、最少字节的三项与有用
-运算量；不读 GPU 数据、不同步（graph 捕获时照样登记）。关闭时发射点只多一次 `if _recording` 判断，不求字节与运算量（eager
-调用的 host 时间不变）；打开时每个 kernel 多约 4–9 µs host 时间。kernel 改名 / 合并时随代码改登记与本节，bench 不用改。
-外部 kernel 也逐个登记：Opus 排序的各相、底座 sorted_sum、preshuffle GEMM、split 链（含 Down 输入补零的 fill + copy）、
-`_shared_gate` 的小 kernel、`addcmul_`、路由张量的转换拷贝（`routing_copy/*`）；fork / join / mixed 标记与 `DEBUG_CHECKS`
-的 host 检查不登记。
+**roofline 与分解：preshuffle GEMM**（aiter 外部 kernel；官方 = 冻结基线（M0）bench 中位数；诊断：隔离链、K / tile 扫描、收尾消融、ATT）
+- Gate/Up（N = 2·I_pad，K 5120）。M ≤ 128（16x64x512 / 32x64x512）访存延迟受限：M ≤ 16 只有 18（TP4）/ 10（TP8）个 WG，主循环每 512-K 步
+  0.564 µs = 1.05 TB/s，ATT 停顿 waitcnt 73%、MFMA 3%；隔离 7.7–10.5 µs，① = 冷读包络 3.1–5.8 µs。M ≥ 1024（64x128x256）MFMA 受限：
+  主循环 443 TF（98% 线），固定段 9.2 µs（8%），M1152–1536 尾波 1 → 2（162 个 WG > 160 槽，+12 µs）；串行档官方 56–99% 线（M16384–32768 6 例 ≥ 95%）；
+  ① = T0 + 运算/450 TF（M4096 109.8、M32768 861 µs），隔离 = ① 的 1.01–1.09×（M ≥ 2048）、1.11–1.58×（M1024–1536）。
+- Down（N 5120，K = I_pad 补到 128 的倍数）。M ≤ 128（16x32x128 / 32x64x128）：每 WG 只有 5 / 3 个 K 步，ATT waitcnt 83%，主循环 0.83 TB/s；
+  隔离 4.2–7.6 µs，① 3.0–4.1。M ≥ 256（64x128x128）：主循环 426–449 TF（95–100%），但收尾不与主循环重叠：K 扫描截距 27.3 µs（M4096）/
+  211 µs（M32768）≈ bf16 输出按 1.6 TB/s 写（每 lane 2 B 的 `buffer_store_short`），占 TP4 30%、TP8 41%；K 补零 640/576 多 11%、384/320 多 20%。
+  去掉写回的消融：TP4 M32768 700 → 460 µs、TP8 498 → 242 µs（= ①）。串行档官方 34–63% 线。
+- 分解（ds_layer_tp4 M32768 的 Down，724.1 µs）：收尾 211.3 + 主循环 503.6（有用 453.2 + 补零 50.4，426 TF）+ 层内态 18.7 = 733.6（+1.3%）。
+  ① = T0 + 有用运算/450 TF：TP4 M4096 56.1、M32768 432，TP8 M32768 241 µs；隔离 = ① 的 1.5–2.2×，换更大的 tile 只快 6–7%（层内 ≤ 1%）。
+- 层内比隔离慢 0–25%：routed 部分的大写回把整卡带进慢态（隔离链前加一次 147–294 MB 的写即复现 1.5×，空闲与持续负载都不会）。
+- 核对：串行档按 M 的线性模型 70/81 ≤ 10%（超出的 11 个都在 M1152–2048：层内慢态、TP8 Gate/Up 尾波、5–9 µs 的 shared_fold_mid）；
+  侧流 M4–16 的隔离值对官方 68/72；代表例 7/8（mtp_layer_tp4 M1152 Gate/Up 的官方比同进程层内高 15%，未定位）。
 
-**字节** = 唯一 routed expert 数 × 每 expert 字节 + shared 字节 + 固定字节（唯一 expert 数由调用方在 host 上从路由列数出）。
-按 kernel 接口的必需流量，每个不同字节算一次，不扣 cache 命中：权重、delta、通道因子按存储格式（含 I 补零）；激活、中间量、
-输出按存储 dtype（x bf16、xq fp8 + xs f32、mid f32、mq fp8 + ms f32、routes bf16、out bf16）；先读后写的 out 算读 + 写，
-原子加算一次写；排序元数据取最少（每条路由的 sorted id、sorted weight 各 4 B，num_valid 8 B，每个 expert 一个块的 expert 号
-4 B，不计填充行）。**运算量**只算 GEMM 的有用部分 2·行数·N·K：routed 的行数为 M·topk，含屏蔽的路由（host 不读 ids），
-shared 为 M；MXFP4 按解码后的 FP8 MFMA 算；N、K 用 I_pad，shared 用它自己的 I_pad，Down 的 K 补到 128 的部分不算；不计排序块
-与 MFMA 列的填充；其余 kernel 为 0。一次调用合计 6·M·H·(topk·I_pad + I_s)（I_s 为 shared 的 I_pad，无 shared 时为 0）。
-两种 shared I 口径：登记用 I_pad（TP8 为 320），bench 整层例的 MF_METRIC flops 仍用 shared 的原始 I（TP8 为 288），所以 TP8
-层例的登记合计比 MF_METRIC 的 flops 多 6·M·H·32。
+**roofline 与分解：shared_fold_mid**（官方 = 冻结基线（M0）bench 中位数；诊断：ISA、ATT、隔离扫描）
+- VALU 发射受限：一 wave 一行，每行 472 条 VALU + 49 条超越函数 ≈ 2480 发射周期；I576 的第二组 16 B 只有 8/64 个 lane 有效（其余算重复值）；
+  ATT VALU 80%。T = 2.24 + 4.585 µs/千行（TP4；TP8 2.42 + 2.447，R² ≥ 0.9997）。
+- 官方：M ≤ 128 为 2.4–3.9 µs（≈ T0），M32768 TP4 156.0、TP8 86.2 µs；串行档 9–16% 线。
+- 可达上限：① = 冷读包络（M32768 TP4 23.5、TP8 14.1 µs，实测是它的 6.5× / 5.8×）；② 并进 Gate/Up GEMM 的收尾（要跨 tile 的行 amax）。
+- 核对：串行档模型对官方的超出只在 5–9 µs 的例（±13–17%，约 1 µs）。
 
-记号：R = M·topk 条 routed 路由，C 为路由张量列数（带 shared 时 topk+1），W1 / W2 = 一个 expert 的 w1 / w2 及其 delta、通道因子，
-S1 / S2 = shared_w1 / shared_w2 及其行 scale，B = 4 B（块的 expert 号）。每个家族：每 expert 字节；shared 字节；固定字节；运算量。
-- Gate/Up（decode、去重、流式、prefill）：W1（流式、prefill 加 B）；0；读 x 2MH 或 xq MH + xs 4M、ids 4R（去重加 plan 16R，
-  流式与 prefill 换成 sorted id 4R + num_valid 8），写 mid 4RI 或尾部量化的 mq RI + ms 4R（计划版另写 plan、清零 out 2MH）；4·R·I·H。
-- Down（decode、去重、流式、prefill）：W2（流式、prefill 加 B）；0；读 mq + ms 或 mid 4RI、ids 与 weights 各 4R（流式与 prefill 为
-  sorted 8R + 8，去重加 plan），写 out 2MH（SHARED 版先读后写，计 2 份）或 routes 2RH（prefill Down 另写 loc 4R）；2·R·H·I。
-- 混合 Gate/Up / Down：W1 / W2；S1 / S2；x 2MH + ids 4MC + 写 mid 4MCI / 读 mid、ids、weights + 写 out；routed 部分 +
-  4·M·I_s·H / 2·M·H·I_s。
-- 行量化（decode、prefill、计划）：0；0；输入 + q + scale，fill 版加 loc，计划版加 ids 4R、plan 16R（H4096 去重另清零 out 2MH）；0。
-- 流式 prep：B；0；读 ids、weights 8R 与 x 2MH，写 sorted 8R + 8、loc 4MC、xq + xs，清零时加 out 2MH；0。
-- route_sum、sorted_sum：0；0；loc 4MC + 它指向的 routes 2MCH（含 shared 行）+ out 2MH；0。
-- Opus 排序（无 workspace 时 1 个 kernel；有时 P0 + P23，≥ 2048 token 再加清零与 P1）：末个 B；0；单 kernel 16R + 8，分相时
-  每相 + workspace 一次，P0 + ids 4R，末相 + 16R + 8；0。
-- shared 折叠（GEMM、shared_mid、GEMM）：0；S1 / 0 / S2；xq + xs + gate_up、gate_up + mq + ms + 12M（+ loc 4M）、mq + ms + out；
-  2·M·2I_s·H / 0 / 2·M·H·I_s。split 链同样逐步算（补零：fill M·K_w、copy 2M·I_s）。
-- 小 kernel（routing_copy、shared_gate、addcmul_）：0；0；读 + 写（addcmul_ 读 out、shared、gate，写 out）；0。
+## split 链（aiter / CK 外部 kernel）
+shared 不能折叠时（M > 65536、shared 要写 out 而 out 未 16 B 对齐、单槽 / 去重 Down、prefill M ≤ 1024）按 ATOM 的 split 链计算（调用顺序见
+文首「先读」）：per_token_quant_hip(x) → CK gemm_a8w8_bpreshuffle(gate / up) → silu_and_mul → per_token_quant_hip(mid) → Down 输入补零
+（fill + copy）→ CK GEMM(Down) → out.addcmul_(shared, 权重)，路由权重另经 `_shared_gate` 的 6 个小 kernel。bench 里只有两个 M98304 例走它。
 
-bench 计时的调用都不登记：计时之后在开关内再调一次 a8w4 取登记（`_recorded_launches`；kernel 只取决于形状、选项与模块常量，
-与计时的调用相同）。`_kernel_us` 把它与 run_perftest 那一遍的 profiler 事件对齐：每个 stream 的事件按 profile 的顺序
-（对不上再按开始时间），登记的 main / side / aux 各取一个 stream，每次调用的条数相同、kernel 名序列与多数调用相同才算对上；
-几种取法都对得上时，最后结束的 stream 为 main（调用在末个 kernel 之前 join 侧流）。profiler 停止时丢了末尾几次调用的记录、
-或个别调用的记录错位时，这些调用不用（`INFO kernel_map ... dropped_calls`），能用的不到一半就打印 `mismatch`；时间取能用的
-调用去掉首次（多于 30 次时再去掉总时间的 IQR 离群）后的均值。bound：运算量 / 字节 < 112.5（450 TF ÷ 4 TB/s）为 mem。
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：整层 graph 消融、分块折叠对照）
+- 两例 shared 链合计 9676 µs（ds_layer_tp4 M98304）/ 7430 µs（mtp_layer_tp8 M98304），shared 增量 9114 / 6954 µs = 墙钟的 20% / 41%；
+  墙钟 = 主流 25 个 kernel 之和（≤ 0.2%）。
+- CK 在这些形状没有调优表（用默认 kernel）：Gate/Up 63–67% 线、Down 29–44%（K 补零到 128 的倍数）；addcmul_ 1.8 TB/s（45–46%）、
+  x 量化 2.4 TB/s（60–61%）、silu_and_mul 1.3 TB/s（32–33%）、mid 量化 0.56–0.86 TB/s（14–22%）；补零 fill + copy 共 78–131 µs，
+  6 个 gate 小 kernel 共 34 µs（每个 5–8 µs，T0 级）。
+- 可达上限：逐 kernel 的 ① 之和 ≈ 5200 / 3400 µs；② 按 65536 行分块调用折叠的 preshuffle GEMM（kernel 不改，已测）：shared 增量
+  6007 / 3924 µs，墙钟 −6.7% / −17.8%（对融合 FP8 0.96× / 0.94×），对 FP32 参考的 rel L2 1.21e-2 / 1.07e-2（split 1.40e-2 / 1.21e-2）。
+
+## 链路与空隙
+整层墙钟（CUDA graph 重放）= 主流 kernel 之和 + 侧流的 fork/join（FJ）+ shared 链的露出与竞争（X）；按档的模型对 95 个整层例的官方墙钟
+92 例在 10% 内，侧流 · 流式改用 graph 口径后 94 例（官方 = 冻结基线（M0）bench 中位数；FJ、X 取诊断的整层 graph 消融：FJ = 侧流只留 shared_fold_mid 对侧流不发 kernel 的
+墙钟差，X = 完整折叠对只留 mid 的墙钟差）。
+
+| 档（整层例） | 墙钟 = | 例数 | 模型对官方墙钟 | shared 增量（官方） |
+|---|---|---|---|---|
+| 混合 decode（M ≤ 4） | Gate/Up 混合 + Down 混合（eager 时长），空隙 ≈ 0 | 12 | −10.5…+2.1% | 0.0–8.2 µs |
+| 侧流 · 折叠 decode（M4–10） | 主流 Σ + FJ + X | 16 | −9.7…+7.2% | 5.8–18.4 µs |
+| 侧流 · 流式（M11–1024） | routed 链（graph）+ shared 增量 | 38 | −4.0…+6.0% | 3.4–61.3 µs |
+| 串行（M1025–65536，流式末段与 prefill） | 主流 Σ（含 shared 的 GEMM、mid、GEMM） | 27 | −5.1…+0.7%（中位 +0.3%） | 47.8–1855.8 µs |
+| split（M98304） | 主流 Σ（25 个 kernel） | 2 | ≤ 0.2% | 9114 / 6954 µs |
+
+- 超 10% 的 3 例：混合档 mtp_layer_tp4 M4 −10.5%（混合 kernel 在 graph 连续重放里比 eager 慢 5–16%，同进程实测）；侧流 · 流式档若按 eager
+  主流 Σ + FJ + X 算，ds_layer_tp4 M64 −11.8%、ds_layer_tp8 M256 −12.2%——routed 链的 graph 墙钟是 eager 主流 Σ 的 0.99–1.13 倍（M16–512 多为
+  1.07–1.13；也可能是双流时 eager profile 少记了主流 kernel，机理未核实）；乘上同进程实测的 graph / eager 比后为 −3.2% / −2.4%，
+  表中改用 graph 口径。
+- 折叠 decode：增量 = 路由改动 0–4（多一个 x 行量化、Down 先读 out）+ FJ 0.2–7.8 + X 1.6–8.7 µs，E = 墙钟 − 主流 Σ = 9.0–18.6 µs。
+  例：mtp_layer_tp8 M5 的 41.94 µs = 主流（x 行量化 3.90 + Gate/Up 12.76 + mid 行量化 2.44 + Down 9.37）28.47 + E 13.47；比 M4 混合（22.05）
+  多出的 19.9 µs = 两个行量化 6.3 + E 13.5。fork 到 join 之间主流段 15.2 µs、shared 链隔离 14.2 µs，单看藏得住，但两边都在读权重，互相拖慢。
+- 侧流 · 流式：M11–128 增量 3.5–14.6 µs（FJ 中位 3.8、X 中位 3.9）；M256–1024 增量 3.4–61.3 µs，以 X 为主（中位 23.5，5.8–54.9）——
+  routed Gate/Up 与 shared GEMM 都吃满 CU，并发只省掉其中的空转。
+- 串行：增量 = 三个 shared kernel（留一消融之和 / 整条链 0.94–1.10）+ sorted_sum / route_sum 多读一列（M32768 +48 µs）。
+- 相邻 kernel 的空隙：graph 里真实 kernel 的槽 ≈ 它的 eager 时长（派发与收尾和前一个 kernel 重叠）——decode 与 shared 链每个边界 ≈ 0
+  （±0.3 µs）；流式 routed 链小 M 每个边界 0.5–1.6 µs（中位约 1.2，每次调用 3–5 个边界），原子 Down 的链每个边界 2.7–4.9 µs（原因未查）；
+  prefill 链按 0.78 µs / 边界计 ≤ 0.8%。所以少一个 kernel 省的是它的 T0（约 2–2.5 µs）与这一点空隙。
+- fork/join：校准（两条流各一个等长 spin kernel，0–20 µs）为 11–12 µs/次、与时长无关；层内按上面的消融口径实测 FJ 中位
+  decode 4.5（0.2–7.8）、流式 M11–128 3.8（0.1–7.9）、M256–1024 4.8（1.3–9.0）µs；侧流不发 kernel 时 ≈ 0（54 例中位 +0.2 µs）。
+  侧流只在省下的串行时间超过 FJ + X 时划算。
+- 链路可达上限 ②（合并 / 融合后，对该链的实测）：
+  - decode（整层与 routed 例）②/墙钟 0.34–0.69：② = 整条链最少字节（含 shared 权重）的冷读包络 + 0.8 + 1.8 µs（只保留一次 Gate/Up → Down
+    的全设备依赖），行量化、fork/join 与中间量往返都不再单独付费；
+  - 流式 routed 链（对链内 kernel 和）0.40–0.77：在各 kernel 的 ① 上把 mid 行量化并进 Gate/Up、少一个边界（每例 4–8 µs）；
+  - prefill routed 链（对链内 kernel 和）0.50–0.75：单一前端（排序 + x 量化 + loc）+ Gate/Up 写 FP8 mid + Down 原子累加，mid 行量化与
+    sorted_sum 消失；
+  - shared 增量的下限 = max(shared 字节 / 4 TB/s, shared 运算 / 450 TF)：M1–10 1.3–2.4 µs、M11–128 1.4–5.0、M256–1024 5.6–40.3；串行档在各
+    kernel ① 之和上再并掉 mid 与 shared 行的写读，ds_layer_tp4 M1536 / 4096 / 32768 的增量 130 / 226 / 1847 → 约 62 / 160 / 1210 µs。
