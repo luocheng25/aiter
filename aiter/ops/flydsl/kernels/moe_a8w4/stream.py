@@ -1272,6 +1272,7 @@ def compile_a8w4_down_stream(
         assert W == 4, "the reduce / owner workgroups of TP run four waves"
         assert GPB * TP.NSPLIT * 16 * R * W == N, (N, TP.NSPLIT, R, W)
         assert TP.COPY == int(ATOMIC) and TP.H == N and TP.TOPK == TOPK, TP
+        assert not (TP.PRO or TP.SB or TP.LAS), TP
         ROUTE_AUX = TP.ROUTE_AUX
 
     def body(

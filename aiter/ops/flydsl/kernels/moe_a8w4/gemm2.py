@@ -18,7 +18,8 @@ block's activations again): few sorted blocks then still fill the machine in sev
 ``TP`` (a ``mega_moe_tp_gfx942.down_tp.DownTP``): the streamed Down of ``MegaMoeTPGfx942`` -- a 1-D grid that
 computes the ``NSPLIT`` column blocks one after the other (part-major) and runs the cross-rank sum of the finished
 blocks in workgroups of the same launch inserted between the compute workgroups (``DownTP.segments``, ``down_tp``
-docstring); route and ``loc`` stores take its cache policy.
+docstring); route and ``loc`` stores take its cache policy, and its ``PRO`` / ``SB`` / ``LAS`` reorder the loads,
+stores and compute of a workgroup's block loop (the same results; ``DownTP`` docstring).
 """
 
 import flydsl.compiler as flyc
@@ -92,6 +93,9 @@ def compile_a8w4_gemm2(
         else "#llvm.target_features<[]>"
     )
     CHUNK = XCD_CHUNK * NSPLIT  # workgroups of one XCD chunk
+    EARLY = TP is not None and TP.PRO
+    SB = TP is not None and TP.SB
+    LAS = TP is not None and TP.LAS
 
     def _part(part):
         """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK and TP)."""
@@ -246,7 +250,8 @@ def compile_a8w4_gemm2(
                     fx.copy(cp_atom, atom_A, dst)
                 fx.gpu.barrier()
 
-            gather_A(ldsA0, 0)
+            if const_expr(not EARLY):
+                gather_A(ldsA0, 0)
 
             nBN = N // BLOCK_N // NSPLIT
             # First 64-row block of this workgroup's part of the hidden dimension.
@@ -268,83 +273,8 @@ def compile_a8w4_gemm2(
                 num_records_bytes=fx.Int64(M) * TOPK * 4,
             )
 
-            def body(bm, ops):
-                # Computes the first bm sorted rows; ops is a fresh builder cache per variant.
-                ldsA = fx.flat_divide(ldsA0, (bm, BLOCK_K))
-                layoutC = fx.make_composed_layout(
-                    fx.static(swz), fx.make_ordered_layout((bm, BLOCK_N, 2), (1, 0, 2))
-                )
-                layoutCt = fx.make_composed_layout(
-                    fx.static(swz), fx.make_ordered_layout((BLOCK_N, bm, 2), (0, 1, 2))
-                )
-                ldsC = lds.C.peek().view(layoutC)
-                ldsCt = lds.C.peek().view(layoutCt)
-                mm = ops.create_thr_mma(fp8, (4, 1, 1))
-
-                c_fake_tensor = fx.make_view(
-                    fx.get_iter(arg_p_input),
-                    fx.make_ordered_layout((BLOCK_N, bm), (0, 1)),
-                )
-                fragC = [
-                    mm.make_fragment_C(c_fake_tensor),
-                    mm.make_fragment_C(c_fake_tensor),
-                ]
-                fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
-
-                frag_act = [
-                    ops.load_tiled_mma_fragB(
-                        mm, ldsA, [None, None, 0, None], copy_atom_bits=128
-                    )
-                ]
-                for p in range_constexpr(1, len(A_COLS)):
-                    fx.gpu.barrier()  # Every wave has read the previous part before it is overwritten.
-                    part = lds_A(A_COLS[p])
-                    gather_A(part, A_K0[p])
-                    frag_act.append(
-                        ops.load_tiled_mma_fragB(
-                            mm,
-                            fx.flat_divide(part, (bm, BLOCK_K)),
-                            [None, None, 0, None],
-                            copy_atom_bits=128,
-                        )
-                    )
-                fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
-
-                sorted_weights = fx.make_view(
-                    fx.get_iter(arg_p_sorted_weights),
-                    fx.make_layout((BLOCK_N, bm), (0, 1)),
-                )
-                frag_sorted_weight = ops.load_tiled_mma_fragC(
-                    mm, sorted_weights, copy_atom_bits=32
-                )
-                sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
-                coord_tensor = fx.make_view(
-                    fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
-                )
-                frag_coord = ops.load_tiled_mma_fragC(
-                    mm, coord_tensor, copy_atom_bits=32
-                )
-                frag_row_scale = mm.make_fragment_C(coord_tensor)
-                frag_row_scale_r = ops.get_tiled_mma_retile(
-                    mm, frag_row_scale, "C", copy_atom=sc_atom
-                )
-                for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
-                    sorted_id = coord[0].bitcast(fx.Uint32)
-                    atom = fxh.atom_tensor(
-                        arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
-                    )
-                    fx.copy(sc_atom, atom, dst)
-                for frag_pt, frag_sw in fxh.all_elements(
-                    frag_row_scale, frag_sorted_weight
-                ):
-                    frag_pt.store(frag_pt.load() * frag_sw.load())
-
-                # Decoded FP8 weight operand of one 64-row block: (8, 1, 2, KB).
-                w_fake = fx.make_view(
-                    fx.get_iter(arg_p_input),
-                    fx.make_layout((BLOCK_N, BLOCK_K, KB), (K, 1, BLOCK_K)),
-                )
-                frag_w = mm.make_fragment_A(w_fake)
+            def weight_state(ops, mm):
+                """Registers of two weight blocks and their loader (slot = block parity)."""
                 w_voff, d_voff = a8w4.lane_offsets(tid, K)
                 w_regs = [
                     [
@@ -391,6 +321,111 @@ def compile_a8w4_gemm2(
                             [None, None, n0 + n, 0],
                             frag_pc_scales[slot],
                         )
+
+                return w_regs, d_regs, frag_pc_scales, load_block
+
+            if const_expr(EARLY):
+                # The weights of the first two blocks and the sorted row of loc load while the activations are
+                # gathered (they depend on the expert and the sorted ids only).
+                mm_early = flyobj.create_thr_mma(fp8, (4, 1, 1))
+                early_w = weight_state(flyobj, mm_early)
+                early_w[3](0, 0)
+                early_w[3](1, 1)
+                loc_sid = arg_p_sorted_ids[fx.Int32(tid) % BM]
+                gather_A(ldsA0, 0)
+
+            def body(bm, ops):
+                # Computes the first bm sorted rows; ops is a fresh builder cache per variant.
+                ldsA = fx.flat_divide(ldsA0, (bm, BLOCK_K))
+                layoutC = fx.make_composed_layout(
+                    fx.static(swz), fx.make_ordered_layout((bm, BLOCK_N, 2), (1, 0, 2))
+                )
+                layoutCt = fx.make_composed_layout(
+                    fx.static(swz), fx.make_ordered_layout((BLOCK_N, bm, 2), (0, 1, 2))
+                )
+                ldsC = lds.C.peek().view(layoutC)
+                ldsCt = lds.C.peek().view(layoutCt)
+                mm = mm_early if EARLY else ops.create_thr_mma(fp8, (4, 1, 1))
+
+                c_fake_tensor = fx.make_view(
+                    fx.get_iter(arg_p_input),
+                    fx.make_ordered_layout((BLOCK_N, bm), (0, 1)),
+                )
+                fragC = [
+                    mm.make_fragment_C(c_fake_tensor),
+                    mm.make_fragment_C(c_fake_tensor),
+                ]
+                fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
+
+                def load_act():
+                    frag_act = [
+                        ops.load_tiled_mma_fragB(
+                            mm, ldsA, [None, None, 0, None], copy_atom_bits=128
+                        )
+                    ]
+                    for p in range_constexpr(1, len(A_COLS)):
+                        fx.gpu.barrier()  # Every wave has read the previous part before it is overwritten.
+                        part = lds_A(A_COLS[p])
+                        gather_A(part, A_K0[p])
+                        frag_act.append(
+                            ops.load_tiled_mma_fragB(
+                                mm,
+                                fx.flat_divide(part, (bm, BLOCK_K)),
+                                [None, None, 0, None],
+                                copy_atom_bits=128,
+                            )
+                        )
+                    fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
+                    return frag_act
+
+                def load_row_scales():
+                    sorted_weights = fx.make_view(
+                        fx.get_iter(arg_p_sorted_weights),
+                        fx.make_layout((BLOCK_N, bm), (0, 1)),
+                    )
+                    frag_sorted_weight = ops.load_tiled_mma_fragC(
+                        mm, sorted_weights, copy_atom_bits=32
+                    )
+                    sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
+                    coord_tensor = fx.make_view(
+                        fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
+                    )
+                    frag_coord = ops.load_tiled_mma_fragC(
+                        mm, coord_tensor, copy_atom_bits=32
+                    )
+                    frag_row_scale = mm.make_fragment_C(coord_tensor)
+                    frag_row_scale_r = ops.get_tiled_mma_retile(
+                        mm, frag_row_scale, "C", copy_atom=sc_atom
+                    )
+                    for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
+                        sorted_id = coord[0].bitcast(fx.Uint32)
+                        atom = fxh.atom_tensor(
+                            arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
+                        )
+                        fx.copy(sc_atom, atom, dst)
+                    for frag_pt, frag_sw in fxh.all_elements(
+                        frag_row_scale, frag_sorted_weight
+                    ):
+                        frag_pt.store(frag_pt.load() * frag_sw.load())
+                    return frag_row_scale
+
+                if const_expr(EARLY):
+                    # The row scales' loads go out before the activation fragments are read from LDS.
+                    frag_row_scale = load_row_scales()
+                    frag_act = load_act()
+                else:
+                    frag_act = load_act()
+                    frag_row_scale = load_row_scales()
+
+                # Decoded FP8 weight operand of one 64-row block: (8, 1, 2, KB).
+                w_fake = fx.make_view(
+                    fx.get_iter(arg_p_input),
+                    fx.make_layout((BLOCK_N, BLOCK_K, KB), (K, 1, BLOCK_K)),
+                )
+                frag_w = mm.make_fragment_A(w_fake)
+                w_regs, d_regs, frag_pc_scales, load_block = (
+                    early_w if EARLY else weight_state(ops, mm)
+                )
 
                 def gemm_compute(slot, fragC):
                     for kb in range_constexpr(KB):
@@ -443,20 +478,34 @@ def compile_a8w4_gemm2(
                         cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n0 + n]
                     )
 
-                load_block(0, 0)
+                if const_expr(not EARLY):
+                    load_block(0, 0)
                 gemm_compute(0, fragC[0])
-                load_block(1, 1)
+                if const_expr(not EARLY):
+                    load_block(1, 1)
                 postprocess_store2lds(fragC[0], 0)
                 fx.gpu.barrier()
+
+                def half(n, slot):
+                    # LAS: the weight loads of block n + 2 go out before the stores of block n.
+                    if const_expr(LAS):
+                        load_block(n + 2, slot)
+                        postprocess_store2vmem(n, slot)
+                    else:
+                        postprocess_store2vmem(n, slot)
+                        load_block(n + 2, slot)
+
                 for n, state in range(0, nBN - 2, 2, init=[]):
-                    postprocess_store2vmem(n, 0)
-                    load_block(n + 2, 0)
+                    half(n, 0)
                     gemm_compute(1, fragC[1])
                     postprocess_store2lds(fragC[1], 1)
                     fx.gpu.barrier()
+                    if const_expr(SB):
+                        # Keeps the next half's compute below the barrier: hoisted next to its weight loads, the
+                        # wait for them (vmcnt counts loads and stores in issue order) also waited for the stores.
+                        rocdl.sched_barrier(0)
 
-                    postprocess_store2vmem(n + 1, 1)
-                    load_block(n + 3, 1)
+                    half(n + 1, 1)
                     gemm_compute(0, fragC[0])
                     postprocess_store2lds(fragC[0], 0)
                     fx.gpu.barrier()
@@ -482,7 +531,7 @@ def compile_a8w4_gemm2(
             # Sorted row of each valid route (padding rows store nothing). Stored after the main loop:
             # at the start the store made the whole kernel ~30% slower (Qwen TP2).
             row = fx.Int32(tid) % BM
-            sid = arg_p_sorted_ids[row].bitcast(fx.Uint32)
+            sid = (loc_sid if EARLY else arg_p_sorted_ids[row]).bitcast(fx.Uint32)
             token = fx.Int32(sid & fx.Uint32(0xFFFFFF))
             route = (token * TOPK + fx.Int32(sid >> 24)) * 4
             past = fx.Int32(0x7FFF0000)

@@ -156,6 +156,10 @@ from .tp_reduce import (
 
 # Workgroup roles of the streamed Down grid (module docstring).
 ROLE_COMPUTE, ROLE_REDUCE, ROLE_OWNER = 0, 1, 2
+# ``SYS`` with the non-temporal hint (nt): route rows written through as a stream (``DownTP.ROUTE_AUX``), the same
+# scope. The Down alone 5.6 % faster at Qwen TP4 M 32768 than with ``SYS`` (20261126-213259-dtax-run-0510), but the
+# reduce workgroups' reads of the rows miss more: a gain at large batches only (mega_moe_tp_gfx942.DOWN_TUNE).
+SYS_NT = SYS | 2
 # Column blocks the flag / epoch layout has room for (fixed, so calls with another NSPLIT find the same slots).
 NSPLIT_MAX = 16
 # Tile sizes (tokens) DownTP takes; the workspace sizes the slots and inbox rows for all of them.
@@ -276,14 +280,21 @@ class DownTP:
     nothing), 2 = the Down and this rank's reduction over the routes into ``out``, nothing sent, 3 = as 1 without
     the compute workgroups' counting (no ``s_waitcnt vmcnt(0)`` before they end), 4 = the Down and the reduce
     workgroups' reduce-scatter (owner workgroups and the gather do nothing). ``TRACE``: every workgroup stores its
-    start and end ``s_memrealtime`` (int64 pair) at ``ctr`` word ``ctr_words(OS)`` + 4 * wg. ``WPE``: the
-    kernel's ``waves_per_eu`` compile hint (0: none). ``STAMP`` (with ``OS``): the one-shot sum's timestamps
-    (``STAMP_SLOTS``).
+    start and end ``s_memrealtime`` (int64 pair) at ``ctr`` word ``ctr_words(OS)`` + 4 * wg. ``STAMP`` (with
+    ``OS``): the one-shot sum's timestamps (``STAMP_SLOTS``).
 
     ``OS`` (two ranks, no owner workgroups; the ``CHUNKED`` prefill Down of one token chunk, ``TPArgs.t_lo`` /
     ``t_hi`` / ``chunk``, rule 11): the one-shot sum, the reduce workgroups take the chunk's tiles only and store
     this rank's partials into ``out``, the SDMA queue pushes them to the peer (rule 12); the chunk's block counters
-    are ``ctr`` words ``chunk * NSPLIT_MAX`` on."""
+    are ``ctr`` words ``chunk * NSPLIT_MAX`` on.
+
+    Compute workgroups' schedule (the prefill Down, ``compile_a8w4_gemm2``; the results are the same bits): ``PRO``
+    issues the loads of the first two weight blocks, of the row scales and of ``loc``'s sorted row before the
+    activations are gathered; ``SB`` puts a scheduling barrier after the middle barrier of the block loop (else the
+    compiler hoists the next half's dequantization and MFMAs above it, next to their weight loads, whose wait then
+    also waits for the route stores issued before them: ``vmcnt`` counts loads and stores in issue order); ``LAS``
+    issues each half's weight loads before its route stores. ``WPE``: the kernel's ``waves_per_eu`` compile hint
+    (0: none); ``SB`` / ``LAS`` raise the VGPRs: with ``WPE`` they keep the occupancy."""
     WORLD: int
     H: int
     TOPK: int
@@ -305,6 +316,9 @@ class DownTP:
     WPE: int = 0
     OS: int = 0
     STAMP: int = 0
+    PRO: int = 0
+    SB: int = 0
+    LAS: int = 0
 
     def __post_init__(self):
         assert self.WORLD in (2, 4, 8), self.WORLD

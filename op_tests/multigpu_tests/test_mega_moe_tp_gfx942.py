@@ -1015,7 +1015,7 @@ def test_set_weights(pool):
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
 # prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups. The
 # streamed Down (its counters reset by its own kernels) is replayed on the prefill path at DeepSeek-V4.1 TP4 8192
-# (10 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048; the token
+# (5 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048; the token
 # chunks at TP2 8192 (the replayed Down kernels submit the SDMA pushes).
 GRAPH_CASES = [
     ("tp2", 8),
@@ -1582,17 +1582,21 @@ def test_single_slot_decode_fallback(pool):
 # Why: the benchmark and the tests above check each output against the FP32 reference within the tolerance only, and
 # their batch sizes leave the streamed Down's gather at 1 item per workgroup or in full groups. Where the routes and
 # the ranks are summed in f32 (prefill path, DeepSeek-V4.1's streaming path) the streamed Down must equal the
-# unstreamed path (STREAM_DOWN off: Down kernel, tp_reduce) bitwise: TP4 3272 / 3273 (2045 / 2050 tiles of 8 tokens
+# unstreamed path (STREAM_DOWN off: Down kernel, tp_reduce) bitwise, also under each shape's compute schedule of the
+# prefill path (DOWN_TUNE: loads and stores reordered, the same bits): TP4 3272 / 3273 (2045 / 2050 tiles of 8 tokens
 # over the column blocks: 1 / 4 per gather workgroup, the last group partial), TP4 8193 (a 1-token last tile, rank 0
-# owning one tile more), TP2 8193 (token chunks: the gather sums both ranks' partials, a 1-token last tile),
-# DeepSeek-V4.1 TP4 4097 (10 column blocks) and 513 (its first streamed batch). Not
-# here: Qwen's streaming path, whose BF16 atomics add the routes in a different order every call.
+# owning one tile more; route stores with nt above 8192 rows), TP2 4096 (with owner workgroups) and 8193 (token
+# chunks: the gather sums both ranks' partials, a 1-token last tile), DeepSeek-V4.1 TP4 2048 / 4097 (5 column blocks,
+# without / with XCD chunks) and 513 (its first streamed batch). Not here: Qwen's streaming path, whose BF16 atomics
+# add the routes in a different order every call.
 STREAM_BITWISE_CASES = (
     ("tp4", 3272),
     ("tp4", 3273),
     ("tp4", 8193),
+    ("tp2", 4096),
     ("tp2", 8193),
     ("ds_tp4", 513),
+    ("ds_tp4", 2048),
     ("ds_tp4", 4097),
 )
 

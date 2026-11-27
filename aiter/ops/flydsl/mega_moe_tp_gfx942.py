@@ -227,11 +227,29 @@ STREAM_TP_R = 8
 # (largest batch, that tuple) in increasing order, the first one the batch fits (None: any). Shapes without an
 # entry keep the Down kernel and tp_reduce. Paired timing on MI308X against those (20261126-084336-p1-run-ce23):
 # TP2 0.87-0.90 (M 2048-32768), TP4 0.96-0.99 (M 4096-32768), DeepSeek-V4.1 TP4 0.93-0.95 (M 2048-32768; 10
-# column blocks 0.97 at M 2048).
+# column blocks 0.97 at M 2048). DeepSeek-V4.1 TP4 with the compute schedule of DOWN_TUNE: 5 column blocks with
+# 32 / 16 reduce / owner workgroups against the former 10 column blocks 0.96-0.97 (M 4096-32768) and against
+# 64 / 32 0.98 (M 2048); there 64 / 32 or 96 / 48 0.99-1.04 and 16 / 8, 24 / 12, 32 / 8 or 16 / 16 0.96-1.00
+# against 10 column blocks, 2 column blocks 1.16-1.20 (20261126-222126-dtax-run-94b4,
+# 20261126-222417-dtax-run-843e, 20261126-222419-dtax-run-2025). TP2 / TP4 with fewer reduce / owner
+# workgroups 1.00-1.02.
 STREAM_SPEC = {
     (2, 2560): (5, 32, 16, 8, {"UX": 1}),
     (4, 2560): (5, 64, 32, 8, {"UX": 1}),
-    (4, 5120): ((2048, (5, 64, 32, 8)), (None, (10, 32, 16, 8))),
+    (4, 5120): (5, 32, 16, 8),
+}
+# Schedule of the compute workgroups of the streamed prefill Down (STREAM_SPEC; down_tp.DownTP PRO / SB / LAS with
+# WPE, and ROUTE_AUX: the same bits) by (world, hidden size), or pairs (largest batch, fields) as there. Paired
+# timing on MI308X against none (20261126-214137-dtax-run-303d, 20261126-214139-dtax-run-84f7): TP4 0.97-0.98 (M
+# 8192-32768), TP2 0.98-0.99 (M 2048-32768), DeepSeek-V4.1 TP4 0.98-0.99 (M 2048-32768; at 5 column blocks again,
+# 20261126-222707-dtax-run-89ab). down_tp.SYS_NT only
+# from TP4 M 16384 on: 0.98-1.01 at TP4 M 4096-8192, TP2 and DeepSeek-V4.1 TP4 (the reduce workgroups' reads of
+# the rows then miss more).
+_DOWN_TUNE_TP4 = {"PRO": 1, "SB": 1, "WPE": 4}
+DOWN_TUNE = {
+    (2, 2560): {"PRO": 1, "LAS": 1, "WPE": 3},
+    (4, 2560): ((8192, _DOWN_TUNE_TP4), (None, {**_DOWN_TUNE_TP4, "ROUTE_AUX": down_tp.SYS_NT})),
+    (4, 5120): {"SB": 1, "LAS": 1},
 }
 # The same for the fused batches on the stream path (the streaming Down's own column blocks, DownTP.COPY set by the
 # caller). Paired timing on MI308X against the Down kernel and tp_reduce (20261126-100503-p1-run-aaf7): TP2 0.94 /
@@ -250,7 +268,8 @@ STREAM_TIER_SPEC = {
 GATHER_ITEMS = 4
 GATHER_FROM = 2048
 # Token chunks of the streamed prefill Down with the one-shot cross-rank sum (down_tp rules 11-12) per (world,
-# hidden size): (from M rows, split points as fractions of M) -- the batches of at least that many rows run in
+# hidden size): (from M rows, split points as fractions of M[, {DownTP fields of the one-shot Down}]) -- the batches
+# of at least that many rows run in
 # token chunks (the split points rounded to whole tiles of every rank; chunk c's sort, Gate/Up, quantization and
 # Down after chunk c - 1's Down), and every rank's SDMA queue (on KFD's recommended engine, sdma.push_order) pushes
 # each chunk's partials into the peer's landing block by block while the Downs go on; the gather sums both ranks'.
@@ -258,10 +277,12 @@ GATHER_FROM = 2048
 # against the path without chunks (20261126-180318-tcs-run-a818, 20261126-180107-tcs-run-0a5b,
 # 20261126-184959-tcs-run-c2a7): TP2 0.95 / 0.92 / 0.90 (M 8192 / 16384 / 32768) but 1.01-1.04 at M 4096 and 1.17
 # at M 2048; one chunk 0.99-1.02. TP4 with an SDMA all-gather of the owners' sums instead: 0.99 at M 32768,
-# 1.01-1.06 at M 8192 - 16384; DeepSeek-V4.1 TP4 1.01-1.04 (M 16384 / 32768): none. AITER_MEGA_MOE_TP_CHUNK=0: no
-# token chunks.
+# 1.01-1.06 at M 8192 - 16384; DeepSeek-V4.1 TP4 1.01-1.04 (M 16384 / 32768): none. The one-shot Down has no owner
+# workgroups (NY = 0), so it takes more reduce workgroups: NX 96 instead of 32, paired 0.98-0.99 at TP2 M 8192 -
+# 32768 (20261126-220800-dtax-run-7e84; NX 64 / 128 alike, more for the last block nothing).
+# AITER_MEGA_MOE_TP_CHUNK=0: no token chunks.
 CHUNK_SPEC = {
-    (2, 2560): (8192, (0.78,)),
+    (2, 2560): (8192, (0.78,), {"NX": 96}),
 }
 CHUNK_DOWN = os.environ.get("AITER_MEGA_MOE_TP_CHUNK", "1") != "0"
 # Timing analysis of the one-shot path (DownTP.STAMP; needs TRACE_WGS >= down_tp.STAMP_BYTES / 16).
@@ -272,15 +293,20 @@ TRACE_WGS = 0
 
 
 def _stream_spec(world, H, topk, M, table=None, **over):
-    """The ``down_tp.DownTP`` of an M-row batch of a shape (``table``, default ``STREAM_SPEC``; ``over``: more
-    fields), None if it does not stream."""
-    spec = (STREAM_SPEC if table is None else table).get((world, H))
-    if spec and isinstance(spec[0], tuple):
-        spec = next((t for up_to, t in spec if up_to is None or M <= up_to), None)
+    """The ``down_tp.DownTP`` of an M-row batch of a shape (``table``, default ``STREAM_SPEC`` with ``DOWN_TUNE``;
+    ``over``: more fields), None if it does not stream."""
+
+    def pick(spec):
+        if isinstance(spec, tuple) and spec and isinstance(spec[0], tuple):
+            return next((t for up_to, t in spec if up_to is None or M <= up_to), None)
+        return spec
+
+    spec = pick((STREAM_SPEC if table is None else table).get((world, H)))
     if spec is None:
         return None
     nsplit, nx, ny, tt, *extra = spec
     fields = extra.pop() if extra and isinstance(extra[-1], dict) else {}
+    tune = (pick(DOWN_TUNE.get((world, H))) or {}) if table is None else {}
     return down_tp.DownTP(
         WORLD=world,
         H=H,
@@ -289,9 +315,7 @@ def _stream_spec(world, H, topk, M, table=None, **over):
         NSPLIT=nsplit,
         NX=nx,
         NY=ny,
-        **dict(zip(("DRY", "ROUTE_AUX"), extra)),
-        **fields,
-        **over,
+        **{**tune, **dict(zip(("DRY", "ROUTE_AUX"), extra)), **fields, **over},
     )
 
 
@@ -815,7 +839,9 @@ class MegaMoeTPGfx942:
         entry = CHUNK_SPEC.get((cfg.world_size, cfg.model_dim)) if CHUNK_DOWN else None
         if entry is not None and M >= entry[0] and cfg.world_size == 2 and ws.sdma_table() is not None:
             starts, tab = _chunk_starts(M, cfg.world_size * spec.TT, entry[1]), ws.tab3
-            spec = dataclasses.replace(spec, NY=0, NYT=0, OS=1, STAMP=OS_STAMP)
+            spec = dataclasses.replace(
+                spec, NY=0, NYT=0, OS=1, STAMP=OS_STAMP, **(entry[2] if len(entry) > 2 else {})
+            )
         key = (M, starts) if starts else M
         limit = _wait_limit(WAIT_S if key in self._seen else FIRST_WAIT_S)
 
