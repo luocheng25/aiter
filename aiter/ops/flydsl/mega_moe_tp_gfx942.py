@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tensor-parallel MoE layer for gfx942 with the interface of ``MegaMoeTP`` (``comm_mode="ar"`` only).
+"""Tensor-parallel MoE layer for gfx942 with the interface of ``MegaMoeTP`` (``comm_mode="ar"`` and ``"ag_rs"``).
 
-Experts are replicated over the TP group and ``inter_dim`` is sharded. Every rank gets the same input rows and
-routing; ``forward`` runs this rank's slice with the single-GPU A8W4 op (``moe_a8w4.flydsl_moe_a8w4_ptpc``: FP8
-per-token activations, MXFP4 routed experts, an optional FP8 shared expert) into a BF16 partial output and sums the
-partials over the ranks with one all-reduce: aiter's custom all-reduce (``CustomAllreduce``) below
-``AR_RCCL_MIN_BYTES[world_size]`` bytes where its ``should_custom_ar`` accepts the tensor, else RCCL
-(``torch.distributed.all_reduce`` on ``group``). The outputs of all ranks are bitwise identical.
+Experts are replicated over the TP group and ``inter_dim`` is sharded. ``comm_mode="ar"``: every rank gets the same
+input rows and routing; ``forward`` runs this rank's slice with the single-GPU A8W4 op
+(``moe_a8w4.flydsl_moe_a8w4_ptpc``: FP8 per-token activations, MXFP4 routed experts, an optional FP8 shared expert)
+into a BF16 partial output and sums the partials over the ranks with one all-reduce: aiter's custom all-reduce
+(``CustomAllreduce``) below ``AR_RCCL_MIN_BYTES[world_size]`` bytes where its ``should_custom_ar`` accepts the
+tensor, else RCCL (``torch.distributed.all_reduce`` on ``group``). The outputs of all ranks are bitwise identical.
 
-This version fuses no communication into the kernels (milestone M0 of the shared-expert task): the fused cross-rank
-sums of the MXFP4-only version (Down kernels that sum across the ranks, the token-tile reduce-scatter, SDMA chunks)
-return on top of the same op later. What only existed for them is trivial here: ``prepare`` only compiles and warms
-up, the watchdog bits stay 0 and ``reset`` only clears them.
+``comm_mode="ag_rs"`` (data-parallel attention in front, sequence-parallel in and out): every rank passes its own
+M_r tokens (the same M_r on every rank) and gets their output. ``forward`` gathers every rank's rows and routing
+(all-gather; rank r's rows at [r * M_r, (r + 1) * M_r)), runs this rank's slice of the layer on all world_size * M_r
+rows with the same op and sends each rank the sum of the partials of its rows (reduce-scatter). The all-gather is
+one ``custom_all_gatherv`` of x and the routing below ``AG_RCCL_MIN_BYTES[world_size]`` bytes of x where it takes
+them, else RCCL for x (``all_gather_into_tensor``) and the custom gather (RCCL where it declines) for the routing;
+the reduce-scatter is ``custom_reduce_scatter`` below ``RS_RCCL_MIN_BYTES[world_size]`` bytes of partials where its
+``should_custom_rs`` accepts them, else RCCL (``reduce_scatter_tensor``). The custom reduce-scatter sums each element
+in f32 in rank order 0, 1, ... and rounds to BF16 once; RCCL's ring adds in BF16 hop by hop in an order fixed by
+the size and the ranks. Both modes are deterministic: the same inputs give bitwise the same outputs.
+
+This version fuses no communication into the kernels in either mode: the fused cross-rank sums of the MXFP4-only
+version (Down kernels that sum across the ranks, the token-tile reduce-scatter, SDMA chunks) return on top of the
+same op later. What only existed for them is trivial here: ``prepare`` only compiles and warms up, the watchdog bits
+stay 0 and ``reset`` only clears them.
 
 Weights: the routed experts come in the ``MegaMoeTP`` layout (MXFP4, ``shuffle_weight(16, 16)`` + ``e8m0_shuffle``)
 and are unshuffled and converted once (constructor / ``set_weights``) by ``moe_a8w4.prepare_moe_a8w4_ptpc_weight``;
@@ -32,15 +43,16 @@ id is >= 0 and its last id is E, else with weight 0.
 Contract (as ``MegaMoeTP``):
 
 * ``forward`` is a collective: every rank calls it the same number of times, in the same order, with the same
-  input and routing.
+  input and routing (ar) or the same number of local tokens M_r (ag_rs; pad a shorter batch with rows whose
+  ``topk_ids`` are all -1: such a row gets 0, and a first id of -1 also drops the row's shared expert).
 * ``prepare(local_tokens)`` before CUDA graph capture: it compiles and runs every kernel these batches launch.
 * ``activation`` must be ``Silu``; a finite ``swiglu_limit`` L > 0 computes
-  ``SiLU(gate.clamp(max=L)) * up.clamp(-L, L)`` (DeepSeek-V4.1), the shared expert's too. The all-reduce is BF16
-  whatever ``comm_dtype`` says; the gfx950 fields (``schedule``, ``act_dtype``, ``lb_*``, ``bigm_min_tokens``, Situ
-  betas, ``ar_gather="fp8"``) and the fused tail are rejected.
+  ``SiLU(gate.clamp(max=L)) * up.clamp(-L, L)`` (DeepSeek-V4.1), the shared expert's too. The collectives are BF16
+  (the ag_rs routing int32 / float32) whatever ``comm_dtype`` says; the gfx950 fields (``schedule``, ``act_dtype``,
+  ``lb_*``, ``bigm_min_tokens``, Situ betas, ``ar_gather="fp8"``) and the fused tail are rejected.
 
-Errors: the constructor raises ValueError off gfx942, for the rejected config fields above (NotImplementedError for
-a ``comm_mode`` other than "ar") and for a cfg rank / world_size other than the group's. The constructor and
+Errors: the constructor raises ValueError off gfx942, for an unknown ``comm_mode``, for the rejected config fields
+above and for a cfg rank / world_size other than the group's. The constructor and
 ``set_weights`` raise TypeError for routed weights of another dtype, ValueError for other shapes or another device
 than the layer's, pass the shared expert's errors of ``prepare_moe_a8w4_ptpc_weight`` on (ValueError for a partial
 set, other dtypes, shapes or devices, mixed scale formats, NaN elements or scales and the E8M0 code 255; TypeError
@@ -48,7 +60,12 @@ for an argument that is no tensor), and ``set_weights`` raises ValueError when i
 expert. ``forward`` raises ValueError for a tail, an x that is no bfloat16 [M, model_dim], routing of another shape
 than [M, topk] ([M, topk + 1] with a shared expert), more than ``max_local_tokens * world_size`` rows and an ``out``
 that is no contiguous bfloat16 [M, model_dim]; the single-GPU op's checks follow (TypeError for routing of other
-dtypes, ValueError for a non-contiguous x).
+dtypes, ValueError for a non-contiguous x). In the ag_rs mode it checks everything before the first collective:
+ValueError for a tail, an x that is no contiguous bfloat16 [M_r, model_dim], routing of another shape than
+[M_r, topk] ([M_r, topk + 1]), inputs on another device than the layer's, M_r > ``max_local_tokens`` and an ``out``
+that is no contiguous bfloat16 [M_r, model_dim]; TypeError for ids other than int32 / int64 or weights that are not
+floating; with ``moe_a8w4.DEBUG_CHECKS`` (``AITER_MOE_A8W4_DEBUG=1``; outside a CUDA graph capture) ValueError on
+every rank when the ranks' M_r differ (compared over the gloo group).
 """
 
 from __future__ import annotations
@@ -68,9 +85,18 @@ __all__ = ["MegaMoeTPConfig", "MegaMoeTPGfx942", "mega_moe_tp_gfx942_supported"]
 
 # The all-reduce of the BF16 partials: aiter's custom all-reduce below AR_RCCL_MIN_BYTES[world_size] bytes (where its
 # should_custom_ar accepts the tensor), RCCL from there on; other TP sizes take the custom all-reduce wherever it
-# accepts. Cold paired timing on MI308X (runs 20261127-032311 / -032433, CA / RCCL us): TP2 5 MiB 136 / 143,
-# 6.25 MiB 173 / 173, 7.5 MiB 202 / 200; TP4 11.25 MiB 168 / 168, 12.5 MiB 187 / 188, 13.75 MiB 201 / 198.
+# accepts. Cold paired timing on MI308X (CA / RCCL us): TP2 5 MiB 136 / 143, 6.25 MiB 173 / 173, 7.5 MiB 202 / 200;
+# TP4 11.25 MiB 168 / 168, 12.5 MiB 187 / 188, 13.75 MiB 201 / 198.
 AR_RCCL_MIN_BYTES = {2: 6 << 20, 4: 13 << 20}
+# ag_rs: the all-gather takes one custom_all_gatherv of x and the routing below AG_RCCL_MIN_BYTES[world_size] bytes of
+# x per rank, RCCL for x from there on (the routing still through the custom gather); the reduce-scatter takes the
+# custom one below RS_RCCL_MIN_BYTES[world_size] bytes of partials (world_size * M_r rows), RCCL from there on. Other
+# TP sizes take the custom collectives wherever they accept. Cold paired timing on idle MI308X, TP4 H5120 (custom /
+# RCCL us): all-gather at M_r 576 / 614 / 640 171 / 173, 184 / 183, 192 / 188 (DeepSeek x: M_r <= 614 custom);
+# reduce-scatter at M_r 640 / 704 / 768 196 / 196, 214 / 213, 233 / 226 (M_r <= 665 custom).
+AG_RCCL_MIN_BYTES = {4: 6 << 20}
+RS_RCCL_MIN_BYTES = {4: 26 << 20}
+COMM_MODES = ("ar", "ag_rs")
 
 
 def mega_moe_tp_gfx942_supported(gfx: str | None = None) -> bool:
@@ -156,6 +182,7 @@ class _Comm:
         ca = CustomAllreduce(group=cpu_group, device=device)
         self.ca = None if ca.disabled else ca
         self.last = None
+        self.last_ag = self.last_rs = None
 
     def uses_custom(self, y):
         """Whether ``all_reduce(y)`` takes the custom all-reduce (see AR_RCCL_MIN_BYTES), else RCCL."""
@@ -175,6 +202,57 @@ class _Comm:
         self.last = "rccl_all_reduce"
         dist.all_reduce(y, group=self.group)
         return y
+
+    def all_gather(self, x, topk_ids, topk_weights):
+        """Every rank's rows of x [m, H] BF16, topk_ids [m, K] int32 and topk_weights [m, K] float32 (contiguous, the
+        same m on every rank) -> three new tensors [world * m, ...], rank r's rows at r * m (see AG_RCCL_MIN_BYTES).
+        ``last_ag`` names the collective that gathered x ("custom_all_gather" / "rccl_all_gather").
+        """
+        world, m = self.world, x.shape[0]
+        if self.ca is not None and x.numel() * x.element_size() < AG_RCCL_MIN_BYTES.get(
+            world, math.inf
+        ):
+            # None (on every rank alike) where one launch cannot take them
+            got = self.ca.custom_all_gatherv([x, topk_ids, topk_weights])
+            if got is not None:
+                self.last_ag = "custom_all_gather"
+                return tuple(got)
+        xs = x.new_empty((world * m, x.shape[1]))
+        dist.all_gather_into_tensor(xs, x, group=self.group)
+        got = (
+            self.ca.custom_all_gatherv([topk_ids, topk_weights])
+            if self.ca is not None
+            else None
+        )
+        if got is None:
+            k = topk_ids.shape[1]
+            packed = torch.cat([topk_ids, topk_weights.view(torch.int32)], dim=1)
+            every = packed.new_empty((world * m, 2 * k))
+            dist.all_gather_into_tensor(every, packed, group=self.group)
+            got = (
+                every[:, :k].contiguous(),
+                every[:, k:].contiguous().view(torch.float32),
+            )
+        self.last_ag = "rccl_all_gather"
+        return (xs, *got)
+
+    def reduce_scatter(self, part, out):
+        """out [m, H] = the sum over the ranks of their rows [rank * m, (rank + 1) * m) of part [world * m, H] (BF16,
+        contiguous; see RS_RCCL_MIN_BYTES) -> out. ``last_rs`` names the collective ("custom_reduce_scatter": each
+        element summed in f32 in rank order, rounded once / "rccl_reduce_scatter": the ring, BF16 per hop).
+        """
+        nbytes = part.numel() * part.element_size()
+        if (
+            self.ca is not None
+            and nbytes < RS_RCCL_MIN_BYTES.get(self.world, math.inf)
+            and self.ca.should_custom_rs(part, 0)
+        ):
+            self.ca.custom_reduce_scatter(part, out, 0)
+            self.last_rs = "custom_reduce_scatter"
+        else:
+            dist.reduce_scatter_tensor(out, part, group=self.group)
+            self.last_rs = "rccl_reduce_scatter"
+        return out
 
     def close(self):
         """Collective: no peer may still read this rank's buffers when they are freed."""
@@ -215,9 +293,9 @@ def _release_comm(key):
 # ---------------------------------------------------------------------------------------------------------------
 def _check_config(cfg: MegaMoeTPConfig) -> float:
     """Reject what this implementation does not run; returns the SwiGLU limit (0.0: off)."""
-    if cfg.comm_mode != "ar":
-        raise NotImplementedError(
-            f"MegaMoeTPGfx942: comm_mode {cfg.comm_mode!r} (only 'ar')"
+    if cfg.comm_mode not in COMM_MODES:
+        raise ValueError(
+            f"MegaMoeTPGfx942: unknown comm_mode {cfg.comm_mode!r} (one of {COMM_MODES})"
         )
     if cfg.activation != ActivationType.Silu:
         raise ValueError(
@@ -318,7 +396,9 @@ class MegaMoeTPGfx942:
         # Whether the layer has a shared expert (fixed by the constructor's weights).
         self._shared = None
         # Kernels of the most recent forward in launch order (moe_a8w4.last_path), then its all-reduce
-        # ("custom_all_reduce" / "rccl_all_reduce"); tests check the dispatch with it.
+        # ("custom_all_reduce" / "rccl_all_reduce"); ag_rs: its all-gather ("custom_all_gather" / "rccl_all_gather"),
+        # the kernels, its reduce-scatter ("custom_reduce_scatter" / "rccl_reduce_scatter"). Tests check the dispatch
+        # with it.
         self.last_path: tuple[str, ...] = ()
         self.set_weights(
             w1=w1,
@@ -403,9 +483,15 @@ class MegaMoeTPGfx942:
     ) -> torch.Tensor:
         """x [M, H] BF16, replicated on every rank, with its routing (topk_weights / topk_ids [M, topk], with a shared
         expert [M, topk + 1] ending in its id E; see the module docstring) -> y [M, H] BF16, the whole layer's
-        output, identical on every rank (``out`` if given, else a new tensor)."""
+        output, identical on every rank (``out`` if given, else a new tensor).
+
+        ag_rs: x_local [M_r, H] BF16 holds this rank's own tokens (the same M_r on every rank, padding rows routed to
+        -1) with their routing [M_r, topk] ([M_r, topk + 1]) -> their output [M_r, H] BF16 (``out`` if given).
+        """
         if tail is not None:
             raise ValueError("MegaMoeTPGfx942: no fused tail (gfx950 ag_rs only)")
+        if self.cfg.comm_mode == "ag_rs":
+            return self._forward_ag_rs(x_local, topk_weights, topk_ids, out)
         cfg = self.cfg
         if (
             x_local.dim() != 2
@@ -471,6 +557,108 @@ class MegaMoeTPGfx942:
 
     __call__ = forward
 
+    def _forward_ag_rs(self, x_local, topk_weights, topk_ids, out):
+        """``forward`` of comm_mode ag_rs: all-gather, the op on every rank's rows, reduce-scatter. It checks
+        everything before the first collective, so that a rank that raises leaves no peer waiting in one.
+        """
+        cfg, dev = self.cfg, self.device
+        if (
+            x_local.dim() != 2
+            or x_local.shape[1] != cfg.model_dim
+            or x_local.dtype != torch.bfloat16
+            or not x_local.is_contiguous()
+        ):
+            raise ValueError(
+                f"MegaMoeTPGfx942: x must be a contiguous bfloat16 [M_r, {cfg.model_dim}] tensor (ag_rs), got "
+                f"{x_local.dtype} {tuple(x_local.shape)}"
+            )
+        m = x_local.shape[0]
+        width = cfg.topk + 1 if self._shared else cfg.topk
+        if tuple(topk_ids.shape) != (m, width) or tuple(topk_weights.shape) != (
+            m,
+            width,
+        ):
+            what = (
+                " (topk routed columns, then the shared expert's)"
+                if self._shared
+                else ""
+            )
+            raise ValueError(
+                f"MegaMoeTPGfx942: topk_ids / topk_weights must be [{m}, {width}]{what}, got "
+                f"{tuple(topk_ids.shape)} / {tuple(topk_weights.shape)}"
+            )
+        if (
+            topk_ids.dtype not in (torch.int32, torch.int64)
+            or not topk_weights.is_floating_point()
+        ):
+            raise TypeError(
+                f"MegaMoeTPGfx942: topk_ids must be int32 / int64 and topk_weights floating, got "
+                f"{topk_ids.dtype} / {topk_weights.dtype}"
+            )
+        for name, t in (
+            ("x", x_local),
+            ("topk_weights", topk_weights),
+            ("topk_ids", topk_ids),
+        ):
+            if t.device != dev:
+                raise ValueError(
+                    f"MegaMoeTPGfx942: {name} is on {t.device}, the layer on {dev}"
+                )
+        if m > cfg.max_local_tokens:
+            raise ValueError(
+                f"MegaMoeTPGfx942: M_r {m} exceeds max_local_tokens {cfg.max_local_tokens}"
+            )
+        if out is not None and (
+            out.dtype != torch.bfloat16
+            or tuple(out.shape) != (m, cfg.model_dim)
+            or not out.is_contiguous()
+            or out.device != dev
+        ):
+            raise ValueError(
+                f"MegaMoeTPGfx942: out must be a contiguous bfloat16 [{m}, {cfg.model_dim}] tensor on {dev}"
+            )
+        comm = self._comm
+        if moe_a8w4.DEBUG_CHECKS and not torch.cuda.is_current_stream_capturing():
+            counts = [None] * cfg.world_size
+            dist.all_gather_object(counts, m, group=comm.cpu_group)
+            if len(set(counts)) != 1:
+                raise ValueError(
+                    f"MegaMoeTPGfx942: ag_rs needs the same M_r on every rank, got {counts}"
+                )
+        if out is None:
+            out = torch.empty((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
+        if m == 0:
+            self.last_path = ()
+            return out
+        xs, ids, tw = comm.all_gather(
+            x_local,
+            topk_ids.to(torch.int32).contiguous(),
+            topk_weights.to(torch.float32).contiguous(),
+        )
+        part = torch.empty_like(xs)
+        moe_a8w4.flydsl_moe_a8w4_ptpc(
+            xs, self._weights, tw, ids, output=part, swiglu_limit=self._limit
+        )
+        comm.reduce_scatter(part, out)
+        self.last_path = (comm.last_ag, *moe_a8w4.last_path, comm.last_rs)
+        return out
+
+    def _balanced_batch(self, start, m):
+        """Rows [start, start + m) of the warm-up batch: x 0, token i's slot j routed to expert
+        (i * topk + j) % experts (distinct within a token), the shared expert E last with weight 1.
+        """
+        cfg, dev = self.cfg, self.device
+        x = torch.zeros((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
+        ids = (
+            torch.arange(start, start + m, device=dev)[:, None] * cfg.topk
+            + torch.arange(cfg.topk, device=dev)
+        ) % cfg.experts
+        tw = torch.full((m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev)
+        if self._shared:
+            ids = torch.cat([ids, torch.full_like(ids[:, :1], cfg.experts)], dim=1)
+            tw = torch.cat([tw, torch.ones_like(tw[:, :1])], dim=1)
+        return x, tw, ids.to(torch.int32)
+
     def prepare(
         self,
         local_tokens,
@@ -479,8 +667,8 @@ class MegaMoeTPGfx942:
         warmup: bool = True,
     ) -> None:
         """Collective: compile and run once every kernel of the batches of these local token counts (ar: every
-        replicated batch M with ceil(M / world_size) in ``local_tokens``), so that serving and CUDA graph capture
-        compile nothing. (No watchdog to check in this version.)
+        replicated batch M with ceil(M / world_size) in ``local_tokens``; ag_rs: every M_r in ``local_tokens``), so
+        that serving and CUDA graph capture compile nothing. (No watchdog to check in this version.)
         """
         if tail or tail_bf16:
             raise ValueError("MegaMoeTPGfx942: no fused tail (gfx950 ag_rs only)")
@@ -489,26 +677,17 @@ class MegaMoeTPGfx942:
         cfg = self.cfg
         ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
         tp = cfg.world_size
+        if cfg.comm_mode == "ag_rs":
+            # this rank's rows of the warm-up batch of tp * t rows
+            for t in sorted({t for t in ts if t > 0}):
+                self.forward(*self._balanced_batch(cfg.rank * t, t))
+            torch.cuda.synchronize(self.device)
+            return
         rows = sorted(
             {m for t in ts for m in range((t - 1) * tp + 1, t * tp + 1) if m > 0}
         )
         for m in rows:
-            x = torch.zeros(
-                (m, cfg.model_dim), dtype=torch.bfloat16, device=self.device
-            )
-            # balanced routing: token i's slot j to expert (i * topk + j) % experts (distinct within a token), the
-            # shared expert E last with weight 1
-            ids = (
-                torch.arange(m, device=self.device)[:, None] * cfg.topk
-                + torch.arange(cfg.topk, device=self.device)
-            ) % cfg.experts
-            tw = torch.full(
-                (m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=self.device
-            )
-            if self._shared:
-                ids = torch.cat([ids, torch.full_like(ids[:, :1], cfg.experts)], dim=1)
-                tw = torch.cat([tw, torch.ones_like(tw[:, :1])], dim=1)
-            self.forward(x, tw, ids.to(torch.int32))
+            self.forward(*self._balanced_batch(0, m))
         torch.cuda.synchronize(self.device)
 
     @property
