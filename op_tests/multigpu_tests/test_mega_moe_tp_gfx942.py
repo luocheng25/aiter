@@ -7,28 +7,38 @@ One file, three regions:
 1. basic tests (``pytest <file> -m basic``): one case per dispatch tier and shape; run first after every change.
 2. other coverage (``pytest <file> -m "not basic"``): what the basic tests and the benchmark cannot cover; every
    test says why.
-3. benchmark (``python <file> [--cases ...]``, after the last test): the SPEC cases {tp2, tp4, ds_tp4} x M in
+3. benchmark (``python <file> [--cases ...]``, after the last test): the SPEC cases {tp2, tp4, ds_layer_tp4} x M in
    {1, 2, 4, ..., 32768} + {48}; cold-cache protocol, slowest rank; prints ``MF_METRIC`` / ``MF_REF``.
 
+Shapes: tp2 / tp4 are Qwen3.8-Flash-Next (513 MXFP4 experts, the last one its fused shared expert in the last of 11
+slots); ds_layer_tp4 is a DeepSeek-V4.1-Flash layer (384 MXFP4 experts, topk 6, and the FP8 shared expert as expert
+E in a 7th routing column, SwiGLU limit 10); mtp_layer_tp4 is its MTP layer (128 experts, topk 3 + the shared
+expert; other coverage only).
+
 Every rank of a TP group gets the same input rows and routing (generated on rank 0 and broadcast; asserted bitwise
-identical) and its own MXFP4 weight slice (independent random weights per rank). The reference is independent FP32
-torch: per rank the exact MXFP4 dequantization, FP8 per-token activations and FP8 per-(token, slot) intermediate
-activations (scale = amax / 240), summed over the ranks of the group. Acceptance: finite, calc_diff <= 1e-3 and
-max|y - ref| <= 4.5% max|ref|; the outputs of all ranks are bitwise identical.
+identical) and its own weight slice (independent random weights per rank). The reference is independent FP32 torch:
+per rank the exact MXFP4 / FP8 dequantization, FP8 per-token activations and FP8 per-(token, slot) intermediate
+activations (scale = amax / 240), the shared expert weighted by ATOM's rule, summed over the ranks of the group.
+Acceptance: finite, calc_diff <= 1e-3 and max|y - ref| <= 4.5% max|ref|; the outputs of all ranks are bitwise
+identical.
 
 Multi-GPU runs go through a pool of 4 spawned worker processes (rank r on GPU r, world group + TP2 sub-group),
 started once per session; a test sends a job (``_job_<name>``) to every rank and checks the returned results.
 """
 
 import argparse
+import importlib
+import importlib.abc
+import importlib.util
+import itertools
+import json
 import multiprocessing
 import os
 import queue
-import shutil
+import re
 import socket
 import statistics
 import sys
-import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -39,14 +49,16 @@ import torch.distributed as dist
 
 SEED = int(os.environ.get("MF_SEED", "0"))
 SHAPES = {
-    # world, hidden, experts, topk, real per-rank inter_dim, fused shared expert (last slot), swiglu_limit
+    # world, hidden, routed experts, routed topk, real per-rank inter_dim, routing ("qwen": make_inputs, "layer":
+    # make_layer_inputs), FP8 shared expert (expert E in a last routing column), swiglu_limit
     "tp2": {
         "world": 2,
         "H": 2560,
         "E": 513,
         "topk": 11,
         "I": 320,
-        "shared": True,
+        "routing": "qwen",
+        "shared": False,
         "limit": None,
     },  # Qwen3.8-Flash-Next TP2
     "tp4": {
@@ -55,28 +67,41 @@ SHAPES = {
         "E": 513,
         "topk": 11,
         "I": 160,
-        "shared": True,
+        "routing": "qwen",
+        "shared": False,
         "limit": None,
     },  # Qwen3.8-Flash-Next TP4
-    "ds_tp4": {
+    "ds_layer_tp4": {
         "world": 4,
         "H": 5120,
         "E": 384,
         "topk": 6,
         "I": 576,
-        "shared": False,
+        "routing": "layer",
+        "shared": True,
         "limit": 10.0,
-    },  # DeepSeek-V4.1-Flash TP4
+    },  # DeepSeek-V4.1-Flash TP4 (E385 / topk 7 with the shared expert)
+    "mtp_layer_tp4": {
+        "world": 4,
+        "H": 5120,
+        "E": 128,
+        "topk": 3,
+        "I": 576,
+        "routing": "layer",
+        "shared": True,
+        "limit": 10.0,
+    },  # DeepSeek-V4.1-Flash MTP layer TP4 (other coverage only)
 }
 SHAPE_INDEX = {name: i for i, name in enumerate(SHAPES)}
-TOKENS = tuple(sorted({1 << k for k in range(16)} | {48}))
-CASES = [f"{shape}_m{m}" for shape in SHAPES for m in TOKENS]
+SHARED_ARGS = ("shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale")
 MAX_TOKENS = 1 << 15
 POOL_WORLD = 4
 
 FP8_MAX = 240.0
+FP8_OCP_MAX = 448.0
 CALC_DIFF_MAX = 1e-3
 MAX_ERR_RATIO = 0.045
+LAYER_ROUTED_SCALING = 1.5
 _E2M1 = (
     0.0,
     0.5,
@@ -94,40 +119,6 @@ _E2M1 = (
     -3.0,
     -4.0,
     -6.0,
-)
-
-# Kernel sequences of moe_a8w4.fused_moe_a8w4 (layer.last_path without the all-reduce) on the unfused paths.
-DEC = "a8w4_gateup_decode>a8w4_down_decode"
-DPQ = "a8w4_gateup_decode>a8w4_row_quant_decode>a8w4_down_decode_pq"
-PQ = "a8w4_row_quant_decode>a8w4_gateup_decode_pq>a8w4_row_quant_decode>a8w4_down_decode_pq"
-DD = "a8w4_row_quant_plan_decode>a8w4_gateup_decode_dd>a8w4_row_quant_decode>a8w4_down_decode_pq"
-ST16 = (
-    "a8w4_stream_prep>a8w4_gateup_stream_bm16>a8w4_row_quant_fp8>a8w4_down_stream_bm16"
-)
-ST16_RS = ST16 + ">a8w4_route_sum"
-ST32Q = "a8w4_stream_prep>a8w4_gateup_quant_stream_bm32>a8w4_down_stream_bm32"
-ST64Q = "a8w4_stream_prep>a8w4_gateup_quant_stream_bm64>a8w4_down_stream_bm64"
-ST32_RS = "a8w4_stream_prep>a8w4_gateup_stream_bm32>a8w4_row_quant_fp8>a8w4_down_stream_bm32>a8w4_route_sum"
-PF_PREP = (
-    "a8w4_stream_prep>a8w4_gateup_prefill_bm64_bn128_tk128>a8w4_row_quant_fp8>a8w4_down_prefill_bm64"
-    ">sorted_sum"
-)
-PF_SORT = (
-    "moe_sorting_opus>a8w4_row_quant_fp8>a8w4_gateup_prefill_bm64_bn128_tk128>a8w4_row_quant_fp8"
-    ">a8w4_down_prefill_bm64>sorted_sum"
-)
-COMPUTE_PATHS = (
-    DEC,
-    DPQ,
-    PQ,
-    DD,
-    ST16,
-    ST16_RS,
-    ST32Q,
-    ST64Q,
-    ST32_RS,
-    PF_PREP,
-    PF_SORT,
 )
 CA, RCCL = "custom_all_reduce", "rccl_all_reduce"
 
@@ -149,12 +140,19 @@ def input_seed(shape, M, g):
     return SEED * 1000 + 500 + 37 * SHAPE_INDEX[shape] + 4 * M + g
 
 
-# Path checks. The tests pin a forward's dispatch tier -- its Gate/Up kernel, the first one named a8w4_gateup* -- and
-# require exactly one communication segment: one all-reduce at the end (CA / RCCL: unfused), or at least one fused
-# communication kernel and no all-reduce (fused). A fused communication kernel has the word "tp" in its
-# "_"-separated name (a8w4_down_decode_tp, a8w4_tp_reduce, sorted_sum_tp). The kernels after Gate/Up are not
-# pinned: fusing the TP reduction changes them.
-GATEUP_PREFIX, TP_WORD, FUSED_COMM = "a8w4_gateup", "tp", "fused"
+# Path checks. A forward's path (layer.last_path joined by ">") holds the single-GPU op's kernels (moe_a8w4.last_path:
+# with a shared expert also its "shared_*" steps or "*_shared" kernels) and then the communication. The tests pin the
+# dispatch tier -- the first Gate/Up kernel (a8w4_gateup*) --, whether a shared expert ran, and exactly one
+# communication segment: one all-reduce at the end (CA / RCCL), or fused communication kernels and no all-reduce (the
+# fused cross-rank sums of later milestones: the word "tp" in their "_"-separated names, e.g. a8w4_down_decode_tp,
+# a8w4_tp_reduce, sorted_sum_tp). Not pinned: the kernels after Gate/Up and which all-reduce an M takes (fusing the
+# communication changes them; 2.2 tests the all-reduce rule on the communicator itself).
+GATEUP_PREFIX, TP_WORD, SHARED_WORD, FUSED_COMM = "a8w4_gateup", "tp", "shared", "fused"
+# Every Gate/Up kernel name of moe_a8w4: decode (plan / pre-quantized / deduplicated / mixed with the shared expert),
+# streaming (block_m; quant: the intermediate quantized inside) and prefill (block_m x block_n x tile_k).
+GATEUP_KERNEL = re.compile(
+    r"a8w4_gateup_(decode(_plan)?(_pq|_dd|_mixed)?|(quant_)?stream_bm\d+|prefill_bm\d+_bn\d+_tk\d+)"
+)
 
 
 def gateup_tier(path):
@@ -173,25 +171,29 @@ def comm_kind(path):
     return ars[0] if ars == kernels[-1:] else None
 
 
-GATEUP_KERNELS = frozenset(map(gateup_tier, COMPUTE_PATHS))
+def has_shared(path):
+    """Whether a shared expert ran: a step or kernel with the word "shared" in its "_"-separated name."""
+    return any(SHARED_WORD in k.split("_") for k in path.split(">"))
 
 
 def _known_path(path):
     """A path of this implementation: a known Gate/Up kernel (tier) and exactly one communication segment."""
-    return gateup_tier(path) in GATEUP_KERNELS and comm_kind(path) is not None
+    tier = gateup_tier(path)
+    return (
+        tier is not None
+        and GATEUP_KERNEL.fullmatch(tier) is not None
+        and comm_kind(path) is not None
+    )
 
 
 # =====================================================================================================================
 # Weights, inputs and the independent FP32 reference (torch only, no kernel under test)
 # =====================================================================================================================
-def make_weights(experts, hidden, inter, *, seed, fp8_inter=None, device="cuda"):
+def make_weights(experts, hidden, inter, *, seed, device="cuda"):
     """Random BF16 MoE weights (generated expert by expert), quantized to standard MXFP4.
 
     Returns ``w1`` float4_e2m1fn_x2 [E, 2I, H/2] (rows [0, I) gate, [I, 2I) up), ``w1_scale`` float8_e8m0fnu
-    [E, 2I, H/32], ``w2`` [E, H, I/2], ``w2_scale`` [E, H, I/32]. With ``fp8_inter`` (>= inter) also the same BF16
-    weights with I zero-padded to ``fp8_inter``, quantized per output channel to FP8 E4M3FNUZ (not shuffled):
-    ``w1_fp8`` [E, 2P, H], ``w1_fp8_scale`` [E, 2P, 1], ``w2_fp8`` [E, H, P], ``w2_fp8_scale`` [E, H, 1] (float32).
-    Standard deviations: w1 1/sqrt(H), w2 1/sqrt(I).
+    [E, 2I, H/32], ``w2`` [E, H, I/2], ``w2_scale`` [E, H, I/32]. Standard deviations: w1 1/sqrt(H), w2 1/sqrt(I).
     """
     import aiter
 
@@ -208,39 +210,15 @@ def make_weights(experts, hidden, inter, *, seed, fp8_inter=None, device="cuda")
             (experts, h, i // 32), dtype=torch.uint8, device=device
         ),
     }
-    fp8 = torch.float8_e4m3fnuz
-    if fp8_inter is not None:
-        assert fp8_inter >= inter
-        p = fp8_inter
-        pt = aiter.get_torch_quant(aiter.QuantType.per_Token)
-        out.update(
-            w1_fp8=torch.empty((experts, 2 * p, h), dtype=fp8, device=device),
-            w1_fp8_scale=torch.empty(
-                (experts, 2 * p, 1), dtype=torch.float32, device=device
-            ),
-            w2_fp8=torch.empty((experts, h, p), dtype=fp8, device=device),
-            w2_fp8_scale=torch.empty(
-                (experts, h, 1), dtype=torch.float32, device=device
-            ),
-        )
     for e in range(experts):
         v1 = torch.randn((2 * i, h), generator=gen, device=device) * h**-0.5
         v2 = torch.randn((h, i), generator=gen, device=device) * i**-0.5
-        v1, v2 = v1.to(torch.bfloat16), v2.to(torch.bfloat16)
         for name, value in (("w1", v1), ("w2", v2)):
-            q, s = mx(value, quant_dtype=torch.float4_e2m1fn_x2)
+            q, s = mx(value.to(torch.bfloat16), quant_dtype=torch.float4_e2m1fn_x2)
             out[name][e].copy_(q.view(torch.uint8))
             out[f"{name}_scale"][e].copy_(
                 s.view(torch.uint8).reshape(out[f"{name}_scale"][e].shape)
             )
-        if fp8_inter is not None:
-            z = v1.new_zeros((p - i, h))
-            v1p = torch.cat([v1[:i], z, v1[i:], z])
-            v2p = torch.cat([v2, v2.new_zeros((h, p - i))], dim=1)
-            for name, value in (("w1_fp8", v1p), ("w2_fp8", v2p)):
-                q, s = pt(value, quant_dtype=fp8)
-                out[name][e].copy_(q)
-                out[f"{name}_scale"][e].copy_(s.view(-1, 1))
     for name in ("w1", "w2"):
         out[name] = out[name].view(torch.float4_e2m1fn_x2)
         out[f"{name}_scale"] = out[f"{name}_scale"].view(torch.float8_e8m0fnu)
@@ -263,27 +241,39 @@ def to_megamoe_layout(w):
     return out
 
 
-def make_inputs(tokens, hidden, experts, topk, *, seed, shared, device="cuda"):
-    """``(x, topk_weight, topk_ids)``: x BF16 [M, H] ~ N(0, 1).
+def _fp8_rows(v):
+    """float32 [N, K] -> E4M3FN [N, K] and float32 [N, 1] scales amax / 448 per row (1 for a zero row), RNE: the
+    per-row format of FP4PTPC checkpoints."""
+    amax = v.abs().amax(dim=1, keepdim=True)
+    scale = amax / torch.full_like(amax, FP8_OCP_MAX)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    return (v / scale).to(torch.float8_e4m3fn), scale
 
-    ``shared`` (Qwen3.8): the last expert (E-1) is the fused shared expert, always in a token's last slot; the
-    other topk-1 are uniform without repetition in [0, E-1), weighted by the softmax of topk-1 random logits, the
-    shared one by sigmoid(randn). Otherwise topk distinct uniform experts in [0, E), softmax weights.
+
+def make_shared_weights(hidden, inter, *, seed, device="cuda"):
+    """One rank's slice of a random shared expert: ``(shared_w1, shared_w1_scale, shared_w2, shared_w2_scale)``,
+    float8_e4m3fn [2I, H] (rows [0, I) gate, [I, 2I) up) and [H, I] with float32 [N, 1] per-row scales (``_fp8_rows``)
+    of BF16 weights with standard deviations 1/sqrt(H) (w1) and 1/sqrt(I) (w2)."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    v1 = torch.randn((2 * inter, hidden), generator=gen, device=device) * hidden**-0.5
+    v2 = torch.randn((hidden, inter), generator=gen, device=device) * inter**-0.5
+    v1, v2 = v1.to(torch.bfloat16).float(), v2.to(torch.bfloat16).float()
+    return (*_fp8_rows(v1), *_fp8_rows(v2))
+
+
+def shared_kwargs(shared):
+    """The ``shared_*`` keyword arguments of a shared expert tuple (none for None)."""
+    return {} if shared is None else dict(zip(SHARED_ARGS, shared))
+
+
+def make_inputs(tokens, hidden, experts, topk, *, seed, device="cuda"):
+    """Qwen3.8 routing: ``(x, topk_weight, topk_ids)``, x BF16 [M, H] ~ N(0, 1), routing [M, topk].
+
+    The last expert (E-1) is the fused shared expert, always in a token's last slot; the other topk-1 are uniform
+    without repetition in [0, E-1), weighted by the softmax of topk-1 random logits, the shared one by sigmoid(randn).
     """
     gen = torch.Generator(device=device).manual_seed(seed)
     x = torch.randn((tokens, hidden), generator=gen, device=device).to(torch.bfloat16)
-    if not shared:
-        ids = (
-            torch.rand((tokens, experts), generator=gen, device=device)
-            .topk(topk, dim=-1)
-            .indices
-        )
-        logits = torch.randn((tokens, topk), generator=gen, device=device)
-        return (
-            x,
-            torch.softmax(logits, dim=-1).float().contiguous(),
-            ids.to(torch.int32).contiguous(),
-        )
     routed = (
         torch.rand((tokens, experts - 1), generator=gen, device=device)
         .topk(topk - 1, dim=-1)
@@ -299,6 +289,25 @@ def make_inputs(tokens, hidden, experts, topk, *, seed, shared, device="cuda"):
     return x, weights, ids
 
 
+def make_layer_inputs(tokens, hidden, experts, topk, *, seed, device="cuda"):
+    """DeepSeek-V4.1 routing with a shared expert: ``(x, topk_weight, topk_ids)``, x BF16 [M, H] ~ N(0, 1), routing
+    [M, topk + 1] (ids int32, weights float32): topk distinct uniform routed experts in [0, E) weighted by the softmax
+    of topk random logits times LAYER_ROUTED_SCALING, then the shared expert E with weight 1 (ATOM's convention).
+    """
+    gen = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn((tokens, hidden), generator=gen, device=device).to(torch.bfloat16)
+    ids = (
+        torch.rand((tokens, experts), generator=gen, device=device)
+        .topk(topk, dim=-1)
+        .indices
+    )
+    logits = torch.randn((tokens, topk), generator=gen, device=device)
+    routed = torch.softmax(logits, dim=-1) * LAYER_ROUTED_SCALING
+    ids = torch.cat([ids, torch.full_like(ids[:, :1], experts)], dim=1)
+    weights = torch.cat([routed, torch.ones_like(routed[:, :1])], dim=1)
+    return x, weights.float().contiguous(), ids.to(torch.int32).contiguous()
+
+
 def dequant_mxfp4(q, scale):
     """Standard MXFP4 [..., N, K/2] + E8M0 [..., N, K/32] -> exact float32 [..., N, K]."""
     b = q.view(torch.uint8)
@@ -306,6 +315,16 @@ def dequant_mxfp4(q, scale):
     value = torch.tensor(_E2M1, dtype=torch.float32, device=b.device)[nib]
     factor = torch.exp2(scale.view(torch.uint8).to(torch.float64) - 127).float()
     return (value.unflatten(-1, (-1, 32)) * factor.unsqueeze(-1)).flatten(-2)
+
+
+def dequant_fp8(w, scale):
+    """FP8 [N, K] (E4M3FN or E4M3FNUZ) with float32 per-row scales ([N] / [N, 1]) or E8M0 scales of 32x32 blocks ->
+    the exact float32 [N, K]."""
+    v = w.float()
+    if scale.dtype == torch.float32:
+        return v * scale.reshape(-1, 1)
+    factor = torch.exp2(scale.view(torch.uint8).double() - 127).float()
+    return v * factor.repeat_interleave(32, 0).repeat_interleave(32, 1)
 
 
 def quant_rows_fp8(t):
@@ -322,19 +341,22 @@ def quant_rows_fp8(t):
 def reference(
     x, w1, w1_scale, w2, w2_scale, topk_weight, topk_ids, *, swiglu_limit=0.0
 ):
-    """Independent FP32 MoE of one rank's weights -> float32 [M, H].
+    """Independent FP32 MoE of one rank's routed experts -> float32 [M, H].
 
     Standard MXFP4 weights (``make_weights``), FP8 per-token input and FP8 per-(token, slot) intermediate,
     SiLU(gate) * up, routing weights applied after Down and summed per token. ``swiglu_limit`` L > 0 is the
-    DeepSeek-V4.1 SwiGLU clamp on the f32 gate / up: gate = min(gate, L), up = clamp(up, -L, L).
+    DeepSeek-V4.1 SwiGLU clamp on the f32 gate / up: gate = min(gate, L), up = clamp(up, -L, L). An id of -1 masks
+    its route.
     """
-    M, _ = x.shape
+    M, H = x.shape
     E, n1 = w1.shape[0], w1.shape[1]
     I, topk = n1 // 2, topk_ids.shape[1]  # noqa: E741,RUF100
     xa = quant_rows_fp8(x)
     flat = topk_ids.reshape(-1).long()
+    # Masked routes sort last, as expert E, which the groups leave out.
+    flat = torch.where(flat < 0, E, flat)
     order = torch.argsort(flat, stable=True)
-    counts = torch.bincount(flat, minlength=E).tolist()
+    counts = torch.bincount(flat, minlength=E + 1).tolist()[:E]
     tokens, slots = order // topk, order % topk
     groups, start = [], 0
     for e, n in enumerate(counts):
@@ -350,10 +372,53 @@ def reference(
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
         mid[t, s] = torch.nn.functional.silu(gate) * up
     mid = quant_rows_fp8(mid)
-    out = torch.zeros((M, x.shape[1]), dtype=torch.float32, device=x.device)
+    out = torch.zeros((M, H), dtype=torch.float32, device=x.device)
     for e, t, s in groups:
         y = mid[t, s] @ dequant_mxfp4(w2[e], w2_scale[e]).T
         out.index_add_(0, t, y * topk_weight[t, s].float().unsqueeze(-1))
+    return out
+
+
+def reference_shared(x, w1, w1_scale, w2, w2_scale, *, swiglu_limit=0.0):
+    """Independent FP32 shared expert of one rank's slice -> float32 [M, H] before its routing weight: the input
+    quantized per row to FP8 (``quant_rows_fp8``), the exactly dequantized FP8 weights, the SwiGLU limit as in
+    ``reference``, SiLU(gate) * up quantized per row, Down."""
+    inter = w1.shape[0] // 2
+    h = quant_rows_fp8(x) @ dequant_fp8(w1, w1_scale).T
+    gate, up = h[:, :inter], h[:, inter:]
+    if swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    mid = quant_rows_fp8(torch.nn.functional.silu(gate) * up)
+    return mid @ dequant_fp8(w2, w2_scale).T
+
+
+def shared_route_weight(topk_weight, topk_ids, experts):
+    """The shared expert's weight per token (ATOM's rule): the last column's weight where the first id is >= 0 and the
+    last id is the shared expert's (E), else 0."""
+    live = (topk_ids[:, 0] >= 0) & (topk_ids[:, -1] == experts)
+    return torch.where(live, topk_weight[:, -1].float(), 0.0)
+
+
+def reference_rank(shape, raw, shared, x, topk_weight, topk_ids):
+    """This rank's FP32 share of the layer's output (summed over the group by the caller): ``reference`` of its routed
+    experts on the first topk routing columns, plus ``reference_shared`` of its shared expert slice times
+    ``shared_route_weight``."""
+    s = SHAPES[shape]
+    k, limit = s["topk"], s["limit"] or 0.0
+    out = reference(
+        x,
+        raw["w1"],
+        raw["w1_scale"],
+        raw["w2"],
+        raw["w2_scale"],
+        topk_weight[:, :k],
+        topk_ids[:, :k],
+        swiglu_limit=limit,
+    )
+    if shared is not None:
+        weight = shared_route_weight(topk_weight, topk_ids, s["E"])
+        out += reference_shared(x, *shared, swiglu_limit=limit) * weight.unsqueeze(-1)
     return out
 
 
@@ -397,9 +462,8 @@ def check(out, ref):
     }
 
 
-def make_config(shape, rank, **kw):
-    from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPConfig
-
+def config_args(shape, rank, **kw):
+    """The ``MegaMoeTPConfig`` fields of a shape (``kw`` overrides them)."""
     s = SHAPES[shape]
     args = {
         "rank": rank,
@@ -413,7 +477,13 @@ def make_config(shape, rank, **kw):
         "swiglu_limit": s["limit"],
     }
     args.update(kw)
-    return MegaMoeTPConfig(**args)
+    return args
+
+
+def make_config(shape, rank, **kw):
+    from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPConfig
+
+    return MegaMoeTPConfig(**config_args(shape, rank, **kw))
 
 
 # =====================================================================================================================
@@ -540,7 +610,7 @@ def _worker_main(rank, world, port, tasks, results, ppid):
 
 
 class _Rank:
-    """Per-process state: TP groups, one layer (and its reference weights) per shape, benchmark state."""
+    """Per-process state: TP groups, one layer (with its reference weights) per shape, benchmark state."""
 
     def __init__(self, rank, world, device):
         import aiter  # noqa: F401
@@ -562,48 +632,52 @@ class _Rank:
     def member(self, shape):
         return self.rank < SHAPES[shape]["world"]
 
-    def build(self, shape, variant=0, fp8_inter=None):
-        """(layer, standard MXFP4 weights, FP8 weights or None) of this rank (collective over the shape's group)."""
+    def weights(self, shape, variant=0):
+        """This rank's slice of the shape's weights: (routed standard MXFP4 dict, shared expert tuple or None)."""
+        s = SHAPES[shape]
+        seed = weight_seed(shape, self.rank, variant)
+        raw = make_weights(s["E"], s["H"], s["I"], seed=seed, device=self.device)
+        shared = None
+        if s["shared"]:
+            shared = make_shared_weights(
+                s["H"], s["I"], seed=seed + 7, device=self.device
+            )
+        return raw, shared
+
+    def build(self, shape, variant=0):
+        """(layer, routed weights, shared weights or None) of this rank (collective over the shape's group)."""
         from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
 
-        s = SHAPES[shape]
-        raw = make_weights(
-            s["E"],
-            s["H"],
-            s["I"],
-            seed=weight_seed(shape, self.rank, variant),
-            fp8_inter=fp8_inter,
-            device=self.device,
-        )
-        fp8 = {k: raw.pop(k) for k in [k for k in raw if "_fp8" in k]} or None
-        group, cpu = self.tp[s["world"]]
+        raw, shared = self.weights(shape, variant)
+        group, cpu = self.tp[SHAPES[shape]["world"]]
         layer = MegaMoeTPGfx942(
             make_config(shape, self.rank),
             **to_megamoe_layout(raw),
+            **shared_kwargs(shared),
             group=group,
             device=self.device,
             cpu_group=cpu,
         )
-        return layer, raw, fp8
+        return layer, raw, shared
 
     def get(self, shape):
         assert self.member(shape), f"rank {self.rank} is not in {shape}"
         if shape not in self.layers:
-            self.layers[shape] = self.build(shape)[:2]
+            self.layers[shape] = self.build(shape)
         return self.layers[shape]
 
     def inputs(self, shape, M, g, share=True):
         """Input group g of case (shape, M). ``share``: every rank of the group takes rank 0's copy (collective):
-        ranks may break topk ties of the random routing differently, and ar replicates the input.
+        ranks may break topk ties of the random routing differently, and the layer replicates the input.
         """
         s = SHAPES[shape]
-        x, tw, ids = make_inputs(
+        make = make_layer_inputs if s["routing"] == "layer" else make_inputs
+        x, tw, ids = make(
             M,
             s["H"],
             s["E"],
             s["topk"],
             seed=input_seed(shape, M, g),
-            shared=s["shared"],
             device=self.device,
         )
         if share:
@@ -614,8 +688,10 @@ class _Rank:
     def release(self):
         """Collective over each group this rank uses: free the benchmark state and every layer."""
         if self.bench is not None:
-            self.bench["ar"].close()
-            self.bench = None
+            bench, self.bench = self.bench, None
+            if bench["m7"] is not None:
+                bench["m7"].close()
+            bench["ar"].close()
         for shape in sorted(self.layers):
             self.layers.pop(shape)[0].close()
         torch.cuda.synchronize(self.device)
@@ -634,24 +710,18 @@ def _identical(t, group):
     return bool(same.item())
 
 
-def _verify(state, shape, raw, inputs, y):
+def _group_reference(state, shape, raw, shared, inputs):
+    """The FP32 reference of the layer: ``reference_rank`` summed over the shape's group (collective)."""
+    ref = reference_rank(shape, raw, shared, *inputs)
+    dist.all_reduce(ref, group=state.tp[SHAPES[shape]["world"]][0])
+    return ref
+
+
+def _verify(state, shape, raw, shared, inputs, y):
     """Check this rank's output y against the FP32 reference summed over the group; bitwise identity of y and of
     the inputs over the group (collective)."""
-    s = SHAPES[shape]
-    group = state.tp[s["world"]][0]
-    x, tw, ids = inputs
-    ref = reference(
-        x,
-        raw["w1"],
-        raw["w1_scale"],
-        raw["w2"],
-        raw["w2_scale"],
-        tw,
-        ids,
-        swiglu_limit=s["limit"] or 0.0,
-    )
-    dist.all_reduce(ref, group=group)
-    res = check(y, ref)
+    group = state.tp[SHAPES[shape]["world"]][0]
+    res = check(y, _group_reference(state, shape, raw, shared, inputs))
     res["identical"] = _identical(y, group)
     res["inputs_identical"] = all(_identical(t, group) for t in inputs)
     return res
@@ -661,13 +731,15 @@ def _job_check(state, shape, tokens):
     """forward + verify of input group 0 for each M in tokens."""
     if not state.member(shape):
         return None
-    layer, raw = state.get(shape)
+    layer, raw, shared = state.get(shape)
     rows = []
     for M in tokens:
         inputs = state.inputs(shape, M, 0)
         y = layer.forward(*inputs)
         path = ">".join(layer.last_path)
-        rows.append(dict(M=M, path=path, **_verify(state, shape, raw, inputs, y)))
+        rows.append(
+            dict(M=M, path=path, **_verify(state, shape, raw, shared, inputs, y))
+        )
     return rows
 
 
@@ -704,232 +776,258 @@ def pool():
 
 
 # =====================================================================================================================
-# Region 1: basic tests (-m basic): one case per dispatch tier x shape. Each pins the tier -- the Gate/Up kernel of
-# the unfused kernel sequence listed -- and the communication segment: FUSED_COMM (the cross-rank sum fused into the
-# Down decode kernel up to 16 rows, from 2 MiB (TP2) / 1 MiB (TP4) of BF16 output into tp_reduce or streamed out of
-# the Down kernel) or CA (the custom all-reduce in between). Not pinned: the kernels after Gate/Up, but for the token
-# chunks (CHUNK_FROM_M): CHUNK_KERNEL before them and the gather a8w4_tp_reduce last.
+# Region 1: basic tests (-m basic): one case per dispatch tier of the single-GPU op x shape -- decode (Down on
+# pre-quantized rows from 4 rows), decode on pre-quantized rows, H5120's decode deduplicated by expert, the mixed
+# routed + shared decode, the decode with the shared expert on a side stream, streaming with block 16 / 32 / 64
+# (quant: Gate/Up quantizes the intermediate itself), prefill sorted by the streaming prep or by Opus. Each checks the
+# output against the FP32 reference and pins the tier (gateup_tier), whether the shared expert ran (has_shared) and
+# exactly one communication segment (comm_kind), not which one.
 # =====================================================================================================================
-# First M in token chunks (the host's CHUNK_SPEC; TP2 with SDMA queues on every rank): CHUNK_KERNEL lists each
-# chunk's sorted blocks, then Gate/Up and a one-shot Down per chunk (SDMA pushes its partials to the peer), and
-# a8w4_tp_reduce sums both ranks' partials.
-CHUNK_FROM_M = {"tp2": 8192}
-CHUNK_KERNEL = "a8w4_chunk_blocks"
-
-
-def in_chunks(shape, M):
-    """Whether an M-row batch of shape runs in token chunks."""
-    return shape in CHUNK_FROM_M and M >= CHUNK_FROM_M[shape]
-
+DEC, PQ, DD, MIX = (
+    "a8w4_gateup_decode",
+    "a8w4_gateup_decode_pq",
+    "a8w4_gateup_decode_dd",
+    "a8w4_gateup_decode_mixed",
+)
+ST16, ST32, ST64 = (f"a8w4_gateup_stream_bm{b}" for b in (16, 32, 64))
+ST32Q, ST64Q = (f"a8w4_gateup_quant_stream_bm{b}" for b in (32, 64))
+PF = "a8w4_gateup_prefill_bm64_bn128_tk128"
 
 BASIC = [
     # decode: one workgroup per route / token
-    ("tp2", 1, DEC, FUSED_COMM),
-    ("ds_tp4", 2, DEC, FUSED_COMM),
-    ("tp4", 8, DPQ, FUSED_COMM),  # Down on pre-quantized rows
-    ("tp2", 32, PQ, CA),  # both GEMMs on pre-quantized rows
-    ("ds_tp4", 16, DD, FUSED_COMM),  # H5120: Gate/Up deduplicated by expert
-    # streaming (weights streamed once per expert block)
-    ("tp2", 256, ST16, CA),
-    ("ds_tp4", 512, ST16_RS, FUSED_COMM),  # Down writes routes, tp_reduce sums them
-    ("tp4", 48, ST32Q, CA),  # Gate/Up quantizes the intermediate itself
-    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),  # Down writes routes, streams their sum out
-    ("tp4", 2048, ST64Q, FUSED_COMM),  # atomic Down, then streams the ranks' sum out
+    ("tp2", 1, DEC),
+    ("tp4", 8, DEC),  # Down on pre-quantized rows
+    ("tp2", 32, PQ),  # both GEMMs on pre-quantized rows
+    ("ds_layer_tp4", 1, MIX),  # routed and shared experts in the same two kernels
+    ("ds_layer_tp4", 4, PQ),  # the shared expert on a side stream, joined into Down
+    ("ds_layer_tp4", 8, DD),  # H5120: Gate/Up deduplicated by expert
+    # streaming: weights streamed once per expert block
+    ("tp2", 256, ST16),
+    ("tp4", 1024, ST32Q),
+    ("tp4", 2048, ST64Q),
+    ("ds_layer_tp4", 64, ST16),
+    ("ds_layer_tp4", 1024, ST32),
     # prefill: sorted 64-row blocks
-    ("tp2", 2048, PF_PREP, FUSED_COMM),  # sorting by the streaming prep
-    ("tp4", 4096, PF_SORT, FUSED_COMM),  # Opus moe_sorting
-    ("ds_tp4", 4096, PF_SORT, FUSED_COMM),
-    ("tp2", 8192, PF_SORT, FUSED_COMM),  # token chunks, the partials pushed by SDMA
+    ("tp2", 2048, PF),  # sorting by the streaming prep
+    ("tp4", 4096, PF),  # Opus moe_sorting
+    ("ds_layer_tp4", 2048, PF),  # the shared expert's GEMMs ahead of the routed ones
 ]
 
 
 @pytest.mark.basic
-@pytest.mark.parametrize(
-    "shape,M,path,comm", BASIC, ids=[f"{s}_m{m}" for s, m, _, _ in BASIC]
-)
-def test_basic(pool, shape, M, path, comm):
-    tier = gateup_tier(path)
+@pytest.mark.parametrize("shape,M,tier", BASIC, ids=[f"{s}_m{m}" for s, m, _ in BASIC])
+def test_basic(pool, shape, M, tier):
     rows = _member_rows(pool.run("check", shape=shape, tokens=[M]), shape)
     _assert_verified(rows)
+    shared = SHAPES[shape]["shared"]
     for r in rows:
+        p = r["path"]
         assert (
-            gateup_tier(r["path"]) == tier and comm_kind(r["path"]) == comm
-        ), f"rank {r['rank']}: expected Gate/Up {tier} and communication {comm}, path {r['path']}"
-        kernels = r["path"].split(">")
-        assert not in_chunks(shape, M) or (
-            CHUNK_KERNEL in kernels and kernels[-1] == "a8w4_tp_reduce"
-        ), f"rank {r['rank']}: expected token chunks ending in a8w4_tp_reduce, path {r['path']}"
+            gateup_tier(p) == tier
+            and has_shared(p) == shared
+            and comm_kind(p) is not None
+        ), (
+            f"rank {r['rank']}: expected Gate/Up {tier}, shared expert {shared} and one communication segment, "
+            f"path {p}"
+        )
 
 
 # =====================================================================================================================
 # Region 2: other coverage (-m "not basic"). Not here: full-precision checks of the 51 SPEC cases -- the benchmark
-# verifies every timed output against the reference (and the cross-rank identity) and fails otherwise.
+# verifies every timed output against the reference (and the cross-rank identity) and fails otherwise --, and the
+# dispatch boundaries of the single-GPU op (op_tests/test_flydsl_moe_a8w4.py tests both sides of each; this layer
+# adds no dispatch of its own but the all-reduce rule, 2.2).
 # =====================================================================================================================
-# --- 2.1 both sides of every dispatch boundary --------------------------------------------------------------------
-# Why: the benchmark and the basic tests only take powers of two (+48), on one side of each M threshold of the
-# dispatch (decode pre-quantization, decode / streaming / prefill, block 16 / 32 / 64, prep / Opus sorting,
-# DeepSeek's XCD chunking, the fused communication below); these are the M on the other side, and odd M (partial
-# blocks / tiles). The benchmark does not check paths and the basic tests do not pin the fused kernel, so the
-# communication kernel of every M is pinned here: decode_tp single-slot at 1 row / slot pairs at 2-16 rows, the
-# custom all-reduce from 17 rows, tp_reduce from the byte threshold, and from STREAM_FROM_M the Down kernel that
-# streams the sum out (down_tp) before its gather (TP4 384 / 385, DeepSeek-V4.1 TP4 512 / 513: STREAM_TIER_SPEC).
-BOUNDARY_TOKENS = {
-    "tp2": (1, 2, 3, 11, 12, 16, 17, 33, 62, 63, 409, 410, 559, 560, 1023, 1024)
-    + (1026, 1027, 2234, 2235),
-    "tp4": (1, 2, 3, 16, 17, 19, 20, 33, 62, 63, 204, 205, 384, 385, 559, 560)
-    + (1023, 1024, 1305, 1306, 2611, 2612),
-    "ds_tp4": (1, 2, 3, 7, 16, 17, 33, 102, 103, 512, 513, 768, 769, 1025, 2049)
-    + (2730, 2731),
-}
-# First M whose cross-rank sum is fused into tp_reduce: FUSED_MIN_BYTES of BF16 output (TP2 2 MiB, TP4 1 MiB).
-FUSED_FROM_M = {"tp2": 410, "tp4": 205, "ds_tp4": 103}
-# First M whose Down kernel streams that sum out (down_tp: a8w4_down_*_tp, then a8w4_tp_reduce only gathers): every
-# fused batch of TP2 and of the prefill path, the streaming path's from STREAM_TIER_SPEC's bounds.
-STREAM_FROM_M = {"tp2": 410, "tp4": 385, "ds_tp4": 513}
+# --- 2.1 DeepSeek-V4.1's MTP layer ----------------------------------------------------------------------------------
+# Why: the benchmark and the basic tests take the SPEC shapes only; the MTP layer (128 routed experts, topk 3 + the
+# shared expert) reaches shared-expert tiers at other M than ds_layer_tp4: the mixed routed + shared decode still at
+# 4 rows (ds_layer_tp4: up to 2), and at 1280 rows the block-64 streaming Gate/Up after the shared expert's GEMMs,
+# with the prefill Down (ds_layer_tp4 streams with blocks 16 / 32 only).
+MTP_CASES = ((4, MIX), (1280, ST64))
 
 
-def streams_down(path):
-    """Whether the kernel before the last one of a path is a Down kernel streaming the cross-rank sum (down_tp)."""
-    kernels = path.split(">")
-    return (
-        len(kernels) > 1
-        and kernels[-2].startswith("a8w4_down_")
-        and kernels[-2].endswith("_tp")
-    )
-
-
-def expected_comm_kernel(shape, M):
-    """The last kernel of an M-row forward of shape: its fused communication kernel or the custom all-reduce."""
-    if M == 1:
-        return "a8w4_down_decode_tp"
-    if M <= 16:
-        return "a8w4_down_decode_pq_tp"
-    return "a8w4_tp_reduce" if M >= FUSED_FROM_M[shape] else CA
-
-
-@pytest.mark.parametrize("shape", list(BOUNDARY_TOKENS))
-def test_dispatch_boundaries(pool, shape):
-    rows = _member_rows(
-        pool.run("check", shape=shape, tokens=list(BOUNDARY_TOKENS[shape])), shape
-    )
+def test_mtp_layer(pool):
+    shape = "mtp_layer_tp4"
+    tiers = dict(MTP_CASES)
+    rows = _member_rows(pool.run("check", shape=shape, tokens=list(tiers)), shape)
     _assert_verified(rows)
     for r in rows:
-        last = expected_comm_kernel(shape, r["M"])
+        p = r["path"]
         assert (
-            _known_path(r["path"]) and r["path"].split(">")[-1] == last
-        ), f"M={r['M']} rank {r['rank']}: expected a known path ending in {last}, path {r['path']}"
-        streamed = r["M"] >= STREAM_FROM_M[shape]
-        assert (
-            streams_down(r["path"]) == streamed
-        ), f"M={r['M']} rank {r['rank']}: expected a streamed Down {streamed}, path {r['path']}"
+            gateup_tier(p) == tiers[r["M"]]
+            and has_shared(p)
+            and comm_kind(p) is not None
+        ), f"M={r['M']} rank {r['rank']}: expected Gate/Up {tiers[r['M']]} with the shared expert, path {p}"
 
 
-# --- 2.2 out=, M = 0 ----------------------------------------------------------------------------------------------
-# Why: the benchmark and the basic tests never pass ``out`` and never send M = 0. ``out`` (NaN-filled) is written
-# by the fused decode Down (8 rows), copied back from the custom all-reduce (48) and, after the atomic streaming Down
-# accumulated into it, written by its owner workgroups and the gather (2048).
-OUT_ARG_TOKENS = (8, 48, 2048)
+# --- 2.2 the all-reduce rule ------------------------------------------------------------------------------------
+# Why: which all-reduce a forward takes is pinned nowhere else (fusing the communication changes it). Here the
+# layer's communicator itself sums BF16 [rows, 2560] tensors on both sides of AR_RCCL_MIN_BYTES (TP2 and TP4): the
+# custom all-reduce below, RCCL from there on, both exact (sums of small integers).
+def _ar_rows(world, hidden):
+    """(rows, expected all-reduce) on both sides of the RCCL threshold of a TP size, BF16 rows of ``hidden``."""
+    from aiter.ops.flydsl.mega_moe_tp_gfx942 import AR_RCCL_MIN_BYTES
+
+    # the first row count at or above the threshold
+    first = -(-AR_RCCL_MIN_BYTES[world] // (2 * hidden))
+    return ((first - 1, CA), (first, RCCL))
+
+
+def _job_ar_rule(state, shape):
+    if not state.member(shape):
+        return None
+    s, dev = SHAPES[shape], state.device
+    comm, w = state.get(shape)[0]._comm, s["world"]
+    rows = []
+    for M, kind in _ar_rows(w, s["H"]):
+        gen = torch.Generator(device=dev).manual_seed(SEED + M)
+        base = torch.randint(-8, 9, (M, s["H"]), generator=gen, device=dev)
+        y = (base * (state.rank + 1)).to(torch.bfloat16)
+        uses_custom = comm.uses_custom(y)
+        out = comm.all_reduce(y)
+        torch.cuda.synchronize(dev)
+        exact = torch.equal(out, (base * (w * (w + 1) // 2)).to(torch.bfloat16))
+        rows.append(
+            {
+                "M": M,
+                "want": kind,
+                "last": comm.last,
+                "uses_custom": uses_custom,
+                "bytes": y.numel() * 2,
+                "exact": exact,
+            }
+        )
+    return rows
+
+
+@pytest.mark.parametrize("shape", ["tp2", "tp4"])
+def test_all_reduce_rule(pool, shape):
+    for rank, rows in enumerate(pool.run("ar_rule", shape=shape)):
+        if rank >= SHAPES[shape]["world"]:
+            assert rows is None
+            continue
+        for r in rows:
+            assert (
+                r["last"] == r["want"]
+                and r["uses_custom"] == (r["want"] == CA)
+                and r["exact"]
+            ), f"rank {rank}: {r}"
+
+
+# --- 2.3 out=, M = 0 --------------------------------------------------------------------------------------------
+# Why: the benchmark and the basic tests never pass ``out`` and never send M = 0. ``out`` (NaN-filled) must hold the
+# output whichever all-reduce runs (the custom one returns a new tensor, copied back; RCCL sums in place): TP4 8 and
+# 4096 rows, DeepSeek-V4.1 TP4 64 rows (shared expert). M = 0 returns an empty output and launches nothing.
+OUT_ARG_CASES = (("tp4", 8), ("tp4", 4096), ("ds_layer_tp4", 64))
 
 
 def _job_out_arg(state):
-    shape = "tp4"
-    layer, raw = state.get(shape)
-    s = SHAPES[shape]
-    rows = []
-    for M in OUT_ARG_TOKENS:
+    rows, empty = [], []
+    for shape, M in OUT_ARG_CASES:
+        layer, raw, shared = state.get(shape)
         inputs = state.inputs(shape, M, 1)
         out = torch.full(
-            (M, s["H"]), float("nan"), dtype=torch.bfloat16, device=state.device
+            (M, SHAPES[shape]["H"]),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=state.device,
         )
         y = layer.forward(*inputs, out=out)
         rows.append(
             dict(
+                shape=shape,
                 M=M,
                 path=">".join(layer.last_path),
                 returned_out=y is out,
-                **_verify(state, shape, raw, inputs, out),
+                **_verify(state, shape, raw, shared, inputs, out),
             )
         )
-    empty = layer.forward(
-        torch.empty((0, s["H"]), dtype=torch.bfloat16, device=state.device),
-        torch.empty((0, s["topk"]), dtype=torch.float32, device=state.device),
-        torch.empty((0, s["topk"]), dtype=torch.int32, device=state.device),
-    )
-    return {
-        "rows": rows,
-        "empty_shape": tuple(empty.shape),
-        "empty_path": tuple(layer.last_path),
-    }
+    for shape in ("tp4", "ds_layer_tp4"):
+        s, layer = SHAPES[shape], state.get(shape)[0]
+        width = s["topk"] + int(s["shared"])
+        y = layer.forward(
+            torch.empty((0, s["H"]), dtype=torch.bfloat16, device=state.device),
+            torch.empty((0, width), dtype=torch.float32, device=state.device),
+            torch.empty((0, width), dtype=torch.int32, device=state.device),
+        )
+        empty.append((shape, tuple(y.shape), tuple(layer.last_path)))
+    return {"rows": rows, "empty": empty}
 
 
 def test_out_argument_and_empty_batch(pool):
-    results = pool.run("out_arg")
-    for rank, res in enumerate(results):
+    for rank, res in enumerate(pool.run("out_arg")):
         _assert_verified(res["rows"])
-        assert [r["M"] for r in res["rows"]] == list(OUT_ARG_TOKENS), res["rows"]
+        assert [(r["shape"], r["M"]) for r in res["rows"]] == list(OUT_ARG_CASES)
         for r in res["rows"]:
-            assert r[
-                "returned_out"
-            ], f"rank {rank} M={r['M']}: forward(out=...) did not return out"
-            last = expected_comm_kernel("tp4", r["M"])
-            assert (
-                r["path"].split(">")[-1] == last
-            ), f"rank {rank} M={r['M']}: expected {last} last, path {r['path']}"
-        assert (
-            res["empty_shape"] == (0, SHAPES["tp4"]["H"]) and res["empty_path"] == ()
-        ), res
+            assert r["returned_out"] and _known_path(
+                r["path"]
+            ), f"rank {rank}: forward(out=...) did not return out or ran an unknown path: {r}"
+        assert res["empty"] == [
+            (shape, (0, SHAPES[shape]["H"]), ()) for shape in ("tp4", "ds_layer_tp4")
+        ], res["empty"]
 
 
-# --- 2.3 repeated calls across tiers, reset, error flags --------------------------------------------------------
+# --- 2.4 repeated calls across tiers, reset, error flags --------------------------------------------------------
 # Why: the benchmark repeats one case at a time and the basic tests call each case once; here one instance jumps
-# between decode / streaming / prefill (shared workspaces, cached handles), calls reset() in between, and the
-# watchdog API (check_errors / poll_errors / error_flag) is read afterwards.
+# between decode / streaming / prefill (cached plans and buffers of the op; with the shared expert also its side
+# stream), calls reset() in between, and the watchdog API (check_errors / poll_errors / error_flag) is read
+# afterwards.
+REPEAT = {
+    "tp2": (1, 2048, 48, 4096, 16, 256, 1),
+    "ds_layer_tp4": (1, 2048, 8, 64, 4),
+}
+
+
 def _job_repeat(state):
-    shape = "tp2"
-    if not state.member(shape):
-        return None
-    layer, raw = state.get(shape)
-    rows = []
-    for M in (1, 2048, 48, 4096, 16, 256, 1):
-        for g in (0, 1):
-            inputs = state.inputs(shape, M, g)
-            y = layer.forward(*inputs)
-            rows.append(
-                dict(
-                    M=M,
-                    g=g,
-                    path=">".join(layer.last_path),
-                    **_verify(state, shape, raw, inputs, y),
+    res = {}
+    for shape, tokens in REPEAT.items():
+        if not state.member(shape):
+            continue
+        layer, raw, shared = state.get(shape)
+        rows = []
+        for M in tokens:
+            for g in (0, 1):
+                inputs = state.inputs(shape, M, g)
+                y = layer.forward(*inputs)
+                rows.append(
+                    dict(
+                        M=M,
+                        g=g,
+                        path=">".join(layer.last_path),
+                        **_verify(state, shape, raw, shared, inputs, y),
+                    )
                 )
-            )
-        layer.reset()
-    layer.check_errors()
-    return {
-        "rows": rows,
-        "poll": layer.poll_errors(),
-        "flag": int(layer.error_flag().abs().max().item()),
-    }
+            layer.reset()
+        layer.check_errors()
+        res[shape] = {
+            "rows": rows,
+            "poll": layer.poll_errors(),
+            "flag": int(layer.error_flag().abs().max().item()),
+        }
+    return res
 
 
 def test_repeated_calls_and_reset(pool):
-    results = pool.run("repeat")
-    for rank, res in enumerate(results[: SHAPES["tp2"]["world"]]):
-        _assert_verified(res["rows"])
-        assert all(_known_path(r["path"]) for r in res["rows"]), res["rows"]
-        assert res["poll"] == 0 and res["flag"] == 0, f"rank {rank}: error flags {res}"
-    assert results[2] is None and results[3] is None
+    for rank, res in enumerate(pool.run("repeat")):
+        assert sorted(res) == sorted(s for s in REPEAT if rank < SHAPES[s]["world"])
+        for shape, r in res.items():
+            _assert_verified(r["rows"])
+            assert all(_known_path(x["path"]) for x in r["rows"]), r["rows"]
+            assert (
+                r["poll"] == 0 and r["flag"] == 0
+            ), f"rank {rank} {shape}: error flags {r}"
 
 
-# --- 2.4 TP2 / TP4 groups interleaved ---------------------------------------------------------------------------
+# --- 2.5 TP2 / TP4 groups interleaved ---------------------------------------------------------------------------
 # Why: the benchmark and the basic tests run one shape after another; here ranks 0 and 1 interleave forwards of a
 # TP2 layer and of two TP4 layers (which share one communicator) while ranks 2 and 3 run only the TP4 ones.
 ALTERNATE = (
     ("tp2", 8),
     ("tp4", 64),
-    ("ds_tp4", 16),
+    ("ds_layer_tp4", 16),
     ("tp2", 4096),
     ("tp4", 1),
-    ("ds_tp4", 48),
+    ("ds_layer_tp4", 48),
     ("tp2", 1),
 )
 
@@ -939,7 +1037,7 @@ def _job_alternate(state):
     for shape, M in ALTERNATE:
         if not state.member(shape):
             continue
-        layer, raw = state.get(shape)
+        layer, raw, shared = state.get(shape)
         inputs = state.inputs(shape, M, 3)
         y = layer.forward(*inputs)
         rows.append(
@@ -947,92 +1045,92 @@ def _job_alternate(state):
                 shape=shape,
                 M=M,
                 path=">".join(layer.last_path),
-                **_verify(state, shape, raw, inputs, y),
+                **_verify(state, shape, raw, shared, inputs, y),
             )
         )
     return rows
 
 
 def test_tp2_tp4_interleaved(pool):
-    results = pool.run("alternate")
-    for rank, rows in enumerate(results):
+    for rank, rows in enumerate(pool.run("alternate")):
         expect = [(s, m) for s, m in ALTERNATE if rank < SHAPES[s]["world"]]
         assert [(r["shape"], r["M"]) for r in rows] == expect
         _assert_verified(rows)
         assert all(_known_path(r["path"]) for r in rows), rows
 
 
-# --- 2.5 set_weights --------------------------------------------------------------------------------------------
+# --- 2.6 set_weights --------------------------------------------------------------------------------------------
 # Why: the benchmark and the basic tests construct each layer once with one set of weights; set_weights converts
-# another layer's weights in place and must switch every later forward to them (and back).
+# another layer's weights in place (routed experts, and the shared expert's) and must switch every later forward to
+# them (and back).
+SET_WEIGHTS = {"tp4": (16, 256), "ds_layer_tp4": (4, 64)}
+
+
 def _job_set_weights(state):
-    shape = "tp4"
-    layer, raw = state.get(shape)
-    s = SHAPES[shape]
-    raw2 = make_weights(
-        s["E"],
-        s["H"],
-        s["I"],
-        seed=weight_seed(shape, state.rank, variant=1),
-        device=state.device,
-    )
-    rows = []
-    try:
-        layer.set_weights(**to_megamoe_layout(raw2))
-        for M in (16, 256):
-            inputs = state.inputs(shape, M, 2)
-            y = layer.forward(*inputs)
-            rows.append(
-                dict(
-                    weights=2,
-                    M=M,
-                    path=">".join(layer.last_path),
-                    **_verify(state, shape, raw2, inputs, y),
+    res = {}
+    for shape, tokens in SET_WEIGHTS.items():
+        layer, raw, shared = state.get(shape)
+        raw2, shared2 = state.weights(shape, variant=1)
+        rows = []
+        try:
+            layer.set_weights(**to_megamoe_layout(raw2), **shared_kwargs(shared2))
+            for M in tokens:
+                inputs = state.inputs(shape, M, 2)
+                y = layer.forward(*inputs)
+                rows.append(
+                    dict(
+                        weights=2,
+                        M=M,
+                        path=">".join(layer.last_path),
+                        **_verify(state, shape, raw2, shared2, inputs, y),
+                    )
                 )
+        finally:
+            layer.set_weights(**to_megamoe_layout(raw), **shared_kwargs(shared))
+        inputs = state.inputs(shape, tokens[0], 2)
+        y = layer.forward(*inputs)
+        rows.append(
+            dict(
+                weights=1,
+                M=tokens[0],
+                path=">".join(layer.last_path),
+                **_verify(state, shape, raw, shared, inputs, y),
             )
-    finally:
-        layer.set_weights(**to_megamoe_layout(raw))
-    inputs = state.inputs(shape, 16, 2)
-    y = layer.forward(*inputs)
-    rows.append(
-        dict(
-            weights=1,
-            M=16,
-            path=">".join(layer.last_path),
-            **_verify(state, shape, raw, inputs, y),
         )
-    )
-    return rows
+        res[shape] = rows
+    return res
 
 
 def test_set_weights(pool):
-    for rows in pool.run("set_weights"):
-        _assert_verified(rows)
-        assert [r["weights"] for r in rows] == [2, 2, 1]
+    for res in pool.run("set_weights"):
+        assert sorted(res) == sorted(SET_WEIGHTS)
+        for shape, rows in res.items():
+            _assert_verified(rows)
+            assert [r["weights"] for r in rows] == [2] * len(SET_WEIGHTS[shape]) + [1]
+            assert all(has_shared(r["path"]) == SHAPES[shape]["shared"] for r in rows)
 
 
-# --- 2.6 CUDA graph capture and replay --------------------------------------------------------------------------
+# --- 2.7 CUDA graph capture and replay --------------------------------------------------------------------------
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
-# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups. The
-# streamed Down (its counters reset by its own kernels) is replayed on the prefill path at DeepSeek-V4.1 TP4 8192
-# (5 column blocks) and TP2 4096 (2 ranks), and on the streaming path, with its BF16 atomics, at TP4 2048; the token
-# chunks at TP2 8192 (the replayed Down kernels submit the SDMA pushes).
+# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups: decode
+# (TP2 8; DeepSeek-V4.1 TP4 1, the mixed decode, and 4, the shared expert on its side stream), streaming (TP4 2048,
+# DeepSeek-V4.1 TP4 64 with the side stream), prefill (DeepSeek-V4.1 TP4 2048) and both all-reduces (TP2 4096 and
+# DeepSeek-V4.1 TP4 2048 take RCCL, the others the custom all-reduce).
 GRAPH_CASES = [
     ("tp2", 8),
-    ("ds_tp4", 1),
-    ("ds_tp4", 16),
-    ("ds_tp4", 48),
-    ("ds_tp4", 8192),
     ("tp4", 2048),
     ("tp2", 4096),
-    ("tp2", 8192),
+    ("ds_layer_tp4", 1),
+    ("ds_layer_tp4", 4),
+    ("ds_layer_tp4", 64),
+    ("ds_layer_tp4", 2048),
 ]
 
 
 def _job_graph(state, shape, M):
     if not state.member(shape):
         return None
-    layer, raw = state.get(shape)
+    layer, raw, shared = state.get(shape)
     dev = state.device
     layer.prepare([-(-M // SHAPES[shape]["world"])])
     xs, tws, idss = (t.clone() for t in state.inputs(shape, M, 0))
@@ -1054,7 +1152,9 @@ def _job_graph(state, shape, M):
             static.copy_(t)
         graph.replay()
         torch.cuda.synchronize(dev)
-        rows.append(dict(M=M, g=g, path=path, **_verify(state, shape, raw, inputs, ys)))
+        rows.append(
+            dict(M=M, g=g, path=path, **_verify(state, shape, raw, shared, inputs, ys))
+        )
     graph.reset()
     return rows
 
@@ -1065,16 +1165,16 @@ def _job_graph(state, shape, M):
 def test_cuda_graph(pool, shape, M):
     rows = _member_rows(pool.run("graph", shape=shape, M=M), shape)
     _assert_verified(rows)
-    assert all(_known_path(r["path"]) for r in rows), rows
     assert all(
-        (CHUNK_KERNEL in r["path"].split(">")) == in_chunks(shape, M) for r in rows
+        _known_path(r["path"]) and has_shared(r["path"]) == SHAPES[shape]["shared"]
+        for r in rows
     ), rows
 
 
-# --- 2.7 default communicators ----------------------------------------------------------------------------------
+# --- 2.8 default communicators ----------------------------------------------------------------------------------
 # Why: the benchmark and the other tests pass explicit TP / gloo groups; with group=None and cpu_group=None the
-# layer uses the default group and creates its gloo group itself (collective) -- the fused sum's workspace (8 rows)
-# and the custom all-reduce (48 rows) run over it -- and close() releases both.
+# layer uses the default group and creates its gloo group itself (collective), sums over them (8 and 48 rows) and
+# close() releases both.
 DEFAULT_COMM_TOKENS = (8, 48)
 
 
@@ -1082,7 +1182,7 @@ def _job_default_comm(state):
     from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
 
     shape = "tp4"
-    _, raw = state.get(shape)
+    _, raw, _ = state.get(shape)
     layer = MegaMoeTPGfx942(
         make_config(shape, state.rank), **to_megamoe_layout(raw), device=state.device
     )
@@ -1095,7 +1195,7 @@ def _job_default_comm(state):
                 dict(
                     M=M,
                     path=">".join(layer.last_path),
-                    **_verify(state, shape, raw, inputs, y),
+                    **_verify(state, shape, raw, None, inputs, y),
                 )
             )
         return rows
@@ -1107,27 +1207,30 @@ def test_default_communicators(pool):
     for rows in pool.run("default_comm"):
         _assert_verified(rows)
         assert [r["M"] for r in rows] == list(DEFAULT_COMM_TOKENS), rows
-        # the fused sum over the layer's own groups, and the custom all-reduce (not the RCCL fallback)
-        for r in rows:
-            last = expected_comm_kernel("tp4", r["M"])
-            assert _known_path(r["path"]) and r["path"].split(">")[-1] == last, rows
+        assert all(_known_path(r["path"]) for r in rows), rows
 
 
-# --- 2.8 rejected configurations and arguments ------------------------------------------------------------------
-# Why: the benchmark and the basic tests pass valid arguments only. Rank 0 alone: every check raises before any
-# collective.
+# --- 2.9 rejected configurations and arguments ------------------------------------------------------------------
+# Why: the benchmark and the basic tests pass valid arguments only. Every rank constructs the TP4 and DeepSeek-V4.1
+# layers (collective), then rank 0 alone: every check raises before any collective (constructor checks before the
+# communicator; set_weights checks before converting; forward checks before launching). With a shared expert: a
+# partial set, an argument that is no tensor, no FP8 / two FP8 formats, two scale formats, scales of another shape
+# or dtype, other shapes than [2I, H] / [H, I], another device, NaN elements / E8M0 codes / scales; set_weights that
+# adds or drops the shared expert; a routing of the routed width only.
 def _job_errors(state):
     import aiter.ops.flydsl.mega_moe_tp_gfx942 as mod
     from aiter import ActivationType
 
-    shape = "tp4"
-    layer, raw = state.get(shape)
+    shape, ds = "tp4", "ds_layer_tp4"
+    layer, raw, _ = state.get(shape)
+    ds_layer, ds_raw, ds_shared = state.get(ds)
     if state.rank != 0:
         return None
     s, dev = SHAPES[shape], state.device
-    w = to_megamoe_layout(raw)
+    w, wd = to_megamoe_layout(raw), to_megamoe_layout(ds_raw)
     group, cpu = state.tp[s["world"]]
     x, tw, ids = state.inputs(shape, 8, 0, share=False)
+    xd, twd, idsd = state.inputs(ds, 8, 0, share=False)
     rows = MAX_TOKENS + 1
     big = (
         torch.zeros((rows, s["H"]), dtype=torch.bfloat16, device=dev),
@@ -1144,6 +1247,16 @@ def _job_errors(state):
             cpu_group=cpu,
         )
 
+    def build_ds(**shared):
+        return mod.MegaMoeTPGfx942(
+            make_config(ds, 0),
+            **wd,
+            **dict(shared_kwargs(ds_shared), **shared),
+            group=group,
+            device=dev,
+            cpu_group=cpu,
+        )
+
     def on_gfx950():
         real = mod.get_gfx_runtime
         mod.get_gfx_runtime = lambda: "gfx950"
@@ -1152,6 +1265,18 @@ def _job_errors(state):
         finally:
             mod.get_gfx_runtime = real
 
+    w1s, s1s, w2s, s2s = ds_shared
+    H, inter = SHAPES[ds]["H"], SHAPES[ds]["I"]
+
+    def blocks(rows_, cols, code=127):
+        return torch.full(
+            (rows_ // 32, cols // 32), code, dtype=torch.uint8, device=dev
+        )
+
+    nan_w1 = w1s.clone()
+    nan_w1.view(torch.uint8)[0, 0] = 0x7F
+    inf_s1 = s1s.clone()
+    inf_s1[0] = float("inf")
     cases = [
         ("not gfx942", on_gfx950, ValueError, "gfx942"),
         (
@@ -1173,6 +1298,12 @@ def _job_errors(state):
             "gfx950",
         ),
         ("gfx950 lb_min", lambda: build({"lb_min": 1}), ValueError, "gfx950"),
+        (
+            "comm_dtype unknown",
+            lambda: build({"comm_dtype": "int8"}),
+            ValueError,
+            "comm_dtype",
+        ),
         (
             "ar_gather fp8",
             lambda: build({"ar_gather": "fp8"}),
@@ -1204,13 +1335,122 @@ def _job_errors(state):
                 .view(w["w1_scale"].dtype)
             ),
             ValueError,
-            "0xFF",
+            "255",
         ),
         (
             "model_dim not a multiple of 512",
             lambda: build({"model_dim": s["H"] + 256}),
             ValueError,
             "model_dim",
+        ),
+        (
+            "max_local_tokens < 1",
+            lambda: build({"max_local_tokens": 0}),
+            ValueError,
+            "max_local_tokens",
+        ),
+        (
+            "shared: a partial set",
+            lambda: build_ds(shared_w2_scale=None),
+            ValueError,
+            "needs all of",
+        ),
+        (
+            "shared: no tensor",
+            lambda: build_ds(shared_w1=[0.0]),
+            TypeError,
+            "must be a tensor",
+        ),
+        (
+            "shared: uint8 weight",
+            lambda: build_ds(shared_w1=w1s.view(torch.uint8)),
+            ValueError,
+            "float8_e4m3fn",
+        ),
+        (
+            "shared: E4M3FN and E4M3FNUZ",
+            lambda: build_ds(shared_w2=w2s.view(torch.float8_e4m3fnuz)),
+            ValueError,
+            "one FP8 format",
+        ),
+        (
+            "shared: per-row and 32x32 block scales",
+            lambda: build_ds(shared_w2_scale=blocks(H, inter)),
+            ValueError,
+            "one format",
+        ),
+        (
+            "shared: per-row scale shape",
+            lambda: build_ds(shared_w1_scale=s1s[:-1]),
+            ValueError,
+            "per-row float32 scales",
+        ),
+        (
+            "shared: block scale shape",
+            lambda: build_ds(
+                shared_w1_scale=blocks(2 * inter, H)[:-1],
+                shared_w2_scale=blocks(H, inter),
+            ),
+            ValueError,
+            "32x32 blocks",
+        ),
+        (
+            "shared: bfloat16 scales",
+            lambda: build_ds(
+                shared_w1_scale=s1s.bfloat16(), shared_w2_scale=s2s.bfloat16()
+            ),
+            ValueError,
+            "must be float32 per-row scales",
+        ),
+        (
+            "shared: w1 rows",
+            lambda: build_ds(shared_w1=w1s[:-32], shared_w1_scale=s1s[:-32]),
+            ValueError,
+            "shapes must match",
+        ),
+        (
+            "shared: on the CPU",
+            lambda: build_ds(shared_w2_scale=s2s.cpu()),
+            ValueError,
+            "is on cpu",
+        ),
+        (
+            "shared: NaN element",
+            lambda: build_ds(shared_w1=nan_w1),
+            ValueError,
+            "NaN elements",
+        ),
+        (
+            "shared: non-finite per-row scale",
+            lambda: build_ds(shared_w1_scale=inf_s1),
+            ValueError,
+            "non-finite",
+        ),
+        (
+            "shared: E8M0 NaN code",
+            lambda: build_ds(
+                shared_w1_scale=blocks(2 * inter, H, 255),
+                shared_w2_scale=blocks(H, inter),
+            ),
+            ValueError,
+            "255",
+        ),
+        (
+            "set_weights adds a shared expert",
+            lambda: layer.set_weights(
+                **w,
+                **shared_kwargs(
+                    make_shared_weights(s["H"], s["I"], seed=SEED + 9, device=dev)
+                ),
+            ),
+            ValueError,
+            "keep that",
+        ),
+        (
+            "set_weights drops the shared expert",
+            lambda: ds_layer.set_weights(**wd),
+            ValueError,
+            "keep that",
         ),
         ("x dtype", lambda: layer.forward(x.float(), tw, ids), ValueError, "x must be"),
         (
@@ -1222,6 +1462,12 @@ def _job_errors(state):
         (
             "topk shape",
             lambda: layer.forward(x, tw[:, :-1], ids[:, :-1]),
+            ValueError,
+            "topk",
+        ),
+        (
+            "shared: routing without the shared column",
+            lambda: ds_layer.forward(xd, twd[:, :-1], idsd[:, :-1]),
             ValueError,
             "topk",
         ),
@@ -1264,561 +1510,359 @@ def _job_errors(state):
 def test_rejected_arguments(pool):
     failures = pool.run("errors")[0]
     assert not failures, "\n".join(failures)
+    # the rejected set_weights calls left the layers' weights in place
+    for shape in ("tp4", "ds_layer_tp4"):
+        rows = _member_rows(pool.run("check", shape=shape, tokens=[8]), shape)
+        _assert_verified(rows)
 
 
-# --- 2.9 the path checks themselves (CPU only) ------------------------------------------------------------------
+# --- 2.10 the path checks themselves (CPU only) -----------------------------------------------------------------
 # Why: the benchmark does not check paths, and the tests above only see the paths this code takes (a known Gate/Up
-# kernel, one all-reduce at the end); a check that accepted anything would pass them all. Its verdicts on fused
-# reductions and on broken paths (no / several / misplaced all-reduces, no / an unknown Gate/Up) are pinned here.
+# kernel, one all-reduce at the end, the shared expert's steps); checks that accepted anything would pass them all.
+# Their verdicts on fused reductions (later milestones), on the shared expert's steps and on broken paths (no /
+# several / misplaced all-reduces, no / an unknown Gate/Up) are pinned here.
 def test_path_checks():
+    qwen_decode = "a8w4_gateup_decode>a8w4_down_decode"
+    qwen_prefill = f"moe_sorting_opus>a8w4_row_quant_fp8>{PF}>a8w4_row_quant_fp8>a8w4_down_prefill_bm64>sorted_sum"
+    shared_gemms = "shared_fold_gemm_gateup>shared_fold_mid>shared_fold_gemm_down"
+    ds_mixed = f"{MIX}>a8w4_down_decode_mixed>shared_mixed"
+    ds_side = (
+        f"a8w4_row_quant_decode>{PQ}>shared_fork>{shared_gemms}>a8w4_row_quant_decode>shared_join>"
+        "a8w4_down_decode_pq_shared"
+    )
+    ds_prefill = f"a8w4_stream_prep>{shared_gemms}>{PF}>a8w4_row_quant_fp8>a8w4_down_prefill_bm64>sorted_sum"
     fused = "a8w4_gateup_decode>a8w4_down_decode_tp"
-    cases = [  # path, comm_kind, _known_path
-        (f"{DPQ}>{CA}", CA, True),
-        (f"{PF_SORT}>{RCCL}", RCCL, True),
-        (fused, FUSED_COMM, True),
-        (f"{ST16}>a8w4_tp_reduce", FUSED_COMM, True),
-        (f"{PF_PREP}_tp", FUSED_COMM, True),  # sorted_sum_tp
-        (DEC, None, False),  # no communication
-        (f"{fused}>{CA}", None, False),  # fused and an all-reduce
-        (f"{DEC}>{RCCL}>{RCCL}", None, False),
-        (f"a8w4_gateup_decode>{CA}>a8w4_down_decode", None, False),  # not last
-        ("a8w4_gateup_decode>a8w4_down_decode_stp", None, False),  # no word "tp"
-        (f"a8w4_down_decode>{CA}", CA, False),  # no Gate/Up kernel
-        (f"a8w4_gateup_decode_v2>a8w4_down_decode>{CA}", CA, False),  # unknown one
+    stream_fused = f"a8w4_stream_prep>{ST16}>a8w4_row_quant_fp8>a8w4_down_stream_bm16>a8w4_tp_reduce"
+    cases = [  # path, comm_kind, _known_path, has_shared
+        (f"{qwen_decode}>{CA}", CA, True, False),
+        (f"{qwen_prefill}>{RCCL}", RCCL, True, False),
+        (f"{ds_mixed}>{CA}", CA, True, True),
+        (f"{ds_side}>{CA}", CA, True, True),
+        (f"{ds_prefill}>{RCCL}", RCCL, True, True),
+        (fused, FUSED_COMM, True, False),
+        (stream_fused, FUSED_COMM, True, False),
+        (f"{ds_prefill}_tp", FUSED_COMM, True, True),  # sorted_sum_tp
+        (qwen_decode, None, False, False),  # no communication
+        (f"{fused}>{CA}", None, False, False),  # fused and an all-reduce
+        (f"{qwen_decode}>{RCCL}>{RCCL}", None, False, False),
+        (f"a8w4_gateup_decode>{CA}>a8w4_down_decode", None, False, False),  # not last
+        ("a8w4_gateup_decode>a8w4_down_decode_stp", None, False, False),  # no word "tp"
+        (f"a8w4_down_decode>{CA}", CA, False, False),  # no Gate/Up kernel
+        (f"a8w4_gateup_decode_v2>a8w4_down_decode>{CA}", CA, False, False),  # unknown
+        (f"{qwen_decode}_unshared>{CA}", CA, True, False),  # no word "shared"
     ]
     wrong = [
-        (p, comm_kind(p), _known_path(p))
-        for p, kind, known in cases
-        if (comm_kind(p), _known_path(p)) != (kind, known)
+        (p, comm_kind(p), _known_path(p), has_shared(p))
+        for p, *want in cases
+        if [comm_kind(p), _known_path(p), has_shared(p)] != want
     ]
     assert not wrong, wrong
-    # the first Gate/Up kernel, also behind sorting / quantization; every unfused sequence has one
-    assert gateup_tier(PF_SORT) == "a8w4_gateup_prefill_bm64_bn128_tk128"
-    assert gateup_tier(fused) == gateup_tier(DEC) == "a8w4_gateup_decode"
-    assert None not in GATEUP_KERNELS
+    # the first Gate/Up kernel, also behind sorting / quantization / the shared expert's GEMMs
+    assert gateup_tier(qwen_prefill) == gateup_tier(ds_prefill) == PF
+    assert gateup_tier(ds_side) == PQ and gateup_tier(fused) == DEC
+    tiers = (DEC, PQ, DD, MIX, ST16, ST32, ST64, ST32Q, ST64Q, PF)
+    assert all(GATEUP_KERNEL.fullmatch(t) for t in tiers), tiers
 
 
-# --- 2.10 waits on peers: a late rank, a rank that skips a call, reset(), prepare()'s retry ----------------------
-# Why: the benchmark and the basic tests start every rank's fused kernel together and never time out. Here the fused
-# decode Down (8 rows), tp_reduce (256 rows) and the streamed Down with its gather (TP4 1024 / TP2 512: streaming
-# path, BF16 atomics; DeepSeek-V4.1 TP4 4096: prefill path) and the token chunks (TP2 8192: the SDMA queue's wait
-# for the peer, the gather's waits for both pushes) wait for a rank that starts 0.5 s late (right sums, no
-# error bits); with the wait bound cut to 50 ms, for a rank that skips the call: the others give up within the bound
-# with their kernel's error bit, check_errors() raises once and clears it, the skipping rank's call after that is
-# right or has its error bit too, and reset() restores right sums. prepare() resets every rank and warms up again
-# when one rank's watchdog reports an error, and raises on every rank when it reports one again.
-PEER_WAIT_CASES = (
-    ("tp4", 8),
-    ("tp4", 256),
-    ("tp4", 1024),
-    ("tp2", 512),
-    ("ds_tp4", 4096),
-    ("tp2", 8192),
+# --- 2.11 real shared experts: DeepSeek-V4.1-Flash layers 2 and 37, TP4 ------------------------------------------
+# Why: the basic tests and the benchmark grade random per-row FP8 weights against a reference with this op's own
+# quantization. Here the official FP8 shared experts with E8M0 scales of 32x32 blocks, sliced for TP4 along I (rank r:
+# w1 / w3 rows and w2 columns [576 r, 576 r + 576)), run through the whole layer -- every rank's slice, then the
+# all-reduce -- on inputs N(0, 1) and N(0, 1) with 4 outlier channels times 50 (M 64, seeds 731-733, SwiGLU limit 10;
+# 8 routed experts with routing weight 0, so the output is the shared expert's). The relative L2 error against the FP32
+# expert on the same block weights (x and the intermediate not quantized; the ranks' terms summed) is at most 1.5
+# times that of the model's own quantization (x and the intermediate in FP8 with one UE8M0 scale per 32, as
+# DeepSeek-V4.1 runs it), as op_tests/test_flydsl_moe_a8w4.py grades rank 0's slice alone on one GPU. Reads the
+# checkpoint at AITER_MEGA_MOE_TP_DSV41_DIR (default /models/DeepSeek-V4.1-Flash-1017-partial); skipped without it.
+DSV41_DIR = os.environ.get(
+    "AITER_MEGA_MOE_TP_DSV41_DIR", "/models/DeepSeek-V4.1-Flash-1017-partial"
 )
-# error_flag() bit of a wait that gave up, by fused kernel (tp_reduce.ERR_TIMEOUT, decode_tp.ERR_TIMEOUT; down_tp
-# and its gather a8w4_tp_reduce set tp_reduce's)
-TIMEOUT_BIT = {
-    "a8w4_tp_reduce": 1,
-    "a8w4_down_decode_tp": 2,
-    "a8w4_down_decode_pq_tp": 2,
-}
+DSV41_LAYERS = ("layers.2", "layers.37")
+DSV41_TOKENS, DSV41_EXPERTS, DSV41_TOPK = 64, 8, 2
 
 
-def _job_peer_wait(state, shape, M):
-    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
+def _dsv41_files(layer):
+    """{tensor name: safetensors file} of a layer's shared expert in DSV41_DIR (pytest.skip without them)."""
+    index = Path(DSV41_DIR) / "model.safetensors.index.json"
+    if not index.exists():
+        pytest.skip(f"{index} not found (DeepSeek-V4.1-Flash checkpoint)")
+    weight_map = json.loads(index.read_text())["weight_map"]
+    names = [
+        f"{layer}.ffn.shared_experts.{m}.{k}"
+        for m in ("w1", "w3", "w2")
+        for k in ("weight", "scale")
+    ]
+    files = {n: weight_map.get(n) for n in names}
+    missing = [
+        n for n, f in files.items() if f is None or not (Path(DSV41_DIR) / f).exists()
+    ]
+    if missing:
+        pytest.skip(f"{DSV41_DIR}: missing {missing}")
+    return {n: str(Path(DSV41_DIR) / f) for n, f in files.items()}
 
-    if not state.member(shape):
-        return None
-    layer, raw = state.get(shape)
-    s = SHAPES[shape]
-    W, dev = s["world"], state.device
-    group, cpu = state.tp[W]
-    laggard = state.rank == W - 1
 
-    def verified(step, g):
-        inputs = state.inputs(shape, M, g)
-        y = layer.forward(*inputs)
-        path = ">".join(layer.last_path)
-        return dict(step=step, path=path, **_verify(state, shape, raw, inputs, y))
+def _dsv41_slice(files, layer, rank, world, inter):
+    """This rank's TP slice of a layer's official shared expert on the CPU: (shared_w1 [2I, H] = w1 rows then w3 rows,
+    its E8M0 [2I/32, H/32] block scales, shared_w2 [H, I], [H/32, I/32])."""
+    from safetensors import safe_open
 
-    def raised(fn):
-        try:
-            fn()
-        except RuntimeError as e:
-            return str(e)
-        return None
-
-    rows = [verified("warm", 0)]
-    res = {}
-    # a rank 0.5 s late, within the wait bound
-    inputs = state.inputs(shape, M, 1)
-    torch.cuda.synchronize(dev)
-    dist.barrier(group=cpu)
-    if laggard:
-        time.sleep(0.5)
-    y = layer.forward(*inputs)
-    path = ">".join(layer.last_path)
-    rows.append(dict(step="late", path=path, **_verify(state, shape, raw, inputs, y)))
-    res["late_bits"] = layer.poll_errors()
-    # a rank that skips the call (wait bound 50 ms), then calls after the others gave up
-    x, tw, ids = inputs = state.inputs(shape, M, 2)
-    ref = reference(
-        x,
-        raw["w1"],
-        raw["w1_scale"],
-        raw["w2"],
-        raw["w2_scale"],
-        tw,
-        ids,
-        swiglu_limit=s["limit"] or 0.0,
+    out = {}
+    for name, path in files.items():
+        block = 32 if name.endswith(".scale") else 1  # a scale covers 32 rows / columns
+        down = ".w2." in name  # w2 [H, I]: sliced along its columns
+        with safe_open(path, "pt", device="cpu") as f:
+            t = f.get_slice(name)
+            assert t.get_shape()[int(down)] * block == world * inter, (
+                name,
+                t.get_shape(),
+            )
+            part = slice(rank * inter // block, (rank + 1) * inter // block)
+            out[name] = (t[:, part] if down else t[part]).contiguous()
+    p = f"{layer}.ffn.shared_experts."
+    return (
+        torch.cat([out[p + "w1.weight"], out[p + "w3.weight"]]),
+        torch.cat([out[p + "w1.scale"], out[p + "w3.scale"]]),
+        out[p + "w2.weight"],
+        out[p + "w2.scale"],
     )
-    dist.all_reduce(ref, group=group)
-    torch.cuda.synchronize(dev)
-    dist.barrier(group=cpu)
-    saved = mod.WAIT_S, mod.FIRST_WAIT_S
-    mod.WAIT_S = mod.FIRST_WAIT_S = 0.05
-    try:
-        began = time.perf_counter()
-        if not laggard:
-            layer.forward(*inputs)
-        torch.cuda.synchronize(dev)
-        res["took"] = time.perf_counter() - began
-        res["bits"] = layer.poll_errors()
-        res["raised"] = raised(layer.check_errors)
-        res["cleared"] = layer.poll_errors()
-        dist.barrier(group=cpu)
-        if laggard:
-            y = layer.forward(*inputs)
-            res["skip_ok"] = check(y, ref)["ok"]
-            res["skip_bits"] = layer.poll_errors()
-            res["skip_raised"] = raised(layer.check_errors)
-    finally:
-        mod.WAIT_S, mod.FIRST_WAIT_S = saved
-    layer.reset()
-    rows += [verified("reset", g) for g in (0, 3)]
-    res["reset_bits"] = layer.poll_errors()
-    # prepare(): one rank's watchdog reports an error (the warmup itself runs clean: a real sticky bit would make that
-    # rank's waits give up early) once -> every rank resets and warms up again; twice -> RuntimeError on every rank
-    local = -(-M // W)
-
-    def failing(times):
-        left = [times]
-
-        def poll():
-            left[0] -= 1
-            return 1 if left[0] >= 0 else type(layer).poll_errors(layer)
-
-        return poll
-
-    for name, times in (("retry", 1), ("stuck", 2)):
-        if laggard:
-            layer.poll_errors = failing(times)
-        try:
-            res[name] = raised(lambda: layer.prepare([local]))
-        finally:
-            if laggard:
-                del layer.poll_errors
-        res[f"{name}_bits"] = layer.poll_errors()
-    layer.reset()
-    rows.append(verified("after prepare", 1))
-    res["final_bits"] = layer.poll_errors()
-    return dict(res, rows=rows)
 
 
-@pytest.mark.parametrize(
-    "shape,M", PEER_WAIT_CASES, ids=[f"{s}_m{m}" for s, m in PEER_WAIT_CASES]
-)
-def test_peer_waits_and_timeouts(pool, shape, M):
-    last = expected_comm_kernel(shape, M)
-    W = SHAPES[shape]["world"]
-    for rank, res in enumerate(pool.run("peer_wait", shape=shape, M=M)):
-        if rank >= W:
-            assert res is None
-            continue
-        _assert_verified(res["rows"])
-        assert all(r["path"].split(">")[-1] == last for r in res["rows"]), res["rows"]
-        assert all(
-            (CHUNK_KERNEL in r["path"].split(">")) == in_chunks(shape, M)
-            for r in res["rows"]
-        ), res["rows"]
-        assert res["late_bits"] == 0, f"rank {rank}: error bits after a late peer {res}"
-        if rank == W - 1:  # skipped; its late call is right or flagged
-            assert res["bits"] == 0 and res["raised"] is None, res
-            assert res["skip_ok"] or res["skip_bits"], res
-            assert (res["skip_raised"] is not None) == bool(res["skip_bits"]), res
-        else:
-            assert res["bits"] == TIMEOUT_BIT[last] and res["took"] < 5.0, res
-            assert res["raised"] and "gave up" in res["raised"], res
-        assert res["cleared"] == res["reset_bits"] == 0, res
-        assert res["retry"] is None and res["retry_bits"] == res["stuck_bits"] == 0, res
-        assert res["stuck"] and "timed out" in res["stuck"], res
-        assert res["final_bits"] == 0, res
+def _rel_l2(a, b):
+    return ((a.double() - b.double()).norm() / b.double().norm()).item()
 
 
-# --- 2.11 CUDA graph replays between eager calls, two instances on one workspace --------------------------------
-# Why: the benchmark and the basic tests run one instance eagerly, and 2.6 replays one graph by itself; serving
-# replays decode graphs between eager calls of other sizes, and the instances of one communicator, hidden size and
-# batch bound (layers of a model) share the fused sums' buffers and their epochs / parities (advanced by the kernels).
-# Two TP4 instances with different weights run in graphs of 8 / 256 / 1024 rows (decode_tp, tp_reduce, the streamed
-# Down) replayed between eager calls of both (fused sizes and the custom all-reduce).
-GRAPH_EAGER_TOKENS = (8, 256, 1024)
-GRAPH_EAGER_STEPS = (
-    ("replay", 256),
-    ("eager", 4096),
-    ("replay", 8),
-    ("eager", 256),
-    ("replay", 1024),
-    ("eager", 8),
-    ("replay", 256),
-    ("eager", 1023),
-    ("eager", 1),
-    ("replay", 8),
-    ("eager", 48),
-    ("replay", 1024),
-    ("eager", 2),
-    ("replay", 8),
-)
-
-
-def _job_graph_shared(state):
-    shape = "tp4"
-    dev = state.device
-    layer, raw = state.get(shape)
-    other, raw2, _ = state.build(shape, variant=1)
-    pairs = ((layer, raw), (other, raw2))
-    graphs = {}
-    try:
-        for M in GRAPH_EAGER_TOKENS:
-            statics = [t.clone() for t in state.inputs(shape, M, 0)]
-            outs = [torch.empty_like(statics[0]) for _ in pairs]
-            side = torch.cuda.Stream(device=dev)
-            side.wait_stream(torch.cuda.current_stream(dev))
-            with torch.cuda.stream(side):
-                for (lay, _), y in zip(pairs, outs):
-                    lay.forward(*statics, out=y)
-            torch.cuda.current_stream(dev).wait_stream(side)
-            torch.cuda.synchronize(dev)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                for (lay, _), y in zip(pairs, outs):
-                    lay.forward(*statics, out=y)
-            paths = [">".join(lay.last_path) for lay, _ in pairs]
-            graphs[M] = (graph, statics, outs, paths)
-        rows = []
-        for i, (kind, M) in enumerate(GRAPH_EAGER_STEPS):
-            inputs = state.inputs(shape, M, i % 4)
-            if kind == "replay":
-                graph, statics, ys, paths = graphs[M]
-                for static, t in zip(statics, inputs):
-                    static.copy_(t)
-                graph.replay()
-            else:
-                ys, paths = [], []
-                for lay, _ in pairs:
-                    ys.append(lay.forward(*inputs))
-                    paths.append(">".join(lay.last_path))
-            for j, ((lay, w), y, path) in enumerate(zip(pairs, ys, paths)):
-                res = _verify(state, shape, w, inputs, y)
-                res.update(step=(i, kind), M=M, layer=j, path=path)
-                rows.append(dict(res, bits=lay.poll_errors()))
-        return {"shared": other._ws is layer._ws, "rows": rows}
-    finally:
-        for graph, *_ in graphs.values():
-            graph.reset()
-        other.close()
-
-
-def test_graph_eager_shared_workspace(pool):
-    for rank, res in enumerate(pool.run("graph_shared")):
-        assert res["shared"], f"rank {rank}: the instances do not share the workspace"
-        rows = res["rows"]
-        _assert_verified(rows)
-        assert len(rows) == 2 * len(GRAPH_EAGER_STEPS), rows
-        for r in rows:
-            last = expected_comm_kernel("tp4", r["M"])
-            assert r["path"].split(">")[-1] == last and r["bits"] == 0, (rank, r)
-
-
-# --- 2.12 the single-slot fused decode Down above 1 row -----------------------------------------------------------
-# Why: every weight of the benchmark and the tests fits the slot-pair Down (moe_a8w4._down_pq_fits), so their fused
-# decode sums 2-16 rows with the slot-pair kernel only; a w2 of 4 GiB or more (32-bit offsets) does not fit, too
-# large to allocate here: with the check patched, the single-slot decode_tp kernel sums the unquantized rows.
-SINGLE_SLOT_CASES = (("tp4", 2), ("tp4", 16), ("ds_tp4", 2), ("ds_tp4", 16))
-
-
-def _job_single_slot(state):
-    from aiter.ops.flydsl import moe_a8w4
-
-    real = moe_a8w4._down_pq_fits
-    moe_a8w4._down_pq_fits = lambda *args: False
-    try:
-        rows = []
-        for shape, M in SINGLE_SLOT_CASES:
-            layer, raw = state.get(shape)
-            inputs = state.inputs(shape, M, 1)
-            y = layer.forward(*inputs)
-            res = _verify(state, shape, raw, inputs, y)
-            rows.append(dict(res, shape=shape, M=M, path=">".join(layer.last_path)))
-        return rows
-    finally:
-        moe_a8w4._down_pq_fits = real
-
-
-def test_single_slot_decode_fallback(pool):
-    for rows in pool.run("single_slot"):
-        _assert_verified(rows)
-        assert [(r["shape"], r["M"]) for r in rows] == list(SINGLE_SLOT_CASES), rows
-        for r in rows:
-            kernels = r["path"].split(">")
-            # straight from Gate/Up: no row quantization in between
-            assert (
-                _known_path(r["path"])
-                and kernels[-1] == "a8w4_down_decode_tp"
-                and kernels[-2].startswith(GATEUP_PREFIX)
-            ), r
-
-
-# --- 2.13 the streamed Down against the Down kernel and tp_reduce, bitwise ----------------------------------------
-# Why: the benchmark and the tests above check each output against the FP32 reference within the tolerance only, and
-# their batch sizes leave the streamed Down's gather at 1 item per workgroup or in full groups. Where the routes and
-# the ranks are summed in f32 (prefill path, DeepSeek-V4.1's streaming path) the streamed Down must equal the
-# unstreamed path (STREAM_DOWN off: Down kernel, tp_reduce) bitwise, also under each shape's compute schedule of the
-# prefill path (DOWN_TUNE: loads and stores reordered, the same bits): TP4 3272 / 3273 (2045 / 2050 tiles of 8 tokens
-# over the column blocks: 1 / 4 per gather workgroup, the last group partial), TP4 8193 (a 1-token last tile, rank 0
-# owning one tile more; route stores with nt above 8192 rows), TP2 4096 (with owner workgroups) and 8193 (token
-# chunks: the gather sums both ranks' partials, a 1-token last tile), DeepSeek-V4.1 TP4 2048 / 4097 (5 column blocks,
-# without / with XCD chunks) and 513 (its first streamed batch). Not here: Qwen's streaming path, whose BF16 atomics
-# add the routes in a different order every call.
-STREAM_BITWISE_CASES = (
-    ("tp4", 3272),
-    ("tp4", 3273),
-    ("tp4", 8193),
-    ("tp2", 4096),
-    ("tp2", 8193),
-    ("ds_tp4", 513),
-    ("ds_tp4", 2048),
-    ("ds_tp4", 4097),
-)
-
-
-def _job_stream_bitwise(state, shape, M):
-    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
-
-    if not state.member(shape):
-        return None
-    layer, raw = state.get(shape)
-    inputs = state.inputs(shape, M, 1)
-    y = layer.forward(*inputs)
-    row = dict(
-        M=M, path=">".join(layer.last_path), **_verify(state, shape, raw, inputs, y)
+def _quant_1x32(t):
+    """The model's activation quantization: FP8 E4M3FN with one UE8M0 scale per 32 elements, 2**ceil(log2(amax /
+    448)) (exact from the binary exponent), RNE; dequantized, float32."""
+    rows, cols = t.shape
+    b = t.float().view(rows, cols // 32, 32)
+    amax = b.abs().amax(dim=-1, keepdim=True).double()
+    m, e = torch.frexp(
+        torch.where(amax > 0, amax, torch.full_like(amax, FP8_OCP_MAX)) / FP8_OCP_MAX
     )
-    saved = mod.STREAM_DOWN
-    mod.STREAM_DOWN = False
-    try:
-        y_off = layer.forward(*inputs)
-    finally:
-        mod.STREAM_DOWN = saved
-    row.update(
-        off_path=">".join(layer.last_path),
-        same=torch.equal(y, y_off),
-        bits=layer.poll_errors(),
-    )
-    return [row]
+    scale = torch.exp2((e - (m == 0.5).to(e.dtype)).double()).float()
+    return ((b / scale).to(torch.float8_e4m3fn).float() * scale).view(rows, cols)
 
 
-@pytest.mark.parametrize(
-    "shape,M", STREAM_BITWISE_CASES, ids=[f"{s}_m{m}" for s, m in STREAM_BITWISE_CASES]
-)
-def test_streamed_down_bitwise(pool, shape, M):
-    rows = _member_rows(pool.run("stream_bitwise", shape=shape, M=M), shape)
-    _assert_verified(rows)
-    for r in rows:
-        assert streams_down(r["path"]) and not streams_down(r["off_path"]), r
-        assert r["off_path"].split(">")[-1] == "a8w4_tp_reduce", r
-        assert r["same"] and r["bits"] == 0, r
+def _shared_fp32(x, w1, w2, limit, quant=None):
+    """A shared expert slice in float32 on dequantized weights; ``quant`` quantizes x and the intermediate (None:
+    not)."""
+    inter = w1.shape[0] // 2
+    xa = x.float() if quant is None else quant(x)
+    h = xa @ w1.T
+    gate, up = h[:, :inter].clamp(max=limit), h[:, inter:].clamp(-limit, limit)
+    mid = torch.nn.functional.silu(gate) * up
+    return (mid if quant is None else quant(mid)) @ w2.T
 
 
-# --- 2.14 token chunks: both sides of the threshold, odd M, alternating with unchunked batches --------------------
-# Why: the benchmark and the basic test run token chunks at powers of two only, each batch size by itself, against
-# the tolerance only. One instance here alternates chunked and unchunked batches -- 8192, 8191 (both sides of
-# CHUNK_FROM_M), 12345 and 8193 (odd: a 1-token last tile, the chunks split at 9632 / 6384), 4096 -- and every output
-# must equal the path without token chunks (CHUNK_DOWN off: the owners' sums streamed out of one Down) bitwise.
-CHUNK_TOKENS = (8192, 8191, 12345, 4096, 8193)
-
-
-def _job_token_chunks(state):
-    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
-
-    shape = "tp2"
-    if not state.member(shape):
-        return None
-    layer, raw = state.get(shape)
-    rows = []
-    for M in CHUNK_TOKENS:
-        inputs = state.inputs(shape, M, 1)
-        y = layer.forward(*inputs)
-        row = dict(
-            M=M, path=">".join(layer.last_path), **_verify(state, shape, raw, inputs, y)
-        )
-        saved = mod.CHUNK_DOWN
-        mod.CHUNK_DOWN = False
-        try:
-            y_off = layer.forward(*inputs)
-        finally:
-            mod.CHUNK_DOWN = saved
-        row.update(
-            off_path=">".join(layer.last_path),
-            same=torch.equal(y, y_off),
-            bits=layer.poll_errors(),
-        )
-        rows.append(row)
-    return rows
-
-
-def test_token_chunks(pool):
-    rows = _member_rows(pool.run("token_chunks"), "tp2")
-    _assert_verified(rows)
-    assert [r["M"] for r in rows if r["rank"] == 0] == list(CHUNK_TOKENS), rows
-    for r in rows:
-        kernels, off = r["path"].split(">"), r["off_path"].split(">")
-        chunks = in_chunks("tp2", r["M"])
-        assert _known_path(r["path"]) and kernels[-1] == off[-1] == "a8w4_tp_reduce", r
-        assert (CHUNK_KERNEL in kernels) == chunks and CHUNK_KERNEL not in off, r
-        downs = [k for k in kernels if k.startswith("a8w4_down_")]
-        assert len(downs) == (2 if chunks else 1), r
-        assert streams_down(r["path"]) and streams_down(r["off_path"]), r
-        assert r["same"] and r["bits"] == 0, r
-
-
-# --- 2.15 SDMA queues: none on one rank, AITER_MEGA_TP_SDMA_ENGINES -----------------------------------------------
-# Why: the benchmark and the tests above get every rank's SDMA queues on the default engines. A new instance (its
-# own workspace: max_local_tokens) acquires them at its first chunked batch: with an invalid ENGINES_ENV on rank 1
-# (its acquire raises) every rank warns and takes the path without token chunks; with the permutation 4,2,6 on both
-# the queues are on those engines, pushing in that order. Both outputs, and the shared instance's after them (its
-# queues kept), equal the shared instance's chunked output bitwise. sdma._SHARED (the queues of a device, shared by
-# the workspaces) is set aside where the queues must be created anew.
-SDMA_STEPS = (
-    ("no_queues", 4096, {1: "1,2,3"}),
-    ("engines", 4160, {0: "4,2,6", 1: "4,2,6"}),
-)
-
-
-def _job_sdma_setup(state):
-    import warnings
-
-    from aiter.ops.flydsl.kernels.mega_moe_tp_gfx942 import sdma
+def _job_real_shared(state, layer, files):
     from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
 
-    shape, M = "tp2", 8192
-    if not state.member(shape):
-        return None
-    layer, raw = state.get(shape)
-    group, cpu = state.tp[SHAPES[shape]["world"]]
-    inputs = state.inputs(shape, M, 1)
-    y = layer.forward(*inputs)
-    rows = [
-        dict(
-            step="shared",
-            path=">".join(layer.last_path),
-            **_verify(state, shape, raw, inputs, y),
-        )
-    ]
-    for step, local, env in SDMA_STEPS:
-        mine = env.get(state.rank)
-        shared, saved_env = dict(sdma._SHARED), os.environ.get(sdma.ENGINES_ENV)
-        other = MegaMoeTPGfx942(
-            make_config(shape, state.rank, max_local_tokens=local),
-            **to_megamoe_layout(raw),
-            group=group,
-            device=state.device,
-            cpu_group=cpu,
-        )
-        try:
-            if mine is not None:
-                sdma._SHARED.clear()
-                os.environ[sdma.ENGINES_ENV] = mine
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                y2 = other.forward(*inputs)
-            queues = other._ws.sdma
+    shape = "ds_layer_tp4"
+    s, dev, rank = SHAPES[shape], state.device, state.rank
+    group, cpu = state.tp[s["world"]]
+    E, topk, M, limit = DSV41_EXPERTS, DSV41_TOPK, DSV41_TOKENS, s["limit"]
+    shared = tuple(
+        t.to(dev) for t in _dsv41_slice(files, layer, rank, s["world"], s["I"])
+    )
+    w1, w2 = dequant_fp8(*shared[:2]), dequant_fp8(*shared[2:])
+    raw = make_weights(E, s["H"], s["I"], seed=730 + rank, device=dev)
+    tp = MegaMoeTPGfx942(
+        make_config(shape, rank, experts=E, topk=topk),
+        **to_megamoe_layout(raw),
+        **shared_kwargs(shared),
+        group=group,
+        device=dev,
+        cpu_group=cpu,
+    )
+    ids = torch.arange(topk + 1, dtype=torch.int32, device=dev).repeat(M, 1)
+    ids[:, -1] = E
+    weight = torch.zeros((M, topk + 1), dtype=torch.float32, device=dev)
+    weight[:, -1] = 1.0
+    rows = []
+    try:
+        for kind, seed in itertools.product(("gauss", "outliers"), range(3)):
+            gen = torch.Generator(device=dev).manual_seed(731 + seed)
+            x = torch.randn((M, s["H"]), generator=gen, device=dev)
+            if kind == "outliers":
+                channels = torch.randperm(s["H"], generator=gen, device=dev)[:4]
+                x[:, channels] *= 50
+            x = x.to(torch.bfloat16)
+            dist.broadcast(x, src=0, group=group)
+            y = tp.forward(x, weight, ids)
+            path = ">".join(tp.last_path)
+            exact = _shared_fp32(x, w1, w2, limit)
+            model = _shared_fp32(x, w1, w2, limit, _quant_1x32)
+            for t in (exact, model):
+                dist.all_reduce(t, group=group)
             rows.append(
                 {
-                    "step": step,
-                    "path": ">".join(other.last_path),
-                    "warned": any("no SDMA queues" in str(w.message) for w in caught),
-                    "engines": None if queues is None else queues.engines,
-                    "order": other._ws.sdma_order,
-                    "same": torch.equal(y, y2),
-                    "bits": other.poll_errors(),
+                    "kind": kind,
+                    "seed": seed,
+                    "path": path,
+                    "ours": _rel_l2(y, exact),
+                    "model": _rel_l2(model, exact),
+                    "identical": _identical(y, group),
                 }
             )
-        finally:
-            if saved_env is None:
-                os.environ.pop(sdma.ENGINES_ENV, None)
-            else:
-                os.environ[sdma.ENGINES_ENV] = saved_env
-            other.close()
-            sdma._SHARED.clear()
-            sdma._SHARED.update(shared)
-    y3 = layer.forward(*inputs)
-    rows.append(
-        {
-            "step": "shared_after",
-            "path": ">".join(layer.last_path),
-            "same": torch.equal(y, y3),
-            "bits": layer.poll_errors(),
-        }
-    )
+    finally:
+        tp.close()
     return rows
 
 
-def test_sdma_fallback_and_engines(pool):
-    rows = _member_rows(pool.run("sdma_setup"), "tp2")
-    _assert_verified([r for r in rows if r["step"] == "shared"])
-    steps = {}
-    for r in rows:
-        steps.setdefault(r["step"], []).append(r)
-        assert r["path"].split(">")[-1] == "a8w4_tp_reduce", r
-        assert streams_down(r["path"]), r
-        assert r["step"] == "shared" or (r["same"] and r["bits"] == 0), r
-    assert sorted(steps) == ["engines", "no_queues", "shared", "shared_after"], rows
-    for r in steps["shared"] + steps["shared_after"] + steps["engines"]:
-        assert CHUNK_KERNEL in r["path"].split(">"), r
-    for r in steps["no_queues"]:
-        assert r["warned"] and r["engines"] is None, r
-        assert CHUNK_KERNEL not in r["path"].split(">"), r
-    for r in steps["engines"]:
-        assert not r["warned"] and r["engines"] == (4, 2, 6), r
-        assert r["order"] == (0, 1, 2), r
+@pytest.mark.parametrize("layer", DSV41_LAYERS)
+def test_real_shared_experts_tp4(pool, layer):
+    pytest.importorskip("safetensors")
+    files = _dsv41_files(layer)
+    results = pool.run("real_shared", layer=layer, files=files)
+    for rank, rows in enumerate(results):
+        assert len(rows) == 6, rows
+        for r in rows:
+            if rank == 0:
+                print(
+                    f"{layer} {r['kind']} seed {r['seed']}: relative L2 ours {r['ours']:.4e}, model "
+                    f"{r['model']:.4e}, ours / model {r['ours'] / r['model']:.3f}"
+                )
+            assert r["identical"] and has_shared(r["path"]), (rank, r)
+            assert comm_kind(r["path"]) is not None, (rank, r)
+            assert r["ours"] <= 1.5 * r["model"], (rank, r)
 
 
 # =====================================================================================================================
 # Region 3: benchmark (python <this file> [--cases ...]) -- after the last test
+#
+# The 51 SPEC cases {tp2, tp4, ds_layer_tp4} x M in {1, 2, 4, ..., 32768} + {48}. Cold-cache protocol: before every
+# timed call a 512 MiB flush, an idle gap longer than any implementation's host issue time and a 128-byte custom
+# all-reduce aligning the ranks; one call = forward + its cross-rank sum; per call the slowest rank; median of ITERS
+# calls over GROUPS input groups. The implementations alternate call by call in one process:
+#   mega_moe_tp_gfx942 (MF_METRIC): this implementation;
+#   mega_tp_m7 (MF_REF, tp2 / tp4, the first MF_REF of those cases): M7's MegaMoeTPGfx942 (fused communication),
+#       loaded from $MEGA_TP_M7_SRC (an aiter tree at tag mega-tp-a8w4-M7) by _M7Loader;
+#   a8w4_shared_ar (MF_REF, every case): the tree's flydsl_moe_a8w4_ptpc and an all-reduce with the rule frozen in
+#       REF_AR_RCCL_MIN_BYTES (the faster of aiter's custom all-reduce and RCCL; not imported from the
+#       implementation).
+# Every timed output passes the acceptance check against the FP32 reference and is bitwise identical over the ranks.
+# flops per rank and call: tp2 / tp4 6 M topk H I, ds_layer_tp4 6 M H (topk I + I) (I the real per-rank inter_dim);
+# bytes per rank and call: the selected experts' weights (ds_layer_tp4: and the shared expert's) in each
+# implementation's own layout, x read and y written.
 # =====================================================================================================================
-OURS, REF2, REF1 = "mega_moe_tp_gfx942", "a8w4_2stage_ar", "aiter_fp8_ptpc_ar"
-FP8_INTER = {
-    "tp2": 320,
-    "tp4": 192,
-}  # Qwen shapes: Aiter FP8 ptpc reference, I zero-padded as in its tuned table
-BENCH_TABLE = "qwen38_flash_next_fp8_ptpc_tuned_fmoe.csv"
+OURS, M7, REF = "mega_moe_tp_gfx942", "mega_tp_m7", "a8w4_shared_ar"
+BENCH_SHAPES = ("tp2", "tp4", "ds_layer_tp4")
+M7_SHAPES = ("tp2", "tp4")
+TOKENS = sorted({1 << i for i in range(16)} | {48})
+CASES = [f"{shape}_m{M}" for shape in BENCH_SHAPES for M in TOKENS]
 WARMUP, ITERS, GROUPS = 3, 30, 4
 FLUSH_BYTES, IDLE_US = 512 << 20, 200
 HBM_BYTES_PER_S, FP8_FLOPS = 5.3e12, 606e12  # MI308X
+# a8w4_shared_ar's all-reduce: custom below these bytes (where should_custom_ar accepts), RCCL from there on.
+REF_AR_RCCL_MIN_BYTES = {2: 6 << 20, 4: 13 << 20}
+M7_ENV, M7_PACKAGE = "MEGA_TP_M7_SRC", "_mega_tp_m7"
+# M7's own modules (aiter.ops.flydsl.<name>, and everything under the prefixes): always loaded from M7's files.
+M7_OWN = (
+    "mega_moe_tp_gfx942",
+    "moe_a8w4",
+    "mega_moe_tp",
+    "communication_ops_host_utils",
+)
+M7_OWN_PREFIXES = ("kernels.moe_a8w4.", "kernels.mega_moe_tp_gfx942.")
+
+
+class _M7Loader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Imports ``M7_PACKAGE.<name>`` from ``<src>/aiter/ops/flydsl/<name>``: M7_OWN modules, packages and modules
+    whose file differs from the tree's are loaded from M7's file with ``aiter.ops.flydsl.`` in their source pointing
+    to M7_PACKAGE (packages are always M7's: an alias would attach M7's submodules to the tree's package; the root
+    package is left empty); every other module is an alias of the tree's byte-identical module (gfx9_fp8 common /
+    moe_reduce, tensor_shim, communication utils, ...), sharing its state. Imports from outside aiter.ops.flydsl
+    (aiter.dist's CustomAllreduce, aiter.fused_moe's moe_sorting, ...) are the tree's.
+    """
+
+    def __init__(self, src, tree):
+        self.src, self.tree, self.aliases, self.specs = Path(src), Path(tree), {}, {}
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != M7_PACKAGE and not fullname.startswith(M7_PACKAGE + "."):
+            return None
+        rel = fullname[len(M7_PACKAGE) + 1 :]
+        base = self.src.joinpath(*rel.split(".")) if rel else self.src
+        if (base / "__init__.py").is_file():
+            return importlib.util.spec_from_file_location(
+                fullname,
+                base / "__init__.py",
+                loader=self,
+                submodule_search_locations=[str(base)],
+            )
+        file = base.with_suffix(".py")
+        if not file.is_file():
+            return None
+        tree = self.tree.joinpath(*rel.split(".")).with_suffix(".py")
+        own = rel in M7_OWN or rel.startswith(M7_OWN_PREFIXES)
+        if not own and tree.is_file() and tree.read_bytes() == file.read_bytes():
+            self.aliases[fullname] = "aiter.ops.flydsl." + rel
+        return importlib.util.spec_from_file_location(fullname, file, loader=self)
+
+    def create_module(self, spec):
+        if spec.name not in self.aliases:
+            return None
+        module = importlib.import_module(self.aliases[spec.name])
+        self.specs[spec.name] = module.__spec__
+        return module
+
+    def exec_module(self, module):
+        name = module.__spec__.name
+        if name in self.aliases:  # the import system replaced the tree module's spec
+            module.__spec__ = self.specs[name]
+            return
+        if name == M7_PACKAGE:
+            return
+        file = module.__spec__.origin
+        src = re.sub(
+            r"\baiter\.ops\.flydsl\.",
+            M7_PACKAGE + ".",
+            Path(file).read_text(encoding="utf-8"),
+        )
+        exec(compile(src, file, "exec"), module.__dict__)  # noqa: S102 (M7's source)
+
+
+_M7_MODULE = None
+
+
+def _load_m7():
+    """M7's ``mega_moe_tp_gfx942`` module (once per process), from ``$MEGA_TP_M7_SRC`` (see _M7Loader)."""
+    global _M7_MODULE
+    if _M7_MODULE is None:
+        src = os.environ.get(M7_ENV)
+        if not src:
+            raise RuntimeError(
+                f"{M7_ENV} is not set (an aiter tree at mega-tp-a8w4-M7)"
+            )
+        import aiter.ops.flydsl as tree
+
+        loader = _M7Loader(
+            Path(src) / "aiter" / "ops" / "flydsl", Path(tree.__file__).parent
+        )
+        sys.meta_path.insert(0, loader)
+        mod = importlib.import_module(f"{M7_PACKAGE}.mega_moe_tp_gfx942")
+        for name in (f"{M7_PACKAGE}.mega_moe_tp_gfx942", f"{M7_PACKAGE}.moe_a8w4"):
+            origin = Path(sys.modules[name].__file__).resolve()
+            assert origin.is_relative_to(loader.src.resolve()), (name, origin)
+        _M7_MODULE = mod
+    return _M7_MODULE
 
 
 class _RefAR:
-    """The all-reduce of the references, as SGLang on AMD: aiter CustomAllreduce when should_custom_ar accepts the
-    tensor, RCCL otherwise. Its 128-byte custom all-reduce also aligns the ranks before every timed call.
-    """
+    """a8w4_shared_ar's all-reduce: aiter's CustomAllreduce below REF_AR_RCCL_MIN_BYTES[world] bytes where its
+    should_custom_ar accepts the tensor, RCCL otherwise. Its 128-byte custom all-reduce also aligns the ranks before
+    every timed call."""
 
-    def __init__(self, group, cpu_group, device):
+    def __init__(self, group, cpu_group, device, world):
         from aiter.dist.device_communicators.custom_all_reduce import (
             CustomAllreduce,
             IPCBufferPool,
         )
 
         self.group, self.cpu_group, self.device = group, cpu_group, device
-        # The pool's store keys use a per-process counter; align it, as the TP2 ranks already made pools.
+        self.min_rccl = REF_AR_RCCL_MIN_BYTES[world]
+        # The pool's store keys use a per-process counter; align it, as the ranks made different pools before.
         seq = torch.tensor([IPCBufferPool._pool_seq], dtype=torch.int64)
         dist.all_reduce(seq, op=dist.ReduceOp.MAX, group=cpu_group)
         IPCBufferPool._pool_seq = int(seq.item())
@@ -1828,7 +1872,7 @@ class _RefAR:
         self.last = None
 
     def __call__(self, y):
-        if self.ca.should_custom_ar(y):
+        if y.numel() * y.element_size() < self.min_rccl and self.ca.should_custom_ar(y):
             self.last = CA
             return self.ca.custom_all_reduce(y)
         self.last = RCCL
@@ -1844,96 +1888,17 @@ class _RefAR:
         self.ca.close()
 
 
-def _aiter_row(fm, tokens, hidden, inter, experts, topk):
-    """The row of the tuned table the Aiter dispatcher should take for this case."""
-    from aiter import ActivationType, QuantType, dtypes
-
-    key = (
-        fm.get_gfx_runtime(),
-        fm.get_cu_num(),
-        fm.get_padded_M(tokens),
-        hidden,
-        inter,
-        experts,
-        topk,
-        str(ActivationType.Silu),
-        str(dtypes.bf16),
-        str(dtypes.fp8),
-        str(dtypes.fp8),
-        str(QuantType.per_Token),
-        1,
-        0,
-    )
-    fm.get_2stage_cfgs(
-        fm.get_padded_M(tokens),
-        hidden,
-        inter,
-        experts,
-        topk,
-        dtypes.bf16,
-        dtypes.fp8,
-        dtypes.fp8,
-        QuantType.per_Token,
-        True,
-        ActivationType.Silu,
-        False,
-        0,
-        0,
-    )
-    row = fm.cfg_2stages[0].get(key)
-    if row is None or not 0 < float(row["us"]) < float("inf"):
-        raise RuntimeError(f"{BENCH_TABLE} has no valid row for {key}")
-    return row
-
-
-def _row_kernels(row):
-    name = str(row["kernelName1"])
-    if int(row["run_1stage"]):
-        return f"asm_1stage:{name}"
-    return name if name.startswith("impl__") else f"{name}+{row['kernelName2']}"
-
-
-def _uses_row(meta, row):
-    """Whether the dispatcher's metadata is this table row (1-stage asm, impl__ and CK 2-stage rows)."""
-    name = str(row["kernelName1"])
-    if int(meta.block_m) != int(row["block_m"]) or bool(meta.run_1stage) != bool(
-        int(row["run_1stage"])
-    ):
-        return False
-    if meta.run_1stage:
-        return meta.stage1.keywords.get("kernelName") == name
-    if meta.full_impl is not None and name.startswith("impl__"):
-        configs = [
-            c.cell_contents
-            for c in meta.full_impl.__closure__ or ()
-            if isinstance(c.cell_contents, str)
-        ]
-        return configs == [name.split("__", 2)[2]]
-    if meta.full_impl is None and name.startswith("moe_ck2stages_"):
-        return meta.stage1.keywords.get(
-            "kernelName"
-        ) == name and meta.stage2.keywords.get("kernelName") == str(row["kernelName2"])
-    return False
-
-
-def _a8w4_bytes_per_expert(hidden, inter):
-    """Bytes of one expert in the A8W4 layout (``moe_a8w4.prepare_a8w4_weights``): FP4 codes, E8M0 deltas (two
-    bytes per 64-K block, padded to groups of four blocks) and an FP32 scale per row; I zero-padded to 64.
-    """
-    ip = -(-inter // 64) * 64
-
-    def matrix(n, k):
-        return n * k // 2 + n * (-(-(k // 64) // 4) * 8) + n * 4
-
-    return matrix(2 * ip, hidden) + matrix(hidden, ip)
-
-
-def _bytes_per_expert(weights, experts):
-    values = weights.values() if isinstance(weights, dict) else vars(weights).values()
-    return (
-        sum(t.numel() * t.element_size() for t in values if isinstance(t, torch.Tensor))
-        // experts
-    )
+def _weight_bytes(weights):
+    """(bytes per routed expert, bytes of the shared expert) of a prepared weight object, from its tensor fields
+    (``shared_*``: the shared expert)."""
+    routed = shared = 0
+    for name, t in vars(weights).items():
+        if isinstance(t, torch.Tensor):
+            if name.startswith("shared_"):
+                shared += t.numel() * t.element_size()
+            else:
+                routed += t.numel() * t.element_size()
+    return routed / weights.experts, shared
 
 
 def _cycles_per_us():
@@ -1969,48 +1934,45 @@ def _job_bench_setup(state, shape):
     state.release()
     if not state.member(shape):
         return None
+    from aiter.ops.flydsl import moe_a8w4
+
     began = time.time()
     s = SHAPES[shape]
-    layer, raw, fp8 = state.build(shape, fp8_inter=FP8_INTER.get(shape))
-    state.layers[shape] = (layer, raw)
+    state.layers[shape] = state.build(shape)
+    _, raw, shared = state.layers[shape]
     group, cpu = state.tp[s["world"]]
     bench = state.bench = {
         "shape": shape,
-        "ar": _RefAR(group, cpu, state.device),
-        "fp8": None,
-        "pyhip": None,
+        "m7": None,
+        "ar": _RefAR(group, cpu, state.device, s["world"]),
+        "ref": moe_a8w4.prepare_moe_a8w4_ptpc_weight(
+            raw["w1"],
+            raw["w1_scale"],
+            raw["w2"],
+            raw["w2_scale"],
+            **shared_kwargs(shared),
+        ),
         "cycles": _cycles_per_us(),
         "flush": torch.empty(
             FLUSH_BYTES // 4, dtype=torch.float32, device=state.device
         ),
     }
-    if fp8 is not None:
-        from aiter.ops.shuffle import shuffle_weight
-
-        bench["fp8"] = {
-            "w1": shuffle_weight(fp8["w1_fp8"], layout=(16, 16)),
-            "w1_scale": fp8["w1_fp8_scale"],
-            "w2": shuffle_weight(fp8["w2_fp8"], layout=(16, 16)),
-            "w2_scale": fp8["w2_fp8_scale"],
-        }
-    src = os.environ.get("PYHIP_SRC")
-    if src:  # reference 2: the pyhip M17 source this implementation was ported from
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from pyhip.ops.moe.flydsl import moe_a8w4 as m17
-
-        bench["pyhip"] = (
-            m17,
-            m17.prepare_a8w4_weights(
-                raw["w1"], raw["w1_scale"], raw["w2"], raw["w2_scale"]
-            ),
+    m7_file = ""
+    if shape in M7_SHAPES:
+        m7 = _load_m7()
+        bench["m7"] = m7.MegaMoeTPGfx942(
+            m7.MegaMoeTPConfig(**config_args(shape, state.rank)),
+            **to_megamoe_layout(raw),
+            group=group,
+            device=state.device,
+            cpu_group=cpu,
         )
+        m7_file = m7.__file__
     torch.cuda.synchronize(state.device)
     return {
-        "took": time.time() - began,
-        "pyhip": src or "",
-        "aiter": fp8 is not None,
-        "cycles_per_us": bench["cycles"],
+        "took": round(time.time() - began, 1),
+        "m7": m7_file,
+        "cycles_per_us": round(bench["cycles"], 1),
     }
 
 
@@ -2021,80 +1983,37 @@ def _job_bench(state, case, warmup, iters):
     bench = state.bench
     if bench is None or bench["shape"] != shape:
         raise RuntimeError(f"bench_setup({shape!r}) has not run")
+    from aiter.ops.flydsl import moe_a8w4
+
     s, dev = SHAPES[shape], state.device
-    layer, raw = state.layers[shape]
+    layer, raw, shared = state.layers[shape]
     group, cpu = state.tp[s["world"]]
-    ar, H, E = bench["ar"], s["H"], s["E"]
+    ar, m7, ref_w, H, k = bench["ar"], bench["m7"], bench["ref"], s["H"], s["topk"]
     groups = [state.inputs(shape, M, g) for g in range(GROUPS)]
-    impls, paths, kernels = {OURS: lambda g: layer.forward(*groups[g])}, {}, None
-    per_expert = {OURS: _a8w4_bytes_per_expert(H, s["I"])}
-    if bench["pyhip"] is not None:
-        m17, prepared = bench["pyhip"]
-        bufs = [
-            torch.empty((M, H), dtype=torch.bfloat16, device=dev) for _ in range(GROUPS)
-        ]
-        limit_kw = {"swiglu_limit": s["limit"]} if s["limit"] else {}
+    bufs = [
+        torch.empty((M, H), dtype=torch.bfloat16, device=dev) for _ in range(GROUPS)
+    ]
 
-        def ref2(g):
-            x, tw, ids = groups[g]
-            m17.fused_moe_a8w4(x, prepared, tw, ids, output=bufs[g], **limit_kw)
-            return ar(bufs[g])
+    def ref(g):
+        x, tw, ids = groups[g]
+        moe_a8w4.flydsl_moe_a8w4_ptpc(
+            x, ref_w, tw, ids, output=bufs[g], swiglu_limit=s["limit"] or 0.0
+        )
+        return ar(bufs[g])
 
-        impls[REF2] = ref2
-        per_expert[REF2] = _bytes_per_expert(prepared, E)
-    if bench["fp8"] is not None:
-        import aiter.fused_moe as fm
-        from aiter import ActivationType, QuantType
-
-        fw = bench["fp8"]
-
-        def ref1(g):
-            x, tw, ids = groups[g]
-            return ar(
-                fm.fused_moe(
-                    x,
-                    fw["w1"],
-                    fw["w2"],
-                    tw,
-                    ids,
-                    activation=ActivationType.Silu,
-                    quant_type=QuantType.per_Token,
-                    w1_scale=fw["w1_scale"],
-                    w2_scale=fw["w2_scale"],
-                )
-            )
-
-        row = _aiter_row(fm, M, H, FP8_INTER[shape], E, s["topk"])
-        seen, resolve = [], fm.get_2stage_cfgs
-
-        def spy(*args, **kwargs):
-            meta = resolve(*args, **kwargs)
-            seen.append(meta)
-            return meta
-
-        fm.get_2stage_cfgs = spy
-        try:
-            ref1(0)
-        finally:
-            fm.get_2stage_cfgs = resolve
-        kernels = _row_kernels(row)
-        if not seen or not _uses_row(seen[-1], row):
-            raise RuntimeError(
-                f"{case}: Aiter did not run the tuned row {kernels} (block_m={row['block_m']}); "
-                f"got {seen[-1] if seen else None}"
-            )
-        impls[REF1] = ref1
-        per_expert[REF1] = _bytes_per_expert(fw, E)
+    impls, weights = {OURS: lambda g: layer.forward(*groups[g])}, {OURS: layer._weights}
+    if m7 is not None:
+        impls[M7], weights[M7] = (lambda g: m7.forward(*groups[g])), m7._weights
+    impls[REF], weights[REF] = ref, ref_w
 
     def path_of(impl):
         if impl == OURS:
             return ">".join(layer.last_path)
-        return (
-            ">".join(list(m17.last_path) if impl == REF2 else [f"aiter:{kernels}"])
-            + f">{ar.last}"
-        )
+        if impl == M7:
+            return ">".join(m7.last_path)
+        return ">".join([*moe_a8w4.last_path, ar.last])
 
-    last = {k: [None] * GROUPS for k in impls}
+    last, paths = {n: [None] * GROUPS for n in impls}, {}
     dist.barrier(group=cpu)
     for i in range(warmup):
         for impl, fn in impls.items():
@@ -2120,23 +2039,19 @@ def _job_bench(state, case, warmup, iters):
     torch.cuda.synchronize(dev)
     dist.barrier(group=cpu)
     events = {impl: [] for impl in impls}
-    # The A8W4 implementations alternate with each other; the Aiter FP8 reference runs on its own afterwards: an
-    # A8W4 call right after an Aiter FP8 call measured up to 5% faster (decode / streaming), even after the flush
-    # and the sleep, which would favour whichever implementation follows it.
-    for batch in ([n for n in impls if n != REF1], [n for n in impls if n == REF1]):
-        for i in range(iters):
-            g = i % GROUPS
-            for impl in batch:
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                    enable_timing=True
-                )
-                bench["flush"].zero_()
-                torch.cuda._sleep(sleep_cycles)
-                ar.barrier()
-                start.record()
-                last[impl][g] = impls[impl](g)
-                end.record()
-                events[impl].append((start, end))
+    for i in range(iters):
+        g = i % GROUPS
+        for impl, fn in impls.items():
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True
+            )
+            bench["flush"].zero_()
+            torch.cuda._sleep(sleep_cycles)
+            ar.barrier()
+            start.record()
+            last[impl][g] = fn(g)
+            end.record()
+            events[impl].append((start, end))
     torch.cuda.synchronize(dev)
 
     res = {}
@@ -2147,6 +2062,7 @@ def _job_bench(state, case, warmup, iters):
         every = [torch.empty_like(mine) for _ in range(s["world"])]
         dist.all_gather(every, mine, group=group)
         worst = torch.stack(every).max(0).values.tolist()
+        per_expert, shared_bytes = _weight_bytes(weights[impl])
         res[impl] = {
             "us": statistics.median(worst),
             "p10": _q(worst, 0.1),
@@ -2161,46 +2077,32 @@ def _job_bench(state, case, warmup, iters):
             "err_ratio": 0.0,
             "error_flag": 0,
             "bytes": statistics.mean(
-                ids.unique().numel() * per_expert[impl] + M * H * 2 * 2
+                ids[:, :k].unique().numel() * per_expert + shared_bytes + M * H * 2 * 2
                 for _, _, ids in groups
             ),
         }
-    res[OURS]["error_flag"] = max(
-        int(layer.error_flag().abs().max().item()), int(layer.poll_errors())
-    )
-    # every timed output: FP32 reference (A8W4 implementations; Aiter: finite only), cross-rank identity
+    for impl, obj in ((OURS, layer), (M7, m7)):
+        if impl in res:
+            res[impl]["error_flag"] = max(
+                int(obj.error_flag().abs().max().item()), int(obj.poll_errors())
+            )
+    # every timed output: the FP32 reference summed over the group, bitwise identity over the ranks
     for g, inputs in enumerate(groups):
-        x, tw, ids = inputs
-        ref = reference(
-            x,
-            raw["w1"],
-            raw["w1_scale"],
-            raw["w2"],
-            raw["w2_scale"],
-            tw,
-            ids,
-            swiglu_limit=s["limit"] or 0.0,
-        )
-        dist.all_reduce(ref, group=group)
+        ref_y = _group_reference(state, shape, raw, shared, inputs)
         same_inputs = all(_identical(t, group) for t in inputs)
         for impl in impls:
-            st, y = res[impl], last[impl][g]
-            if impl == REF1:
-                st["ok"] = st["ok"] and bool(torch.isfinite(y).all())
-            else:
-                r = check(y, ref)
-                st["ok"] = st["ok"] and bool(r["ok"])
-                st["calc_diff"] = max(st["calc_diff"], r["calc_diff"])
-                st["err_ratio"] = max(st["err_ratio"], r["err_ratio"])
-            st["identical"] = st["identical"] and _identical(y, group)
+            st, r = res[impl], check(last[impl][g], ref_y)
+            st["ok"] = st["ok"] and bool(r["ok"])
+            st["calc_diff"] = max(st["calc_diff"], r["calc_diff"])
+            st["err_ratio"] = max(st["err_ratio"], r["err_ratio"])
+            st["identical"] = st["identical"] and _identical(last[impl][g], group)
             st["inputs_identical"] = st["inputs_identical"] and same_inputs
-        del ref
-    flops = 6 * M * s["topk"] * H * s["I"]
+        del ref_y
+    inter = (k + 1) * s["I"] if s["shared"] else k * s["I"]
     return {
         "case": case,
-        "flops": flops,
+        "flops": 6 * M * H * inter,
         "idle_us": idle_us,
-        "kernels": kernels,
         "impls": res,
     }
 
@@ -2234,16 +2136,12 @@ def _report(case, r, failures):
     else:
         failures.append(case)
         print(f"FAIL case={case} impl={OURS} {ours}", flush=True)
-    for impl in (
-        REF2,
-        REF1,
-    ):  # mf keeps the first MF_REF impl of a case: reference 2 first
+    for impl in (M7, REF):  # mf keeps the first MF_REF impl of a case: M7 first
         if impl not in impls:
             continue
-        st = impls[impl]
-        extra = f" kernels={r['kernels']}" if impl == REF1 else ""
+        st, extra = impls[impl], ""
         if not good(st):
-            extra += " ok=0"
+            extra = " ok=0"
             failures.append(f"{case}:{impl}")
             print(f"FAIL case={case} impl={impl} {st}", flush=True)
         print(
@@ -2252,9 +2150,8 @@ def _report(case, r, failures):
             flush=True,
         )
     w = s["world"]
-    xgmi = (
-        2 * (w - 1) / w * M * s["H"] * 2
-    )  # bytes a rank sends (and receives) in a ring-equivalent all-reduce
+    # bytes a rank sends (and receives) in a ring-equivalent all-reduce
+    xgmi = 2 * (w - 1) / w * M * s["H"] * 2
     times = " ".join(
         f"{impl}={st['us']:.2f}us(p10={st['p10']:.2f},p90={st['p90']:.2f},rank0={st['rank0_us']:.2f},"
         f"{util(st)})"
@@ -2281,8 +2178,8 @@ def _report(case, r, failures):
 
 def _bench_main(argv=None):
     parser = argparse.ArgumentParser(
-        description="MegaMoeTPGfx942 benchmark: SPEC cases, cold-cache protocol, "
-        "slowest rank; references a8w4_2stage_ar and aiter_fp8_ptpc_ar"
+        description="MegaMoeTPGfx942 benchmark: SPEC cases, cold-cache protocol, slowest rank; references "
+        f"{M7} (tp2 / tp4, from ${M7_ENV}) and {REF}"
     )
     parser.add_argument(
         "--cases", nargs="+", choices=CASES, default=CASES, metavar="CASE"
@@ -2292,21 +2189,15 @@ def _bench_main(argv=None):
     args = parser.parse_args(argv)
     if args.warmup < 1 or args.iters < 1:
         parser.error("--warmup and --iters must be >= 1")
+    if not os.environ.get(M7_ENV) and any(
+        parse_case(c)[0] in M7_SHAPES for c in args.cases
+    ):
+        parser.error(f"{M7_ENV} must name M7's aiter tree for the {M7} reference")
     began = time.time()
-    # Aiter reference: only the Qwen3.8 FP8 ptpc tuned table (a copy: Aiter's duplicate check may rewrite it); the
-    # workers inherit the environment.
-    table_src = (
-        Path(__file__).resolve().parents[2]
-        / "aiter/configs/model_configs"
-        / BENCH_TABLE
-    )
-    tmp = Path(tempfile.mkdtemp(prefix="bench_mega_moe_tp_gfx942_"))
-    shutil.copyfile(table_src, tmp / BENCH_TABLE)
-    os.environ["AITER_CONFIG_FMOE"] = str(tmp / BENCH_TABLE)
-    os.environ["AITER_ONLINE_TUNE"] = "0"
     print(
         f"INFO seed={SEED} warmup={args.warmup} iters={args.iters} groups={GROUPS} flush_bytes={FLUSH_BYTES} "
-        f"aiter_table={table_src} pyhip_src={os.environ.get('PYHIP_SRC', '')} cases={len(args.cases)}",
+        f"m7_src={os.environ.get(M7_ENV, '')} ref_ar_rccl_min_bytes={REF_AR_RCCL_MIN_BYTES} "
+        f"cases={len(args.cases)}",
         flush=True,
     )
     failures = []
@@ -2315,7 +2206,7 @@ def _bench_main(argv=None):
         gfx = p.start()
         if gfx != "gfx942":
             raise SystemExit(f"MegaMoeTPGfx942 runs on gfx942 only (found {gfx})")
-        for shape in SHAPES:
+        for shape in BENCH_SHAPES:
             names = [c for c in args.cases if parse_case(c)[0] == shape]
             if not names:
                 continue
@@ -2332,7 +2223,6 @@ def _bench_main(argv=None):
         p.close()
     finally:
         p.kill()
-        shutil.rmtree(tmp, ignore_errors=True)
     print(f"INFO done in {time.time() - began:.0f}s failures={failures}", flush=True)
     if failures:
         sys.exit(1)

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Per-row FP8 E4M3FNUZ quantization for the A8W4 path: ``scale = amax / 240``, ``q = RNE(x / scale)``.
+"""Per-row FP8 E4M3FNUZ quantization for the A8W4 MoE: ``scale = amax / 240``, ``q = RNE(x / scale)``.
 
 Matches ``torch`` exactly (IEEE quotient, round-to-nearest-even conversion, ``-0 -> +0``), so the
-activation quantization points agree bit for bit with a torch reference
-(``op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py``).
+activation quantization points agree bit for bit with the fp32 reference of
+``op_tests/test_flydsl_moe_a8w4.py``.
 
 A row is split into 16-byte chunks shared by ``L`` lanes: lane ``l`` takes chunks ``l, l + L, ...``
 (at least 4 when the row allows), so every load / store instruction covers contiguous memory. The quotient
@@ -17,8 +17,6 @@ bound the quotient by ``240 * (1 + 2**-23)``, which FP8 rounds to 240. Inputs mu
 row maximum ignores NaN).
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -29,7 +27,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from ..moe_gemm_2stage.gfx9_fp8 import common as fxh
+from . import common as fxh
 
 _ESIZE = {"bf16": 2, "f32": 4}
 _SMALL_SCALE = 2.0**-64
@@ -50,20 +48,24 @@ def _buffer_rsrc(ptr, nbytes):
     return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
 
 
-def _store(rsrc, value, offset, aux=0):
-    """Raw buffer store (``aux``: cache policy bits); bytes past the buffer end are dropped."""
-    # Raw ROCDL op: FlyDSL has no buffer store at a byte offset into a raw resource (fx.copy takes coordinates).
+def _store(rsrc, value, offset):
+    """Raw buffer store; bytes past the buffer end are dropped."""
+    # Raw buffer store: the typed fx.copy store takes its offset from a view layout; callers
+    # compute byte offsets and send the lanes that must not write past the buffer end, where
+    # the hardware range check drops the store (no branch).
     rocdl_dialect.RawPtrBufferStoreOp(
         _raw(value),
         rsrc,
         offset.ir_value(),
         fx.Int32(0).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
+        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
     )
 
 
 def _pack_fp8x4(q):
     """4 f32 (|q| < 248) -> one dword of FP8 E4M3FNUZ (RNE); 0x80 (-0, NaN in FNUZ) becomes 0."""
+    # FlyDSL 0.5.3 cannot lower the typed `.to(fx.Float8E4M3FNUZ)` (arith.truncf to FP8
+    # has no LLVM translation); the rocdl op is v_cvt_pk_fp8_f32, two values per op.
     packed = rocdl.cvt_pk_fp8_f32(T.i32, q[0], q[1], fx.Int32(0), False)
     packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, q[2], q[3], packed, True))
     low = packed & fx.Uint32(0x7F7F7F7F)
@@ -71,12 +73,12 @@ def _pack_fp8x4(q):
     return ((low + fx.Uint32(0x7F7F7F7F)) & packed) | low
 
 
-@functools.cache
 def compile_row_quant_fp8(cols, in_dtype, fill=0):
     """Launcher ``(x, q, scale, aux, rows, stream)``: x ``in_dtype`` [rows, cols] -> q FP8 [rows, cols], scale f32 [rows].
 
     ``in_dtype`` is ``"bf16"`` or ``"f32"``; ``cols % 64 == 0``. All-zero rows get scale 1. With ``fill`` > 0
     the kernel also sets int32 ``aux`` [rows, fill] to -1 (otherwise ``aux`` is not accessed).
+    Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     assert cols % 64 == 0, f"cols={cols} must be a multiple of 64"
     esize = _ESIZE[in_dtype]
@@ -113,7 +115,8 @@ def compile_row_quant_fp8(cols, in_dtype, fill=0):
         in_base = row * (cols * esize) + sub * 16
         values = []
         for c in range_constexpr(steps):
-            # Raw ROCDL op: a 16-byte load from the raw resource in_rsrc (BufferTensor.load needs a tensor view).
+            # Raw 16-byte buffer load at a per-lane byte offset (see _store); rows past ``rows``
+            # read zeros from the range check.
             raw = Vec(
                 rocdl_dialect.RawPtrBufferLoadOp(
                     ir.VectorType.get([4], fx.Int32.ir_type),

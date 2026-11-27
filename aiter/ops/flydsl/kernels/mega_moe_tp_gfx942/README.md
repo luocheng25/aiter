@@ -1,7 +1,7 @@
-# mega_moe_tp_gfx942（gfx942 TP MoE 层：fp8 激活（按 token）× mxfp4 权重，all-reduce 模式）：设计说明
+# mega_moe_tp_gfx942（gfx942 TP MoE 层：FP8 激活（按 token）× MXFP4 routed + FP8 shared expert，all-reduce 模式）：设计说明
 
 <!-- mf:summary -->
-> 由 mf 生成（11-27 01:59）· 目标：让 aiter 的 MegaMoE TP 在 gfx942（MI308X）上跑 A8W4：激活按 token 量化成 FP8 × MXFP4 权重，experts 复制、inter_dim 按 TP 切，MoE 计算与 TP 通信融合；Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash TP4，M=1…32768 的 2 的幂及 48，一次完整 MoE 层（含通信）的耗时逐 case 不慢于两个对照（aiter fp8 ptpc fused_moe + 单独 all-reduce；pyhip 2stage A8W4 + 单独 all-reduce）中较快的；主流程框架（MegaMoE TP / 2stage+融合通信 / #8530 改 TP）由实验决定（1.08× 相对冻结基线）· 已完成 7 个里程碑（含本提交 M7） · 最佳累计 1.086× · 下一步：写报告
+> 由 mf 生成（11-27 06:17）· 目标：让 aiter 的 MegaMoeTPGfx942（gfx942 / MI308X，A8W4：FP8 按 token × MXFP4）在带 shared expert 的整层上更快：以 mega-tp-a8w4-M7 为起点叠加 moe-a8w4-shared-M6（只留一套 kernel）。AR 模式：Qwen3.8-Flash-Next TP2/TP4 与 DeepSeek-V4.1-Flash 主干整层 TP4（E384+1 FP8 shared），M=1…32768 与 48，对冻结基线（每卡 shared-M6 + 单独 AR）几何平均 ≥1.10×；DP4+TP4 模式（comm_mode=ag_rs，只 DeepSeek 主干，每卡 M_r=1…8192 与 12）对冻结基线（AG + 每卡 shared-M6 + RS）几何平均 ≥1.20×；两者分别考核，逐 case 不慢于基线，routed-only 形状不慢于 mega-tp-a8w4-M7（1.122× 相对冻结基线）· 已完成 1 个里程碑（含本提交 M0） · 最佳累计 — · 下一步：M0b DP 模式功能版（冻结前）：MegaMoeTPGfx942 实现 comm_mode="ag_rs"（x_local / out 为本卡 token，各卡 M_r 相同，padding 路由 −1）= 入口 AG（bf16）+ 每卡 flydsl_moe_a8w4_ptpc 算全部 4·M_r token + 出口 RS（RCCL / aiter 取快）；bench 加 15 个 ds_dp4_m<M_r> case（M_r 1…8192 与 12）与 a8w4_shared_agrs 对照，用例分区；之后一次冻结 AR 51 + DP 15 例
 <!-- /mf:summary -->
 
 <!-- 设计文档标准（skill myflow-review）：读者是 tech lead，10 分钟读完，只靠本文能回答
@@ -9,227 +9,126 @@
      正文 ≤150 行；一行只说一件事（≤120 字，链接地址不计）；每节第一句是结论；只写当前设计（过程写在提交信息里）；
      接口细节、报错清单、数据格式留在代码 docstring，这里只给链接。这些注释读者看不到，也不计入篇幅。 -->
 ## 1. 目标与范围
-在 MI308X（gfx942）上提供与 `MegaMoeTP` 同接口的 TP MoE 层 `MegaMoeTPGfx942`：本卡 A8W4 两阶段 MoE + 跨卡求和（多数 M 融合进 Down 或末个 kernel）。
-- 输入：每卡相同的 x bf16 [M, H] 与路由（topk_weights f32、topk_ids）；输出：每卡 y bf16 [M, H] 为整层结果，各卡逐位相同。
-- 权重：experts 复制、inter_dim 按 TP 切；收 `MegaMoeTP` 的 mxfp4 布局（`shuffle_weight(16,16)` + `e8m0_shuffle`），加载时转一次。
-- 计算：x 按 token 量化成 fp8（amax/240）→ Gate/Up（mxfp4 在寄存器里解成 fp8 走 fp8 MFMA）→ SiLU / SwiGLU → 中间激活按行量化 → Down。
-- 形状：Qwen3.8-Flash-Next TP2 / TP4（H2560、E513 含 1 个融合 shared、topk11、每卡 I 320 / 160）。
-- 形状：DeepSeek-V4.1-Flash TP4（H5120、E384、topk6、I576、swiglu_limit 10）；M = 1…32768 的 2 的幂及 48，共 51 case。
-- 验收：逐 case 耗时不慢于对照 1、2（第 4 节）中较快者，目标相对冻结基线几何均值 1.08×；精度过 fp32 参考判据，各卡输出逐位相同。
-- 只做 `comm_mode="ar"`；ag_rs、fused tail、gfx950 / gfx1250、已量化输入明确报错；TP8 不报错（不融合，走 AR）但未测；不保证跨次运行逐位相同。
+在 MI308X（gfx942）上提供与 `MegaMoeTP` 同接口的 TP MoE 层 `MegaMoeTPGfx942`：每卡跑单卡 A8W4 入口（可带 FP8 shared），再一次 all-reduce。
+- 输入：各卡相同的 x bf16 [M, H] 与路由；有 shared 时路由为 [M, topk + 1]、末列为 E（ATOM 约定）。
+- 输出：每卡 y bf16 [M, H] 为整层结果，各卡逐位相同。
+- 权重：routed 复制、I 按 TP 切，收 `MegaMoeTP` 的 MXFP4 布局；shared 收本卡切片（FP8，逐行 f32 或 32×32 E8M0 块 scale）。
+- 形状：Qwen3.8-Flash-Next TP2 / TP4（H2560、E513 含 1 个融合 MXFP4 shared、topk 11、每卡 I 320 / 160 补零到 192）。
+- 形状：DeepSeek-V4.1-Flash 主干 TP4（H5120、E384 + 1 个 FP8 shared、topk 6 + 1、每卡 I576、SwiGLU limit 10）；M = 1…32768 的 2 的幂及 48。
+- 验收：本版即基线；任务目标对它几何均值 ≥ 1.10×、逐 case 不慢，Qwen 34 case 不慢于 mega-tp-a8w4-M7；精度过 FP32 参考、各卡逐位相同。
+- 不做：`comm_mode="ag_rs"`（第 6 节）、fused tail、gfx950 字段、非 bf16 的 x（都明确报错）；TP8 能跑但未测；不保证跨次运行逐位相同。
 ## 2. 总体设计
-本卡先算部分和（pyhip M17 的 A8W4 两阶段 kernel 移植，按 M 分 decode / 流式 / prefill 三档，tp2 M ≥ 8192 再把 token 分两块），跨卡求和按 M 与每卡输出字节四选一。
+TP 层只做权重转换、校验与一次 all-reduce：本卡计算整段交给单卡入口 `flydsl_moe_a8w4_ptpc`（分档与 kernel 都在 gfx9_fp8）。
 ```text
-构造 / set_weights：MegaMoeTP 布局 → 私有 A8W4 布局（fp4 码按 MFMA K 序、每 32-K 组一个 delta 字节、每通道因子，I 补零到 64 的倍数）
-构造（集合操作）：同一通信组、H、M 上限的实例共享一份 hipIpc 对称工作区（收件箱、标志、landing），交换地址；epoch / 奇偶位在设备上
-forward(x, topk_weights, topk_ids)（可被 CUDA graph 捕获；无 host 同步与集合调用，工作区首个分块批次取 SDMA 队列除外）：
-  M ≤ 16：decode 各 kernel，Down 换成 down_decode[_pq]_tp：块末与各卡交换 f32 部分和，各卡按 rank 顺序相加 → y
-  tp2 M ≥ 410、tp4 ≥ 385、ds ≥ 513：Down 换成 down_{stream|prefill}_tp（RS、求和、AG 藏在里面）→ gather → y；tp2 ≥ 8192 分两块、SDMA 推部分和
-  其余 M > 32 且每卡输出 ≥ 2 MiB（TP2）/ 1 MiB（TP4）：末步（route_sum / sorted_sum / 原子 Down 之后）换成 tp_reduce → y
-  其余：fused_moe_a8w4 写本卡部分和 → aiter CustomAllreduce（≤ 64 MiB）否则 RCCL all_reduce → y
-  四种都让每个元素在各卡按同一顺序求和（或一卡求和后广播），所以各卡 y 逐位相同
+构造 / set_weights：MegaMoeTP 布局 → 反 shuffle 成标准 MXFP4 → prepare_moe_a8w4_ptpc_weight（routed + 可选 shared，转一次）
+构造（集合操作）：同一 (TP 组, gloo 组, 设备) 的实例共用一个通信器 = aiter CustomAllreduce + RCCL 组（引用计数）
+forward(x, topk_weights, topk_ids, out=None)（可被 CUDA graph 捕获；M = 0 不发 kernel）：
+  part = flydsl_moe_a8w4_ptpc(x, weight, topk_weights, topk_ids, output=part, swiglu_limit)    # 本卡部分和 bf16
+  y = 字节 < AR_RCCL_MIN_BYTES[卡数] 且 CA 接受 ? CustomAllreduce(part)（新张量）: RCCL all_reduce(part)（原地）
+  last_path = 单卡入口的 last_path + ("custom_all_reduce" | "rccl_all_reduce")
+  各卡 y 逐位相同：两种 AR 下每个元素在各卡的求和顺序相同（用例逐位检查）
 ```
-| 51 case 的 M | 本卡路径（kernel 顺序；跨卡求和换掉的 Down / 末步见上） | 为什么 |
+| M（51 case） | 本卡路径（单卡入口的档，kernel 依次） | 单卡入口为什么选它 |
 |---|---|---|
-| 1（三个形状） | decode：gateup_decode（WG 内量化 x）→ down_decode（WG 内量化 mid） | 不排序，两次 launch |
-| tp2 2–8、tp4 2–16、ds 2–4 | 同上，但 mid 先 row_quant_decode，Down 换槽对版 down_decode_pq | 多行时 WG 内重复量化不划算 |
-| tp2 16–32、tp4 32 | x 也先 row_quant_decode，Gate/Up 换 gateup_decode_pq | Gate/Up WG 数 ≥ 2560 时单独量化 x 更快 |
-| ds 8–32 | row_quant_plan_decode（量化 x、去重计划）→ gateup_decode_dd → row_quant_decode → down_decode_pq | 同 expert 共读权重 |
-| 48–1024（tp4 到 2048） | 流式：stream_prep → gateup_stream →［row_quant_fp8］→ down_stream →［route_sum］ | 每 expert 行少：权重只读一次 |
-| tp2 2048、ds 2048 | prefill：stream_prep → gateup_prefill → row_quant_fp8 → down_prefill → sorted_sum | 路由少时 prep 更快 |
-| ≥ 4096 | prefill：Opus 排序 → row_quant_fp8 → gateup_prefill → row_quant_fp8 → down_prefill → sorted_sum | 免 prep 的平方开销 |
-| tp2 ≥ 8192 | 同上，chunk_blocks 后 token 分两块，逐块［gateup_prefill → row_quant_fp8 → down_prefill］ | 块 0 的通信藏进块 1 的计算 |
-- 范围按形状实测：tp4 M ≤ 384、ds ≤ 512 流式化反而慢 1–5%；tp2 M ≤ 4096、tp4、ds 分块的税大于藏住的通信。
-- 开关：`AITER_MEGA_MOE_TP_STREAM_DOWN=0` 全部退回 tp_reduce；`AITER_MEGA_MOE_TP_CHUNK=0` 不分块；`AITER_MEGA_TP_SDMA_ENGINES` 指定引擎。
-- Down_tp 按形状实测：prefill 档每列块 X / Y 为 tp2 32 / 16（分块 96 / 0）、tp4 64 / 32、ds 32 / 16；tp4 M > 8192 的 routes 加 nt。
-- 核心 kernel 骨架（每个 kernel 的 Gluon 风格分阶段写法、任务划分与流水线见 [kernels.md](kernels.md)）：
-```text
-decode Gate/Up：grid (I/16, M·topk)，4 wave = gate / up × K 前后半；每 lane 一条 16 B 覆盖两个 64-K 块，部分和经 LDS 相加
-decode Down：grid (H/16, M)，wave 按槽取（槽对版一条 16 B 覆盖两个槽）；各 wave 部分和经 LDS 按固定顺序相加 → bf16 写 out
-decode Down _tp：同上到 LDS 相加；wave 0 把块的 f32 部分和写进各卡收件箱（哨兵即标志），等齐后按 rank 顺序相加 → bf16 写 out
-去重 Gate/Up：同 grid，只有组首 WG 计算（同 expert 的 2–3 条路由的 x 行进 LDS，共用一次权重读）
-流式 prep：前 ⌈M·topk/256⌉ 个 WG 各统计全部路由（LDS 原子）后放置自己的 256 条，其余 WG 量化 x 行（并清零 out）
-流式 Gate/Up：grid (I/(16·G·W), 排序块)，权重（non-temporal）与激活直读 VGPR、提前 P 个 64-K 步；按有效 16 行子块数特化
-流式 Down：grid (H/(16·R·W), 排序块)，本块激活驻留 VGPR；逐通道块解码 → MFMA → bf16 写 routes 或两块凑一次原子加进 out
-prefill Gate/Up：grid (2I/128, 排序块)，4 wave 管 64 行 × 64 gate 与同号 64 up；权重进 VGPR 提前 2 tile，x 经 LDS 双缓冲
-prefill Down：64 行 mq 经 LDS（I576 分两段）装入后驻留 VGPR；逐列块解码 → MFMA → bf16 写 routes，并写每条路由的排序行号
-tp_reduce：WG 轮取 token tile；非 owner 把 tile i 的部分和（route 求和或拷贝）写进 owner（rank i % W）收件箱 + RS 标志；
-  owner 等齐后按 rank 顺序 f32 求和，bf16 写本卡 out 与各卡 landing + AG 标志；第二遍等 AG，把 landing 行拷进 out
-Down_tp：一次 launch 三类 WG，1-D grid 按 5 个列块主序 C(0) | C(1) 中插 X(0)、Y(0) | … | C(4) 中插 X(3)、Y(3) | X(4) Y(4)
-  C：Down 的一个排序块 × 一个列块，写 routes（Qwen 原子加进 out）后给该列块计数 +1，从不等待；prefill 档按形状（`DOWN_TUNE`）调发射顺序，等权重时不被 routes 写穿拖住
-  X：等本列块算完，逐 tile 把本卡部分和（topk 条路由 f32 求和；Qwen 流式直接拷 out 行）写进 owner 收件箱 + RS；Y：同 tp_reduce 的 owner
-  gather（a8w4_tp_reduce）：等 AG，把别卡求好的行从 landing 拷进 out，并清零列块计数
-token 分块（tp2）：chunk_blocks 按块首 token 把排序块分进两块的块表；每块的 Gate/Up、Down_tp 只跑表里的块
-  Down_tp OS：无 Y；X 把部分和写本卡 out，X(0) 的 WG0 给 SDMA 排「等列块 → 推进对端 landing → 置旗标」；gather 等到后相加
-```
+| Qwen 1–2 | decode：gateup_decode → down_decode | 不排序：排序块几乎全是填充 |
+| Qwen tp2 4–8、tp4 4–16 | decode，先量化 mid：gateup_decode → row_quant_decode → down_decode_pq | Down 槽对版：16 B 覆盖两槽 |
+| Qwen tp2 16–32、tp4 32 | decode，x 也先量化：row_quant_decode → gateup_decode_pq → … → down_decode_pq | 免得每个 WG 各量化整行 |
+| ds 1–2 | 混合 decode：shared 作末路，进同两个 kernel（gateup / down_decode_mixed） | 省 shared 的 split 链与相加 |
+| ds 4–8 | decode 槽对 Down（M8 去重 Gate/Up）；shared 在侧流算 GEMM，折进 down_decode_pq_shared | 折叠省量化与相加 |
+| Qwen 48–1024、tp4 2048、ds 16–1024 | 流式：stream_prep → gateup_stream（块 16 / 32 / 64）→ down_stream | 每 expert 行少，读权重为主 |
+| tp2 2048、ds 2048 | prefill：stream_prep 排序 →（ds：shared GEMM）→ gateup / down_prefill → sorted_sum | prep 一次 launch 更快 |
+| ≥ 4096 | prefill：Opus moe_sorting 排序、x 单独量化，其余同上 | 路由多时 prep 慢 |
+- ds 的流式档 shared 也在侧流、Down 后 route_sum 合并；Qwen 的流式 Down 原子加进 prep 清零的输出（I < 512）。
+- AR 按部分和字节分：Qwen TP2 M ≤ 1228、Qwen TP4 M ≤ 2662、ds M ≤ 1331 走 CA，更大的走 RCCL（阈值见第 3 节）。
+- 本层没有自己的 kernel（[kernels.md](kernels.md)）；各档 kernel 的骨架、任务划分与流水线见 gfx9_fp8 的
+  [README](../moe_gemm_2stage/gfx9_fp8/README.md) 与 [kernels.md](../moe_gemm_2stage/gfx9_fp8/kernels.md)。
 ## 3. 关键决策
-本卡计算复用已调好的 pyhip M17 kernel（移植时 ISA 逐条相同）；跨卡求和只在比单独 AR 快的档位融合：大 M 藏进 Down（tp2 再分块交给 SDMA），其余进末个 kernel。
+本卡计算原样复用 shared-M6 的单卡入口（只留一套 kernel）；跨卡求和先用一次单独的 AR，按字节取 CA 与 RCCL 中较快者。
 | 决策 | 备选 | 为什么 | 代价 / 限制 |
 |---|---|---|---|
-| 框架 B：两阶段 A8W4 + 通信 | A：MegaMoeTP（gfx950）；C：#8530 改 TP | A 用 gfx950 专有指令；C 的形状断言挡掉 51 case、小中 M 慢 1.25–2.2× | 通信要自己融合 |
-| 另建类，接口与权重布局同 `MegaMoeTP` | 在 `MegaMoeTP` 里按架构分派 | gfx950 代码零改动；调用方不改权重加载 | 调用方按架构选类 |
-| M > 32：RS 到 tile owner、按 rank 顺序求和、AG | Down 尾部直写远端 | 直写字节是 token 和的 topk 倍；owner 求和故逐位相同 | 两次相互依赖的跨卡往返 |
-| 大 M：RS、求和、AG 由 Down 内专用 WG 做（列块主序） | 接在 Down 后；旁路流；远端原子 | 接在后面露出 12–33%；旁路流本机串行；远端原子使计算慢 13–43% | 切列块：M32768 慢 3–6% |
-| tp2 M ≥ 8192：token 分两块，SDMA 推送部分和 | CU 做 AG；SDMA 拉取；tp4 / ds 也分块 | 露出的通信少 66–73%，快 5–11% | 分块税 117–196 µs；不可跨 stream |
-| 每卡输出 < 2 MiB（TP2）/ 1 MiB（TP4）保留 AR | M > 32 全部融合 | CA 只要一次往返：TP2 1.3 MB、TP4 0.66 MB 及以下 AR 更快 | 12 个中间 case 无融合收益 |
-| M ≤ 16：Down decode 块末经收件箱交换 f32 部分和 | 单独 AR | 省一次 launch 与部分和读写：decode 档累计 1.02–1.13× | M ≥ 2 先 row_quant 走槽对版 |
-| 跨卡等待有界（10 s，某 M 首次 300 s），超时置粘滞位 | 无限等待 | 一卡掉队不会挂死整组 | 超时后输出作废，要集合 reset |
+| 只留 gfx9_fp8 一套 kernel，M7 的融合通信先删 | 两套 kernel 并存 | 两套是同一批 kernel 的重复移植，M7 那套不认 shared | Qwen 大 M 慢于 M7（第 4 节） |
+| 本卡整段调单卡入口 | TP 层自己分派 kernel | 单卡分档已在 TP 切片形状上调过；TP 层零 kernel | 部分和多一次 bf16 写读 |
+| AR 取快：TP2 ≥ 6 MiB、TP4 ≥ 13 MiB 走 RCCL | 总用 CA | 冷测 CA / RCCL µs：TP2 7.5 MiB 202 / 200，TP4 13.75 MiB 201 / 198 | 只测本机 |
+| shared 收本卡切片，格式与校验同单卡入口 | TP 层自己切 shared | ATOM 已按 TP 持有切片；报错与单卡一致 | 切片由调用方负责 |
+| routed 收 `MegaMoeTP` 布局，构造时反 shuffle | 只收标准 MXFP4 | 调用方按架构换类即可，不改权重加载 | 构造 / set_weights 多一次转换 |
 ## 4. 性能与精度
-现状：51 case 全过精度、各卡逐位相同；比较快的对照 2 逐 case 0.743–1.014（几何均值 0.921），Qwen 34 case 全部快于对照 1。
-|档（case 数）|耗时 µs|÷ 对照 2|÷ 对照 1|本实现 TB/s|本实现 TFLOPS|对照 1 TB/s|对照 1 TFLOPS|受限于|
-|---|---|---|---|---|---|---|---|---|
-|decode_tp（15）|17–193|0.878–0.991|0.63–0.77|0.52–2.13（10–40%）|≤8.8（1.4%）|0.74–2.09（14–40%）|≤5.2（0.9%）|权重读|
-|CA（12）|134–471|0.991–1.014|0.67–0.80|1.45–2.47（27–47%）|≤41（6.8%）|1.97–2.77（37–52%）|≤29（4.7%）|权重读|
-|流式 + tp_reduce（4）|239–803|0.980–0.995|0.68（tp4）|1.72–2.48（32–47%）|≤68（11%）|2.18（41%）|19.8（3.3%）|权重读|
-|流式 Down_tp（6）|275–960|0.881–0.976|0.72–0.81|0.81–1.93（15–36%）|≤113（19%）|1.12–2.41（21–45%）|≤89（15%）|权重读、跨卡尾部|
-|prefill Down_tp（11）|708–13560|0.794–0.880|0.72–0.78|≤1.49（28%）|129–257（21–42%）|≤1.32（25%）|92–137（15–23%）|MFMA、跨卡尾部|
-|prefill 分块 + SDMA（3）|2013–7452|0.743–0.751|0.69–0.70|≤0.38（7.2%）|220–238（36–39%）|≤0.47（8.8%）|153–166（25–27%）|MFMA、末块推送|
-- 对照 2 `a8w4_2stage_ar`：移植源 pyhip M17（`811e03a` + FlyDSL 0.5.3 补丁 `45ff9f5`）的 `fused_moe_a8w4` + 单独 AR。
-- 对照 2 的 kernel 即第 2 节表（不分块；M 2 不预量化 mid）；AR 为 CA，tp2 / tp4 M ≥ 16384、ds M ≥ 8192 走 RCCL。
-- 对照 2 字节与 flops 同本实现，TB/s、TFLOPS = 本实现 × 耗时比（decode 档 0.46–2.11 TB/s，prefill 档 108–224 TFLOPS）。
-- 对照 1 `aiter_fp8_ptpc_ar`（只 Qwen）：本分支 aiter `fused_moe`（fp8 per-token，Qwen3.8 fp8 ptpc 调优表）+ 同一 AR。
-- 对照 1 选中：M ≤ 16 多为 FlyDSL 16×16×16，32–1024 多为 asm 一阶段 32×320 / 32×192，≥ 2048 多为 FlyDSL 64×128×256。
-- 计时：三者同一进程、同一冷协议（每次调用前各卡清 512 MiB 缓存、GPU 空转盖住下发、128 B CA 对齐），取最慢卡、30 轮中位。
-- 顺序：本实现与对照 2 逐轮交替；对照 1 单独一轮，因为紧跟 aiter fp8 调用的 A8W4 调用快 4–5%，交替会偏向排在它后面的一方。
-- 吞吐：flops = 6·M·topk·H·I（本卡真实 I）；bytes = 用到的 expert 的本卡权重（各自格式）+ x 读 y 写；峰值 5.3 TB/s、606 TFLOPS。
-- 精度：独立 fp32 参考（各卡部分和之和），判据 calc_diff ≤ 1e-3 且 max|y − ref| ≤ 4.5%·max|ref|；实测最大 8.3e-6 与 1.19%。
+本版与同算法对照 ref 持平；对 M7 几何均值慢 4%：Qwen 流式档（48–512）更快，prefill 档慢 13–35%（缺融合通信）。
+| 档（M） | 本÷M7 | 本÷ref | 本版最高 TB/s / TFLOPS（占峰值） | 对照最高 TB/s / TFLOPS | 结论 |
+|---|---|---|---|---|---|
+| Qwen decode 1–32 | 0.95–1.10 | 0.99–1.01 | 1.77（33%）/ 9.6（2%） | M7 1.77 / 9.5 | M7 把 AR 融进 Down，M1 快 4–10% |
+| Qwen 流式 48–512 | 0.78–1.00 | 0.98–1.00 | 2.34（44%）/ 71.5（12%） | M7 2.13 / 71.5 | 块 16 + CA 时快 7–10%；M48 M7 选块 32 |
+| Qwen 自量化 1024、tp4 2048 | 1.05–1.08 | 1.00–1.01 | 1.28（24%）/ 102（17%） | M7 1.38 / 110 | M7 用 tp_reduce 省掉单独 AR |
+| Qwen prefill ≥2048（tp4 ≥4096） | 1.13–1.35 | 0.99–1.00 | 0.81（15%）/ 177（29%） | M7 1.00 / 239 | M7 归约融进 Down、SDMA 重叠 |
+| ds decode 1–8 | — | 0.99–1.01 | 1.64（31%）/ 7.3（1%） | ref 1.66 / 7.4 | M7 不支持 shared；与 ref 持平 |
+| ds 流式 16–1024 | — | 0.98–1.00 | 2.71（51%）/ 126（21%） | ref 2.71 / 125 | 同上 |
+| ds prefill ≥ 2048 | — | 1.00 | 1.22（23%）/ 231（38%） | ref 1.21 / 231 | 同上 |
+- 峰值按每卡 5.3 TB/s、606 TFLOPS；字节与 FLOPs 按本卡的 I 切片计，耗时取最慢的卡。
+- 对照 M7（mega_tp_m7）：从 `MEGA_TP_M7_SRC` 私有加载 M7 源码，路径同 M7（decode_tp / Down_tp / SDMA 分块）。
+- 对照 ref（a8w4_shared_ar）：树内单卡入口 + bench 自己冻结的 AR 规则；三者同进程、同协议（第 5 节）逐次交替计时。
+- 精度参考：FP32 参考，calc_diff ≤ 1e-3、max 误差 ≤ 4.5%·max|ref|；51 case 最大 9.1e-5 / 1.97%，各卡逐位相同。
+- ds_layer_tp4_m1 在整轮 bench 中受瞬时干扰（本版 492 µs、ref 333 µs），同卡复测 32.6 / 32.7 µs，表中用复测值。
+
 <!-- mf:perf -->
-基线来源（mf 记录）：11-25 12:47 冻结于提交 `e19c1fc3a6`（里程碑 M0，tag `mega-tp-a8w4-M0`），bench 跑 3 次取中位数，GPU0,1,2,3，噪声 ±0.18%；bench 命令 `/root/.myflow-r2/tasks/mega-tp-a8w4/venv/bin/python op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py`。对照实现与精度参考的来源见本节手写部分。
-
-最近的性能里程碑 M7：相对冻结基线 1.085×，相对 M6 0.999×（mf 复核 V13：同卡 ABBA 4 对，GPU0,1,2,3，噪声 ±0.33%）。
-
-<details><summary>逐 case（51 个，mf 生成）</summary>
-
-| case | 基线 | 当前 | 累计加速 | 增量加速 | 对照 µs | 当前/对照 | 基线 TB/s | 当前 TB/s | 对照 TB/s | 基线 TFLOPS | 当前 TFLOPS | 对照 TFLOPS |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| ds_tp4_m1 | 31.71 | 29.33 | 1.081× | 0.996× | 31.64 | 0.927 | 0.90 (17.0%) | 0.97 (18.4%) | 0.90 (17.0%) | 3.35 (0.6%) | 3.62 (0.6%) | 3.36 (0.6%) |
-| ds_tp4_m2 | 49.69 | 45.73 | 1.086× | 1.001× | 49.66 | 0.921 | 1.13 (21.2%) | 1.22 (23.1%) | 1.13 (21.2%) | 4.27 (0.7%) | 4.64 (0.8%) | 4.28 (0.7%) |
-| ds_tp4_m4 | 82.01 | 79.77 | 1.028× | 0.999× | 82.24 | 0.970 | 1.38 (26.0%) | 1.42 (26.7%) | 1.37 (25.9%) | 5.18 (0.9%) | 5.32 (0.9%) | 5.16 (0.9%) |
-| ds_tp4_m8 | 123.87 | 120.32 | 1.030× | 1.000× | 123.21 | 0.976 | 1.71 (32.3%) | 1.76 (33.2%) | 1.72 (32.4%) | 6.86 (1.1%) | 7.06 (1.2%) | 6.89 (1.1%) |
-| ds_tp4_m16 | 195.23 | 193.38 | 1.009× | 1.002× | 195.14 | 0.991 | 2.11 (39.8%) | 2.13 (40.2%) | 2.11 (39.8%) | 8.70 (1.4%) | 8.78 (1.4%) | 8.70 (1.4%) |
-| ds_tp4_m32 | 321.67 | 322.77 | 0.998× | 0.996× | 323.70 | 0.998 | 2.21 (41.7%) | 2.20 (41.5%) | 2.19 (41.4%) | 10.6 (1.7%) | 10.5 (1.7%) | 10.5 (1.7%) |
-| ds_tp4_m48 | 403.21 | 401.78 | 1.004× | 1.002× | 401.84 | 1.000 | 2.40 (45.2%) | 2.41 (45.4%) | 2.41 (45.4%) | 12.6 (2.1%) | 12.7 (2.1%) | 12.7 (2.1%) |
-| ds_tp4_m64 | 470.89 | 470.97 | 1.001× | 0.997× | 470.81 | 0.999 | 2.47 (46.6%) | 2.47 (46.6%) | 2.47 (46.7%) | 14.4 (2.4%) | 14.4 (2.4%) | 14.4 (2.4%) |
-| ds_tp4_m128 | 639.48 | 634.97 | 1.007× | 1.000× | 640.51 | 0.991 | 2.47 (46.5%) | 2.48 (46.9%) | 2.46 (46.5%) | 21.3 (3.5%) | 21.4 (3.5%) | 21.2 (3.5%) |
-| ds_tp4_m256 | 747.44 | 738.93 | 1.012× | 1.001× | 749.70 | 0.985 | 2.42 (45.6%) | 2.44 (46.1%) | 2.41 (45.4%) | 36.4 (6.0%) | 36.8 (6.1%) | 36.3 (6.0%) |
-| ds_tp4_m512 | 816.36 | 802.99 | 1.017× | 0.999× | 819.56 | 0.980 | 2.25 (42.4%) | 2.29 (43.1%) | 2.24 (42.3%) | 66.6 (11.0%) | 67.7 (11.2%) | 66.3 (10.9%) |
-| ds_tp4_m1024 | 1018.98 | 959.5 | 1.061× | 0.999× | 1025.25 | 0.937 | 1.81 (34.2%) | 1.93 (36.3%) | 1.80 (34.0%) | 107 (17.6%) | 113 (18.7%) | 106 (17.5%) |
-| ds_tp4_m2048 | 1455.04 | 1251.14 | 1.163× | 0.998× | 1459.91 | 0.857 | 1.28 (24.2%) | 1.49 (28.2%) | 1.28 (24.1%) | 149 (24.7%) | 174 (28.7%) | 149 (24.6%) |
-| ds_tp4_m4096 | 2371.6 | 1964.91 | 1.206× | 0.998× | 2388.29 | 0.823 | 0.81 (15.2%) | 0.97 (18.3%) | 0.80 (15.1%) | 183 (30.3%) | 221 (36.5%) | 182 (30.0%) |
-| ds_tp4_m8192 | 4059.85 | 3474.33 | 1.169× | 1.002× | 4057.81 | 0.856 | 0.49 (9.3%) | 0.57 (10.8%) | 0.49 (9.3%) | 214 (35.4%) | 250 (41.3%) | 214 (35.4%) |
-| ds_tp4_m16384 | 7978.9 | 6862.82 | 1.162× | 1.000× | 7965.78 | 0.862 | 0.27 (5.1%) | 0.32 (5.9%) | 0.27 (5.1%) | 218 (36.0%) | 253 (41.8%) | 218 (36.0%) |
-| ds_tp4_m32768 | 15611.6 | 13560.3 | 1.151× | 1.000× | 15538.84 | 0.873 | 0.16 (3.0%) | 0.18 (3.5%) | 0.16 (3.0%) | 223 (36.8%) | 257 (42.3%) | 224 (36.9%) |
-| tp2_m1 | 22.21 | 19.82 | 1.121× | 0.996× | 22.16 | 0.896 | 0.66 (12.5%) | 0.74 (14.0%) | 0.66 (12.5%) | 2.43 (0.4%) | 2.73 (0.5%) | 2.44 (0.4%) |
-| tp2_m2 | 31.32 | 29.39 | 1.067× | 1.000× | 31.33 | 0.937 | 0.89 (16.9%) | 0.95 (18.0%) | 0.89 (16.9%) | 3.45 (0.6%) | 3.68 (0.6%) | 3.45 (0.6%) |
-| tp2_m4 | 44.98 | 42.55 | 1.057× | 1.000× | 44.92 | 0.947 | 1.19 (22.4%) | 1.25 (23.7%) | 1.19 (22.4%) | 4.81 (0.8%) | 5.08 (0.8%) | 4.81 (0.8%) |
-| tp2_m8 | 74.13 | 71.23 | 1.039× | 1.000× | 74.48 | 0.957 | 1.36 (25.7%) | 1.42 (26.8%) | 1.36 (25.6%) | 5.83 (1.0%) | 6.07 (1.0%) | 5.81 (1.0%) |
-| tp2_m16 | 114.49 | 111.08 | 1.031× | 1.001× | 115.24 | 0.964 | 1.64 (30.9%) | 1.69 (31.9%) | 1.63 (30.7%) | 7.56 (1.2%) | 7.79 (1.3%) | 7.51 (1.2%) |
-| tp2_m32 | 181.81 | 181.5 | 1.000× | 1.000× | 181.89 | 0.999 | 1.77 (33.4%) | 1.77 (33.5%) | 1.77 (33.4%) | 9.52 (1.6%) | 9.53 (1.6%) | 9.51 (1.6%) |
-| tp2_m48 | 245.42 | 244.68 | 1.000× | 1.004× | 245.02 | 0.998 | 1.71 (32.3%) | 1.72 (32.4%) | 1.72 (32.4%) | 10.6 (1.7%) | 10.6 (1.8%) | 10.6 (1.7%) |
-| tp2_m64 | 236.81 | 236.24 | 1.002× | 0.995× | 238.13 | 0.991 | 2.08 (39.2%) | 2.08 (39.3%) | 2.07 (39.0%) | 14.6 (2.4%) | 14.6 (2.4%) | 14.5 (2.4%) |
-| tp2_m128 | 295.68 | 295.64 | 1.000× | 0.996× | 297.42 | 0.994 | 2.15 (40.5%) | 2.15 (40.5%) | 2.13 (40.3%) | 23.4 (3.9%) | 23.4 (3.9%) | 23.3 (3.8%) |
-| tp2_m256 | 336.6 | 337.31 | 0.998× | 0.998× | 339.39 | 0.993 | 2.03 (38.3%) | 2.03 (38.3%) | 2.01 (38.0%) | 41.1 (6.8%) | 41.0 (6.8%) | 40.8 (6.7%) |
-| tp2_m512 | 407.89 | 384.49 | 1.060× | 0.999× | 410.09 | 0.938 | 1.69 (31.9%) | 1.79 (33.8%) | 1.68 (31.7%) | 67.9 (11.2%) | 72.0 (11.9%) | 67.5 (11.1%) |
-| tp2_m1024 | 565.9 | 502.66 | 1.125× | 0.999× | 567.24 | 0.886 | 1.23 (23.2%) | 1.38 (26.1%) | 1.22 (23.1%) | 97.8 (16.1%) | 110 (18.2%) | 97.6 (16.1%) |
-| tp2_m2048 | 870.605 | 707.64 | 1.229× | 0.995× | 874.43 | 0.809 | 0.81 (15.3%) | 1.00 (18.8%) | 0.81 (15.2%) | 127 (21.0%) | 156 (25.8%) | 127 (20.9%) |
-| tp2_m4096 | 1508.93 | 1206.86 | 1.250× | 1.000× | 1519.80 | 0.794 | 0.48 (9.1%) | 0.60 (11.4%) | 0.48 (9.0%) | 147 (24.2%) | 184 (30.3%) | 146 (24.0%) |
-| tp2_m8192 | 2650.82 | 2012.58 | 1.318× | 0.997× | 2682.15 | 0.751 | 0.29 (5.5%) | 0.38 (7.2%) | 0.29 (5.4%) | 167 (27.6%) | 220 (36.3%) | 165 (27.3%) |
-| tp2_m16384 | 5059.94 | 3777.57 | 1.340× | 0.999× | 5080.75 | 0.743 | 0.17 (3.2%) | 0.23 (4.3%) | 0.17 (3.2%) | 175 (28.9%) | 234 (38.7%) | 174 (28.8%) |
-| tp2_m32768 | 10014.7 | 7452.48 | 1.344× | 1.000× | 9996.62 | 0.746 | 0.10 (1.9%) | 0.14 (2.6%) | 0.10 (1.9%) | 177 (29.2%) | 238 (39.2%) | 177 (29.2%) |
-| tp4_m1 | 19.12 | 16.8 | 1.139× | 1.005× | 19.13 | 0.878 | 0.46 (8.7%) | 0.52 (9.9%) | 0.46 (8.7%) | 1.41 (0.2%) | 1.61 (0.3%) | 1.41 (0.2%) |
-| tp4_m2 | 25.8 | 24.18 | 1.065× | 0.999× | 25.77 | 0.940 | 0.65 (12.3%) | 0.70 (13.1%) | 0.65 (12.3%) | 2.10 (0.3%) | 2.24 (0.4%) | 2.10 (0.3%) |
-| tp4_m4 | 34.44 | 31.96 | 1.078× | 0.997× | 34.27 | 0.932 | 0.91 (17.1%) | 0.98 (18.4%) | 0.91 (17.2%) | 3.14 (0.5%) | 3.38 (0.6%) | 3.16 (0.5%) |
-| tp4_m8 | 51.74 | 49.71 | 1.043× | 0.994× | 51.93 | 0.957 | 1.17 (22.1%) | 1.22 (23.0%) | 1.17 (22.1%) | 4.18 (0.7%) | 4.35 (0.7%) | 4.16 (0.7%) |
-| tp4_m16 | 90.56 | 88.74 | 1.019× | 0.997× | 91.10 | 0.974 | 1.27 (23.9%) | 1.29 (24.4%) | 1.26 (23.8%) | 4.78 (0.8%) | 4.87 (0.8%) | 4.75 (0.8%) |
-| tp4_m32 | 134.42 | 133.94 | 1.001× | 1.000× | 134.31 | 0.998 | 1.45 (27.3%) | 1.45 (27.4%) | 1.45 (27.4%) | 6.44 (1.1%) | 6.46 (1.1%) | 6.44 (1.1%) |
-| tp4_m48 | 165.18 | 164.3 | 1.006× | 1.001× | 165.76 | 0.991 | 1.52 (28.7%) | 1.53 (28.8%) | 1.51 (28.6%) | 7.86 (1.3%) | 7.90 (1.3%) | 7.83 (1.3%) |
-| tp4_m64 | 165.99 | 165.76 | 1.002× | 0.997× | 163.71 | 1.013 | 1.75 (33.0%) | 1.75 (33.1%) | 1.77 (33.5%) | 10.4 (1.7%) | 10.4 (1.7%) | 10.6 (1.7%) |
-| tp4_m128 | 208.63 | 209.28 | 0.997× | 1.001× | 206.26 | 1.014 | 1.81 (34.2%) | 1.81 (34.1%) | 1.83 (34.6%) | 16.6 (2.7%) | 16.5 (2.7%) | 16.8 (2.8%) |
-| tp4_m256 | 242.18 | 238.87 | 1.013× | 1.000× | 240.03 | 0.995 | 1.69 (32.0%) | 1.72 (32.4%) | 1.71 (32.3%) | 28.6 (4.7%) | 29.0 (4.8%) | 28.8 (4.8%) |
-| tp4_m512 | 286.17 | 275.22 | 1.039× | 1.001× | 282.16 | 0.976 | 1.45 (27.4%) | 1.51 (28.5%) | 1.47 (27.8%) | 48.4 (8.0%) | 50.3 (8.3%) | 49.1 (8.1%) |
-| tp4_m1024 | 368.46 | 334.41 | 1.100× | 1.002× | 368.26 | 0.908 | 1.14 (21.6%) | 1.26 (23.8%) | 1.14 (21.6%) | 75.1 (12.4%) | 82.8 (13.7%) | 75.2 (12.4%) |
-| tp4_m2048 | 598.89 | 529.85 | 1.130× | 1.000× | 600.97 | 0.881 | 0.72 (13.6%) | 0.81 (15.4%) | 0.72 (13.5%) | 92.4 (15.3%) | 104 (17.2%) | 92.1 (15.2%) |
-| tp4_m4096 | 1023.46 | 859.05 | 1.192× | 1.006× | 1024.78 | 0.839 | 0.44 (8.3%) | 0.53 (9.9%) | 0.44 (8.3%) | 108 (17.9%) | 129 (21.3%) | 108 (17.8%) |
-| tp4_m8192 | 1798.01 | 1467.06 | 1.226× | 1.002× | 1801.71 | 0.815 | 0.27 (5.2%) | 0.34 (6.4%) | 0.27 (5.2%) | 123 (20.3%) | 151 (24.9%) | 123 (20.3%) |
-| tp4_m16384 | 3193.73 | 2763.18 | 1.155× | 0.999× | 3192.73 | 0.865 | 0.18 (3.4%) | 0.21 (3.9%) | 0.18 (3.4%) | 139 (22.9%) | 160 (26.5%) | 139 (22.9%) |
-| tp4_m32768 | 6171.79 | 5425.05 | 1.138× | 1.000× | 6166.97 | 0.880 | 0.12 (2.3%) | 0.14 (2.6%) | 0.12 (2.3%) | 144 (23.7%) | 163 (26.9%) | 144 (23.7%) |
-
-TB/s、TFLOPS = bench 给出的每次调用数据量 / 运算量 ÷ 中位耗时，括号内占峰值（带宽 5.3 TB/s、算力 606 TFLOPS）；对照 = a8w4_2stage_ar（MF_REF，同一 bench 进程、同一协议）
-
-</details>
+（尚无复核数据）
 <!-- /mf:perf -->
 
 ## 5. 测试覆盖
-三类用例都在 [test_mega_moe_tp_gfx942.py](../../../../../op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py)，全部通过；多卡用例共用一个 4 进程常驻池，有输出的用例都按 fp32 参考判据校验并查各卡逐位相同。
+三类用例都在 [test_mega_moe_tp_gfx942.py](../../../../../op_tests/multigpu_tests/test_mega_moe_tp_gfx942.py)，全部通过；多卡用例共用一个 4 进程常驻池。
+单卡入口的分档交界（门槛两侧、奇数 M）由 [test_flydsl_moe_a8w4.py](../../../../../op_tests/test_flydsl_moe_a8w4.py) 覆盖，下面两个用例命令都带上它。
+有输出的用例都按 FP32 参考判据（calc_diff ≤ 1e-3、max 误差 ≤ 4.5%·max|ref|）校验，并查各卡输出逐位相同。
 
-**基本功能测试**（每次改动先跑：`commands.correctness` = `pytest <文件> -m basic`，14 例，约 80 秒；每例断言档位 = 首个 GateUp kernel、通信段 = 末个 kernel）
+**基本功能测试**（`commands.correctness` = `pytest <文件> -m basic`，14 例约 80 秒；另跑单卡文件 `-m basic` 18 例约 60 秒）
 | 覆盖什么 | 用例 | 结果 |
 |---|---|---|
-| decode + decode_tp：单槽 / 槽对 / 预量化 mid；预量化 x 与 mid + CA | tp2_m1、ds_tp4_m2、tp4_m8；tp2_m32 | 过 |
-| decode 去重 Gate/Up（H5120）+ decode_tp | ds_tp4_m16 | 过 |
-| 流式 Qwen 原子加 + CA：块 16、块 32 自量化 | tp2_m256、tp4_m48 | 过 |
-| 流式 + tp_reduce 求和；流式 Down_tp：拷贝（Qwen 原子加后）/ 求和 | ds_tp4_m512；tp4_m2048、ds_tp4_m1024 | 过 |
-| prefill Down_tp（三形状各自的调度开关）：prep / Opus 排序；tp2 分块 + SDMA | tp2_m2048、tp4_m4096、ds_tp4_m4096；tp2_m8192 | 过 |
+| Qwen decode：单槽 Down、槽对 Down（预量化 mid）、预量化 x 与 mid | tp2_m1、tp4_m8、tp2_m32 | 过 |
+| shared decode：混合、侧流并进 Down、H5120 去重 Gate/Up | ds_layer_tp4_m1、_m4、_m8 | 过 |
+| 流式：块 16、块 32 / 64（Gate/Up 自量化），ds 带侧流 shared | tp2_m256、tp4_m1024、tp4_m2048、ds_layer_tp4_m64、_m1024 | 过 |
+| prefill：prep 排序、Opus 排序，ds 的 shared GEMM 在前 | tp2_m2048、tp4_m4096、ds_layer_tp4_m2048 | 过 |
+- 每例另断言档位：首个 Gate/Up kernel、有无 shared、恰好一个通信段。
 
-**性能测试**（`commands.bench` = `python <文件>`，51 个 case：3 形状 × M = 1…32768 的 2 的幂及 48；计时的输出先过精度与逐位检查）
-| 覆盖什么（分档 / 形状） | case | 结果 |
-|---|---|---|
-| decode + decode_tp × 三形状 | M 1–16，15 个 | ÷对照 2 0.878–0.991，≤ 2.13 TB/s |
-| decode / 流式 + CA × 三形状 | tp2 32–256、tp4 32–128、ds 32–64，12 个 | ÷对照 2 0.991–1.014，≤ 2.47 TB/s |
-| 流式 + tp_reduce（tp4、ds） | tp4 256、ds 128–512，4 个 | ÷对照 2 0.980–0.995，≤ 2.48 TB/s |
-| 流式 Down_tp × 三形状 | tp2 512–1024、tp4 512–2048、ds 1024，6 个 | ÷对照 2 0.881–0.976，≤ 1.93 TB/s |
-| prefill Down_tp × 三形状 | M ≥ 2048（tp4 ≥ 4096，tp2 ≤ 4096），11 个 | ÷对照 2 0.794–0.880，≤ 257 TFLOPS |
-| prefill 分块 + SDMA（tp2） | tp2 8192–32768，3 个 | ÷对照 2 0.743–0.751，≤ 238 TFLOPS |
+**性能测试**（`commands.bench` = `python <文件>`，51 个 case：3 形状 × M = 1…32768 的 2 的幂及 48；计时的输出都过精度与逐位检查）
+| 覆盖什么 | case | 本÷对照 | 最高 TB/s / TFLOPS |
+|---|---|---|---|
+| Qwen TP2 / TP4 的全部档（decode、流式、prefill；CA 与 RCCL 两侧） | tp2_m*、tp4_m*（34） | ÷M7 0.78–1.35，÷ref 0.98–1.01 | 2.34 / 177 |
+| DeepSeek 主干 + shared 的全部档（混合 decode、侧流折叠、流式、prefill） | ds_layer_tp4_m*（17） | ÷ref 0.98–1.01 | 2.71 / 231 |
+- 协议：每次调用前写 512 MiB 冲掉 L2 / MALL、空闲一段并对齐各卡，4 组输入轮换，warmup 3；采样 30 次取中位数。
 
-**其他覆盖测试**（只测前两类覆盖不了的；`commands.verify_extra` = `pytest <文件> -m "not basic"`，36 例，约 120 秒）
+**其他覆盖测试**（只测前两类覆盖不了的；`commands.verify_extra` = `pytest <文件> -m "not basic"`，19 例约 60 秒；另跑单卡文件全量）
 | 覆盖什么 | 为什么前两类覆盖不了 | 用例 | 结果 |
 |---|---|---|---|
-| 分档、融合、Down 流式化门槛两侧、奇数 M、tile 交界，逐 M 钉住通信段、Down 是否流式 | 前两类只取 2 的幂与 48；bench 不查路径 | test_dispatch_boundaries（3 例） | 过 |
-| `out=`：decode_tp 直写、CA 拷回、Down_tp 与 gather 直写；M = 0 | 前两类不传 `out`、没有空批 | test_out_argument_and_empty_batch | 过 |
-| 同一层跨档反复调用、`reset`、错误旗标 API | 前两类每个输入只算一次 | test_repeated_calls_and_reset | 过 |
-| TP2 与 TP4 层在同一进程交替调用 | 前两类按形状分批，不交替 | test_tp2_tp4_interleaved | 过 |
-| `set_weights` 换权重后用新权重 | 前两类不换权重 | test_set_weights | 过 |
-| CUDA graph 捕获与重放（decode_tp、CA、流式 / prefill Down_tp、分块） | 前两类都是 eager 调用 | test_cuda_graph（8 例） | 过 |
-| 不传 group / cpu_group 时自建通信组与工作区 | 前两类都显式传组 | test_default_communicators | 过 |
-| 非法参数 / 形状、非 gfx942、NaN scale | 前两类只走合法输入 | test_rejected_arguments（20 种） | 过 |
-| 路径判定本身：融合、不融合、两者都有 / 都没有 | 判定放行一切时前两类也照过 | test_path_checks（纯 CPU） | 过 |
-| 迟到卡、缺席卡：限时放弃、错误位、`reset` 恢复、prepare 重试 | 前两类各卡同时启动、从不超时 | test_peer_waits_and_timeouts（6 例，Down_tp 占 4，含分块） | 过 |
-| 两实例共享工作区，graph 重放与不同 M 的 eager 交替 | 前两类单实例、eager，每次一个 M | test_graph_eager_shared_workspace | 过 |
-| w2 ≥ 4 GiB 时 decode_tp 退回单槽版（打补丁模拟） | 三个形状的 w2 都放得进槽对版 | test_single_slot_decode_fallback | 过 |
-| Down_tp（含分块）逐位同不流式化：各形状调度开关、nt 两侧、gather 分组阈值两侧、末组不满 | 前两类只比容差，不取交界 M | test_streamed_down_bitwise（8 例） | 过 |
-| 分块门槛两侧（M 8191 / 8192）、奇数 M、与不分块的 M 交替，都与不分块逐位相同 | bench 只取 2 的幂、不比逐位；前两类每实例一个 M | test_token_chunks | 过 |
-| 一卡拿不到 SDMA 队列：两卡都警告、不分块；`AITER_MEGA_TP_SDMA_ENGINES` 指定引擎 | 本机每卡都拿得到队列，前两类不设该变量 | test_sdma_fallback_and_engines | 过 |
+| MTP 层（E128、topk 3 + 1）：M4 仍走混合 decode，M1280 流式块 64 接 prefill Down | 前两类只取 SPEC 形状，ds 主干到不了这两档 | test_mtp_layer | 过 |
+| AR 取快规则：阈值两侧（TP2 / TP4）的种类与结果 | 前两类不钉 CA / RCCL（以后融合会变） | test_all_reduce_rule（2 例） | 过 |
+| `out=`（CA 拷回、RCCL 原地、带 shared）；M = 0 | 前两类不传 `out`、没有空批 | test_out_argument_and_empty_batch | 过 |
+| 同一层跨档反复调用（含 shared 侧流）、`reset`、错误旗标 API | 前两类每个输入只算一次 | test_repeated_calls_and_reset | 过 |
+| TP2 与 TP4 层（共用通信器）在同一进程交替调用 | 前两类按形状分批，不交替 | test_tp2_tp4_interleaved | 过 |
+| `set_weights` 换 routed 与 shared 权重后用新权重 | 前两类不换权重 | test_set_weights | 过 |
+| CUDA graph 捕获与重放：decode、侧流 shared、流式、prefill、CA 与 RCCL | 前两类都是 eager 调用 | test_cuda_graph（7 例） | 过 |
+| 不传 group / cpu_group 时自建 gloo 组，`close` 释放 | 前两类都显式传组 | test_default_communicators | 过 |
+| 非法配置与参数，含 shared 的缺项、dtype、格式、形状、NaN、E8M0 255 | 前两类只走合法输入 | test_rejected_arguments | 过 |
+| 路径判定本身：融合通信、shared 步骤、坏路径 | 判定放行一切时前两类也照过 | test_path_checks（纯 CPU） | 过 |
+| 真实 shared（DeepSeek-V4.1 layers 2 / 37，TP4 切片）：误差 ≤ 模型量化的 1.5 倍 | 前两类用随机逐行权重 | test_real_shared_experts_tp4（2 例） | 过 |
 
-未覆盖 / 跳过：
-- 少于 4 张 gfx942 时多卡用例跳过（常驻池拉不起），只剩 test_path_checks。
-- RCCL：TP2 / TP4 时到不了（> 64 MiB 的输出都融合），只有不融合的 TP 规模（如 TP8）会用，本机测不了。
-- prepare 失败与 w2 ≥ 4 GiB 都用打补丁模拟（真实粘滞错误位会让同伴等满 300 s；真实 4 GiB 权重放不下）。
-- 同一 GateUp 档内的子路径（decode 是否预量化 mid、是否 route_sum、prefill 的排序方式）不固定：换了不报，只查结果。
-- 3 个目标形状以外的形状：没有用例（接口按 H % 512、I % 32 放行，见第 6 节）。
-- 跨次运行逐位相同：不要求（第 1 节），不测；Qwen 流式的 bf16 原子加顺序不定，故其 Down_tp 不比逐位。
-- `DownTP` 的 DRY / TRACE / STAMP（只供计时剖析，DRY 的输出是错的）与调度开关的非默认组合：不进默认路径，没有用例。
-- SDMA：分块批次开始时队列不空闲（置超时位）没有用例（要人为占住队列）；多 stream 并发 forward 是禁止的用法（第 6 节），不测。
+未覆盖 / 跳过（一行一条，写原因）：
+- 少于 4 张 gfx942 时多卡用例跳过（常驻池拉不起），只剩 test_path_checks；没有真实权重时 test_real_shared_experts_tp4 跳过。
+- 单卡文件全量 230 过、3 跳过：本机没有 FP4PTPC 与 mtp.0 的权重数据。
+- 错误旗标置位后的报错：本版没有 kernel 置位，触发不了；只测旗标 API 与 `reset` 清零。
+- TP8 与 3 个目标形状以外的形状：没有用例（接口按 H % 512、I % 32 放行）。
+- 跨次运行逐位相同：不要求（第 1 节），不测；多 stream 并发 forward 不测。
 ## 6. 风险与待定
-- 2 个 CA case（tp4 M64 / M128）慢于对照 2 1.3–1.4%（kernel 序列与 AR 相同，单次比值 0.99–1.03）；Down_tp 余税是切列块（端到端 3–6%）→ 持久化 C WG 待定。
-- SDMA 队列每卡一份、一次一个写者：分块的 forward 不能跨 stream 并发；依赖 /dev/kfd 用户态队列，拿不到时警告并不分块 → 多 stream 部署设 `AITER_MEGA_MOE_TP_CHUNK=0`。
-- 超时后该次输出作废、跨卡状态不一致：所有卡 `check_errors` 后要集合 `reset()`（prepare 自动重试一次）→ 服务侧按此约定接入。
-- 别的形状没有用例：接口按 H % 512、I % 32 放行，分档、门槛与 Down_tp 参数只为这 3 个形状实测 → 用新形状前先补用例与 bench case。
-- 本机 GPU 常有外部租户：有租户时耗时涨 2–3 倍、同次比值抖动 ±10% → 比较前先看 rocm-smi 记录，只信同卡交替运行的比值。
+- Qwen 大 M 慢于 M7（M7 把通信融进 Down 与末个 kernel）→ M1 起把 decode_tp / tp_reduce / Down_tp / SDMA 分块移植到本 kernel（带 shared）。
+- DP4+TP4（`comm_mode="ag_rs"`）未实现、构造时报错 → 下一步在本层加入口 AG + 每卡单卡入口 + 出口 RS，与 AR 模式一起冻结基线。
+- AR 阈值只在本机（MI308X × 4、当前 ROCm / RCCL）冷测 → 换机器或版本时按 test_all_reduce_rule 的尺寸复测。
+- bench 的 M7 对照与移植后的 SDMA 各占一份用户态 SDMA 队列，同一引擎能否共存未验证 → 移植 SDMA 时先测。
+- 本机 GPU 常有外部租户：受干扰时单个 case 可慢数倍 → 比较只信同次运行、逐轮交替的比值，离群值复测。
 ## 7. 进一步阅读
-- 代码入口：[mega_moe_tp_gfx942.py](../../mega_moe_tp_gfx942.py)（类、分派、工作区与错误 API）、[moe_a8w4.py](../../moe_a8w4.py)（权重转换与分档）；设计 [kernels.md](kernels.md)。
-- kernel：计算 [moe_a8w4/](../moe_a8w4/)（分块 [chunks.py](../moe_a8w4/chunks.py)）；跨卡 [tp_reduce.py](tp_reduce.py)、[decode_tp.py](decode_tp.py)、[down_tp.py](down_tp.py)、[sdma.py](sdma.py)（docstring 含规则与不变量）。
+- 代码入口：[mega_moe_tp_gfx942.py](../../mega_moe_tp_gfx942.py)（类、AR 规则、接口约定与报错清单在 docstring）。
+- 单卡入口：[moe_a8w4.py](../../moe_a8w4.py)（`prepare_moe_a8w4_ptpc_weight` / `flydsl_moe_a8w4_ptpc` 的 docstring 是接口契约）。
+- kernel 设计：[kernels.md](kernels.md)；计算 kernel 见 [gfx9_fp8/kernels.md](../moe_gemm_2stage/gfx9_fp8/kernels.md)。
 - 里程碑（每个提交写了改了什么、为什么）：本分支提交历史。
 
 <!-- mf:roadmap -->
-- M0 ✅ 已推送 · 功能 · 功能版（框架 B）：pyhip 2stage A8W4 移植到 aiter（k… · [提交](https://github.com/luocheng25/aiter/commit/e19c1fc3a6675ba05ee9035ca31a1ff660d930a5)
-- M1 ✅ 已推送 · 性能 · 融合通信第一版：M≥48 把 RS+AG 并进最后一个 kernel（L1：部… · 1.042× 对 M1a（预期 1.046×） · [提交](https://github.com/luocheng25/aiter/commit/1f57f98264a89c5f4045515f23e54cfc1fa6f94c)
-- M1a ✅ 已推送 · 维护 · 用例：kernel 路径断言放开通信段（为 M1 融合通信让路） · [提交](https://github.com/luocheng25/aiter/commit/56a62a52572c48d2330d635bb8075fabc4e25a10)
-- M2 ✖ 放弃 · 性能 · C 架构持久 kernel（C-EP）：每卡一次持久 launch，GateU… · 预期 1.03×
-- M3 ✅ 已推送 · 性能 · 通信藏进 Down（P1）：大 M 的 Down 按输出列块为主序，同一 ke… · 1.029× 对 M1（预期 1.05×） · [提交](https://github.com/luocheng25/aiter/commit/ae1bdfcef128fcba427f3c774d6d7daaa60a3d2e)
-- M4 ✅ 已推送 · 维护 · tp2 大 M token 两块流水 + SDMA one-shot：tp2 … · 1.004× 对 M3（预期 1.004×） · [提交](https://github.com/luocheng25/aiter/commit/448abae7712b407ab5f5726e3f6b7aa805a8511c)
-- M5 ✖ 放弃 · 性能 · GateUp 窗口（P2）：路由按 (expert, token) 排序、按轮… · 预期 1.05×
-- M6 ✅ 已推送 · 维护 · Down 计算税：DownTP 计算 WG 的调度修正按形状默认（序幕提前发权… · 1.011× 对 M4（预期 1.008×） · [提交](https://github.com/luocheng25/aiter/commit/945bcb1e29f0ed6da725cb163b110fafa773e4de)
-- M7 ✅ 本提交 · 维护 · 格式化：本任务新增 / 改动的 Python 文件过 aiter CI 的 b… · 0.999× 对 M6（预期 1×）
+- M0 ✅ 本提交 · 功能 · 新基线（功能版）：在 M7 上带进 moe-a8w4-shared-M6，只留…
+- M0b ⏳ 承诺 · 功能 · DP 模式功能版（冻结前）：MegaMoeTPGfx942 实现 comm_m…
 
-下一步（本提交的承诺）：写报告
+下一步（本提交的承诺）：M0b DP 模式功能版（冻结前）：MegaMoeTPGfx942 实现 comm_mode="ag_rs"（x_local / out 为本卡 token，各卡 M_r 相同，padding 路由 −1）= 入口 AG（bf16）+ 每卡 flydsl_moe_a8w4_ptpc 算全部 4·M_r token + 出口 RS（RCCL / aiter 取快）；bench 加 15 个 ds_dp4_m<M_r> case（M_r 1…8192 与 12）与 a8w4_shared_agrs 对照，用例分区；之后一次冻结 AR 51 + DP 15 例
 <!-- /mf:roadmap -->

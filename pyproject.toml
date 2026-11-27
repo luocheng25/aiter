@@ -93,7 +93,7 @@ filterwarnings = [
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
 ]
 markers = [
-    "basic: basic functional tests, one per dispatch tier (run first after every change; pytest -m basic)",
+    "basic: short main-path cases of an op test, run first after every change (pytest -m basic)",
 ]
 
 [tool.black]

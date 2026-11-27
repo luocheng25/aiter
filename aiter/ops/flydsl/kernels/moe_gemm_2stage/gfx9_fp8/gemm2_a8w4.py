@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """A8W4 Down prefill kernel: the default prefill Down kernel of ``gemm2.py`` with MXFP4 weights.
 
 Each workgroup keeps its BM x I FP8 activation tile (gathered by sorted id) in registers (staged through
 LDS in one pass, or in two for I > 512 when the tile exceeds 32 KiB, so that two workgroups fit per CU) and
 walks the hidden dimension in 64-row blocks; each wave reads its 16 weight rows in the
-``common`` layout, decodes them to FP8, runs MFMA 16x16x32 FP8 and scales by the
+``common_a8w4`` layout, decodes them to FP8, runs MFMA 16x16x32 FP8 and scales by the
 channel factor, the activation scale and the routing weight. Rows are written by sorted
 position as BF16 for ``sorted_sum``; each workgroup also stores the sorted row of every valid
 route of its block into ``loc`` [M, TOPK] (the sort's own inverse output costs more). From
@@ -14,12 +14,6 @@ route of its block into ``loc`` [M, TOPK] (the sort's own inverse output costs m
 (``gemm2_8x1``): measured 1–2.5% faster there, 1–3% slower at ``K`` = 192. With ``NSPLIT`` > 1 the
 hidden dimension is split over ``NSPLIT`` workgroups per sorted block (grid x; each gathers the
 block's activations again): few sorted blocks then still fill the machine in several rounds.
-
-``TP`` (a ``mega_moe_tp_gfx942.down_tp.DownTP``): the streamed Down of ``MegaMoeTPGfx942`` -- a 1-D grid that
-computes the ``NSPLIT`` column blocks one after the other (part-major) and runs the cross-rank sum of the finished
-blocks in workgroups of the same launch inserted between the compute workgroups (``DownTP.segments``, ``down_tp``
-docstring); route and ``loc`` stores take its cache policy, and its ``PRO`` / ``SB`` / ``LAS`` reorder the loads,
-stores and compute of a workgroup's block loop (the same results; ``DownTP`` docstring).
 """
 
 import flydsl.compiler as flyc
@@ -30,9 +24,9 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..moe_gemm_2stage.gfx9_fp8 import common as fxh
-from . import common as a8w4
-from .quant import _buffer_rsrc, _store
+from . import common as fxh
+from . import common_a8w4 as a8w4
+from .quant_a8w4 import _buffer_rsrc, _store
 
 # Larger K stages the activation tile in two passes when it exceeds 32 KiB (see compile_a8w4_gemm2).
 A_TWO_PASS_MIN_K = 512
@@ -46,28 +40,28 @@ def compile_a8w4_gemm2(
     BLOCK_TILE_SIZE_M=64,
     E=None,
     NSPLIT=1,
+    TWO_PASS=True,
     XCD_CHUNK=0,
-    TP=None,
-    CHUNKED=False,
+    LOC_TOPK=None,
 ):
     """Build the A8W4 Down launcher.
 
     ``N`` = hidden (``N % 256 == 0``), ``K`` = I (``K % 64 == 0``; pad I in the weights);
     ``BLOCK_TILE_SIZE_M * K`` must be a multiple of 4096 and at most 64 KiB.
-    Launch arguments: x FP8 [M, TOPK, K], w and w_delta (``common`` layout, uint8),
+    Launch arguments: x FP8 [M, TOPK, K], w and w_delta (``common_a8w4`` layout, uint8),
     out BF16 [task_num * BLOCK_TILE_SIZE_M, N] by sorted row, sorted_ids, sorted_weights,
     sorted_expert_ids, num_valid_ids, w_scale f32 [E, N], x_scale f32 [M, TOPK], loc int32 [M, TOPK]
     (receives the sorted row of each valid route; entries of routes the sort dropped keep their
-    value), then M, task_num, stream.
-    ``XCD_CHUNK`` > 0: a 1-D grid ordered as in ``gemm1`` (chunks of ``XCD_CHUNK`` consecutive sorted blocks,
+    value), then M, task_num, stream. ``TWO_PASS=False`` keeps the one-pass activation staging for any K.
+    ``XCD_CHUNK`` > 0: a 1-D grid ordered as in ``a8w4_gemm1`` (chunks of ``XCD_CHUNK`` consecutive sorted blocks,
     all their hidden-dimension parts, dealt to the XCDs in turn, so blocks of one expert share its weights in L2).
-    ``TP``: the streamed Down (module docstring); the launcher then takes ``out``, ``ctr``, ``tab``, ``epoch``,
-    ``err``, M, rank, tpq, limit, task_num, stream after ``loc`` (``down_tp.compile_down_tp``).
-    ``CHUNKED``: ``num_valid_ids`` is a token chunk's descriptor row (``chunks``) and the sorted-block positions are
-    those of its block list (``common.chunk_block``), task_num its bound (``chunks.chunk_bound``); with ``TP`` its
-    roles take the chunk's tokens (``TPArgs.t_lo`` / ``t_hi`` / ``chunk``).
+    ``LOC_TOPK`` (default ``TOPK``): the columns of ``loc``, [M, LOC_TOPK] (a fused shared expert's column after the
+    routed ones, which this kernel leaves alone).
+    Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     BM = BLOCK_TILE_SIZE_M
+    LOC_TOPK = TOPK if LOC_TOPK is None else LOC_TOPK
+    assert LOC_TOPK >= TOPK
     assert (N // 64) % (
         2 * NSPLIT
     ) == 0, f"Down N={N} must split into {NSPLIT} parts of an even number of 64 rows"
@@ -82,7 +76,7 @@ def compile_a8w4_gemm2(
     # The BM x K activation tile goes through LDS in one pass, or for K > A_TWO_PASS_MIN_K with BM * K above 32 KiB in
     # two passes of whole 64-column blocks (K = 576: 5 + 4 blocks, 20 KiB of LDS instead of 36 KiB, two workgroups per
     # CU instead of one); each pass's fragments are read before the next pass overwrites the LDS.
-    one_pass = K <= A_TWO_PASS_MIN_K or BM * K <= 32 * 1024
+    one_pass = not TWO_PASS or K <= A_TWO_PASS_MIN_K or BM * K <= 32 * 1024
     A_BLOCKS = [KB] if one_pass else [-(-KB // 2), KB // 2]
     A_COLS = [64 * b for b in A_BLOCKS]
     A_K0 = [64 * sum(A_BLOCKS[:p]) for p in range(len(A_BLOCKS))]
@@ -102,22 +96,10 @@ def compile_a8w4_gemm2(
         else "#llvm.target_features<[]>"
     )
     CHUNK = XCD_CHUNK * NSPLIT  # workgroups of one XCD chunk
-    EARLY = TP is not None and TP.PRO
-    SB = TP is not None and TP.SB
-    LAS = TP is not None and TP.LAS
 
     def _part(part):
-        """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK and TP)."""
-        return part if XCD_CHUNK > 0 or TP is not None else fx.Int32(fx.gpu.block_idx.x)
-
-    def _chunk_tokens(p_desc):
-        """TP roles of a ``CHUNKED`` launch: the chunk's tokens ``[desc[1], desc[2])`` and its index ``desc[3]``."""
-        desc = fxh.view_as_torch_tensor(p_desc, (4,), fx.Int32)
-        return {
-            "t_lo": fx.Int32(desc[1]),
-            "t_hi": fx.Int32(desc[2]),
-            "chunk": fx.Int32(desc[3]),
-        }
+        """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK)."""
+        return part if XCD_CHUNK > 0 else fx.Int32(fx.gpu.block_idx.x)
 
     def _rne_bits(value):
         bits = value.bitcast(fx.Uint32)
@@ -133,7 +115,7 @@ def compile_a8w4_gemm2(
         ]
         return Vec.from_elements(words, fx.Uint32).bitcast(fx.BFloat16)
 
-    @(flyc.kernel if TP is None else flyc.kernel(name="a8w4_down_prefill_tp"))
+    @flyc.kernel
     def a8w4_down_prefill(
         p_input: fx.Pointer,
         p_weight: fx.Pointer,
@@ -147,30 +129,11 @@ def compile_a8w4_gemm2(
         p_a_scale: fx.Pointer,
         p_loc: fx.Pointer,
         M: fx.Int32,
-        p_out: fx.Pointer,
-        p_ctr: fx.Pointer,
-        p_tab: fx.Pointer,
-        p_epoch: fx.Pointer,
-        p_err: fx.Pointer,
-        rank: fx.Int32,
-        tpq: fx.Int32,
-        limit: fx.Int32,
-        task_pad: fx.Int32,
     ):
-        # p_out .. task_pad: arguments of TP only.
+        # The cache holds IR of one trace, and a launcher can be traced again.
+        flyobj.clear_all()
         tid = fx.gpu.thread_idx.x
-        if const_expr(TP is not None):
-            if const_expr(TP.TRACE):
-                TP.trace(p_ctr, task_pad, 0)
-            role, idx, part = TP.roles(fx.Int32(fx.gpu.block_idx.x), task_pad)
-            if const_expr(XCD_CHUNK > 0):
-                step = idx // a8w4.XCDS
-                e_idx = (
-                    (step // XCD_CHUNK) * a8w4.XCDS + idx % a8w4.XCDS
-                ) * XCD_CHUNK + step % XCD_CHUNK
-            else:
-                e_idx = idx
-        elif const_expr(XCD_CHUNK > 0):
+        if const_expr(XCD_CHUNK > 0):
             wg = fx.Int32(fx.gpu.block_idx.x)
             step = wg // a8w4.XCDS
             work = ((step // CHUNK) * a8w4.XCDS + wg % a8w4.XCDS) * CHUNK + step % CHUNK
@@ -179,19 +142,9 @@ def compile_a8w4_gemm2(
         else:
             e_idx = fx.gpu.block_idx.y
             part = e_idx  # unused: _part reads grid x
-        if const_expr(CHUNKED):
-            pos = e_idx
-            if const_expr(TP is not None):
-                # The reduce / owner workgroups read position 0 (their idx may pass the chunk's bound).
-                pos = (role == 0).select(e_idx, fx.Int32(0))
-            active, e_idx = a8w4.chunk_block(p_num_valid_ids, pos)
-        else:
-            max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
-            active = e_idx * BM < max_valid_id
-        if const_expr(TP is not None):
-            active = (role == 0) & active
+        max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
 
-        if active:
+        if e_idx * BM < max_valid_id:
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), fp8)
             arg_p_output = fxh.view_as_torch_tensor(
                 fxh._as_ptr(p_output, fx.BFloat16) + fx.Int64(e_idx) * (BM * N), (BM, N)
@@ -259,13 +212,14 @@ def compile_a8w4_gemm2(
                     fx.copy(cp_atom, atom_A, dst)
                 fx.gpu.barrier()
 
-            if const_expr(not EARLY):
-                gather_A(ldsA0, 0)
+            gather_A(ldsA0, 0)
 
             nBN = N // BLOCK_N // NSPLIT
             # First 64-row block of this workgroup's part of the hidden dimension.
             n0 = _part(part) * nBN if NSPLIT > 1 else 0
-            # Stride-0 N mode spans one MMA N tile (16): FlyDSL >= 0.5.3 rejects narrower C views.
+            # The second mode (tokens, the MMA's N) broadcasts the per-channel scale with stride 0 and spans
+            # one whole N tile (16): FlyDSL >= 0.5.1 rejects a fragment view whose extent is not a multiple
+            # of the tile.
             arg_w_scale = fx.flat_divide(
                 fx.make_view(
                     fxh._as_ptr(p_w_scale) + expert_id * N,
@@ -282,8 +236,83 @@ def compile_a8w4_gemm2(
                 num_records_bytes=fx.Int64(M) * TOPK * 4,
             )
 
-            def weight_state(ops, mm):
-                """Registers of two weight blocks and their loader (slot = block parity)."""
+            def body(bm, ops):
+                # Computes the first bm sorted rows; ops is a fresh builder cache per variant.
+                ldsA = fx.flat_divide(ldsA0, (bm, BLOCK_K))
+                layoutC = fx.make_composed_layout(
+                    fx.static(swz), fx.make_ordered_layout((bm, BLOCK_N, 2), (1, 0, 2))
+                )
+                layoutCt = fx.make_composed_layout(
+                    fx.static(swz), fx.make_ordered_layout((BLOCK_N, bm, 2), (0, 1, 2))
+                )
+                ldsC = lds.C.peek().view(layoutC)
+                ldsCt = lds.C.peek().view(layoutCt)
+                mm = ops.create_thr_mma(fp8, (4, 1, 1))
+
+                c_fake_tensor = fx.make_view(
+                    fx.get_iter(arg_p_input),
+                    fx.make_ordered_layout((BLOCK_N, bm), (0, 1)),
+                )
+                fragC = [
+                    mm.make_fragment_C(c_fake_tensor),
+                    mm.make_fragment_C(c_fake_tensor),
+                ]
+                fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
+
+                frag_act = [
+                    ops.load_tiled_mma_fragB(
+                        mm, ldsA, [None, None, 0, None], copy_atom_bits=128
+                    )
+                ]
+                for p in range_constexpr(1, len(A_COLS)):
+                    fx.gpu.barrier()  # Every wave has read the previous part before it is overwritten.
+                    part = lds_A(A_COLS[p])
+                    gather_A(part, A_K0[p])
+                    frag_act.append(
+                        ops.load_tiled_mma_fragB(
+                            mm,
+                            fx.flat_divide(part, (bm, BLOCK_K)),
+                            [None, None, 0, None],
+                            copy_atom_bits=128,
+                        )
+                    )
+                fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
+
+                sorted_weights = fx.make_view(
+                    fx.get_iter(arg_p_sorted_weights),
+                    fx.make_layout((BLOCK_N, bm), (0, 1)),
+                )
+                frag_sorted_weight = ops.load_tiled_mma_fragC(
+                    mm, sorted_weights, copy_atom_bits=32
+                )
+                sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
+                coord_tensor = fx.make_view(
+                    fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
+                )
+                frag_coord = ops.load_tiled_mma_fragC(
+                    mm, coord_tensor, copy_atom_bits=32
+                )
+                frag_row_scale = mm.make_fragment_C(coord_tensor)
+                frag_row_scale_r = ops.get_tiled_mma_retile(
+                    mm, frag_row_scale, "C", copy_atom=sc_atom
+                )
+                for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
+                    sorted_id = coord[0].bitcast(fx.Uint32)
+                    atom = fxh.atom_tensor(
+                        arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
+                    )
+                    fx.copy(sc_atom, atom, dst)
+                for frag_pt, frag_sw in fxh.all_elements(
+                    frag_row_scale, frag_sorted_weight
+                ):
+                    frag_pt.store(frag_pt.load() * frag_sw.load())
+
+                # Decoded FP8 weight operand of one 64-row block: (8, 1, 2, KB).
+                w_fake = fx.make_view(
+                    fx.get_iter(arg_p_input),
+                    fx.make_layout((BLOCK_N, BLOCK_K, KB), (K, 1, BLOCK_K)),
+                )
+                frag_w = mm.make_fragment_A(w_fake)
                 w_voff, d_voff = a8w4.lane_offsets(tid, K)
                 w_regs = [
                     [
@@ -331,112 +360,6 @@ def compile_a8w4_gemm2(
                             frag_pc_scales[slot],
                         )
 
-                return w_regs, d_regs, frag_pc_scales, load_block
-
-            if const_expr(EARLY):
-                # The weights of the first two blocks and the sorted row of loc load while the activations are
-                # gathered (they depend on the expert and the sorted ids only).
-                mm_early = flyobj.create_thr_mma(fp8, (4, 1, 1))
-                early_w = weight_state(flyobj, mm_early)
-                early_w[3](0, 0)
-                early_w[3](1, 1)
-                loc_sid = arg_p_sorted_ids[fx.Int32(tid) % BM]
-                gather_A(ldsA0, 0)
-
-            def body(bm, ops):
-                # Computes the first bm sorted rows; ops is a fresh builder cache per variant.
-                ldsA = fx.flat_divide(ldsA0, (bm, BLOCK_K))
-                layoutC = fx.make_composed_layout(
-                    fx.static(swz), fx.make_ordered_layout((bm, BLOCK_N, 2), (1, 0, 2))
-                )
-                layoutCt = fx.make_composed_layout(
-                    fx.static(swz), fx.make_ordered_layout((BLOCK_N, bm, 2), (0, 1, 2))
-                )
-                ldsC = lds.C.peek().view(layoutC)
-                ldsCt = lds.C.peek().view(layoutCt)
-                mm = mm_early if EARLY else ops.create_thr_mma(fp8, (4, 1, 1))
-
-                c_fake_tensor = fx.make_view(
-                    fx.get_iter(arg_p_input),
-                    fx.make_ordered_layout((BLOCK_N, bm), (0, 1)),
-                )
-                fragC = [
-                    mm.make_fragment_C(c_fake_tensor),
-                    mm.make_fragment_C(c_fake_tensor),
-                ]
-                fragC_bf16 = fx.make_fragment_like(fragC[0], fx.BFloat16)
-
-                def load_act():
-                    frag_act = [
-                        ops.load_tiled_mma_fragB(
-                            mm, ldsA, [None, None, 0, None], copy_atom_bits=128
-                        )
-                    ]
-                    for p in range_constexpr(1, len(A_COLS)):
-                        fx.gpu.barrier()  # Every wave has read the previous part before it is overwritten.
-                        part = lds_A(A_COLS[p])
-                        gather_A(part, A_K0[p])
-                        frag_act.append(
-                            ops.load_tiled_mma_fragB(
-                                mm,
-                                fx.flat_divide(part, (bm, BLOCK_K)),
-                                [None, None, 0, None],
-                                copy_atom_bits=128,
-                            )
-                        )
-                    fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
-                    return frag_act
-
-                def load_row_scales():
-                    sorted_weights = fx.make_view(
-                        fx.get_iter(arg_p_sorted_weights),
-                        fx.make_layout((BLOCK_N, bm), (0, 1)),
-                    )
-                    frag_sorted_weight = ops.load_tiled_mma_fragC(
-                        mm, sorted_weights, copy_atom_bits=32
-                    )
-                    sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
-                    coord_tensor = fx.make_view(
-                        fx.get_iter(arg_p_sorted_ids),
-                        fx.make_layout((BLOCK_N, bm), (0, 1)),
-                    )
-                    frag_coord = ops.load_tiled_mma_fragC(
-                        mm, coord_tensor, copy_atom_bits=32
-                    )
-                    frag_row_scale = mm.make_fragment_C(coord_tensor)
-                    frag_row_scale_r = ops.get_tiled_mma_retile(
-                        mm, frag_row_scale, "C", copy_atom=sc_atom
-                    )
-                    for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
-                        sorted_id = coord[0].bitcast(fx.Uint32)
-                        atom = fxh.atom_tensor(
-                            arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
-                        )
-                        fx.copy(sc_atom, atom, dst)
-                    for frag_pt, frag_sw in fxh.all_elements(
-                        frag_row_scale, frag_sorted_weight
-                    ):
-                        frag_pt.store(frag_pt.load() * frag_sw.load())
-                    return frag_row_scale
-
-                if const_expr(EARLY):
-                    # The row scales' loads go out before the activation fragments are read from LDS.
-                    frag_row_scale = load_row_scales()
-                    frag_act = load_act()
-                else:
-                    frag_act = load_act()
-                    frag_row_scale = load_row_scales()
-
-                # Decoded FP8 weight operand of one 64-row block: (8, 1, 2, KB).
-                w_fake = fx.make_view(
-                    fx.get_iter(arg_p_input),
-                    fx.make_layout((BLOCK_N, BLOCK_K, KB), (K, 1, BLOCK_K)),
-                )
-                frag_w = mm.make_fragment_A(w_fake)
-                w_regs, d_regs, frag_pc_scales, load_block = (
-                    early_w if EARLY else weight_state(ops, mm)
-                )
-
                 def gemm_compute(slot, fragC):
                     for kb in range_constexpr(KB):
                         lut = a8w4.fp8_lut(
@@ -473,12 +396,7 @@ def compile_a8w4_gemm2(
                     )
 
                 out_tiles = fx.flat_divide(arg_p_output, (bm, BLOCK_N))
-                if const_expr(TP is not None):
-                    cp_atom_out_128b = fx.make_copy_atom(
-                        fx.rocdl.BufferCopy(128, TP.ROUTE_AUX), fx.BFloat16
-                    )
-                else:
-                    cp_atom_out_128b = ops.get_buffer_copy_atom(fx.BFloat16, 128)
+                cp_atom_out_128b = ops.get_buffer_copy_atom(fx.BFloat16, 128)
                 thrv_out = tcopyLDS.partition_D(out_tiles)
                 fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
@@ -488,34 +406,20 @@ def compile_a8w4_gemm2(
                         cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n0 + n]
                     )
 
-                if const_expr(not EARLY):
-                    load_block(0, 0)
+                load_block(0, 0)
                 gemm_compute(0, fragC[0])
-                if const_expr(not EARLY):
-                    load_block(1, 1)
+                load_block(1, 1)
                 postprocess_store2lds(fragC[0], 0)
                 fx.gpu.barrier()
-
-                def half(n, slot):
-                    # LAS: the weight loads of block n + 2 go out before the stores of block n.
-                    if const_expr(LAS):
-                        load_block(n + 2, slot)
-                        postprocess_store2vmem(n, slot)
-                    else:
-                        postprocess_store2vmem(n, slot)
-                        load_block(n + 2, slot)
-
                 for n, state in range(0, nBN - 2, 2, init=[]):
-                    half(n, 0)
+                    postprocess_store2vmem(n, 0)
+                    load_block(n + 2, 0)
                     gemm_compute(1, fragC[1])
                     postprocess_store2lds(fragC[1], 1)
                     fx.gpu.barrier()
-                    if const_expr(SB):
-                        # Keeps the next half's compute below the barrier: hoisted next to its weight loads, the
-                        # wait for them (vmcnt counts loads and stores in issue order) also waited for the stores.
-                        rocdl.sched_barrier(0)
 
-                    half(n + 1, 1)
+                    postprocess_store2vmem(n + 1, 1)
+                    load_block(n + 3, 1)
                     gemm_compute(0, fragC[0])
                     postprocess_store2lds(fragC[0], 0)
                     fx.gpu.barrier()
@@ -527,7 +431,9 @@ def compile_a8w4_gemm2(
                 postprocess_store2vmem(nBN - 1, 1)
 
             if const_expr(BM % 64 == 0):
-                # Valid rows lead a sorted block: when row BM/2 is padding, BM/2 rows suffice.
+                # Valid rows lead a sorted block: when row BM/2 is padding, BM/2 rows suffice. Raw
+                # readfirstlane: FlyDSL 0.5.3 has no typed wave-uniform broadcast (fx.gpu offers only the
+                # shuffle family, whose result is a VGPR); a scalar condition keeps the branch uniform.
                 half_id = fx.Int32(
                     rocdl.readfirstlane(T.i32, arg_p_sorted_ids[BM // 2])
                 )
@@ -541,40 +447,17 @@ def compile_a8w4_gemm2(
             # Sorted row of each valid route (padding rows store nothing). Stored after the main loop:
             # at the start the store made the whole kernel ~30% slower (Qwen TP2).
             row = fx.Int32(tid) % BM
-            sid = (loc_sid if EARLY else arg_p_sorted_ids[row]).bitcast(fx.Uint32)
+            sid = arg_p_sorted_ids[row].bitcast(fx.Uint32)
             token = fx.Int32(sid & fx.Uint32(0xFFFFFF))
-            route = (token * TOPK + fx.Int32(sid >> 24)) * 4
+            route = (token * LOC_TOPK + fx.Int32(sid >> 24)) * 4
             past = fx.Int32(0x7FFF0000)
             first = fx.Int32(tid) < BM
             if const_expr(NSPLIT > 1):
                 first = (_part(part) == 0).select(fx.Int32(tid), fx.Int32(BM)) < BM
             _store(
-                _buffer_rsrc(p_loc, fx.Int64(M) * (TOPK * 4)),
+                _buffer_rsrc(p_loc, fx.Int64(M) * (LOC_TOPK * 4)),
                 fx.Int32(e_idx) * BM + row,
                 first.select((token < M).select(route, past), past),
-                0 if TP is None else TP.ROUTE_AUX,
-            )
-
-        if const_expr(TP is not None):
-            TP.finish(
-                role,
-                idx,
-                part,
-                TP.args(
-                    p_loc=p_loc,
-                    p_routes=p_output,
-                    p_out=p_out,
-                    p_ctr=p_ctr,
-                    p_tab=p_tab,
-                    p_epoch=p_epoch,
-                    p_err=p_err,
-                    M=M,
-                    rank=rank,
-                    tpq=tpq,
-                    limit=limit,
-                    task_pad=task_pad,
-                    **(_chunk_tokens(p_num_valid_ids) if CHUNKED else {}),
-                ),
             )
 
     @flyc.jit
@@ -597,6 +480,8 @@ def compile_a8w4_gemm2(
         CompilationContext.get_current()
         if const_expr(E is not None) and M * TOPK <= E:
             task_num = M * TOPK
+        # FlyDSL 0.5.3 has no typed per-kernel target-feature option: the raw #llvm.target_features attribute
+        # (plus the launcher's compile hint below) turns packed FP32 VALU ops off for this kernel only.
         features = ir.Attribute.parse(features_text)
         if const_expr(XCD_CHUNK > 0):
             per = a8w4.XCDS * XCD_CHUNK
@@ -616,76 +501,9 @@ def compile_a8w4_gemm2(
             p_a_scale,
             p_loc,
             M,
-            p_loc,
-            p_loc,
-            p_loc,
-            p_loc,
-            p_loc,
-            M,
-            M,
-            M,
-            M,
             value_attrs={"llvm.target_features": features},
         ).launch(grid=grid, block=(256, 1, 1), stream=stream)
 
-    @flyc.jit
-    def launch_tp(
-        p_input: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_output: fx.Pointer,
-        p_sorted_ids: fx.Pointer,
-        p_sorted_weights: fx.Pointer,
-        p_sorted_expert_ids: fx.Pointer,
-        p_num_valid_ids: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_a_scale: fx.Pointer,
-        p_loc: fx.Pointer,
-        p_out: fx.Pointer,
-        p_ctr: fx.Pointer,
-        p_tab: fx.Pointer,
-        p_epoch: fx.Pointer,
-        p_err: fx.Pointer,
-        M: fx.Int32,
-        rank: fx.Int32,
-        tpq: fx.Int32,
-        limit: fx.Int32,
-        task_num: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        features = ir.Attribute.parse(features_text)
-        # Compute workgroups per stage: whole XCD chunks (the stage bases stay multiples of the XCD count).
-        per = a8w4.XCDS * max(XCD_CHUNK, 1)
-        task_pad = (task_num + (per - 1)) // per * per
-        a8w4_down_prefill(
-            p_input,
-            p_weight,
-            p_w_delta,
-            p_output,
-            p_sorted_ids,
-            p_sorted_weights,
-            p_sorted_expert_ids,
-            p_num_valid_ids,
-            p_w_scale,
-            p_a_scale,
-            p_loc,
-            M,
-            p_out,
-            p_ctr,
-            p_tab,
-            p_epoch,
-            p_err,
-            rank,
-            tpq,
-            limit,
-            task_pad,
-            value_attrs={"llvm.target_features": features},
-        ).launch(grid=(TP.grid(task_pad), 1, 1), block=(256, 1, 1), stream=stream)
-
     if no_packed:
         launch.compile_hints["target_features"] = "-packed-fp32-ops"
-        launch_tp.compile_hints["target_features"] = "-packed-fp32-ops"
-    if TP is not None and TP.WPE:
-        launch_tp.compile_hints["waves_per_eu"] = TP.WPE
-    return launch if TP is None else launch_tp
+    return launch

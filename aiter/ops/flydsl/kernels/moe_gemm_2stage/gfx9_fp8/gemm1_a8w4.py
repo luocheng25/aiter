@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """A8W4 Gate/Up prefill kernel: the prefill_1x4 kernel of ``gemm1.py`` with MXFP4 weights.
 
 FP8 activations are gathered by sorted id into double-buffered LDS exactly as in
-``gemm1.py``; the weight operand is read from the ``common`` layout 16 bytes per lane (two
+``gemm1.py``; the weight operand is read from the ``common_a8w4`` layout 16 bytes per lane (two
 adjacent rows of a 16-row block per load), decoded to FP8 in registers and fed to MFMA 16x16x32
 FP8. The per-channel factor and the per-token activation scale are applied in the epilogue (then the
 SwiGLU limit, if any), then SiLU(gate) * up is written as float32 by (token, slot): the intermediate is
@@ -57,9 +57,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from ..moe_gemm_2stage.gfx9_fp8 import common as fxh
-from ..moe_gemm_2stage.gfx9_fp8.common import make_gemm_helpers
-from . import common as a8w4
+from . import common as fxh
+from . import common_a8w4 as a8w4
+from .common import make_gemm_helpers
 
 
 def compile_a8w4_gemm1(
@@ -73,21 +73,19 @@ def compile_a8w4_gemm1(
     E=None,
     SWIGLU_LIMIT=0.0,
     XCD_CHUNK=0,
-    CHUNKED=False,
 ):
     """Build the A8W4 Gate/Up launcher.
 
     ``N`` = 2 * I (weight rows ``[0, I)`` gate, ``[I, 2I)`` up; ``I % (BLOCK_TILE_SIZE_N/2) == 0``),
     ``K`` = hidden (``K % (2 * TILE_K) == 0``). ``BLOCK_TILE_SIZE_M`` must equal the sorting block.
-    Launch arguments: x FP8 [M, K], w and w_delta (``common`` layout, uint8), out f32
+    Launch arguments: x FP8 [M, K], w and w_delta (``common_a8w4`` layout, uint8), out f32
     [M, TOPK, I] (``M * TOPK * I * 4 < 2**31``), sorted_ids, sorted_weights (unused),
     sorted_expert_ids, num_valid_ids, w_scale f32 [E, N], x_scale f32 [M], then M, task_num, stream.
-    ``SWIGLU_LIMIT`` > 0 clamps the dequantized gate and up before SiLU (``common.swiglu_clamp``).
+    ``SWIGLU_LIMIT`` > 0 clamps the dequantized gate and up before SiLU (``common_a8w4.swiglu_clamp``).
     ``XCD_CHUNK`` > 0: a 1-D grid whose workgroup ``L`` (dispatched to XCD ``L % XCDS``) takes the next
     (sorted block, N tile) of chunks of ``XCD_CHUNK`` consecutive blocks dealt to the XCDs in turn, so the N tiles
     of a block (same activation rows) and neighbouring blocks of an expert (same weights) share an L2.
-    ``CHUNKED``: ``num_valid_ids`` is a token chunk's descriptor row (``chunks``) and the (sorted block, N tile)
-    positions are those of its block list (``common.chunk_block``), task_num its bound (``chunks.chunk_bound``).
+    Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     BM, BN = BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N
     assert BN in (128, 256), "BLOCK_TILE_SIZE_N must be 128 or 256"
@@ -132,10 +130,10 @@ def compile_a8w4_gemm1(
     ):
         # Lane holds channels _chan_base + v of token lane % 16 for each (m, n) MMA tile.
         log2_exp1 = -1.4426950408889634
-        INTER = N // 2
+        I = N // 2
         lane = tid % 64
         wave = tid // 64
-        oob = M * (TOPK * INTER * 4)
+        oob = M * (TOPK * I * 4)
         out = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.recast_iter(fx.Float32, fxh._as_ptr(p_output)), fx.make_layout(1, 1)
@@ -150,12 +148,15 @@ def compile_a8w4_gemm1(
             sorted_id = asc_idx[0, n]
             token = sorted_id & 0xFFFFFF
             slot = (sorted_id >> 24) & 0xFF
-            row_bytes = (token * TOPK + slot) * (INTER * 4)
+            row_bytes = (token * TOPK + slot) * (I * 4)
             for m in range_constexpr(m_reps):
                 gate = gate_frag[None, m, n].load()
                 up = up_frag[None, m, n].load()
                 acc = []
                 for j in range_constexpr(gate.numel):
+                    # Bare v_exp_f32 / v_rcp_f32 (raw rocdl): fx.math.exp2 and the f32 division lower
+                    # to the denormal-scaled exp and the correctly rounded divide, several VALU ops more
+                    # per element; the SiLU tolerance is met with the approximations.
                     tmp = rocdl.exp2(T.f32, _raw(gate[j] * log2_exp1))
                     acc.append((gate[j] * rocdl.rcp(T.f32, 1.0 + tmp)) * up[j])
                 offset = row_bytes + (channel + m * 64) * 4
@@ -183,6 +184,8 @@ def compile_a8w4_gemm1(
                 for k in range_constexpr(4):
                     keep = is_up.select(vals[4 + k], vals[k])
                     send = is_up.select(vals[k], vals[4 + k])
+                    # Raw ds_bpermute with the fixed partner byte address: fx.gpu.shuffle_idx scales the
+                    # lane and range-checks it on every call.
                     got = rocdl.ds_bpermute(
                         T.i32, _raw(partner), _raw(send.bitcast(fx.Int32))
                     )
@@ -653,12 +656,8 @@ def compile_a8w4_gemm1(
         num_valid_buf = fx.make_view(
             fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid_ids)), fx.make_layout(1, 1)
         )
-        if const_expr(CHUNKED):
-            live, e_idx = a8w4.chunk_block(p_num_valid_ids, e_idx)
-        else:
-            max_valid_id = num_valid_buf[0]
-            live = e_idx * BM < max_valid_id
-        if live:
+        max_valid_id = num_valid_buf[0]
+        if e_idx * BM < max_valid_id:
             lds = fx.SharedAllocator().allocate(SharedStorage)
             lds.sorted_lds = lds.sorted_lds.peek()
             lds.gemm = lds.gemm.peek()
@@ -726,6 +725,8 @@ def compile_a8w4_gemm1(
             ids = fx.make_view(lds.sorted_lds.ptr, fx.make_layout(BM, 1))
 
             def padding(row):
+                # Raw readfirstlane: FlyDSL 0.5.3 has no typed wave-uniform broadcast (fx.gpu offers only
+                # the shuffle family, whose result is a VGPR); a scalar condition keeps the branch uniform.
                 return (fx.Int32(rocdl.readfirstlane(T.i32, ids[row])) & 0xFFFFFF) >= M
 
             # Valid rows lead a sorted block: compute only the rows up to the first padding row.
