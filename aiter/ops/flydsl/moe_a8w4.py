@@ -1109,13 +1109,22 @@ def _fused_moe_decode_dd(
 
 
 def _fused_moe_decode_wide_dd(
-    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
+    hidden_states,
+    weight,
+    topk_weight,
+    topk_ids,
+    output,
+    limit,
+    shared=None,
+    *,
+    hooks=None,
 ):
     """Decode of the DECODE_WIDE_HIDDEN sizes from DECODE_WIDE_DEDUP_MIN_M tokens: one kernel quantizes x and writes
     the plan, Gate/Up is deduplicated by expert (``decode_dedup_a8w4``), the row kernel quantizes the intermediate and
     the slot-pair Down sums each token's routes (padded I not a multiple of 128: no dedup Down). A folded shared
     expert (``shared``, ``_SharedFold``) starts on the plan kernel's FP8 input, writes ``output`` and the Down adds the
-    routes onto it; the kernels read the routing tensors with its column (the last) as they are.
+    routes onto it; the kernels read the routing tensors with its column (the last) as they are. ``hooks``
+    (``_TPHooks``): ``decode_down`` replaces the Down.
     """
     M, H = hidden_states.shape
     topk = topk_ids.shape[1] - (shared is not None)
@@ -1168,6 +1177,18 @@ def _fused_moe_decode_wide_dd(
     mq, ms = _quantize_decode(mid, M * topk, I, False)
     if shared is not None:
         shared.join()
+    if hooks is not None and hooks.decode_down is not None:
+        hooks.decode_down(
+            True,
+            mq,
+            ms,
+            topk_ids,
+            topk_weight,
+            weight,
+            output,
+            shared=None if shared is None else "fold",
+        )
+        return output
     _launch(
         "a8w4_down_decode_pq" + ("" if shared is None else "_shared"),
         _down_pq_kernel(H, I, topk, _decode_waves(topk, True), device.index, **on),
@@ -1193,7 +1214,15 @@ def _slot_pair_offsets_fit(weight):
 
 
 def _fused_moe_decode(
-    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
+    hidden_states,
+    weight,
+    topk_weight,
+    topk_ids,
+    output,
+    limit,
+    shared=None,
+    *,
+    hooks=None,
 ):
     """The decode path: Gate/Up per route into the f32 intermediate, Down per token summing its routes into
     ``output`` (or the expert-deduplicated variants); ``topk_ids`` / ``topk_weight`` are contiguous int32 /
@@ -1201,7 +1230,8 @@ def _fused_moe_decode(
     its column in them, the last, which the decode kernels skip; its chain takes the FP8 input of the routed Gate/Up
     (from the plan kernel of the deduplicated Gate/Up, else from the row kernel, the per-route Gate/Up then
     pre-quantized at any M) or, with SHARED_FOLD_DECODE_SIDE_QUANT, quantizes x itself first, writes ``output`` and the
-    slot-pair Down adds the routes onto it."""
+    slot-pair Down adds the routes onto it. ``hooks`` (``_TPHooks``): ``decode_down`` replaces the Down of the
+    per-route kernels (not the expert-deduplicated Down)."""
     M, H = hidden_states.shape
     topk = topk_ids.shape[1] - (shared is not None)
     I = weight.inter_padded
@@ -1219,7 +1249,14 @@ def _fused_moe_decode(
     )
     if wide:
         return _fused_moe_decode_wide_dd(
-            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
+            hidden_states,
+            weight,
+            topk_weight,
+            topk_ids,
+            output,
+            limit,
+            shared,
+            hooks=hooks,
         )
     # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once (a folded shared
     # expert's chain takes those rows, unless it quantizes x itself).
@@ -1282,6 +1319,18 @@ def _fused_moe_decode(
         mq, ms = mid, topk_weight
     if shared is not None:
         shared.join()
+    if hooks is not None and hooks.decode_down is not None:
+        hooks.decode_down(
+            down_pq,
+            mq,
+            ms,
+            topk_ids,
+            topk_weight,
+            weight,
+            output,
+            shared=None if shared is None else "fold",
+        )
+        return output
     _launch(
         "a8w4_down_decode"
         + ("_pq" if down_pq else "")
@@ -1301,12 +1350,13 @@ def _fused_moe_decode(
 
 
 def _fused_moe_decode_mixed(
-    hidden_states, weight, topk_weight, topk_ids, output, limit
+    hidden_states, weight, topk_weight, topk_ids, output, limit, hooks=None
 ):
     """The mixed decode path of a call with a shared expert (``_mixed_decode``): ``topk_ids`` / ``topk_weight`` with
     the shared expert's column last, its FP8 weights read in place (the (16, 16) shuffle of ``shared_w1`` /
     ``shared_w2`` is the decode kernels' 16-row x 64-K block layout), Gate/Up into the f32 intermediate, Down per token
-    summing every column into ``output``."""
+    summing every column into ``output``. ``hooks`` (``_TPHooks``): ``decode_down`` replaces the Down.
+    """
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
     I = weight.inter_padded
@@ -1338,20 +1388,32 @@ def _fused_moe_decode_mixed(
         mid,
         M,
     )
-    _launch(
-        "a8w4_down_decode_mixed",
-        down,
-        mid,
-        topk_ids,
-        topk_weight,
-        weight.w2,
-        weight.w2_delta,
-        weight.w2_scale,
-        weight.shared_w2,
-        weight.shared_w2_scale,
-        output,
-        M,
-    )
+    if hooks is not None and hooks.decode_down is not None:
+        hooks.decode_down(
+            False,
+            mid,
+            topk_weight,
+            topk_ids,
+            topk_weight,
+            weight,
+            output,
+            shared="mixed",
+        )
+    else:
+        _launch(
+            "a8w4_down_decode_mixed",
+            down,
+            mid,
+            topk_ids,
+            topk_weight,
+            weight.w2,
+            weight.w2_delta,
+            weight.w2_scale,
+            weight.shared_w2,
+            weight.shared_w2_scale,
+            output,
+            M,
+        )
     # The shared expert ran inside the two kernels: a marker as the split's steps are.
     last_path.append("shared_mixed")
     return output
@@ -1636,7 +1698,15 @@ def _launch(name, kernel, *args):
 
 
 def _fused_moe_stream(
-    hidden_states, weight, topk_weight, topk_ids, output, limit, shared=None
+    hidden_states,
+    weight,
+    topk_weight,
+    topk_ids,
+    output,
+    limit,
+    shared=None,
+    *,
+    hooks=None,
 ):
     """Streaming path (``stream_a8w4``): the prep sorts the routes into blocks of ``_stream_block_m`` rows,
     quantizes the input and, for the atomic Down, zeroes ``output``; the streaming Gate/Up writes SiLU(gate) * up
@@ -1647,7 +1717,8 @@ def _fused_moe_stream(
     With a folded shared expert (``shared``, ``_SharedFold``) the routing tensors keep its column (the last; the prep
     reads them as they are and drops it), its chain starts on the prep's FP8 input and writes either M more rows of
     the routes buffer, which route_sum adds as one more column of loc_ids, or (atomic Down) the whole output, which the
-    prep then leaves alone and the Down adds the routes onto.
+    prep then leaves alone and the Down adds the routes onto. ``hooks`` (``_TPHooks``): ``stream_down`` /
+    ``prefill_down`` replace the Down and route_sum, ``reduce`` route_sum (after the atomic Down: appended).
     """
     M, H = hidden_states.shape
     cols = topk_ids.shape[1]
@@ -1729,11 +1800,26 @@ def _fused_moe_stream(
         M,
         task_num,
     )
+    hook = None if hooks is None else hooks.stream_down
     if atomic:
         # The prep zeroed output (or the shared expert wrote it): Down adds every route into its token's row with
         # BF16 atomics.
         if shared is not None:
             shared.join()
+        if hook is not None:
+            hook(
+                mq,
+                ms,
+                down_args[:4],
+                loc_ids,
+                None,
+                output,
+                weight,
+                block_m,
+                task_num,
+                topk=topk,
+            )
+            return output
         _launch(
             f"a8w4_down_stream_bm{block_m}",
             _stream_down_kernel(
@@ -1745,10 +1831,29 @@ def _fused_moe_stream(
             output,
             *down_args,
         )
+        if hooks is not None and hooks.reduce is not None:
+            hooks.reduce(output, None, None)
         return output
     if routes is None:
         routes = torch.empty((rows, H), dtype=torch.bfloat16, device=device)
     if _stream_prefill_down(H, I, block_m):
+        if hooks is not None and hooks.prefill_down is not None:
+            if shared is not None:
+                shared.join()
+            hooks.prefill_down(
+                mq,
+                ms,
+                down_args[:4],
+                loc_ids,
+                routes,
+                output,
+                weight,
+                task_num,
+                topk=topk,
+                block_m=block_m,
+                xcd_chunk=_xcd_chunk(DOWN_XCD_CHUNK_H5120, H, M * topk),
+            )
+            return output
         # The prefill Down also stores each route's sorted row into loc_ids, the same values the prep wrote.
         _launch(
             f"a8w4_down_prefill_bm{block_m}",
@@ -1772,6 +1877,22 @@ def _fused_moe_stream(
             task_num,
         )
     else:
+        if hook is not None:
+            if shared is not None:
+                shared.join()
+            hook(
+                mq,
+                ms,
+                down_args[:4],
+                loc_ids,
+                routes,
+                output,
+                weight,
+                block_m,
+                task_num,
+                topk=topk,
+            )
+            return output
         _launch(
             f"a8w4_down_stream_bm{block_m}",
             _stream_down_kernel(
@@ -1785,6 +1906,9 @@ def _fused_moe_stream(
         )
     if shared is not None:
         shared.join()
+    if hooks is not None and hooks.reduce is not None:
+        hooks.reduce(output, loc_ids, routes)
+        return output
     _launch(
         "a8w4_route_sum",
         _stream_sum_kernel(cols, H, device.index),
@@ -1949,6 +2073,85 @@ def flydsl_moe_a8w4_ptpc(
     with its ``swiglu_limit`` normalized as on aiter's other SiLU paths and without tile options: it takes only the
     automatic ``block_size_M``, so pinning the prefill tile (``block_m``) needs this function.
     """
+    return _forward(
+        hidden_states,
+        weight,
+        topk_weight,
+        topk_ids,
+        output,
+        swiglu_limit,
+        (block_m, block_n, tile_k),
+        None,
+    )
+
+
+@dataclass(frozen=True)
+class _TPHooks:
+    """Hooks of a tensor-parallel layer that fuses the cross-rank sum into the last kernels of the decode, streaming
+    and prefill tiers (``mega_moe_tp_gfx942``; ``_flydsl_moe_a8w4_ptpc_tp``). Each one launches its kernels on the
+    current stream through ``_launch`` (recorded in ``last_path``) and leaves the layer's output (this rank's rows
+    summed over the ranks) in ``output``; a hook that is None keeps the single-GPU kernels. On the streaming and
+    prefill tiers a folded shared expert (``_SharedFold``) has been joined before any hook runs: its column is the
+    last of ``loc_ids`` and its rows follow the routed ones in ``routes`` (with the atomic streaming Down: written
+    into ``output``).
+
+    * ``reduce(output, loc_ids, routes)`` replaces the last reduction (``sorted_sum`` / ``a8w4_route_sum``):
+      ``routes`` BF16 [rows, H] by sorted row, ``loc_ids`` int32 [M, columns] the sorted row of each route (-1:
+      none); after the atomic streaming Down (which leaves this rank's sum in ``output``) ``reduce(output, None,
+      None)``.
+    * ``prefill_down(mid, mid_scale, routing, loc_ids, routes, output, weight, grid, *, topk, block_m, xcd_chunk)``
+      replaces the prefill Down (``gemm2_a8w4``; the prefill tier and the streaming tier's ``_stream_prefill_down``)
+      and the last reduction: ``mid`` / ``mid_scale`` FP8 [M * topk, I] / f32 [M * topk], ``routing`` (sorted_ids,
+      sorted_weights, sorted_experts, num_valid) of ``grid`` blocks of ``block_m`` rows, ``loc_ids`` filled by the
+      Down (-1 elsewhere; a folded shared expert's column stored), ``routes`` uninitialized but for a folded shared
+      expert's rows, ``topk`` the routed experts per token, ``xcd_chunk`` the single-GPU Down's ``XCD_CHUNK``.
+    * ``stream_down(mid, mid_scale, routing, loc_ids, routes, output, weight, block_m, task_num, *, topk)``
+      replaces the streaming Down and the last reduction: as ``prefill_down`` with ``task_num`` blocks of
+      ``block_m`` rows, ``loc_ids`` stored; ``routes`` None for the atomic Down (``_stream_atomic``: the prep zeroed
+      ``output``, or a folded shared expert wrote it).
+    * ``decode_down(paired, mid, mid_scale, topk_ids, topk_weight, weight, output, *, shared)`` replaces the Down of
+      the per-route decode kernels (``decode_a8w4``; the expert-deduplicated Down keeps its kernel): ``paired`` the
+      slot-pair Down, ``mid`` / ``mid_scale`` FP8 [M * topk, I] / f32 [M * topk], else the single-slot Down, ``mid``
+      f32 [M, topk, I] and ``mid_scale`` the (unread) ``topk_weight``. ``shared``: None (routed experts only), "fold"
+      (a folded shared expert, ``_SharedFold``, joined: ``output`` holds its BF16 output, which the slot-pair Down
+      adds; the routing tensors keep its column, the last, unread) or "mixed" (the mixed decode,
+      ``_fused_moe_decode_mixed``: ``mid`` f32 [M, topk + 1, I] with the shared expert's column last, ``mid_scale``
+      the unread ``topk_weight``, the weights' shared expert read in place).
+    * ``decode_max_m``: most tokens of the decode tier in this layer (at most DECODE_MAX_M, the decode plan's token
+      limit; None: the op's ``_decode_max_m``): the cross-rank sum moves the crossover with the streaming tier.
+    """
+
+    reduce: object = None
+    prefill_down: object = None
+    stream_down: object = None
+    decode_down: object = None
+    decode_max_m: object = None
+
+
+def _flydsl_moe_a8w4_ptpc_tp(
+    hidden_states, weight, topk_weight, topk_ids, *, output, swiglu_limit, hooks
+):
+    """``flydsl_moe_a8w4_ptpc`` without tile options for a tensor-parallel layer that fuses the cross-rank sum into
+    the last kernels (``hooks``, ``_TPHooks``). The tiers the hooks do not reach (the expert-deduplicated decode and
+    ATOM's split of a shared expert) run as the single-GPU op: the caller sees no hook called (it then sums ``output``
+    over the ranks itself)."""
+    return _forward(
+        hidden_states,
+        weight,
+        topk_weight,
+        topk_ids,
+        output,
+        swiglu_limit,
+        (None, None, None),
+        hooks,
+    )
+
+
+def _forward(
+    hidden_states, weight, topk_weight, topk_ids, output, swiglu_limit, tiles, hooks
+):
+    """``flydsl_moe_a8w4_ptpc`` (``tiles``: block_m, block_n, tile_k) with the fused cross-rank sum's ``hooks``
+    (``_TPHooks`` or None)."""
     _require_supported_gfx()
     _check_inputs(hidden_states, weight, topk_weight, topk_ids, output)
     limit = _swiglu_limit(swiglu_limit)
@@ -1959,19 +2162,13 @@ def flydsl_moe_a8w4_ptpc(
         return output
     routed_topk = topk_ids.shape[1] - (1 if weight.has_shared else 0)
     _check_prefill_down(
-        hidden_states.shape[0], weight, routed_topk, block_m, block_n, tile_k
+        hidden_states.shape[0], weight, routed_topk, *tiles, _decode_max_of(hooks)
     )
     if DEBUG_CHECKS:
         _check_routing(topk_ids, weight.experts, weight.has_shared)
     if weight.has_shared:
         return _moe_shared(
-            hidden_states,
-            weight,
-            topk_weight,
-            topk_ids,
-            output,
-            limit,
-            (block_m, block_n, tile_k),
+            hidden_states, weight, topk_weight, topk_ids, output, limit, tiles, hooks
         )
     return _moe_routed(
         hidden_states,
@@ -1980,9 +2177,8 @@ def flydsl_moe_a8w4_ptpc(
         topk_ids,
         output,
         limit,
-        block_m,
-        block_n,
-        tile_k,
+        *tiles,
+        hooks=hooks,
     )
 
 
@@ -2241,18 +2437,18 @@ def _decode_slot_pair_down(M, weight, topk):
     return M >= DECODE_PREQUANT_MIN_M and pairs
 
 
-def _shared_fold_tier(M, weight, topk, output, tiles):
+def _shared_fold_tier(M, weight, topk, output, tiles, decode_max=None):
     """The routed tier into whose last reduction a call (``topk`` routed columns, M > 0) folds its shared expert
     (``_SharedFold``), or None for ATOM's split: decode while the Down is the slot-pair Down
     (``_decode_slot_pair_down``), streaming and prefill from SHARED_FOLD_PREFILL_MIN_M tokens on; never without
     SHARED_FOLD or above SHARED_FOLD_MAX_M tokens (the row limit of the fold's GEMMs). Where the shared Down GEMM writes
     the output itself (decode, the streaming atomic Down) the output must be 16-byte aligned (its 16-byte stores). The
-    routed columns decide, as they decide the tier.
+    routed columns decide, as they decide the tier (``decode_max``: ``_routed_tier``).
     """
     if not SHARED_FOLD or M > SHARED_FOLD_MAX_M:
         return None
     H, I, E = weight.hidden, weight.inter_padded, weight.experts
-    tier = _routed_tier(M, H, I, topk, E, *tiles)
+    tier = _routed_tier(M, H, I, topk, E, *tiles, decode_max)
     aligned = output.data_ptr() % 16 == 0
     if tier == "decode":
         return tier if aligned and _decode_slot_pair_down(M, weight, topk) else None
@@ -2263,12 +2459,12 @@ def _shared_fold_tier(M, weight, topk, output, tiles):
 
 
 def _moe_shared_fold(
-    hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
+    hidden_states, weight, topk_weight, topk_ids, output, limit, tiles, hooks=None
 ):
     """``flydsl_moe_a8w4_ptpc`` with a shared expert folded into the routed experts' last reduction (``_SharedFold``):
     the routed tier runs on the full routing tensors and the chain on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M
     tokens (an output in place included: the chain writes the output only after the routed kernels that read x),
-    else on the current stream."""
+    else on the current stream. ``hooks``: ``_TPHooks`` (``_moe_routed``)."""
     M = hidden_states.shape[0]
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
         topk_ids = topk_ids.to(torch.int32).contiguous()
@@ -2281,23 +2477,31 @@ def _moe_shared_fold(
     )
     fold = _SharedFold(hidden_states, weight, topk_weight, topk_ids, limit, side)
     return _moe_routed(
-        hidden_states, weight, topk_weight, topk_ids, output, limit, *tiles, fold
+        hidden_states,
+        weight,
+        topk_weight,
+        topk_ids,
+        output,
+        limit,
+        *tiles,
+        fold,
+        hooks=hooks,
     )
 
 
-def _mixed_decode(M, weight, topk, tiles, fold=None):
+def _mixed_decode(M, weight, topk, tiles, fold=None, decode_max=None):
     """Whether a call with a shared expert (``topk`` routed columns, M > 0) runs the mixed decode kernels
     (``_fused_moe_decode_mixed``): up to DECODE_SHARED_MIXED_MAX_M tokens, no tile option, the routed experts on the
     per-route decode path (decode tier, not the expert-deduplicated or the wide-hidden deduplicated Gate/Up, x quantized
-    in the Gate/Up kernel; the routed columns decide it, as they decide the tier) and the mixed Down within its limits;
-    where the call could fold the shared expert instead (``fold``: ``_shared_fold_tier``'s answer) only up to
-    DECODE_SHARED_MIXED_MAX_WORK.
+    in the Gate/Up kernel; the routed columns decide it, as they decide the tier, ``decode_max``: ``_routed_tier``) and
+    the mixed Down within its limits; where the call could fold the shared expert instead (``fold``:
+    ``_shared_fold_tier``'s answer) only up to DECODE_SHARED_MIXED_MAX_WORK.
     """
     H, I, E = weight.hidden, weight.inter_padded, weight.experts
     return (
         M <= DECODE_SHARED_MIXED_MAX_M
         and not (fold and M * topk * I > DECODE_SHARED_MIXED_MAX_WORK)
-        and _routed_tier(M, H, I, topk, E, *tiles) == "decode"
+        and _routed_tier(M, H, I, topk, E, *tiles, decode_max) == "decode"
         and not (
             M >= DECODE_DEDUP_MIN_M
             and H >= DECODE_DEDUP_MIN_H
@@ -2309,24 +2513,31 @@ def _mixed_decode(M, weight, topk, tiles, fold=None):
     )
 
 
-def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, tiles):
+def _moe_shared(
+    hidden_states, weight, topk_weight, topk_ids, output, limit, tiles, hooks=None
+):
     """``flydsl_moe_a8w4_ptpc`` with a shared expert: the mixed decode kernels when ``_mixed_decode`` holds, else folded
     into the routed experts' last reduction where ``_shared_fold_tier`` allows it (``_moe_shared_fold``), else the
     routed experts on the first topk columns (``_moe_routed``), the shared expert (``_shared_split``) and its routing
     weight (``_shared_gate``) on side streams up to SHARED_DUAL_STREAM_MAX_M tokens, else first on the current stream,
-    then ``output += shared * gate`` (BF16 operands, one rounding: ATOM's addcmul_)."""
+    then ``output += shared * gate`` (BF16 operands, one rounding: ATOM's addcmul_). ``hooks`` (``_TPHooks``) reach
+    the mixed decode and the fold only: the split adds the shared expert after the routed experts' reduction.
+    """
     M = hidden_states.shape[0]
-    fold = _shared_fold_tier(M, weight, topk_ids.shape[1] - 1, output, tiles)
-    if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles, fold):
+    dmax = _decode_max_of(hooks)
+    fold = _shared_fold_tier(M, weight, topk_ids.shape[1] - 1, output, tiles, dmax)
+    if _mixed_decode(M, weight, topk_ids.shape[1] - 1, tiles, fold, dmax):
         return _fused_moe_decode_mixed(
-            hidden_states, weight, topk_weight, topk_ids, output, limit
+            hidden_states, weight, topk_weight, topk_ids, output, limit, hooks
         )
     if fold:
         return _moe_shared_fold(
-            hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
+            hidden_states, weight, topk_weight, topk_ids, output, limit, tiles, hooks
         )
     E = weight.experts
     routed_weight, routed_ids = topk_weight[:, :-1], topk_ids[:, :-1]
+    # The split's routed experts take no hook, but the tier the checks above chose.
+    split_hooks = None if dmax is None else _TPHooks(decode_max_m=dmax)
     if M <= SHARED_DUAL_STREAM_MAX_M and not _overlaps(output, hidden_states):
         # Fork the side streams from the current one and join them back before the add (also inside a graph
         # capture); tensors crossing streams are recorded on the streams that use them.
@@ -2343,7 +2554,14 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
         topk_weight.record_stream(aux)
         topk_ids.record_stream(aux)
         _moe_routed(
-            hidden_states, weight, routed_weight, routed_ids, output, limit, *tiles
+            hidden_states,
+            weight,
+            routed_weight,
+            routed_ids,
+            output,
+            limit,
+            *tiles,
+            hooks=split_hooks,
         )
         current.wait_stream(side)
         current.wait_stream(aux)
@@ -2354,7 +2572,14 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
         # The shared expert first: output may be hidden_states itself.
         shared = _shared_split(hidden_states, weight, limit)
         _moe_routed(
-            hidden_states, weight, routed_weight, routed_ids, output, limit, *tiles
+            hidden_states,
+            weight,
+            routed_weight,
+            routed_ids,
+            output,
+            limit,
+            *tiles,
+            hooks=split_hooks,
         )
         gate = _shared_gate(topk_weight, topk_ids, E)
     output.addcmul_(shared, gate)
@@ -2375,11 +2600,21 @@ def _decode_max_m(H):
     return DECODE_MAX_M
 
 
-def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
+def _decode_max_of(hooks):
+    """The decode tier's token limit a tensor-parallel caller sets (``_TPHooks.decode_max_m``), None for the op's."""
+    return None if hooks is None else hooks.decode_max_m
+
+
+def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k, decode_max=None):
     """Tier of the routed experts of a call (M > 0): "decode", "stream" or "prefill". Chosen before the prefill tile
-    defaults are filled in: any tile option selects prefill."""
+    defaults are filled in: any tile option selects prefill. ``decode_max``: a tensor-parallel layer's limit in place
+    of ``_decode_max_m`` (``_TPHooks.decode_max_m``; at most DECODE_MAX_M), None for the op's.
+    """
     if block_m is None and block_n is None and tile_k is None:
-        decode_max = _decode_max_m(H)
+        if decode_max is None:
+            decode_max = _decode_max_m(H)
+        else:
+            decode_max = min(decode_max, DECODE_MAX_M)
         if (M <= decode_max or _dedup_beyond_decode(M, H, I, topk, E)) and _decode_fits(
             H, I, topk, False
         ):
@@ -2389,10 +2624,11 @@ def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
     return "prefill"
 
 
-def _prefill_down_block_m(M, H, I, topk, E, block_m, block_n, tile_k):
+def _prefill_down_block_m(M, H, I, topk, E, block_m, block_n, tile_k, decode_max=None):
     """Sorting block of the prefill Down (gemm2_a8w4) the routed experts of a call build (the prefill tier, or the
-    streaming tier's blocks of 64, ``_stream_prefill_down``), 0 if none."""
-    tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
+    streaming tier's blocks of 64, ``_stream_prefill_down``), 0 if none (``decode_max``: ``_routed_tier``).
+    """
+    tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k, decode_max)
     if tier == "decode":
         return 0
     if tier == "stream":
@@ -2401,16 +2637,17 @@ def _prefill_down_block_m(M, H, I, topk, E, block_m, block_n, tile_k):
     return 64 if block_m is None else block_m
 
 
-def _check_prefill_down(M, weight, topk, block_m, block_n, tile_k):
+def _check_prefill_down(M, weight, topk, block_m, block_n, tile_k, decode_max=None):
     """ValueError before any launch when the call's prefill Down cannot hold its block_m x padded-I FP8 activation
     tile in LDS (``gemm2_a8w4``: block_m * I_padded <= 64 KiB, so I_padded <= 1024 with the default block_m 64); the
-    decode and streaming Downs take any padded I their dispatch accepts."""
+    decode and streaming Downs take any padded I their dispatch accepts (``decode_max``: ``_routed_tier``).
+    """
     I = weight.inter_padded
     # Every prefill Down of the call fits (the streaming tier's takes blocks of 64): no tier needed.
     if I * (64 if block_m is None else block_m) <= layout.LDS_BYTES:
         return
     bm = _prefill_down_block_m(
-        M, weight.hidden, I, topk, weight.experts, block_m, block_n, tile_k
+        M, weight.hidden, I, topk, weight.experts, block_m, block_n, tile_k, decode_max
     )
     if bm and bm * I > layout.LDS_BYTES:
         raise ValueError(
@@ -2452,11 +2689,14 @@ def _moe_routed(
     block_n,
     tile_k,
     shared=None,
+    *,
+    hooks=None,
 ):
     """The routed experts of ``flydsl_moe_a8w4_ptpc`` (M > 0) into ``output``: the tier and its kernels. With a folded
     shared expert (``shared``, ``_SharedFold``) the routing tensors keep its column, the last: the routed experts take
     the others, and each tier starts the shared expert's chain on its FP8 input and joins it before its last
-    reduction."""
+    reduction. ``hooks`` (``_TPHooks``): the decode, streaming and prefill tiers hand their Down and last reduction
+    to a tensor-parallel caller."""
     from aiter.fused_moe import moe_sorting
 
     M, H = hidden_states.shape
@@ -2468,14 +2708,30 @@ def _moe_routed(
         topk_ids = topk_ids.to(torch.int32).contiguous()
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
         topk_weight = topk_weight.to(torch.float32).contiguous()
-    tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
+    tier = _routed_tier(
+        M, H, I, topk, E, block_m, block_n, tile_k, _decode_max_of(hooks)
+    )
     if tier == "decode":
         return _fused_moe_decode(
-            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
+            hidden_states,
+            weight,
+            topk_weight,
+            topk_ids,
+            output,
+            limit,
+            shared,
+            hooks=hooks,
         )
     if tier == "stream":
         return _fused_moe_stream(
-            hidden_states, weight, topk_weight, topk_ids, output, limit, shared
+            hidden_states,
+            weight,
+            topk_weight,
+            topk_ids,
+            output,
+            limit,
+            shared,
+            hooks=hooks,
         )
     if block_m is None and block_n is None and tile_k is None:
         tile_k = 128 if _many_rows(M, H, I, topk, E) else 256
@@ -2551,6 +2807,24 @@ def _moe_routed(
     if shared is not None:
         shared.fork()
     mq, ms = _quantize(mid, M * topk, I, "f32")
+    if hooks is not None and hooks.prefill_down is not None:
+        # The fused Down reads the shared expert's rows within its launch.
+        if shared is not None:
+            shared.join()
+        hooks.prefill_down(
+            mq,
+            ms,
+            routing,
+            loc_ids,
+            routes,
+            output,
+            weight,
+            grid,
+            topk=topk,
+            block_m=block_m,
+            xcd_chunk=_xcd_chunk(DOWN_XCD_CHUNK_H5120, H, M * topk),
+        )
+        return output
     down = _prefill_down(
         M,
         topk,
@@ -2577,6 +2851,9 @@ def _moe_routed(
     )
     if shared is not None:
         shared.join()
+    if hooks is not None and hooks.reduce is not None:
+        hooks.reduce(output, loc_ids, routes)
+        return output
     sorted_sum(cols, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
     return output

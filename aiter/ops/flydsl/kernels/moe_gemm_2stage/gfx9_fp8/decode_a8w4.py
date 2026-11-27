@@ -65,6 +65,7 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common as fxh
 from . import common_a8w4 as a8w4
+from .stream_a8w4 import _address, _load, _rsrc
 
 FP8_MAX = 240.0
 _LOG2E = 1.4426950408889634
@@ -113,6 +114,15 @@ def down_decode_fits(K, TOPK, WAVES, paired):
             True,
         )
     return K % 64 == 0 and pieces_ok and lds + _LUT_BYTES <= a8w4.LDS_BYTES
+
+
+def down_decode_pq_prefetch(K, TOPK, WAVES, PREFETCH=None):
+    """64-K blocks the slot-pair Down decode kernel loads up front: ``PREFETCH`` (default DOWN_PQ_PREFETCH_BLOCKS), at
+    most the blocks of all its rounds."""
+    ROUNDS = ((TOPK + 1) // 2 + WAVES - 1) // WAVES
+    return min(
+        ROUNDS * (K // 64), DOWN_PQ_PREFETCH_BLOCKS if PREFETCH is None else PREFETCH
+    )
 
 
 def _lds_ptr(base, byte_off, elem, align):
@@ -619,6 +629,176 @@ def _pair_channel(lane, h):
     return (lane // 8) * 16 + (lane % 8) * 2 + h
 
 
+def down_decode_storage(K, TOPK, WAVES):
+    """LDS of the single-slot Down decode kernel (``compile_a8w4_down_decode``)."""
+    ROUNDS = (TOPK + WAVES - 1) // WAVES
+
+    @fx.struct
+    class SharedStorage:
+        mq: fx.Array[fx.Uint8, WAVES * ROUNDS * K, 16]
+        part: fx.Array[fx.Float32, WAVES * 32, 16]
+        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
+
+    return SharedStorage
+
+
+@flyc.jit
+def down_decode_partials(
+    N,
+    K,
+    TOPK,
+    WAVES,
+    Storage,
+    p_mid,
+    p_ids,
+    p_topk_weight,
+    p_weight,
+    p_w_delta,
+    p_w_scale,
+):
+    """Body of the single-slot Down decode kernel up to the waves' partial sums of its 32 channels in LDS (shared
+    with the tensor-parallel variant, ``mega_moe_tp_gfx942/decode_tp.py``). ``Storage`` from ``down_decode_storage``.
+    Returns ``(tid, j, token, part_base)``: ``down_decode_sum`` reads the partials after a barrier.
+    """
+    KB = K // 64
+    KQ = a8w4.delta_dwords(K)
+    ROUNDS = (TOPK + WAVES - 1) // WAVES
+    PREFETCH = min(ROUNDS * KB, DOWN_PREFETCH_BLOCKS)
+    K_PER_LANE = K // 64
+    W_BYTES = a8w4.weight_bytes(N, K)
+    D_BYTES = a8w4.delta_bytes(N, K)
+
+    tid = gpu.thread_idx.x
+    lane = tid % 64
+    wave = _wave_index(tid)
+    j = gpu.block_idx.x  # 16-row blocks 2 j and 2 j + 1
+    token = gpu.block_idx.y
+
+    lds = fx.SharedAllocator().allocate(Storage).peek()
+    mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
+    part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
+    lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
+    _lut_table_init(lut_base, tid)
+
+    ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
+    tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
+    w_voff, d_voff, s_voff = _row_block_pair_offsets(lane, KB, KQ)
+
+    slots, valid = [], []
+    for r in range_constexpr(ROUNDS):
+        slot = wave + WAVES * r
+        ok = slot < TOPK
+        slots.append(ok.select(slot, fx.Int32(TOPK - 1)))
+        valid.append(ok)
+    experts = [ids[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
+    weights = [tws[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
+    x_off = (lane // 16) * 16
+    # Intermediate rows do not depend on the expert ids: issue them first.
+    mids = []
+    for r in range_constexpr(ROUNDS):
+        mid = fx.make_view(
+            fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(token * TOPK + slots[r]) * K,
+            fx.make_layout(K, 1),
+        )
+        mids.append([mid[lane + 64 * u] for u in range_constexpr(K_PER_LANE)])
+    w_bufs = [
+        a8w4.expert_bytes(p_weight, experts[r], W_BYTES, masked=True)
+        for r in range_constexpr(ROUNDS)
+    ]
+    d_bufs = [
+        a8w4.expert_bytes(p_w_delta, experts[r], D_BYTES, masked=True)
+        for r in range_constexpr(ROUNDS)
+    ]
+    raws = [[] for _ in range_constexpr(ROUNDS)]
+    deltas = [[] for _ in range_constexpr(ROUNDS)]
+
+    def issue(step):
+        # Trace-time helper: the loads of block step % KB of round step // KB, each delta load (both rows, 4
+        # blocks) right before the weight blocks it covers.
+        r, i = divmod(step, KB)
+        if const_expr(i % 4 == 0):
+            deltas[r].append(
+                a8w4.load_dwordx2(
+                    d_bufs[r],
+                    d_voff,
+                    fx.Int32((2 * j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
+                )
+            )
+        raws[r].append(
+            _load_dwordx4(
+                w_bufs[r], w_voff, fx.Int32((2 * j * KB + i) * a8w4.W_BLOCK_BYTES)
+            )
+        )
+
+    # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
+    for step in range_constexpr(PREFETCH):
+        issue(step)
+    chan_scale = []
+    for r in range_constexpr(ROUNDS):
+        # Channel factors of the lane's two rows, through the expert's factor row (zero bytes when masked).
+        s_buf = a8w4.expert_bytes(p_w_scale, experts[r], N * 4, masked=True)
+        factors = a8w4.load_dwordx2(s_buf, s_voff, fx.Int32(j * 128))
+        chan_scale.append(
+            [fx.Uint32(factors[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
+        )
+    rocdl.sched_barrier(0)
+
+    # Quantize this wave's intermediate rows into its LDS slots (two corrections: the bytes of the division).
+    row_scale = []
+    for r in range_constexpr(ROUNDS):
+        amax, scale = _row_amax_scale(mids[r])
+        row_scale.append(scale)
+        base = (wave * ROUNDS + r) * K
+        if _fast_div_ok(amax):
+            _stage_row_fast(mq_base, base, lane, mids[r], scale, 2)
+        else:
+            _stage_row_ieee(mq_base, base, lane, mids[r], scale)
+    gpu.barrier()
+
+    totals = [fx.Float32(0.0), fx.Float32(0.0)]
+    for r in range_constexpr(ROUNDS):
+        base = (wave * ROUNDS + r) * K
+        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
+        for i in range_constexpr(KB):
+            step = r * KB + i
+            if const_expr(0 < step and step + PREFETCH - 1 < ROUNDS * KB):
+                issue(step + PREFETCH - 1)
+            xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
+            accs = _row_block_pair_mfmas(
+                xop,
+                raws[r][i],
+                deltas[r][i // 4],
+                lut_base,
+                fx.Uint32(8 * (i % 4)),
+                accs,
+            )
+        # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
+        live = valid[r] & (experts[r] >= 0)
+        for h in range_constexpr(2):
+            contrib = Vec(accs[h])[0] * chan_scale[r][h] * row_scale[r] * weights[r]
+            totals[h] = totals[h] + live.select(contrib, fx.Float32(0.0))
+
+    if lane < 16:
+        for h in range_constexpr(2):
+            _lds_store(
+                part_base,
+                (wave * 32 + _pair_channel(lane, h)) * 4,
+                Vec.from_elements([totals[h]], fx.Float32),
+                fx.Float32,
+                4,
+            )
+    return tid, j, token, part_base
+
+
+def down_decode_sum(WAVES, part_base, c):
+    """f32 sum over the waves of ``down_decode_partials`` for channel ``c`` (0..31) of the workgroup."""
+    parts = [
+        _lds_load(part_base, (w * 32 + c) * 4, fx.Float32, 1, 4)[0]
+        for w in range_constexpr(WAVES)
+    ]
+    return _tree_sum(parts)
+
+
 def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
     """Launcher ``(mid, mid_scale, topk_ids, topk_weight, w, w_delta, w_scale, out, M, stream)``.
 
@@ -629,21 +809,9 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
     channels (two 16-row blocks read with 16-byte loads, see "Row-block pairs" in the module docstring).
     """
     assert N % 32 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
-    KB = K // 64
-    KQ = a8w4.delta_dwords(K)
     NB2 = N // 32
     WAVES = TOPK if WAVES is None else WAVES
-    ROUNDS = (TOPK + WAVES - 1) // WAVES
-    PREFETCH = min(ROUNDS * KB, DOWN_PREFETCH_BLOCKS)
-    K_PER_LANE = K // 64
-    W_BYTES = a8w4.weight_bytes(N, K)
-    D_BYTES = a8w4.delta_bytes(N, K)
-
-    @fx.struct
-    class SharedStorage:
-        mq: fx.Array[fx.Uint8, WAVES * ROUNDS * K, 16]
-        part: fx.Array[fx.Float32, WAVES * 32, 16]
-        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
+    SharedStorage = down_decode_storage(K, TOPK, WAVES)
 
     @flyc.kernel
     def a8w4_down_decode(
@@ -657,132 +825,22 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
         p_out: fx.Pointer,
         M: fx.Int32,
     ):
-        tid = gpu.thread_idx.x
-        lane = tid % 64
-        wave = _wave_index(tid)
-        j = gpu.block_idx.x  # 16-row blocks 2 j and 2 j + 1
-        token = gpu.block_idx.y
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
-        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
-        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
-        _lut_table_init(lut_base, tid)
-
-        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
-        tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
-        w_voff, d_voff, s_voff = _row_block_pair_offsets(lane, KB, KQ)
-
-        slots, valid = [], []
-        for r in range_constexpr(ROUNDS):
-            slot = wave + WAVES * r
-            ok = slot < TOPK
-            slots.append(ok.select(slot, fx.Int32(TOPK - 1)))
-            valid.append(ok)
-        experts = [ids[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
-        weights = [tws[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
-        x_off = (lane // 16) * 16
-        # Intermediate rows do not depend on the expert ids: issue them first.
-        mids = []
-        for r in range_constexpr(ROUNDS):
-            mid = fx.make_view(
-                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(token * TOPK + slots[r]) * K,
-                fx.make_layout(K, 1),
-            )
-            mids.append([mid[lane + 64 * u] for u in range_constexpr(K_PER_LANE)])
-        w_bufs = [
-            a8w4.expert_bytes(p_weight, experts[r], W_BYTES, masked=True)
-            for r in range_constexpr(ROUNDS)
-        ]
-        d_bufs = [
-            a8w4.expert_bytes(p_w_delta, experts[r], D_BYTES, masked=True)
-            for r in range_constexpr(ROUNDS)
-        ]
-        raws = [[] for _ in range_constexpr(ROUNDS)]
-        deltas = [[] for _ in range_constexpr(ROUNDS)]
-
-        def issue(step):
-            # Trace-time helper: the loads of block step % KB of round step // KB, each delta load (both rows, 4
-            # blocks) right before the weight blocks it covers.
-            r, i = divmod(step, KB)
-            if const_expr(i % 4 == 0):
-                deltas[r].append(
-                    a8w4.load_dwordx2(
-                        d_bufs[r],
-                        d_voff,
-                        fx.Int32((2 * j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
-                    )
-                )
-            raws[r].append(
-                _load_dwordx4(
-                    w_bufs[r], w_voff, fx.Int32((2 * j * KB + i) * a8w4.W_BLOCK_BYTES)
-                )
-            )
-
-        # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
-        for step in range_constexpr(PREFETCH):
-            issue(step)
-        chan_scale = []
-        for r in range_constexpr(ROUNDS):
-            # Channel factors of the lane's two rows, through the expert's factor row (zero bytes when masked).
-            s_buf = a8w4.expert_bytes(p_w_scale, experts[r], N * 4, masked=True)
-            factors = a8w4.load_dwordx2(s_buf, s_voff, fx.Int32(j * 128))
-            chan_scale.append(
-                [fx.Uint32(factors[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
-            )
-        rocdl.sched_barrier(0)
-
-        # Quantize this wave's intermediate rows into its LDS slots (two corrections: the bytes of the division).
-        row_scale = []
-        for r in range_constexpr(ROUNDS):
-            amax, scale = _row_amax_scale(mids[r])
-            row_scale.append(scale)
-            base = (wave * ROUNDS + r) * K
-            if _fast_div_ok(amax):
-                _stage_row_fast(mq_base, base, lane, mids[r], scale, 2)
-            else:
-                _stage_row_ieee(mq_base, base, lane, mids[r], scale)
-        gpu.barrier()
-
-        totals = [fx.Float32(0.0), fx.Float32(0.0)]
-        for r in range_constexpr(ROUNDS):
-            base = (wave * ROUNDS + r) * K
-            accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-            for i in range_constexpr(KB):
-                step = r * KB + i
-                if const_expr(0 < step and step + PREFETCH - 1 < ROUNDS * KB):
-                    issue(step + PREFETCH - 1)
-                xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
-                accs = _row_block_pair_mfmas(
-                    xop,
-                    raws[r][i],
-                    deltas[r][i // 4],
-                    lut_base,
-                    fx.Uint32(8 * (i % 4)),
-                    accs,
-                )
-            # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
-            live = valid[r] & (experts[r] >= 0)
-            for h in range_constexpr(2):
-                contrib = Vec(accs[h])[0] * chan_scale[r][h] * row_scale[r] * weights[r]
-                totals[h] = totals[h] + live.select(contrib, fx.Float32(0.0))
-
-        if lane < 16:
-            for h in range_constexpr(2):
-                _lds_store(
-                    part_base,
-                    (wave * 32 + _pair_channel(lane, h)) * 4,
-                    Vec.from_elements([totals[h]], fx.Float32),
-                    fx.Float32,
-                    4,
-                )
+        tid, j, token, part_base = down_decode_partials(
+            N,
+            K,
+            TOPK,
+            WAVES,
+            SharedStorage,
+            p_mid,
+            p_ids,
+            p_topk_weight,
+            p_weight,
+            p_w_delta,
+            p_w_scale,
+        )
         gpu.barrier()
         if tid < 32:
-            parts = [
-                _lds_load(part_base, (w * 32 + tid) * 4, fx.Float32, 1, 4)[0]
-                for w in range_constexpr(WAVES)
-            ]
-            y = _tree_sum(parts)
+            y = down_decode_sum(WAVES, part_base, tid)
             out = fx.make_view(
                 fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
                 fx.make_layout(N, 1),
@@ -818,6 +876,240 @@ def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
     return launch
 
 
+def down_decode_pq_storage(K, TOPK, WAVES):
+    """LDS of the slot-pair Down decode kernel (``compile_a8w4_down_decode_pq``): the staged rows and the zero row,
+    the waves' partials, the LUT."""
+    PAIRS = (TOPK + 1) // 2
+    ROUNDS = (PAIRS + WAVES - 1) // WAVES
+    ROWS = 2 * WAVES * ROUNDS
+
+    @fx.struct
+    class SharedStorage:
+        mq: fx.Array[fx.Uint8, (ROWS + 1) * K, 16]
+        part: fx.Array[fx.Float32, WAVES * 32, 16]
+        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
+
+    return SharedStorage
+
+
+@flyc.jit
+def down_decode_pq_partials(
+    N,
+    K,
+    TOPK,
+    WAVES,
+    SHARED,
+    ID_COLS,
+    PREFETCH,
+    Storage,
+    p_mid,
+    p_mid_scale,
+    p_ids,
+    p_topk_weight,
+    p_weight,
+    p_w_delta,
+    p_w_scale,
+    p_out,
+):
+    """Body of the slot-pair Down decode kernel up to the waves' partial sums of its 16 channels in LDS (as
+    ``down_decode_partials``; ``Storage`` from ``down_decode_pq_storage``, ``PREFETCH`` the blocks loaded up front).
+    Returns ``(tid, j, token, part_base, shared_value)``: ``down_decode_pq_sum`` reads the partials after a barrier;
+    ``shared_value`` is the BF16 output element of channel ``tid % 16`` on entry with ``SHARED``, else None.
+    """
+    KB = K // 64
+    KQ = a8w4.delta_dwords(K)
+    PAIRS = (TOPK + 1) // 2
+    ROUNDS = (PAIRS + WAVES - 1) // WAVES
+    ROWS = 2 * WAVES * ROUNDS  # staged intermediate rows, followed by one all-zero row
+    PIECES = K // 16  # 16-byte pieces of an FP8 row
+    PIECE_LOADS = (PIECES + 31) // 32
+    W_BYTES = a8w4.weight_bytes(N, K)
+    D_BYTES = a8w4.delta_bytes(N, K)
+
+    tid = gpu.thread_idx.x
+    lane = tid % 64
+    wave = _wave_index(tid)
+    j = gpu.block_idx.x
+    token = gpu.block_idx.y
+
+    lds = fx.SharedAllocator().allocate(Storage).peek()
+    mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
+    part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
+    lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
+    _lut_table_init(lut_base, tid)
+    if tid < PIECES:
+        # The zero row: A operand of the masked lanes (see "Slot pairs" in the module docstring).
+        _lds_store(mq_base, ROWS * K + tid * 16, fx.full(2, 0, fx.Int64), fx.Int64, 16)
+
+    ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
+    tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
+    # Round r: slot pair wave + WAVES * r, slot 2 p in lanes 0..31 and slot 2 p + 1 in lanes 32..63.
+    upper = lane >= 32
+    slots, valid = [], []
+    for r in range_constexpr(ROUNDS):
+        for s in range_constexpr(2):
+            slot = (wave + WAVES * r) * 2 + s
+            ok = slot < TOPK
+            slots.append(ok.select(slot, fx.Int32(TOPK - 1)))
+            valid.append(ok)
+    # Raw readfirstlane (no typed wave-uniform broadcast in FlyDSL 0.5.3, see _wave_index): the expert ids
+    # stay scalar for the per-expert channel-factor offsets.
+    experts = [
+        fx.Int32(rocdl.readfirstlane(T.i32, _raw(ids[token * ID_COLS + slots[q]])))
+        for q in range_constexpr(2 * ROUNDS)
+    ]
+    weights = [tws[token * ID_COLS + slots[q]] for q in range_constexpr(2 * ROUNDS)]
+    # Intermediate rows do not depend on the expert ids: issue them first.
+    pieces, row_scale = [], []
+    for r in range_constexpr(ROUNDS):
+        # Lane l loads the 16-byte pieces l % 32 (+ 32 u) of its slot's row, staged in LDS.
+        lane_slot = upper.select(slots[2 * r + 1], slots[2 * r])
+        row = _global_ptr(p_mid, fx.Int64, 16) + fx.Int64(token * TOPK + lane_slot) * (
+            K // 8
+        )
+        for u in range_constexpr(PIECE_LOADS):
+            chunk = lane % 32 + 32 * u
+            if const_expr(32 * (u + 1) > PIECES):
+                chunk = (chunk < PIECES).select(chunk, fx.Int32(PIECES - 1))
+            pieces.append(
+                fx.ptr_load(row + chunk * 2, result_type=Vec.make_type(2, fx.Int64))
+            )
+        for s in range_constexpr(2):
+            row_scale.append(
+                fx.recast_iter(fx.Float32, fxh._as_ptr(p_mid_scale))[
+                    token * TOPK + slots[2 * r + s]
+                ]
+            )
+    # Whole-tensor buffers with per-lane expert offsets (the two halves read different experts).
+    w_all = _all_bytes(p_weight, W_BYTES)
+    d_all = _all_bytes(p_w_delta, D_BYTES)
+    s_all = _all_bytes(p_w_scale, N * 4)
+    w_lane = fx.Int32((lane % 32) * 16)
+    d_lane = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
+    s_lane = fx.Int32((lane % 8) * 8)
+    lane_experts = [
+        upper.select(experts[2 * r + 1], experts[2 * r])
+        for r in range_constexpr(ROUNDS)
+    ]
+    raws = [[] for _ in range_constexpr(ROUNDS)]
+    deltas = [[] for _ in range_constexpr(ROUNDS)]
+
+    def issue(step):
+        # Trace-time helper: the loads of block step % KB of round step // KB, each delta load (both rows, 4
+        # blocks) right before the weight blocks it covers.
+        r, i = divmod(step, KB)
+        if const_expr(i % 4 == 0):
+            deltas[r].append(
+                a8w4.load_dwordx2(
+                    d_all,
+                    lane_experts[r] * D_BYTES + d_lane,
+                    fx.Int32((j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
+                )
+            )
+        raws[r].append(
+            _load_dwordx4(
+                w_all,
+                lane_experts[r] * W_BYTES + w_lane,
+                fx.Int32((j * KB + i) * a8w4.W_BLOCK_BYTES),
+            )
+        )
+
+    # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
+    for step in range_constexpr(PREFETCH):
+        issue(step)
+    chan_scale = []
+    for r in range_constexpr(ROUNDS):
+        for s in range_constexpr(2):
+            # Channel factors of the lane's rows 2 (l % 8) and 2 (l % 8) + 1.
+            ws = a8w4.load_dwordx2(s_all, s_lane, experts[2 * r + s] * (N * 4) + j * 64)
+            chan_scale.append(
+                [fx.Uint32(ws[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
+            )
+    shared_value = None
+    if const_expr(SHARED):
+        # The shared expert's value of this thread's output channel (threads from 16 on load a duplicate).
+        shared_row = fx.make_view(
+            fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
+            fx.make_layout(N, 1),
+        )
+        shared_value = shared_row[j * 16 + tid % 16]
+    rocdl.sched_barrier(0)
+
+    for r in range_constexpr(ROUNDS):
+        for u in range_constexpr(PIECE_LOADS):
+            chunk = lane % 32 + 32 * u
+            dst = ((wave * ROUNDS + r) * 2 + lane // 32) * K + chunk * 16
+            if const_expr(32 * (u + 1) <= PIECES):
+                _lds_store(mq_base, dst, pieces[r * PIECE_LOADS + u], fx.Int64, 16)
+            else:
+                if chunk < PIECES:
+                    _lds_store(mq_base, dst, pieces[r * PIECE_LOADS + u], fx.Int64, 16)
+    gpu.barrier()
+
+    # Lane l holds rows 2 (l % 8) + h, K group b = (l % 32) // 8 of its slot's block. Its A operand
+    # is the activation of that slot and K group if l % 2 equals the slot's half, else zero: output
+    # row 0 / 8 then sums the lower slot, row 1 / 9 the upper one.
+    b = (lane % 32) // 8
+    keep = (lane % 2) == (lane // 32)
+    vals = [fx.Float32(0.0), fx.Float32(0.0)]
+    for r in range_constexpr(ROUNDS):
+        a_off = keep.select(
+            ((wave * ROUNDS + r) * 2 + lane // 32) * K + b * 16, ROWS * K + b * 16
+        )
+        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
+        for i in range_constexpr(KB):
+            step = r * KB + i
+            if const_expr(0 < step and step + PREFETCH - 1 < ROUNDS * KB):
+                issue(step + PREFETCH - 1)
+            xop = _lds_load(mq_base, a_off + i * 64, fx.Int64, 2, 16)
+            ops = [
+                _decode_block(
+                    Vec.from_elements(
+                        [raws[r][i][2 * h], raws[r][i][2 * h + 1]], fx.Uint32
+                    ),
+                    _lut_at(lut_base, deltas[r][i // 4][h], fx.Uint32(8 * (i % 4))),
+                )
+                for h in range_constexpr(2)
+            ]
+            for c in range_constexpr(2):
+                for h in range_constexpr(2):
+                    accs[h] = _mfma(xop[c], ops[h][c], accs[h])
+        for h in range_constexpr(2):
+            acc = Vec(accs[h])
+            for s in range_constexpr(2):
+                q = 2 * r + s
+                contrib = acc[s] * chan_scale[q][h] * row_scale[q] * weights[q]
+                # A masked route (id -1) adds nothing (its weight may be anything); its loads above fell past
+                # the range of _all_bytes.
+                live = valid[q] & (experts[q] >= 0)
+                vals[h] = vals[h] + live.select(contrib, fx.Float32(0.0))
+
+    # Columns 0..7 from row 0 / 1 (lane n), columns 8..15 from row 8 / 9 (lane 32 + n).
+    if (lane < 8) | ((lane >= 40) & (lane < 48)):
+        for h in range_constexpr(2):
+            _lds_store(
+                part_base,
+                ((wave * 2 + h) * 16 + lane % 16) * 4,
+                Vec.from_elements([vals[h]], fx.Float32),
+                fx.Float32,
+                4,
+            )
+    return tid, j, token, part_base, shared_value
+
+
+def down_decode_pq_sum(WAVES, part_base, c, shared=None):
+    """f32 sum over the waves of ``down_decode_pq_partials`` for channel ``c`` (0..15) of the workgroup, plus
+    ``shared`` (the BF16 ``shared_value``; None: nothing)."""
+    # Channel row c = 2m + h: columns m and m + 8 of the waves' accumulators h.
+    col = (c & 1) * 16 + c // 2
+    parts = [
+        _lds_load(part_base, (w * 32 + col) * 4, fx.Float32, 1, 4)[0]
+        + _lds_load(part_base, (w * 32 + col + 8) * 4, fx.Float32, 1, 4)[0]
+        for w in range_constexpr(WAVES)
+    ]
+    return _plus_shared(_tree_sum(parts), shared)
+
+
 def compile_a8w4_down_decode_pq(
     *, N, K, TOPK, WAVES=None, SHARED=False, ID_COLS=None, PREFETCH=None
 ):
@@ -835,27 +1127,11 @@ def compile_a8w4_down_decode_pq(
     assert N % 16 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
     ID_COLS = TOPK if ID_COLS is None else ID_COLS
     assert ID_COLS >= TOPK
-    KB = K // 64
-    KQ = a8w4.delta_dwords(K)
     NB = N // 16
-    PAIRS = (TOPK + 1) // 2
-    WAVES = PAIRS if WAVES is None else WAVES
-    ROUNDS = (PAIRS + WAVES - 1) // WAVES
-    ROWS = 2 * WAVES * ROUNDS  # staged intermediate rows, followed by one all-zero row
-    PIECES = K // 16  # 16-byte pieces of an FP8 row
-    PIECE_LOADS = (PIECES + 31) // 32
-    assert PIECES <= 64 * WAVES
-    PREFETCH = min(
-        ROUNDS * KB, DOWN_PQ_PREFETCH_BLOCKS if PREFETCH is None else PREFETCH
-    )
-    W_BYTES = a8w4.weight_bytes(N, K)
-    D_BYTES = a8w4.delta_bytes(N, K)
-
-    @fx.struct
-    class SharedStorage:
-        mq: fx.Array[fx.Uint8, (ROWS + 1) * K, 16]
-        part: fx.Array[fx.Float32, WAVES * 32, 16]
-        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
+    WAVES = (TOPK + 1) // 2 if WAVES is None else WAVES
+    assert K // 16 <= 64 * WAVES
+    PREFETCH = down_decode_pq_prefetch(K, TOPK, WAVES, PREFETCH)
+    SharedStorage = down_decode_pq_storage(K, TOPK, WAVES)
 
     @flyc.kernel
     def a8w4_down_decode_pq(
@@ -869,190 +1145,27 @@ def compile_a8w4_down_decode_pq(
         p_out: fx.Pointer,
         M: fx.Int32,
     ):
-        tid = gpu.thread_idx.x
-        lane = tid % 64
-        wave = _wave_index(tid)
-        j = gpu.block_idx.x
-        token = gpu.block_idx.y
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
-        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
-        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
-        _lut_table_init(lut_base, tid)
-        if tid < PIECES:
-            # The zero row: A operand of the masked lanes (see "Slot pairs" in the module docstring).
-            _lds_store(
-                mq_base, ROWS * K + tid * 16, fx.full(2, 0, fx.Int64), fx.Int64, 16
-            )
-
-        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
-        tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
-        # Round r: slot pair wave + WAVES * r, slot 2 p in lanes 0..31 and slot 2 p + 1 in lanes 32..63.
-        upper = lane >= 32
-        slots, valid = [], []
-        for r in range_constexpr(ROUNDS):
-            for s in range_constexpr(2):
-                slot = (wave + WAVES * r) * 2 + s
-                ok = slot < TOPK
-                slots.append(ok.select(slot, fx.Int32(TOPK - 1)))
-                valid.append(ok)
-        # Raw readfirstlane (no typed wave-uniform broadcast in FlyDSL 0.5.3, see _wave_index): the expert ids
-        # stay scalar for the per-expert channel-factor offsets.
-        experts = [
-            fx.Int32(rocdl.readfirstlane(T.i32, _raw(ids[token * ID_COLS + slots[q]])))
-            for q in range_constexpr(2 * ROUNDS)
-        ]
-        weights = [tws[token * ID_COLS + slots[q]] for q in range_constexpr(2 * ROUNDS)]
-        # Intermediate rows do not depend on the expert ids: issue them first.
-        pieces, row_scale = [], []
-        for r in range_constexpr(ROUNDS):
-            # Lane l loads the 16-byte pieces l % 32 (+ 32 u) of its slot's row, staged in LDS.
-            lane_slot = upper.select(slots[2 * r + 1], slots[2 * r])
-            row = _global_ptr(p_mid, fx.Int64, 16) + fx.Int64(
-                token * TOPK + lane_slot
-            ) * (K // 8)
-            for u in range_constexpr(PIECE_LOADS):
-                chunk = lane % 32 + 32 * u
-                if const_expr(32 * (u + 1) > PIECES):
-                    chunk = (chunk < PIECES).select(chunk, fx.Int32(PIECES - 1))
-                pieces.append(
-                    fx.ptr_load(row + chunk * 2, result_type=Vec.make_type(2, fx.Int64))
-                )
-            for s in range_constexpr(2):
-                row_scale.append(
-                    fx.recast_iter(fx.Float32, fxh._as_ptr(p_mid_scale))[
-                        token * TOPK + slots[2 * r + s]
-                    ]
-                )
-        # Whole-tensor buffers with per-lane expert offsets (the two halves read different experts).
-        w_all = _all_bytes(p_weight, W_BYTES)
-        d_all = _all_bytes(p_w_delta, D_BYTES)
-        s_all = _all_bytes(p_w_scale, N * 4)
-        w_lane = fx.Int32((lane % 32) * 16)
-        d_lane = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
-        s_lane = fx.Int32((lane % 8) * 8)
-        lane_experts = [
-            upper.select(experts[2 * r + 1], experts[2 * r])
-            for r in range_constexpr(ROUNDS)
-        ]
-        raws = [[] for _ in range_constexpr(ROUNDS)]
-        deltas = [[] for _ in range_constexpr(ROUNDS)]
-
-        def issue(step):
-            # Trace-time helper: the loads of block step % KB of round step // KB, each delta load (both rows, 4
-            # blocks) right before the weight blocks it covers.
-            r, i = divmod(step, KB)
-            if const_expr(i % 4 == 0):
-                deltas[r].append(
-                    a8w4.load_dwordx2(
-                        d_all,
-                        lane_experts[r] * D_BYTES + d_lane,
-                        fx.Int32((j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
-                    )
-                )
-            raws[r].append(
-                _load_dwordx4(
-                    w_all,
-                    lane_experts[r] * W_BYTES + w_lane,
-                    fx.Int32((j * KB + i) * a8w4.W_BLOCK_BYTES),
-                )
-            )
-
-        # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
-        for step in range_constexpr(PREFETCH):
-            issue(step)
-        chan_scale = []
-        for r in range_constexpr(ROUNDS):
-            for s in range_constexpr(2):
-                # Channel factors of the lane's rows 2 (l % 8) and 2 (l % 8) + 1.
-                ws = a8w4.load_dwordx2(
-                    s_all, s_lane, experts[2 * r + s] * (N * 4) + j * 64
-                )
-                chan_scale.append(
-                    [fx.Uint32(ws[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
-                )
-        shared_value = None
-        if const_expr(SHARED):
-            # The shared expert's value of this thread's output channel (threads from 16 on load a duplicate).
-            shared_row = fx.make_view(
-                fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
-                fx.make_layout(N, 1),
-            )
-            shared_value = shared_row[j * 16 + tid % 16]
-        rocdl.sched_barrier(0)
-
-        for r in range_constexpr(ROUNDS):
-            for u in range_constexpr(PIECE_LOADS):
-                chunk = lane % 32 + 32 * u
-                dst = ((wave * ROUNDS + r) * 2 + lane // 32) * K + chunk * 16
-                if const_expr(32 * (u + 1) <= PIECES):
-                    _lds_store(mq_base, dst, pieces[r * PIECE_LOADS + u], fx.Int64, 16)
-                else:
-                    if chunk < PIECES:
-                        _lds_store(
-                            mq_base, dst, pieces[r * PIECE_LOADS + u], fx.Int64, 16
-                        )
-        gpu.barrier()
-
-        # Lane l holds rows 2 (l % 8) + h, K group b = (l % 32) // 8 of its slot's block. Its A operand
-        # is the activation of that slot and K group if l % 2 equals the slot's half, else zero: output
-        # row 0 / 8 then sums the lower slot, row 1 / 9 the upper one.
-        b = (lane % 32) // 8
-        keep = (lane % 2) == (lane // 32)
-        vals = [fx.Float32(0.0), fx.Float32(0.0)]
-        for r in range_constexpr(ROUNDS):
-            a_off = keep.select(
-                ((wave * ROUNDS + r) * 2 + lane // 32) * K + b * 16, ROWS * K + b * 16
-            )
-            accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-            for i in range_constexpr(KB):
-                step = r * KB + i
-                if const_expr(0 < step and step + PREFETCH - 1 < ROUNDS * KB):
-                    issue(step + PREFETCH - 1)
-                xop = _lds_load(mq_base, a_off + i * 64, fx.Int64, 2, 16)
-                ops = [
-                    _decode_block(
-                        Vec.from_elements(
-                            [raws[r][i][2 * h], raws[r][i][2 * h + 1]], fx.Uint32
-                        ),
-                        _lut_at(lut_base, deltas[r][i // 4][h], fx.Uint32(8 * (i % 4))),
-                    )
-                    for h in range_constexpr(2)
-                ]
-                for c in range_constexpr(2):
-                    for h in range_constexpr(2):
-                        accs[h] = _mfma(xop[c], ops[h][c], accs[h])
-            for h in range_constexpr(2):
-                acc = Vec(accs[h])
-                for s in range_constexpr(2):
-                    q = 2 * r + s
-                    contrib = acc[s] * chan_scale[q][h] * row_scale[q] * weights[q]
-                    # A masked route (id -1) adds nothing (its weight may be anything); its loads above fell past
-                    # the range of _all_bytes.
-                    live = valid[q] & (experts[q] >= 0)
-                    vals[h] = vals[h] + live.select(contrib, fx.Float32(0.0))
-
-        # Columns 0..7 from row 0 / 1 (lane n), columns 8..15 from row 8 / 9 (lane 32 + n).
-        if (lane < 8) | ((lane >= 40) & (lane < 48)):
-            for h in range_constexpr(2):
-                _lds_store(
-                    part_base,
-                    ((wave * 2 + h) * 16 + lane % 16) * 4,
-                    Vec.from_elements([vals[h]], fx.Float32),
-                    fx.Float32,
-                    4,
-                )
+        tid, j, token, part_base, shared_value = down_decode_pq_partials(
+            N,
+            K,
+            TOPK,
+            WAVES,
+            SHARED,
+            ID_COLS,
+            PREFETCH,
+            SharedStorage,
+            p_mid,
+            p_mid_scale,
+            p_ids,
+            p_topk_weight,
+            p_weight,
+            p_w_delta,
+            p_w_scale,
+            p_out,
+        )
         gpu.barrier()
         if tid < 16:
-            # Channel row tid = 2m + h: columns m and m + 8 of the waves' accumulators h.
-            col = (tid & 1) * 16 + tid // 2
-            parts = [
-                _lds_load(part_base, (w * 32 + col) * 4, fx.Float32, 1, 4)[0]
-                + _lds_load(part_base, (w * 32 + col + 8) * 4, fx.Float32, 1, 4)[0]
-                for w in range_constexpr(WAVES)
-            ]
-            y = _plus_shared(_tree_sum(parts), shared_value)
+            y = down_decode_pq_sum(WAVES, part_base, tid, shared_value)
             out = fx.make_view(
                 fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
                 fx.make_layout(N, 1),
@@ -1675,6 +1788,209 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
     return launch
 
 
+def down_decode_mixed_storage(K, TOPK):
+    """LDS of the mixed Down decode kernel (``compile_a8w4_down_decode_mixed``): a row, 32 partials and a LUT copy per
+    wave."""
+
+    @fx.struct
+    class SharedStorage:
+        mq: fx.Array[fx.Uint8, TOPK * K, 16]
+        part: fx.Array[fx.Float32, TOPK * 32, 16]
+        lut: fx.Array[fx.Uint8, TOPK * _LUT_BYTES, 16]
+
+    return SharedStorage
+
+
+@flyc.jit
+def down_decode_mixed_partials(
+    N,
+    K,
+    KP,
+    TOPK,
+    E,
+    Storage,
+    p_mid,
+    p_ids,
+    p_topk_weight,
+    p_weight,
+    p_w_delta,
+    p_w_scale,
+    p_shared,
+    p_shared_scale,
+):
+    """Body of the mixed Down decode kernel up to the waves' partial sums of its 32 channels in LDS (as
+    ``down_decode_partials``; ``Storage`` from ``down_decode_mixed_storage``). Returns ``(tid, j, token, part_base)``:
+    ``down_decode_mixed_sum`` reads the partials after a barrier."""
+    KB = K // 64
+    KBP = KP // 64
+    KQ = a8w4.delta_dwords(K)
+    R = TOPK - 1
+    W_BYTES = a8w4.weight_bytes(N, K)
+    D_BYTES = a8w4.delta_bytes(N, K)
+    S_BLOCK = 2 * a8w4.W_BLOCK_BYTES
+    # All blocks' loads first (unlike the single-slot Down's DOWN_PREFETCH_BLOCKS): measured in one process under CUDA
+    # graph replay at the DeepSeek-V4.1 layers M 1-4, 3 blocks first took 1.00-1.03x the time.
+    PREFETCH = KB
+
+    tid = gpu.thread_idx.x
+    lane = tid % 64
+    wave = _wave_index(tid)
+    j = gpu.block_idx.x  # 16-row blocks 2 j and 2 j + 1
+    token = gpu.block_idx.y
+
+    lds = fx.SharedAllocator().allocate(Storage).peek()
+    mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
+    part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
+    lut_base = fx.add_offset(
+        fx.recast_iter(fx.Uint8, lds.lut.ptr),
+        fx.make_int_tuple(wave * _LUT_BYTES),
+    )
+    _lut_table_init(lut_base, lane)
+
+    ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
+    tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
+    row = token * TOPK
+    expert = ids[row + wave]
+    weight = tws[row + wave]
+    first = ids[row]
+    x_off = (lane // 16) * 16
+    # Each branch loads its own intermediate row (first: it does not depend on the expert id) and the shared
+    # expert's wave addresses its row with constants: code common to both branches would be hoisted above the
+    # branch, where its wait for the intermediate row would hold back the weight loads.
+    if wave == R:
+        mid = fx.make_view(
+            fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + R) * K,
+            fx.make_layout(K, 1),
+        )
+        mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
+        live = (expert == E) & (first >= 0)
+        w_rsrc = _rsrc(_address(p_shared), live.select(fx.Int64(N * KP), fx.Int64(0)))
+        s_rsrc = _rsrc(
+            _address(p_shared_scale), live.select(fx.Int64(N * 4), fx.Int64(0))
+        )
+        # raws[b][i]: block i of 16-row block 2 j + b; the first PREFETCH blocks of both now, the rest as the MFMA
+        # loop consumes them.
+        raws = [[], []]
+
+        def issue_shared(i):
+            for b in range_constexpr(2):
+                raws[b].append(
+                    _load(w_rsrc, lane * 16, ((2 * j + b) * KBP + i) * S_BLOCK, 4)
+                )
+
+        for i in range_constexpr(PREFETCH):
+            issue_shared(i)
+        factors = [
+            _load(s_rsrc, (lane % 16) * 4, (2 * j + b) * 64, 1)[0].bitcast(fx.Float32)
+            for b in range_constexpr(2)
+        ]
+        rocdl.sched_barrier(0)
+        amax, row_scale = _row_amax_scale(mids)
+        if _fast_div_ok(amax):
+            _stage_row_fast(mq_base, R * K, lane, mids, row_scale, 2)
+        else:
+            _stage_row_ieee(mq_base, R * K, lane, mids, row_scale)
+        _wave_fence()
+        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
+        for i in range_constexpr(KB):
+            if const_expr(0 < i and i + PREFETCH - 1 < KB):
+                issue_shared(i + PREFETCH - 1)
+            xop = _lds_load(mq_base, R * K + i * 64 + x_off, fx.Int64, 2, 16)
+            for b in range_constexpr(2):
+                w = Vec.from_elements(raws[b][i], fx.Uint32).bitcast(fx.Int64)
+                for c in range_constexpr(2):
+                    accs[b] = _mfma(xop[c], w[c], accs[b])
+        totals = [
+            live.select(
+                Vec(accs[b])[0] * factors[b] * row_scale * weight, fx.Float32(0.0)
+            )
+            for b in range_constexpr(2)
+        ]
+        if lane < 16:
+            for b in range_constexpr(2):
+                _lds_store(
+                    part_base,
+                    (R * 32 + b * 16 + lane) * 4,
+                    Vec.from_elements([totals[b]], fx.Float32),
+                    fx.Float32,
+                    4,
+                )
+    else:
+        base = wave * K
+        mid = fx.make_view(
+            fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + wave) * K,
+            fx.make_layout(K, 1),
+        )
+        mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
+        w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES, masked=True)
+        d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES, masked=True)
+        w_voff, d_voff, s_voff = _row_block_pair_offsets(lane, KB, KQ)
+        # Each delta load (both rows, 4 blocks) right before the weight blocks it covers; the first PREFETCH
+        # blocks now, the rest as the MFMA loop consumes them.
+        raws, deltas = [], []
+
+        def issue_routed(i):
+            if const_expr(i % 4 == 0):
+                deltas.append(
+                    a8w4.load_dwordx2(
+                        d_buf,
+                        d_voff,
+                        fx.Int32((2 * j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
+                    )
+                )
+            raws.append(
+                _load_dwordx4(
+                    w_buf, w_voff, fx.Int32((2 * j * KB + i) * a8w4.W_BLOCK_BYTES)
+                )
+            )
+
+        for i in range_constexpr(PREFETCH):
+            issue_routed(i)
+        s_buf = a8w4.expert_bytes(p_w_scale, expert, N * 4, masked=True)
+        factors = a8w4.load_dwordx2(s_buf, s_voff, fx.Int32(j * 128))
+        rocdl.sched_barrier(0)
+        amax, row_scale = _row_amax_scale(mids)
+        if _fast_div_ok(amax):
+            _stage_row_fast(mq_base, base, lane, mids, row_scale, 2)
+        else:
+            _stage_row_ieee(mq_base, base, lane, mids, row_scale)
+        _wave_fence()
+        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
+        for i in range_constexpr(KB):
+            if const_expr(0 < i and i + PREFETCH - 1 < KB):
+                issue_routed(i + PREFETCH - 1)
+            xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
+            accs = _row_block_pair_mfmas(
+                xop, raws[i], deltas[i // 4], lut_base, fx.Uint32(8 * (i % 4)), accs
+            )
+        # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
+        totals = [
+            (expert >= 0).select(
+                Vec(accs[h])[0]
+                * fx.Uint32(factors[h]).bitcast(fx.Float32)
+                * row_scale
+                * weight,
+                fx.Float32(0.0),
+            )
+            for h in range_constexpr(2)
+        ]
+        if lane < 16:
+            for h in range_constexpr(2):
+                _lds_store(
+                    part_base,
+                    (wave * 32 + _pair_channel(lane, h)) * 4,
+                    Vec.from_elements([totals[h]], fx.Float32),
+                    fx.Float32,
+                    4,
+                )
+    return tid, j, token, part_base
+
+
+def down_decode_mixed_sum(TOPK, part_base, c):
+    """f32 sum over the waves of ``down_decode_mixed_partials`` for channel ``c`` (0..31) of the workgroup."""
+    return down_decode_sum(TOPK, part_base, c)
+
+
 def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
     """Launcher ``(mid, topk_ids, topk_weight, w, w_delta, w_scale, shared_w, shared_scale, out, M, stream)``: the Down
     of ``compile_a8w4_down_decode`` with one wave per routing column (``TOPK`` waves) and a shared FP8 expert in the
@@ -1692,28 +2008,11 @@ def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
     ``_quant_fast`` (two corrections: the correctly rounded quotient, the FP8 bytes of the per-route kernel's
     division).
     """
-    from .stream_a8w4 import _address, _load, _rsrc
-
     assert (
         N % 32 == 0 and KP % 64 == 0 and KP >= K and down_decode_mixed_fits(K, TOPK)
     ), f"unsupported mixed Down decode shape N={N} K={K} KP={KP} TOPK={TOPK}"
-    KB = K // 64
-    KBP = KP // 64
-    KQ = a8w4.delta_dwords(K)
     NB2 = N // 32
-    R = TOPK - 1
-    W_BYTES = a8w4.weight_bytes(N, K)
-    D_BYTES = a8w4.delta_bytes(N, K)
-    S_BLOCK = 2 * a8w4.W_BLOCK_BYTES
-    # All blocks' loads first (unlike the single-slot Down's DOWN_PREFETCH_BLOCKS): measured in one process under CUDA
-    # graph replay at the DeepSeek-V4.1 layers M 1-4, 3 blocks first took 1.00-1.03x the time.
-    PREFETCH = KB
-
-    @fx.struct
-    class SharedStorage:
-        mq: fx.Array[fx.Uint8, TOPK * K, 16]
-        part: fx.Array[fx.Float32, TOPK * 32, 16]
-        lut: fx.Array[fx.Uint8, TOPK * _LUT_BYTES, 16]
+    SharedStorage = down_decode_mixed_storage(K, TOPK)
 
     @flyc.kernel
     def a8w4_down_decode_mixed(
@@ -1728,168 +2027,25 @@ def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
         p_out: fx.Pointer,
         M: fx.Int32,
     ):
-        tid = gpu.thread_idx.x
-        lane = tid % 64
-        wave = _wave_index(tid)
-        j = gpu.block_idx.x  # 16-row blocks 2 j and 2 j + 1
-        token = gpu.block_idx.y
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
-        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
-        lut_base = fx.add_offset(
-            fx.recast_iter(fx.Uint8, lds.lut.ptr),
-            fx.make_int_tuple(wave * _LUT_BYTES),
+        tid, j, token, part_base = down_decode_mixed_partials(
+            N,
+            K,
+            KP,
+            TOPK,
+            E,
+            SharedStorage,
+            p_mid,
+            p_ids,
+            p_topk_weight,
+            p_weight,
+            p_w_delta,
+            p_w_scale,
+            p_shared,
+            p_shared_scale,
         )
-        _lut_table_init(lut_base, lane)
-
-        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
-        tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
-        row = token * TOPK
-        expert = ids[row + wave]
-        weight = tws[row + wave]
-        first = ids[row]
-        x_off = (lane // 16) * 16
-        # Each branch loads its own intermediate row (first: it does not depend on the expert id) and the shared
-        # expert's wave addresses its row with constants: code common to both branches would be hoisted above the
-        # branch, where its wait for the intermediate row would hold back the weight loads.
-        if wave == R:
-            mid = fx.make_view(
-                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + R) * K,
-                fx.make_layout(K, 1),
-            )
-            mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
-            live = (expert == E) & (first >= 0)
-            w_rsrc = _rsrc(
-                _address(p_shared), live.select(fx.Int64(N * KP), fx.Int64(0))
-            )
-            s_rsrc = _rsrc(
-                _address(p_shared_scale), live.select(fx.Int64(N * 4), fx.Int64(0))
-            )
-            # raws[b][i]: block i of 16-row block 2 j + b; the first PREFETCH blocks of both now, the rest as the MFMA
-            # loop consumes them.
-            raws = [[], []]
-
-            def issue_shared(i):
-                for b in range_constexpr(2):
-                    raws[b].append(
-                        _load(w_rsrc, lane * 16, ((2 * j + b) * KBP + i) * S_BLOCK, 4)
-                    )
-
-            for i in range_constexpr(PREFETCH):
-                issue_shared(i)
-            factors = [
-                _load(s_rsrc, (lane % 16) * 4, (2 * j + b) * 64, 1)[0].bitcast(
-                    fx.Float32
-                )
-                for b in range_constexpr(2)
-            ]
-            rocdl.sched_barrier(0)
-            amax, row_scale = _row_amax_scale(mids)
-            if _fast_div_ok(amax):
-                _stage_row_fast(mq_base, R * K, lane, mids, row_scale, 2)
-            else:
-                _stage_row_ieee(mq_base, R * K, lane, mids, row_scale)
-            _wave_fence()
-            accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-            for i in range_constexpr(KB):
-                if const_expr(0 < i and i + PREFETCH - 1 < KB):
-                    issue_shared(i + PREFETCH - 1)
-                xop = _lds_load(mq_base, R * K + i * 64 + x_off, fx.Int64, 2, 16)
-                for b in range_constexpr(2):
-                    w = Vec.from_elements(raws[b][i], fx.Uint32).bitcast(fx.Int64)
-                    for c in range_constexpr(2):
-                        accs[b] = _mfma(xop[c], w[c], accs[b])
-            totals = [
-                live.select(
-                    Vec(accs[b])[0] * factors[b] * row_scale * weight, fx.Float32(0.0)
-                )
-                for b in range_constexpr(2)
-            ]
-            if lane < 16:
-                for b in range_constexpr(2):
-                    _lds_store(
-                        part_base,
-                        (R * 32 + b * 16 + lane) * 4,
-                        Vec.from_elements([totals[b]], fx.Float32),
-                        fx.Float32,
-                        4,
-                    )
-        else:
-            base = wave * K
-            mid = fx.make_view(
-                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + wave) * K,
-                fx.make_layout(K, 1),
-            )
-            mids = [mid[lane + 64 * u] for u in range_constexpr(KB)]
-            w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES, masked=True)
-            d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES, masked=True)
-            w_voff, d_voff, s_voff = _row_block_pair_offsets(lane, KB, KQ)
-            # Each delta load (both rows, 4 blocks) right before the weight blocks it covers; the first PREFETCH
-            # blocks now, the rest as the MFMA loop consumes them.
-            raws, deltas = [], []
-
-            def issue_routed(i):
-                if const_expr(i % 4 == 0):
-                    deltas.append(
-                        a8w4.load_dwordx2(
-                            d_buf,
-                            d_voff,
-                            fx.Int32((2 * j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
-                        )
-                    )
-                raws.append(
-                    _load_dwordx4(
-                        w_buf, w_voff, fx.Int32((2 * j * KB + i) * a8w4.W_BLOCK_BYTES)
-                    )
-                )
-
-            for i in range_constexpr(PREFETCH):
-                issue_routed(i)
-            s_buf = a8w4.expert_bytes(p_w_scale, expert, N * 4, masked=True)
-            factors = a8w4.load_dwordx2(s_buf, s_voff, fx.Int32(j * 128))
-            rocdl.sched_barrier(0)
-            amax, row_scale = _row_amax_scale(mids)
-            if _fast_div_ok(amax):
-                _stage_row_fast(mq_base, base, lane, mids, row_scale, 2)
-            else:
-                _stage_row_ieee(mq_base, base, lane, mids, row_scale)
-            _wave_fence()
-            accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-            for i in range_constexpr(KB):
-                if const_expr(0 < i and i + PREFETCH - 1 < KB):
-                    issue_routed(i + PREFETCH - 1)
-                xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
-                accs = _row_block_pair_mfmas(
-                    xop, raws[i], deltas[i // 4], lut_base, fx.Uint32(8 * (i % 4)), accs
-                )
-            # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
-            totals = [
-                (expert >= 0).select(
-                    Vec(accs[h])[0]
-                    * fx.Uint32(factors[h]).bitcast(fx.Float32)
-                    * row_scale
-                    * weight,
-                    fx.Float32(0.0),
-                )
-                for h in range_constexpr(2)
-            ]
-            if lane < 16:
-                for h in range_constexpr(2):
-                    _lds_store(
-                        part_base,
-                        (wave * 32 + _pair_channel(lane, h)) * 4,
-                        Vec.from_elements([totals[h]], fx.Float32),
-                        fx.Float32,
-                        4,
-                    )
         gpu.barrier()
         if tid < 32:
-            parts = [
-                _lds_load(part_base, (w * 32 + tid) * 4, fx.Float32, 1, 4)[0]
-                for w in range_constexpr(TOPK)
-            ]
-            y = _tree_sum(parts)
+            y = down_decode_mixed_sum(TOPK, part_base, tid)
             out = fx.make_view(
                 fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
                 fx.make_layout(N, 1),

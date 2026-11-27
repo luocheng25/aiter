@@ -108,9 +108,9 @@ def _load(rsrc, voffset, soffset, dwords, aux=0):
     return [vec[i] for i in range(dwords)]
 
 
-def _store(rsrc, words, voffset):
-    # Raw buffer store: the typed fx.copy store takes its offset from a view layout; here a per-lane byte offset,
-    # _DROP drops the store in the hardware range check (no branch).
+def _store(rsrc, words, voffset, aux=0):
+    # Raw buffer store (aux: cache policy bits): the typed fx.copy store takes its offset from a view layout; here a
+    # per-lane byte offset, _DROP drops the store in the hardware range check (no branch).
     words = list(words)
     # A one-element vector store cannot be scalarized by the backend: store a plain i32.
     value = (
@@ -123,7 +123,7 @@ def _store(rsrc, words, voffset):
         rsrc,
         fx.Int32(voffset).ir_value(),
         fx.Int32(0).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+        aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
     )
 
 
@@ -1360,6 +1360,7 @@ def compile_a8w4_down_stream(
     ATOMIC=False,
     LDS_ACTS=False,
     W_AUX=0,
+    TP=None,
 ):
     """Build the streaming A8W4 Down launcher.
 
@@ -1379,6 +1380,16 @@ def compile_a8w4_down_stream(
     token's row with agent-scope BF16x2 atomics: the MFMA takes the rows as A, so lane ``16b + j`` holds
     channels ``2j`` and ``2j + 1`` of the pair (chains 0 and 1) of rows ``4b .. 4b+3``, and one atomic instruction
     covers 64 contiguous bytes of four rows.
+
+    ``TP`` (a ``mega_moe_tp_gfx942.down_tp.DownTP``, ``W == 4``, ``TP.COPY == ATOMIC``): the streamed Down of
+    ``MegaMoeTPGfx942`` -- a 1-D grid that computes the ``TP.NSPLIT`` column blocks one after the other (the
+    ``16 * R * W``-column groups of a column block of one sorted block on consecutive workgroups) and runs the
+    cross-rank sum of the finished blocks in workgroups of the same launch inserted between the compute workgroups
+    (``DownTP.segments``, ``down_tp`` module docstring). The route rows (without ``ATOMIC``) are stored written
+    through (``TP.ROUTE_AUX``). The launcher then takes, after ``task_num``, ``loc`` (int32 [M, TP.TOPK], the sorted
+    row of each route; a folded shared expert's column, the last, included), the result ``out`` BF16 [M, N],
+    ``ctr``, ``tab``, ``epoch``, ``err``, rank, tpq and limit (``down_tp.TPArgs``). ``TP=None`` builds exactly the
+    kernel above.
     """
     assert K % 64 == 0, f"Down K={K} must be a multiple of 64"
     assert N % (16 * R * W) == 0, f"Down N={N} must be a multiple of {16 * R * W}"
@@ -1406,6 +1417,17 @@ def compile_a8w4_down_stream(
     LDS = _LUT_LDS + W * REGION + ACT_LDS
     assert LDS == down_stream_lds(K, BLOCK_M, W, SHARE)
     assert LDS <= a8w4.LDS_BYTES, f"Down needs {LDS} B of LDS (K={K})"
+    ROUTE_AUX = 0
+    if TP is not None:
+        # Column groups (16 * R * W columns each) per column block of TP.
+        GPB = N // TP.NSPLIT // (16 * R * W)
+        assert W == 4, "the reduce / owner workgroups of TP run four waves"
+        assert GPB * TP.NSPLIT * 16 * R * W == N, (N, TP.NSPLIT, R, W)
+        assert TP.COPY == int(ATOMIC) and TP.H == N, TP
+        # loc's columns: the routed ones, then a folded shared expert's.
+        assert TP.COPY or TP.TOPK in (TOPK, TOPK + 1), (TP.TOPK, TOPK)
+        assert not (TP.PRO or TP.SB or TP.LAS), TP
+        ROUTE_AUX = TP.ROUTE_AUX
 
     def body(
         S,
@@ -1668,6 +1690,7 @@ def compile_a8w4_down_stream(
                     out_rsrc,
                     [_bf16_pair(values[2 * v], values[2 * v + 1]) for v in range(4)],
                     offset,
+                    ROUTE_AUX,
                 )
             rocdl.sched_barrier(0)
 
@@ -1757,4 +1780,148 @@ def compile_a8w4_down_stream(
             grid=(N // (16 * R * W), task_num, 1), block=(64 * W, 1, 1), stream=stream
         )
 
-    return launch
+    if TP is None:
+        return launch
+
+    @flyc.kernel(known_block_size=[64 * W, 1, 1], name="a8w4_down_stream_tp")
+    def a8w4_down_stream_tp(
+        p_x: fx.Pointer,
+        p_w: fx.Pointer,
+        p_d: fx.Pointer,
+        p_out: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_experts: fx.Pointer,
+        p_num_valid: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_x_scale: fx.Pointer,
+        M: fx.Int32,
+        rows: fx.Int32,
+        p_loc: fx.Pointer,
+        p_final: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_err: fx.Pointer,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        task_pad: fx.Int32,
+    ):
+        tid = fx.Int32(gpu.thread_id("x"))
+        lane = tid & 63
+        wave = _uniform(tid >> 6)
+        if const_expr(TP.TRACE):
+            TP.trace(p_ctr, task_pad, 0)
+        role, idx, part = TP.roles(fx.Int32(gpu.block_id("x")), task_pad)
+        blk = idx // GPB
+        group = part * GPB + (idx - blk * GPB)
+        lut_lds = _lds_base(LDS)
+        scale_lds = lut_lds + _LUT_LDS
+        _lut_table(lut_lds, lane)
+        act_lds = scale_lds + W * REGION
+        live, block = _block_head(
+            blk, BLOCK_M, M, lane, p_sorted_ids, p_sorted_experts, p_num_valid, rows
+        )
+        # Role 0: compute (down_tp.ROLE_COMPUTE).
+        live = (role == 0).select(live, fx.Int32(0))
+        for subs in range_constexpr(1, BLOCK_M // 16 + 1):
+            if live == subs:
+                body(
+                    subs,
+                    lut_lds,
+                    scale_lds,
+                    act_lds,
+                    _first(block, subs),
+                    lane,
+                    wave,
+                    group,
+                    M,
+                    rows,
+                    p_x,
+                    p_w,
+                    p_d,
+                    p_out,
+                    p_sorted_weights,
+                    p_w_scale,
+                    p_x_scale,
+                )
+        TP.finish(
+            role,
+            idx,
+            part,
+            TP.args(
+                p_loc=p_loc,
+                p_routes=p_out,
+                p_out=p_final,
+                p_ctr=p_ctr,
+                p_tab=p_tab,
+                p_epoch=p_epoch,
+                p_err=p_err,
+                M=M,
+                rank=rank,
+                tpq=tpq,
+                limit=limit,
+                task_pad=task_pad,
+            ),
+        )
+
+    @flyc.jit
+    def launch_tp(
+        p_x: fx.Pointer,
+        p_w: fx.Pointer,
+        p_d: fx.Pointer,
+        p_out: fx.Pointer,
+        p_sorted_ids: fx.Pointer,
+        p_sorted_weights: fx.Pointer,
+        p_sorted_experts: fx.Pointer,
+        p_num_valid: fx.Pointer,
+        p_w_scale: fx.Pointer,
+        p_x_scale: fx.Pointer,
+        M: fx.Int32,
+        task_num: fx.Int32,
+        p_loc: fx.Pointer,
+        p_final: fx.Pointer,
+        p_ctr: fx.Pointer,
+        p_tab: fx.Pointer,
+        p_epoch: fx.Pointer,
+        p_err: fx.Pointer,
+        rank: fx.Int32,
+        tpq: fx.Int32,
+        limit: fx.Int32,
+        stream: fx.Stream,
+    ):
+        CompilationContext.get_current()
+        rows = task_num * BLOCK_M
+        if const_expr(E is not None) and M * TOPK <= E:
+            task_num = M * TOPK
+        # Compute workgroups per column block: whole XCD rounds (the block bases stay multiples of the XCD count).
+        task_pad = (task_num * GPB + (a8w4.XCDS - 1)) // a8w4.XCDS * a8w4.XCDS
+        a8w4_down_stream_tp(
+            p_x,
+            p_w,
+            p_d,
+            p_out,
+            p_sorted_ids,
+            p_sorted_weights,
+            p_sorted_experts,
+            p_num_valid,
+            p_w_scale,
+            p_x_scale,
+            M,
+            rows,
+            p_loc,
+            p_final,
+            p_ctr,
+            p_tab,
+            p_epoch,
+            p_err,
+            rank,
+            tpq,
+            limit,
+            task_pad,
+        ).launch(grid=(TP.grid(task_pad), 1, 1), block=(64 * W, 1, 1), stream=stream)
+
+    if TP.WPE:
+        launch_tp.compile_hints["waves_per_eu"] = TP.WPE
+    return launch_tp

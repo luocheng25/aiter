@@ -48,8 +48,8 @@ def _buffer_rsrc(ptr, nbytes):
     return fx.rocdl.get_buffer_rsrc(fx.get_iter(tensor))
 
 
-def _store(rsrc, value, offset):
-    """Raw buffer store; bytes past the buffer end are dropped."""
+def _store(rsrc, value, offset, aux=0):
+    """Raw buffer store (``aux``: cache policy bits); bytes past the buffer end are dropped."""
     # Raw buffer store: the typed fx.copy store takes its offset from a view layout; callers
     # compute byte offsets and send the lanes that must not write past the buffer end, where
     # the hardware range check drops the store (no branch).
@@ -58,7 +58,7 @@ def _store(rsrc, value, offset):
         rsrc,
         offset.ir_value(),
         fx.Int32(0).ir_value(),
-        aux=ir.IntegerAttr.get(fx.Int32.ir_type, 0),
+        aux=ir.IntegerAttr.get(fx.Int32.ir_type, aux),
     )
 
 

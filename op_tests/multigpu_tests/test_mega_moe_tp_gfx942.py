@@ -6,7 +6,8 @@ and, in the DP section, ``comm_mode="ag_rs"``.
 One file, three regions (the DP mode's tests in their own section after region 2, its 15 benchmark cases after the
 51 AR cases):
 
-1. basic tests (``pytest <file> -m basic``): one case per dispatch tier and shape; run first after every change.
+1. basic tests (``pytest <file> -m basic``): one case per path of the layer (tier x fused communication) and shape;
+   run first after every change.
 2. other coverage (``pytest <file> -m "not basic"``): what the basic tests and the benchmark cannot cover; every
    test says why.
 3. benchmark (``python <file> [--cases ...]``, after the last test): the SPEC cases {tp2, tp4, ds_layer_tp4} x M in
@@ -155,12 +156,13 @@ def input_seed(shape, M, g):
 
 
 # Path checks. A forward's path (layer.last_path joined by ">") holds the single-GPU op's kernels (moe_a8w4.last_path:
-# with a shared expert also its "shared_*" steps or "*_shared" kernels) and then the communication. The tests pin the
-# dispatch tier -- the first Gate/Up kernel (a8w4_gateup*) --, whether a shared expert ran, and exactly one
-# communication segment: one all-reduce at the end (CA / RCCL), or fused communication kernels and no all-reduce (the
-# fused cross-rank sums of later milestones: the word "tp" in their "_"-separated names, e.g. a8w4_down_decode_tp,
-# a8w4_tp_reduce, sorted_sum_tp). Not pinned: the kernels after Gate/Up and which all-reduce an M takes (fusing the
-# communication changes them; 2.2 tests the all-reduce rule on the communicator itself).
+# with a shared expert also its "shared_*" steps or "*_shared" kernels) and then the communication. The tests pin a
+# known first Gate/Up kernel (a8w4_gateup*), whether a shared expert ran, exactly one communication segment -- one
+# all-reduce at the end (CA / RCCL), or fused communication kernels and no all-reduce (the word "tp" in their
+# "_"-separated names, e.g. a8w4_down_decode_tp, a8w4_route_sum_tp, a8w4_tp_reduce) --, and against the rules of the
+# op and of the layer (_want) the tier family of that Gate/Up kernel and the fused kernels in order. Not pinned: the
+# Gate/Up kernel within its tier and the other kernels (the single-GPU op's dispatch, op_tests/test_flydsl_moe_a8w4.py)
+# and which all-reduce an M takes (2.2 tests the all-reduce rule on the communicator itself).
 GATEUP_PREFIX, TP_WORD, SHARED_WORD, FUSED_COMM = "a8w4_gateup", "tp", "shared", "fused"
 # Every Gate/Up kernel name of moe_a8w4: decode (plan / pre-quantized / deduplicated / mixed with the shared expert),
 # streaming (block_m; quant: the intermediate quantized inside) and prefill (block_m x block_n x tile_k).
@@ -198,6 +200,27 @@ def _known_path(path):
         and GATEUP_KERNEL.fullmatch(tier) is not None
         and comm_kind(path) is not None
     )
+
+
+def tier_family(path):
+    """The tier family of a path's first Gate/Up kernel: "decode", "stream" or "prefill" (moe_a8w4._routed_tier's
+    names), None without one."""
+    tier = gateup_tier(path)
+    if tier is None:
+        return None
+    if tier.startswith(f"{GATEUP_PREFIX}_decode"):
+        return "decode"
+    return "stream" if "stream" in tier.split("_") else "prefill"
+
+
+def tp_kernels(path):
+    """The fused communication kernels of a path (the word "tp"), in order."""
+    return tuple(k for k in path.split(">") if TP_WORD in k.split("_"))
+
+
+def _got(path):
+    """What a path shows of the rules (_want): (tier family, fused communication kernels)."""
+    return tier_family(path), tp_kernels(path)
 
 
 # =====================================================================================================================
@@ -741,8 +764,60 @@ def _verify(state, shape, raw, shared, inputs, y):
     return res
 
 
+def _want(layer, M, dp=False):
+    """What the rules of the op (moe_a8w4) and of the layer give an M-row batch of ``layer`` (dp: the ag_rs mode,
+    M = world * M_r): (the tier family of its first Gate/Up kernel, its fused communication kernels in order), from
+    the modules' constants and dispatch functions (DECODE_TIER_MAX_M, DECODE_TP_MAX_M, FUSED_MIN_*, the workspace's
+    mid_m, STREAM_*SPEC*, the op's tier rules). Building the hooks launches nothing."""
+    from aiter.ops.flydsl import mega_moe_tp_gfx942 as tp
+    from aiter.ops.flydsl import moe_a8w4 as op
+
+    w, topk = layer._weights, layer.cfg.topk
+    H, I, E = w.hidden, w.inter_padded, w.experts
+    tiles, dmax = (None,) * 3, layer._decode_tier_max_m()
+    # a 16-byte aligned output (the layer's) and, in the ag_rs mode, the home rows
+    aligned = torch.empty(8, device=layer.device)
+    tier = op._routed_tier(M, H, I, topk, E, *tiles, dmax)
+    rs, home, mode = ("_rs", aligned, None) if dp else ("", None, None)
+    if layer._shared:
+        fold = op._shared_fold_tier(M, w, topk, aligned, tiles, dmax)
+        mixed = op._mixed_decode(M, w, topk, tiles, fold, dmax)
+        mode = "mixed" if mixed else ("fold" if fold else "split")
+    if mode == "split":
+        return tier, ()
+    if tier == "decode":
+        if not layer._decode_fuses(M):
+            return tier, ()
+        if mode == "mixed":
+            return tier, (f"a8w4_down_decode_mixed_tp{rs}",)
+        if (
+            M >= op.DECODE_DEDUP_MIN_M
+            and H >= op.DECODE_DEDUP_MIN_H
+            and op._down_dd_blocks(H, I)
+        ):
+            return tier, ()
+        pairs = op._slot_pair_offsets_fit(w) and op._decode_fits(H, I, topk, True)
+        wide = H in op.DECODE_WIDE_HIDDEN and M >= op.DECODE_WIDE_DEDUP_MIN_M
+        first = min(op.DECODE_PREQUANT_MIN_M, tp.DECODE_TP_PREQUANT_MIN_M)
+        name = "a8w4_down_decode" + ("_pq" if pairs and (wide or M >= first) else "")
+        return tier, (name + ("_shared" if mode == "fold" else "") + f"_tp{rs}",)
+    bm = op._stream_block_m(M, topk, E, H) if tier == "stream" else 64
+    atomic = tier == "stream" and op._stream_atomic(H, I, bm)
+    if layer._fuses(M):
+        if atomic or not (tier == "prefill" or op._stream_prefill_down(H, I, bm)):
+            down, kind = layer._stream_down(M, [], home), "stream"
+        else:
+            down, kind = layer._prefill_down(M, [], home), "prefill"
+        if down is None:
+            return tier, (f"a8w4_tp_reduce{rs}",)
+        return tier, (f"a8w4_down_{kind}_bm{bm}_tp{rs}", "a8w4_tp_reduce")
+    if layer._mid_fuses(M) and not atomic:
+        return tier, (f"a8w4_route_sum_tp{rs}",)
+    return tier, ()
+
+
 def _job_check(state, shape, tokens):
-    """forward + verify of input group 0 for each M in tokens."""
+    """forward + verify of input group 0 for each M in tokens; the path and what the rules give it (_want)."""
     if not state.member(shape):
         return None
     layer, raw, shared = state.get(shape)
@@ -752,7 +827,13 @@ def _job_check(state, shape, tokens):
         y = layer.forward(*inputs)
         path = ">".join(layer.last_path)
         rows.append(
-            dict(M=M, path=path, **_verify(state, shape, raw, shared, inputs, y))
+            dict(
+                M=M,
+                path=path,
+                want=_want(layer, M),
+                got=_got(path),
+                **_verify(state, shape, raw, shared, inputs, y),
+            )
         )
     return rows
 
@@ -775,6 +856,24 @@ def _assert_verified(rows):
     assert not bad, "wrong or rank-dependent outputs:\n" + "\n".join(map(str, bad))
 
 
+def _assert_paths(rows, shared):
+    """Every row's path (_job_check): a known one, with the shared expert or without, and what the rules give its M
+    (_want: the tier family and the fused communication kernels)."""
+    bad = [
+        r
+        for r in rows
+        if not (
+            _known_path(r["path"])
+            and has_shared(r["path"]) == shared
+            and r["got"] == r["want"]
+        )
+    ]
+    assert not bad, f"paths off the rules (shared expert {shared}):\n" + "\n".join(
+        f"rank {r['rank']} M={r['M']}: want {r['want']}, got {r['got']}, path {r['path']}"
+        for r in bad
+    )
+
+
 @pytest.fixture(scope="session")
 def pool():
     if torch.cuda.device_count() < POOL_WORLD:
@@ -790,12 +889,13 @@ def pool():
 
 
 # =====================================================================================================================
-# Region 1: basic tests (-m basic): one case per dispatch tier of the single-GPU op x shape -- decode (Down on
-# pre-quantized rows from 4 rows), decode on pre-quantized rows, H5120's decode deduplicated by expert, the mixed
-# routed + shared decode, the decode with the shared expert on a side stream, streaming with block 16 / 32 / 64
-# (quant: Gate/Up quantizes the intermediate itself), prefill sorted by the streaming prep or by Opus. Each checks the
-# output against the FP32 reference and pins the tier (gateup_tier), whether the shared expert ran (has_shared) and
-# exactly one communication segment (comm_kind), not which one.
+# Region 1: basic tests (-m basic): one case per path of this layer x shape -- the decode tier with the sum in the
+# Down decode kernel (per route, by slot pair on pre-quantized rows, the mixed routed + shared decode, the shared
+# expert folded into the slot-pair Down), the streaming tier with the custom all-reduce, with sum_tp, with tp_reduce
+# (copying after the atomic streaming Down, or summing the routes) and with the sum streamed out of the Down
+# (down_tp), the prefill tier with down_tp. Each checks the output against the FP32 reference and the path
+# (_assert_paths): the tier family and the fused communication kernels the rules give that M (_want; each case's
+# comment names today's), whether the shared expert ran and exactly one communication segment.
 # =====================================================================================================================
 DEC, PQ, DD, MIX = (
     "a8w4_gateup_decode",
@@ -808,70 +908,56 @@ ST32Q, ST64Q = (f"a8w4_gateup_quant_stream_bm{b}" for b in (32, 64))
 PF = "a8w4_gateup_prefill_bm64_bn128_tk128"
 
 BASIC = [
-    # decode: one workgroup per route / token
-    ("tp2", 1, DEC),
-    ("tp4", 8, DEC),  # Down on pre-quantized rows
-    ("tp2", 32, PQ),  # both GEMMs on pre-quantized rows
-    ("ds_layer_tp4", 1, MIX),  # routed and shared experts in the same two kernels
-    ("ds_layer_tp4", 4, PQ),  # the shared expert on a side stream, joined into Down
-    ("ds_layer_tp4", 8, DD),  # H5120: Gate/Up deduplicated by expert
-    # streaming: weights streamed once per expert block
-    ("tp2", 256, ST16),
-    ("tp4", 1024, ST32Q),
-    ("tp4", 2048, ST64Q),
-    ("ds_layer_tp4", 64, ST16),
-    ("ds_layer_tp4", 1024, ST32),
-    # prefill: sorted 64-row blocks
-    ("tp2", 2048, PF),  # sorting by the streaming prep
-    ("tp4", 4096, PF),  # Opus moe_sorting
-    ("ds_layer_tp4", 2048, PF),  # the shared expert's GEMMs ahead of the routed ones
+    # decode tier: the sum in the Down decode kernel (decode_tp)
+    ("tp2", 1),  # a8w4_down_decode_tp: one workgroup per route
+    ("tp4", 8),  # a8w4_down_decode_pq_tp: Down on pre-quantized rows, by slot pair
+    ("tp2", 32),  # a8w4_down_decode_pq_tp after both GEMMs on pre-quantized rows
+    ("ds_layer_tp4", 1),  # a8w4_down_decode_mixed_tp: routed + shared in two kernels
+    ("ds_layer_tp4", 4),  # a8w4_down_decode_pq_shared_tp: the shared expert folded in
+    ("ds_layer_tp4", 8),  # the same after H5120's Gate/Up deduplicated by expert
+    # streaming tier: weights streamed once per expert block
+    ("tp2", 256),  # the custom all-reduce after the atomic streaming Down
+    ("ds_layer_tp4", 64),  # a8w4_route_sum_tp: the route sum and the sum in one kernel
+    ("tp4", 256),  # a8w4_tp_reduce copying the atomic streaming Down's sums
+    ("ds_layer_tp4", 256),  # a8w4_tp_reduce: route sum, reduce-scatter, sum, all-gather
+    ("tp4", 1024),  # a8w4_down_stream_bm32_tp > a8w4_tp_reduce: sum out of the Down
+    ("tp4", 2048),  # the same with block 64
+    ("ds_layer_tp4", 1024),  # the same with the shared expert folded in
+    # prefill tier: sorted 64-row blocks, a8w4_down_prefill_bm64_tp > a8w4_tp_reduce
+    ("tp2", 2048),  # sorting by the streaming prep
+    ("tp4", 4096),  # Opus moe_sorting
+    ("ds_layer_tp4", 2048),  # the shared expert's GEMMs ahead of the routed ones
 ]
 
 
 @pytest.mark.basic
-@pytest.mark.parametrize("shape,M,tier", BASIC, ids=[f"{s}_m{m}" for s, m, _ in BASIC])
-def test_basic(pool, shape, M, tier):
+@pytest.mark.parametrize("shape,M", BASIC, ids=[f"{s}_m{m}" for s, m in BASIC])
+def test_basic(pool, shape, M):
     rows = _member_rows(pool.run("check", shape=shape, tokens=[M]), shape)
     _assert_verified(rows)
-    shared = SHAPES[shape]["shared"]
-    for r in rows:
-        p = r["path"]
-        assert (
-            gateup_tier(p) == tier
-            and has_shared(p) == shared
-            and comm_kind(p) is not None
-        ), (
-            f"rank {r['rank']}: expected Gate/Up {tier}, shared expert {shared} and one communication segment, "
-            f"path {p}"
-        )
+    _assert_paths(rows, SHAPES[shape]["shared"])
 
 
 # =====================================================================================================================
 # Region 2: other coverage (-m "not basic"). Not here: full-precision checks of the 51 SPEC cases -- the benchmark
 # verifies every timed output against the reference (and the cross-rank identity) and fails otherwise --, and the
-# dispatch boundaries of the single-GPU op (op_tests/test_flydsl_moe_a8w4.py tests both sides of each; this layer
-# adds no dispatch of its own but the all-reduce rule, 2.2).
+# dispatch boundaries of the single-GPU op (op_tests/test_flydsl_moe_a8w4.py tests both sides of each). This layer's
+# own dispatch -- the op's decode tier limit (DECODE_TIER_MAX_M) and the batches each fused kernel takes -- is tested
+# on both sides of each boundary in 2.12 (D.10 in the ag_rs mode), the all-reduce rule in 2.2.
 # =====================================================================================================================
 # --- 2.1 DeepSeek-V4.1's MTP layer ----------------------------------------------------------------------------------
 # Why: the benchmark and the basic tests take the SPEC shapes only; the MTP layer (128 routed experts, topk 3 + the
-# shared expert) reaches shared-expert tiers at other M than ds_layer_tp4: the mixed routed + shared decode still at
-# 4 rows (ds_layer_tp4: up to 2), and at 1280 rows the block-64 streaming Gate/Up after the shared expert's GEMMs,
-# with the prefill Down (ds_layer_tp4 streams with blocks 16 / 32 only).
-MTP_CASES = ((4, MIX), (1280, ST64))
+# shared expert) reaches shared-expert paths at other M than ds_layer_tp4: the mixed routed + shared decode still at
+# 4 rows, and at 1280 rows the block-64 streaming Gate/Up after the shared expert's GEMMs with the prefill Down and
+# the sum streamed out of it (ds_layer_tp4 streams with blocks 16 / 32 and their streaming Down only).
+MTP_TOKENS = (4, 1280)
 
 
 def test_mtp_layer(pool):
     shape = "mtp_layer_tp4"
-    tiers = dict(MTP_CASES)
-    rows = _member_rows(pool.run("check", shape=shape, tokens=list(tiers)), shape)
+    rows = _member_rows(pool.run("check", shape=shape, tokens=list(MTP_TOKENS)), shape)
     _assert_verified(rows)
-    for r in rows:
-        p = r["path"]
-        assert (
-            gateup_tier(p) == tiers[r["M"]]
-            and has_shared(p)
-            and comm_kind(p) is not None
-        ), f"M={r['M']} rank {r['rank']}: expected Gate/Up {tiers[r['M']]} with the shared expert, path {p}"
+    _assert_paths(rows, True)
 
 
 # --- 2.2 the all-reduce rule ------------------------------------------------------------------------------------
@@ -930,9 +1016,10 @@ def test_all_reduce_rule(pool, shape):
 
 # --- 2.3 out=, M = 0 --------------------------------------------------------------------------------------------
 # Why: the benchmark and the basic tests never pass ``out`` and never send M = 0. ``out`` (NaN-filled) must hold the
-# output whichever all-reduce runs (the custom one returns a new tensor, copied back; RCCL sums in place): TP4 8 and
-# 4096 rows, DeepSeek-V4.1 TP4 64 rows (shared expert). M = 0 returns an empty output and launches nothing.
-OUT_ARG_CASES = (("tp4", 8), ("tp4", 4096), ("ds_layer_tp4", 64))
+# output whichever exit runs: TP4 8 rows (the sum in the Down decode kernel), 64 (the custom all-reduce returns a new
+# tensor, copied back) and 4096 (the prefill Down's sum, tp_reduce), DeepSeek-V4.1 TP4 64 rows (sum_tp, shared
+# expert). M = 0 returns an empty output and launches nothing.
+OUT_ARG_CASES = (("tp4", 8), ("tp4", 64), ("tp4", 4096), ("ds_layer_tp4", 64))
 
 
 def _job_out_arg(state):
@@ -984,8 +1071,9 @@ def test_out_argument_and_empty_batch(pool):
 # --- 2.4 repeated calls across tiers, reset, error flags --------------------------------------------------------
 # Why: the benchmark repeats one case at a time and the basic tests call each case once; here one instance jumps
 # between decode / streaming / prefill (cached plans and buffers of the op; with the shared expert also its side
-# stream), calls reset() in between, and the watchdog API (check_errors / poll_errors / error_flag) is read
-# afterwards.
+# stream; the cross-rank state of the fused communication kernels -- epochs, inboxes, parities -- from one kernel
+# and batch size to another), calls reset() in between, and the watchdog API (check_errors / poll_errors /
+# error_flag) is read afterwards.
 REPEAT = {
     "tp2": (1, 2048, 48, 4096, 16, 256, 1),
     "ds_layer_tp4": (1, 2048, 8, 64, 4),
@@ -1126,17 +1214,20 @@ def test_set_weights(pool):
 
 # --- 2.7 CUDA graph capture and replay --------------------------------------------------------------------------
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
-# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups: decode
-# (TP2 8; DeepSeek-V4.1 TP4 1, the mixed decode, and 4, the shared expert on its side stream), streaming (TP4 2048,
-# DeepSeek-V4.1 TP4 64 with the side stream), prefill (DeepSeek-V4.1 TP4 2048) and both all-reduces (TP2 4096 and
-# DeepSeek-V4.1 TP4 2048 take RCCL, the others the custom all-reduce).
+# prepare(), forward is captured once (static input / output buffers) and replayed on two other input groups, once
+# per exit: the sum in the Down decode kernel (TP2 8; DeepSeek-V4.1 TP4 1, the mixed decode, and 4, the shared
+# expert on its side stream), the custom all-reduce (TP4 64), sum_tp (DeepSeek-V4.1 TP4 64 with the side stream),
+# tp_reduce (DeepSeek-V4.1 TP4 256), the sum streamed out of the streaming Down (TP4 2048) and of the prefill Down
+# (TP2 4096, DeepSeek-V4.1 TP4 2048).
 GRAPH_CASES = [
     ("tp2", 8),
+    ("tp4", 64),
     ("tp4", 2048),
     ("tp2", 4096),
     ("ds_layer_tp4", 1),
     ("ds_layer_tp4", 4),
     ("ds_layer_tp4", 64),
+    ("ds_layer_tp4", 256),
     ("ds_layer_tp4", 2048),
 ]
 
@@ -1532,9 +1623,10 @@ def test_rejected_arguments(pool):
 
 # --- 2.10 the path checks themselves (CPU only) -----------------------------------------------------------------
 # Why: the benchmark does not check paths, and the tests above only see the paths this code takes (a known Gate/Up
-# kernel, one all-reduce at the end, the shared expert's steps); checks that accepted anything would pass them all.
-# Their verdicts on fused reductions (later milestones), on the shared expert's steps and on broken paths (no /
-# several / misplaced all-reduces, no / an unknown Gate/Up) are pinned here.
+# kernel, one communication segment at the end, the shared expert's steps); checks that accepted anything would pass
+# them all. Their verdicts on fused communication kernels, on the shared expert's steps and on broken paths (no /
+# several / misplaced all-reduces, no / an unknown Gate/Up), and what _got reads off a path for the rules (the tier
+# family, the fused kernels in order), are pinned here.
 def test_path_checks():
     qwen_decode = "a8w4_gateup_decode>a8w4_down_decode"
     qwen_prefill = f"moe_sorting_opus>a8w4_row_quant_fp8>{PF}>a8w4_row_quant_fp8>a8w4_down_prefill_bm64>sorted_sum"
@@ -1576,6 +1668,14 @@ def test_path_checks():
     assert gateup_tier(ds_side) == PQ and gateup_tier(fused) == DEC
     tiers = (DEC, PQ, DD, MIX, ST16, ST32, ST64, ST32Q, ST64Q, PF)
     assert all(GATEUP_KERNEL.fullmatch(t) for t in tiers), tiers
+    # the tier family of each Gate/Up kernel, and what _got reads off a path
+    families = ["decode"] * 4 + ["stream"] * 5 + ["prefill"]
+    assert [tier_family(f"{t}>{CA}") for t in tiers] == families
+    assert tier_family(f"a8w4_down_decode>{CA}") is None
+    assert _got(fused) == ("decode", ("a8w4_down_decode_tp",))
+    assert _got(stream_fused) == ("stream", ("a8w4_tp_reduce",))
+    assert _got(f"{ds_prefill}_tp") == ("prefill", ("sorted_sum_tp",))
+    assert _got(f"{qwen_prefill}>{RCCL}") == ("prefill", ())
 
 
 # --- 2.11 real shared experts: DeepSeek-V4.1-Flash layers 2 and 37, TP4 ------------------------------------------
@@ -1742,6 +1842,208 @@ def test_real_shared_experts_tp4(pool, layer):
             assert r["ours"] <= 1.5 * r["model"], (rank, r)
 
 
+# --- 2.12 this layer's dispatch boundaries ----------------------------------------------------------------------
+# Why: the benchmark and the basic tests take M in powers of two (and 48), and no boundary of this layer's dispatch
+# lies between two of them on both sides. Here every M where the rules (_want) change below BOUNDARY_MAX_M runs on
+# both sides (M - 1 and M) against the FP32 reference and the rules: the op's decode tier limit (DECODE_TIER_MAX_M),
+# the fused decode's limits (DECODE_TP_MAX_M, DECODE_TP_PREQUANT_MIN_M), sum_tp's rows (MID_WORLDS, the workspace's
+# mid_m), tp_reduce and the sum streamed out of the Down (FUSED_MIN_M, FUSED_MIN_BYTES, STREAM_SPEC,
+# STREAM_TIER_SPEC), and the op's tier boundaries where the fused kernels change (the streaming block size aside: the
+# op's dispatch, op_tests/test_flydsl_moe_a8w4.py). The boundaries come from the modules' constants, so changing a
+# limit moves the cases with it.
+BOUNDARY_MAX_M = {"tp2": 2048, "tp4": 4096, "ds_layer_tp4": 2048}
+
+
+def _boundaries(layer, hi, dp=False):
+    """The batch sizes 2..hi where the rules (_want) change, the streaming block size aside (dp: M_r, of world * M_r
+    rows)."""
+    world = layer.cfg.world_size
+
+    def rule(m):
+        tier, kernels = _want(layer, world * m if dp else m, dp)
+        return tier, tuple(re.sub(r"_bm\d+", "", k) for k in kernels)
+
+    found, prev = [], rule(1)
+    for m in range(2, hi + 1):
+        cur = rule(m)
+        if cur != prev:
+            found.append(m)
+        prev = cur
+    return found
+
+
+def _job_boundaries(state, shape):
+    if not state.member(shape):
+        return None
+    layer = state.get(shape)[0]
+    bounds = _boundaries(layer, BOUNDARY_MAX_M[shape])
+    return _job_check(state, shape, sorted({m for b in bounds for m in (b - 1, b)}))
+
+
+@pytest.mark.parametrize("shape", list(BOUNDARY_MAX_M))
+def test_dispatch_boundaries(pool, shape):
+    rows = _member_rows(pool.run("boundaries", shape=shape), shape)
+    assert len({r["M"] for r in rows}) >= 4, rows
+    _assert_verified(rows)
+    _assert_paths(rows, SHAPES[shape]["shared"])
+
+
+# --- 2.13 waits on peers: a late rank, a rank that skips a call, reset(), prepare()'s retry ----------------------
+# Why: the benchmark and the basic tests start every rank's fused kernels together and never time out. Here each fused
+# kernel -- the sum in the Down decode kernel (decode_tp; TP4 8), sum_tp (DeepSeek-V4.1 TP4 64), tp_reduce
+# (DeepSeek-V4.1 TP4 256), the sum streamed out of the streaming Down (TP4 1024) and of the prefill Down (TP2 2048)
+# -- waits for a rank that starts 0.5 s late (right sums, no error bits); with the wait bound cut to 50 ms, for a rank
+# that skips the call: the others give up within the bound with their kernel's error bit (_timeout_bit), check_errors()
+# raises once and clears it, the skipping rank's call after that is right or has its error bit too (not after sum_tp:
+# an owner that gave up still publishes its sum, which the late rank reads without waiting -- sum_tp rule 3), and
+# reset() restores right sums. prepare() resets every rank and warms up again when one rank's watchdog reports an
+# error, and raises on every rank when it reports one again.
+PEER_WAIT_CASES = (
+    ("tp4", 8),
+    ("ds_layer_tp4", 64),
+    ("ds_layer_tp4", 256),
+    ("tp4", 1024),
+    ("tp2", 2048),
+)
+
+
+def _timeout_bit(kernels):
+    """The error bit (ERR_TIMEOUT) of a wait that gave up in these fused kernels: decode_tp's, sum_tp's, else
+    tp_reduce's (down_tp sets tp_reduce's)."""
+    from aiter.ops.flydsl.kernels.mega_moe_tp_gfx942 import decode_tp, sum_tp, tp_reduce
+
+    words = {w for k in kernels for w in k.split("_")}
+    if "decode" in words:
+        return decode_tp.ERR_TIMEOUT
+    return sum_tp.ERR_TIMEOUT if "sum" in words else tp_reduce.ERR_TIMEOUT
+
+
+def _job_peer_wait(state, shape, M):
+    from aiter.ops.flydsl import mega_moe_tp_gfx942 as mod
+    from aiter.ops.flydsl.kernels.mega_moe_tp_gfx942 import sum_tp
+
+    if not state.member(shape):
+        return None
+    layer, raw, shared = state.get(shape)
+    W, dev = SHAPES[shape]["world"], state.device
+    cpu = state.tp[W][1]
+    laggard = state.rank == W - 1
+    want = _want(layer, M)
+
+    def verified(step, g):
+        inputs = state.inputs(shape, M, g)
+        y = layer.forward(*inputs)
+        path = ">".join(layer.last_path)
+        res = _verify(state, shape, raw, shared, inputs, y)
+        return dict(step=step, M=M, path=path, want=want, got=_got(path), **res)
+
+    def raised(fn):
+        try:
+            fn()
+        except RuntimeError as e:
+            return str(e)
+        return None
+
+    rows = [verified("warm", 0)]
+    res = {"want_bit": _timeout_bit(want[1])}
+    res["late_call_checked"] = res["want_bit"] != sum_tp.ERR_TIMEOUT
+    # a rank 0.5 s late, within the wait bound
+    inputs = state.inputs(shape, M, 1)
+    torch.cuda.synchronize(dev)
+    dist.barrier(group=cpu)
+    if laggard:
+        time.sleep(0.5)
+    y = layer.forward(*inputs)
+    path = ">".join(layer.last_path)
+    res_late = _verify(state, shape, raw, shared, inputs, y)
+    rows.append(
+        dict(step="late", M=M, path=path, want=want, got=_got(path), **res_late)
+    )
+    res["late_bits"] = layer.poll_errors()
+    # a rank that skips the call (wait bound 50 ms), then calls after the others gave up
+    inputs = state.inputs(shape, M, 2)
+    ref = _group_reference(state, shape, raw, shared, inputs)
+    torch.cuda.synchronize(dev)
+    dist.barrier(group=cpu)
+    saved = mod.WAIT_S, mod.FIRST_WAIT_S
+    mod.WAIT_S = mod.FIRST_WAIT_S = 0.05
+    try:
+        began = time.perf_counter()
+        if not laggard:
+            layer.forward(*inputs)
+        torch.cuda.synchronize(dev)
+        res["took"] = time.perf_counter() - began
+        res["bits"] = layer.poll_errors()
+        res["raised"] = raised(layer.check_errors)
+        res["cleared"] = layer.poll_errors()
+        dist.barrier(group=cpu)
+        if laggard:
+            y = layer.forward(*inputs)
+            res["skip_ok"] = check(y, ref)["ok"]
+            res["skip_bits"] = layer.poll_errors()
+            res["skip_raised"] = raised(layer.check_errors)
+    finally:
+        mod.WAIT_S, mod.FIRST_WAIT_S = saved
+    layer.reset()
+    rows += [verified("reset", g) for g in (0, 3)]
+    res["reset_bits"] = layer.poll_errors()
+    # prepare(): one rank's watchdog reports an error (the warmup itself runs clean: a real sticky bit would make that
+    # rank's waits give up early) once -> every rank resets and warms up again; twice -> RuntimeError on every rank
+    local = -(-M // W)
+
+    def failing(times):
+        left = [times]
+
+        def poll():
+            left[0] -= 1
+            return 1 if left[0] >= 0 else type(layer).poll_errors(layer)
+
+        return poll
+
+    for name, times in (("retry", 1), ("stuck", 2)):
+        if laggard:
+            layer.poll_errors = failing(times)
+        try:
+            res[name] = raised(lambda: layer.prepare([local]))
+        finally:
+            if laggard:
+                del layer.poll_errors
+        res[f"{name}_bits"] = layer.poll_errors()
+    layer.reset()
+    rows.append(verified("after prepare", 1))
+    res["final_bits"] = layer.poll_errors()
+    return dict(res, rows=rows)
+
+
+@pytest.mark.parametrize(
+    "shape,M", PEER_WAIT_CASES, ids=[f"{s}_m{m}" for s, m in PEER_WAIT_CASES]
+)
+def test_peer_waits_and_timeouts(pool, shape, M):
+    W = SHAPES[shape]["world"]
+    for rank, res in enumerate(pool.run("peer_wait", shape=shape, M=M)):
+        if rank >= W:
+            assert res is None
+            continue
+        rows = [dict(r, rank=rank) for r in res["rows"]]
+        _assert_verified(rows)
+        _assert_paths(rows, SHAPES[shape]["shared"])
+        assert rows[0]["want"][1], f"{shape} M={M} fuses no communication: {rows[0]}"
+        assert res["late_bits"] == 0, f"rank {rank}: error bits after a late peer {res}"
+        if rank == W - 1:  # skipped; its late call is right or flagged (not sum_tp's)
+            assert res["bits"] == 0 and res["raised"] is None, res
+            assert (
+                res["skip_ok"] or res["skip_bits"] or not res["late_call_checked"]
+            ), res
+            assert (res["skip_raised"] is not None) == bool(res["skip_bits"]), res
+        else:
+            assert res["bits"] == res["want_bit"] and res["took"] < 5.0, res
+            assert res["raised"] and "gave up" in res["raised"], res
+        assert res["cleared"] == res["reset_bits"] == 0, res
+        assert res["retry"] is None and res["retry_bits"] == res["stuck_bits"] == 0, res
+        assert res["stuck"] and "timed out" in res["stuck"], res
+        assert res["final_bits"] == 0, res
+
+
 # =====================================================================================================================
 # DP section: comm_mode="ag_rs" (DP4 attention + TP4 MoE), shape ds_dp4. Every rank passes its own M_r tokens (the
 # same M_r on every rank); the layer gathers all world * M_r rows (rank r's at [r * M_r, (r + 1) * M_r)), runs this
@@ -1750,31 +2052,34 @@ def test_real_shared_experts_tp4(pool, layer):
 # rank checks its output against its rows of the FP32 reference summed over the group (the acceptance of region 1);
 # the outputs differ across ranks, so instead of their cross-rank identity a second call on the same inputs must give
 # bitwise the same output. D.1 holds the basic tests (-m basic), the rest is other coverage. Pinned: a Gate/Up kernel
-# ran, the shared expert ran, and the communication (dp_comm): one all-gather before the first Gate/Up kernel and one
-# reduce-scatter after it, either replaceable by fused communication kernels (the word "tp" in their names, as in
-# region 1), no all-reduce. Not pinned: the tier (the single-GPU op's, tested in region 1 and by
-# op_tests/test_flydsl_moe_a8w4.py) and which collectives an M_r takes (D.2 tests the rule on the communicator).
+# ran, the shared expert ran, and the communication (dp_comm): one all-gather before the first Gate/Up kernel and,
+# after it, fused communication kernels (the word "tp" in their names, as in region 1) or one reduce-scatter that sums
+# in rank order (never RCCL's ring reduce-scatter), no all-reduce; in D.1 and D.10 also the tier family and the fused
+# kernels the rules give that M (_want, as in region 1). Not pinned here: which all-gather an M_r takes, and the
+# ordered reduce-scatter (on no forward path of ds_dp4): D.2 tests both on the communicator.
 # =====================================================================================================================
 DP_SHAPE = "ds_dp4"
 AG_CA, AG_RCCL = "custom_all_gather", "rccl_all_gather"
 RS_CA, RS_RCCL = "custom_reduce_scatter", "rccl_reduce_scatter"
+RS_A2A = "rccl_all_to_all"
 
 
 def dp_comm(path):
     """The communication of an ag_rs path: (entry, exit), None when broken. entry: the one all-gather (AG_CA /
     AG_RCCL), before the first Gate/Up kernel, or FUSED_COMM for no all-gather and a fused communication kernel (the
-    word "tp") up to the first Gate/Up kernel; exit: the one reduce-scatter (RS_CA / RS_RCCL), after the first Gate/Up
-    kernel, or FUSED_COMM for none and a fused communication kernel after it. None too with an all-reduce or without
-    a Gate/Up kernel."""
+    word "tp") up to the first Gate/Up kernel; exit: the one reduce-scatter that sums in rank order (RS_CA / RS_A2A),
+    after the first Gate/Up kernel, or FUSED_COMM for none and a fused communication kernel after it. None too with
+    an all-reduce, with RCCL's reduce-scatter (its ring adds in BF16 hop by hop) and without a Gate/Up kernel.
+    """
     kernels = path.split(">")
     first = next(
         (i for i, k in enumerate(kernels) if k.startswith(GATEUP_PREFIX)), None
     )
-    if first is None or any(k in (CA, RCCL) for k in kernels):
+    if first is None or any(k in (CA, RCCL, RS_RCCL) for k in kernels):
         return None
     fused = [TP_WORD in k.split("_") for k in kernels]
     ags = [i for i, k in enumerate(kernels) if k in (AG_CA, AG_RCCL)]
-    rss = [i for i, k in enumerate(kernels) if k in (RS_CA, RS_RCCL)]
+    rss = [i for i, k in enumerate(kernels) if k in (RS_CA, RS_A2A)]
     if ags:
         entry = kernels[ags[0]] if ags == ags[:1] and ags[0] < first else None
     else:
@@ -1834,14 +2139,14 @@ def _assert_dp_verified(rows):
     assert not bad, "wrong or unrepeatable outputs:\n" + "\n".join(map(str, bad))
 
 
-# --- D.1 basic tests (-m basic): 1 token per rank (decode; the custom all-gather / reduce-scatter) and 2048 (prefill
-# on 8192 rows; RCCL), each called twice.
-DP_BASIC = (1, 2048)
+# --- D.1 basic tests (-m basic): one M_r per path, each called twice: 1 (decode: the sum in the Down decode kernel),
+# 4 (streaming: sum_tp), 32 (streaming: tp_reduce) and 2048 (prefill on 8192 rows: the sum streamed out of the Down).
+DP_BASIC = (1, 4, 32, 2048)
 
 
 def _job_dp_check(state, tokens):
     layer, raw, shared = state.get(DP_SHAPE)
-    rows = []
+    world, rows = SHAPES[DP_SHAPE]["world"], []
     for m in tokens:
         full = _dp_full(state, m, 0)
         y = layer.forward(*_dp_mine(state, full)).clone()
@@ -1851,6 +2156,8 @@ def _job_dp_check(state, tokens):
             dict(
                 M=m,
                 path=path,
+                want=_want(layer, world * m, dp=True),
+                got=_got(path),
                 repeatable=torch.equal(y, again),
                 **_dp_verify(state, raw, shared, full, y),
             )
@@ -1858,42 +2165,50 @@ def _job_dp_check(state, tokens):
     return rows
 
 
+def _assert_dp_paths(rows):
+    """Every row's path (_job_dp_check): an ag_rs path with the shared expert, and what the rules give its M_r."""
+    bad = [r for r in rows if not (_dp_known_path(r["path"]) and r["got"] == r["want"])]
+    assert not bad, "paths off the rules:\n" + "\n".join(
+        f"rank {r['rank']} M_r={r['M']}: want {r['want']}, got {r['got']}, path {r['path']}"
+        for r in bad
+    )
+
+
 @pytest.mark.basic
 @pytest.mark.parametrize("m", DP_BASIC, ids=[f"{DP_SHAPE}_m{m}" for m in DP_BASIC])
 def test_dp_basic(pool, m):
     rows = _rank_rows(pool.run("dp_check", tokens=[m]))
     _assert_dp_verified(rows)
-    for r in rows:
-        assert _dp_known_path(
-            r["path"]
-        ), f"rank {r['rank']}: expected an ag_rs path with the shared expert, got {r['path']}"
+    _assert_dp_paths(rows)
 
 
 # --- D.2 the all-gather / reduce-scatter rule ---------------------------------------------------------------------
-# Why: which collectives a forward takes is pinned nowhere else (fusing the communication changes them; the basic
-# tests take one M_r per side). The layer's communicator gathers BF16 x [M_r, 5120] with int32 / float32 routing and
-# reduce-scatters BF16 partials [4 M_r, 5120] on both sides of AG_RCCL_MIN_BYTES and RS_RCCL_MIN_BYTES (custom below,
-# RCCL from there on), and with the custom communicator off (as where aiter disables it: RCCL, the routing packed
-# into one gather): the gather exact, the reduce-scatter of small integers exact.
+# Why: which all-gather a forward takes is pinned nowhere else (the basic tests take one M_r per side), and the
+# reduce-scatter that sums in rank order (reduce_scatter_ordered) is on no forward path of ds_dp4 (every M_r fuses its
+# sum), so neither the basic tests nor the benchmark run it. The layer's communicator gathers BF16 x [M_r, 5120] with
+# int32 / float32 routing on both sides of AG_RCCL_MIN_BYTES (custom below, RCCL from there on) and reduce-scatters
+# random BF16 partials [4 M_r, 5120] (exponents spread over 2^-16..2^16, so that the order of the sum shows): the
+# custom reduce-scatter where its should_custom_rs takes them (M_r 614, 615), else an all-to-all and the sum on this
+# rank (M_r 2048: past its size cap); with the custom communicator off (as where aiter disables it: RCCL, the routing
+# packed into one gather; the all-to-all) at M_r 8. The gather exact; the reduce-scatter bitwise the f32 sum of the
+# ranks' partials in rank order 0..3, rounded to BF16 once (the DP sum rule).
 def _dp_rule_cases(world, hidden):
-    """(M_r, all-gather, reduce-scatter) on both sides of each threshold of a TP size, BF16 rows of ``hidden``."""
-    from aiter.ops.flydsl.mega_moe_tp_gfx942 import (
-        AG_RCCL_MIN_BYTES,
-        RS_RCCL_MIN_BYTES,
-    )
+    """(M_r, all-gather) on both sides of the all-gather threshold of a TP size, BF16 rows of ``hidden``."""
+    from aiter.ops.flydsl.mega_moe_tp_gfx942 import AG_RCCL_MIN_BYTES
 
-    # the first M_r whose x / whose partials (world * M_r rows) reach the threshold
+    # the first M_r whose x reaches the threshold
     ag = -(-AG_RCCL_MIN_BYTES[world] // (2 * hidden))
-    rs = -(-RS_RCCL_MIN_BYTES[world] // (2 * hidden * world))
-    return [
-        (m, AG_CA if m < ag else AG_RCCL, RS_CA if m < rs else RS_RCCL)
-        for m in sorted({ag - 1, ag, rs - 1, rs})
-    ]
+    return [(ag - 1, AG_CA), (ag, AG_RCCL)]
+
+
+# M_r whose partials the custom reduce-scatter does not take (should_custom_rs: AITER_CUSTOM_RS_MAX_SIZE, 64 MiB)
+DP_RS_A2A_TOKENS = 2048
 
 
 def _job_dp_comm_rule(state):
     s, dev, rank = SHAPES[DP_SHAPE], state.device, state.rank
     comm, world, H = state.get(DP_SHAPE)[0]._comm, s["world"], s["H"]
+    group = state.tp[world][0]
     width = s["topk"] + 1
 
     def rows_of(r, m):
@@ -1905,25 +2220,43 @@ def _job_dp_comm_rule(state):
         tw = torch.randn((m, width), generator=gen, device=dev)
         return x.to(torch.bfloat16), ids, tw
 
-    cases = [(*c, True) for c in _dp_rule_cases(world, H)] + [
-        (8, AG_RCCL, RS_RCCL, False)
+    def partials(m):
+        """This rank's partials [world * m, H] and the rule's sum of its rows (f32, rank order, rounded once)."""
+        gen = torch.Generator(device=dev).manual_seed(SEED + 7919 * rank + m + 1)
+        exp = torch.randint(-16, 17, (world * m, H), generator=gen, device=dev)
+        part = torch.randn((world * m, H), generator=gen, device=dev) * torch.exp2(
+            exp.float()
+        )
+        part = part.to(torch.bfloat16)
+        parts = [torch.empty_like(part) for _ in range(world)]
+        dist.all_gather(parts, part, group=group)
+        mine = slice(rank * m, (rank + 1) * m)
+        acc = parts[0][mine].float()
+        for p in parts[1:]:
+            acc += p[mine].float()
+        return part, acc.to(torch.bfloat16)
+
+    cases = [(m, ag, True) for m, ag in _dp_rule_cases(world, H)] + [
+        (DP_RS_A2A_TOKENS, AG_RCCL, True),
+        (8, AG_RCCL, False),
     ]
     rows = []
-    for m, ag, rs, custom in cases:
+    for m, ag, custom in cases:
+        part, total = partials(m)
         saved = comm.ca
         if not custom:
             comm.ca = None
         try:
+            rs = RS_A2A
+            if comm.ca is not None and comm.ca.should_custom_rs(part, 0):
+                rs = RS_CA
             got = comm.all_gather(*rows_of(rank, m))
             want = [torch.cat(t) for t in zip(*(rows_of(r, m) for r in range(world)))]
-            gen = torch.Generator(device=dev).manual_seed(SEED + m)
-            base = torch.randint(-8, 9, (world * m, H), generator=gen, device=dev)
             out = torch.empty((m, H), dtype=torch.bfloat16, device=dev)
-            comm.reduce_scatter((base * (rank + 1)).to(torch.bfloat16), out)
+            comm.reduce_scatter_ordered(part, out)
             torch.cuda.synchronize(dev)
         finally:
             comm.ca = saved
-        total = base[rank * m : (rank + 1) * m] * (world * (world + 1) // 2)
         rows.append(
             {
                 "M_r": m,
@@ -1931,7 +2264,7 @@ def _job_dp_comm_rule(state):
                 "want": (ag, rs),
                 "got": (comm.last_ag, comm.last_rs),
                 "gather_exact": all(torch.equal(a, b) for a, b in zip(got, want)),
-                "rs_exact": torch.equal(out, total.to(torch.bfloat16)),
+                "rs_exact": torch.equal(out, total),
             }
         )
     return rows
@@ -1939,7 +2272,8 @@ def _job_dp_comm_rule(state):
 
 def test_dp_all_gather_reduce_scatter_rule(pool):
     for rank, rows in enumerate(pool.run("dp_comm_rule")):
-        assert len(rows) >= 3, rows
+        # both reduce-scatters of reduce_scatter_ordered ran
+        assert {r["got"][1] for r in rows} == {RS_CA, RS_A2A}, rows
         for r in rows:
             assert (
                 r["got"] == r["want"] and r["gather_exact"] and r["rs_exact"]
@@ -1950,8 +2284,8 @@ def test_dp_all_gather_reduce_scatter_rule(pool):
 # Why: the benchmark and the basic tests send real tokens only. Serving pads every rank to the same M_r with rows
 # routed to -1 in every column (output 0, no shared expert) and may mask a token's first route (its shared expert
 # dropped as well, its other routes kept). Rank r pads its last 0, 1, M_r / 2, M_r rows (the last rank only padding,
-# random x in every padding row) and masks the first route of its first real row; M_r 2 (decode), 300 (streaming),
-# 1024 (prefill, RCCL).
+# random x in every padding row) and masks the first route of its first real row; M_r 2 (decode: the sum in the Down
+# decode kernel), 300 (streaming: tp_reduce), 1024 (prefill: the sum streamed out of the Down).
 DP_PAD_TOKENS = (2, 300, 1024)
 
 
@@ -1997,8 +2331,8 @@ def test_dp_padding_rows(pool):
 # --- D.4 AR and DP layers interleaved ---------------------------------------------------------------------------
 # Why: the benchmark and the other tests run one layer at a time; a server may keep layers of both modes in one
 # process (e.g. an MTP layer in AR next to DP main layers). Here a ds_layer_tp4 (ar) and a ds_dp4 (ag_rs) instance
-# alternate on the same group, sharing one communicator: the all-reduce and the all-gather / reduce-scatter on both
-# sides of their thresholds.
+# alternate on the same group, sharing one communicator: the fused sums of both modes (decode, sum_tp, the prefill
+# Down's) and the all-gather on both sides of its threshold.
 DP_ALTERNATE = (
     ("ds_layer_tp4", 16),
     (DP_SHAPE, 4),
@@ -2038,9 +2372,10 @@ def test_dp_ar_interleaved(pool):
 
 # --- D.5 CUDA graph capture and replay ----------------------------------------------------------------------------
 # Why: the benchmark and the basic tests run eagerly; serving captures the decode batches in CUDA graphs. After
-# prepare([M_r]) forward is captured once (static buffers) and replayed on two other input groups: M_r 1 and 16 (the
-# custom all-gather / reduce-scatter) and 1024 (RCCL).
-DP_GRAPH_TOKENS = (1, 16, 1024)
+# prepare([M_r]) forward is captured once (static buffers) and replayed on two other input groups, once per exit:
+# M_r 1 (decode: the sum in the Down decode kernel), 16 (sum_tp), 64 (tp_reduce) and 1024 (the prefill Down's sum;
+# the all-gather by RCCL, the others by the custom one).
+DP_GRAPH_TOKENS = (1, 16, 64, 1024)
 
 
 def _job_dp_graph(state, m):
@@ -2082,9 +2417,10 @@ def test_dp_cuda_graph(pool, m):
 
 # --- D.6 out=, M_r = 0 ------------------------------------------------------------------------------------------
 # Why: the benchmark and the basic tests never pass ``out`` and never send M_r = 0. ``out`` (NaN-filled) must hold
-# the output and be returned for either reduce-scatter (M_r 8: custom, 1024: RCCL); M_r = 0 on every rank returns an
-# empty output, launches nothing and communicates nothing.
-DP_OUT_TOKENS = (8, 1024)
+# the output and be returned at every exit: M_r 2 (decode: this rank's rows copied into it), 8 (sum_tp), 300
+# (tp_reduce) and 1024 (the prefill Down's sum), which store the sums straight into it; M_r = 0 on every rank returns
+# an empty output, launches nothing and communicates nothing.
+DP_OUT_TOKENS = (2, 8, 300, 1024)
 
 
 def _job_dp_out_arg(state):
@@ -2279,7 +2615,8 @@ def test_dp_rejected_arguments(pool):
 
 # --- D.8 the DP path checks themselves (CPU only) -----------------------------------------------------------------
 # Why: as 2.10: the tests above only see the paths this code takes, so checks that accepted anything would pass them
-# all. dp_comm's verdicts on the fused communication of later milestones and on broken paths (no / several /
+# all. dp_comm's verdicts on fused communication kernels (the ag_rs mode's "_rs" names), on RCCL's reduce-scatter
+# (rejected: its ring adds in BF16 hop by hop, not the f32 sum in rank order) and on broken paths (no / several /
 # misplaced all-gathers or reduce-scatters, an all-reduce, no Gate/Up) are pinned here.
 def test_dp_path_checks():
     mixed = f"{MIX}>a8w4_down_decode_mixed>shared_mixed"
@@ -2293,18 +2630,20 @@ def test_dp_path_checks():
     )
     cases = [  # path, dp_comm, _dp_known_path
         (f"{AG_CA}>{mixed}>{RS_CA}", (AG_CA, RS_CA), True),
-        (f"{AG_RCCL}>{prefill}>{RS_RCCL}", (AG_RCCL, RS_RCCL), True),
+        (f"{AG_RCCL}>{prefill}>{RS_A2A}", (AG_RCCL, RS_A2A), True),
+        (f"{AG_RCCL}>{prefill}>{RS_RCCL}", None, False),  # RCCL's ring reduce-scatter
         (f"{AG_RCCL}>{side}>{RS_CA}", (AG_RCCL, RS_CA), True),
         (f"a8w4_row_quant_fp8>{AG_CA}>{side}>{RS_CA}", (AG_CA, RS_CA), True),
         (f"{AG_CA}>{prefill}_tp", (AG_CA, FUSED_COMM), True),  # sorted_sum_tp
         (f"a8w4_quant_ag_tp>{side}_tp", (FUSED_COMM, FUSED_COMM), True),
+        (f"{AG_CA}>{side}_tp_rs", (AG_CA, FUSED_COMM), True),  # decode_tp, DEST "dp"
         (f"{AG_CA}>{ST16}>a8w4_down_stream_bm16>{RS_CA}", (AG_CA, RS_CA), False),
         (f"{AG_CA}>{mixed}", None, False),  # no reduce-scatter
         (f"{mixed}>{RS_CA}", None, False),  # no all-gather
         (f"{AG_CA}>{mixed}>{CA}", None, False),  # an all-reduce
         (f"{AG_CA}>{mixed}>{RS_CA}>{RCCL}", None, False),
         (f"{AG_CA}>{AG_RCCL}>{mixed}>{RS_CA}", None, False),
-        (f"{AG_CA}>{mixed}>{RS_CA}>{RS_RCCL}", None, False),
+        (f"{AG_CA}>{mixed}>{RS_CA}>{RS_A2A}", None, False),
         (f"{mixed}>{AG_CA}>{RS_CA}", None, False),  # all-gather after Gate/Up
         (f"{AG_CA}>{RS_CA}>{mixed}", None, False),  # reduce-scatter before it
         (f"{AG_CA}>a8w4_down_decode>{RS_CA}", None, False),  # no Gate/Up
@@ -2318,6 +2657,10 @@ def test_dp_path_checks():
     ]
     assert not wrong, wrong
     assert comm_kind(f"{AG_CA}>{mixed}>{RS_CA}") is None
+    assert _got(f"{AG_CA}>{side}_tp_rs") == (
+        "decode",
+        ("a8w4_down_decode_pq_shared_tp_rs",),
+    )
 
 
 # --- D.9 routing dtypes and strides -------------------------------------------------------------------------------
@@ -2349,6 +2692,111 @@ def _job_dp_routing_dtypes(state):
 def test_dp_routing_dtypes(pool):
     for rank, res in enumerate(pool.run("dp_routing_dtypes")):
         assert len(res) == 2 and all(res.values()), (rank, res)
+
+
+# --- D.10 dispatch boundaries of the ag_rs mode -------------------------------------------------------------------
+# Why: the benchmark and the basic tests take M_r in powers of two (and 12), and no boundary of the rules lies
+# between two of them on both sides. Here every M_r where the rules (_want of world * M_r rows) change below
+# DP_BOUNDARY_MAX_M runs on both sides (M_r - 1 and M_r), each called twice, against the FP32 reference and the
+# rules: the fused decode's limits, sum_tp's rows (the workspace's mid_m), tp_reduce from FUSED_MIN_M /
+# FUSED_MIN_BYTES and the sum streamed out of the prefill Down (STREAM_SPEC with the home-rank owners). The
+# boundaries come from the modules' constants (_boundaries), so changing a limit moves the cases with it.
+DP_BOUNDARY_MAX_M = 512
+
+
+def _job_dp_boundaries(state):
+    layer = state.get(DP_SHAPE)[0]
+    bounds = _boundaries(layer, DP_BOUNDARY_MAX_M, dp=True)
+    return _job_dp_check(state, sorted({m for b in bounds for m in (b - 1, b)}))
+
+
+def test_dp_dispatch_boundaries(pool):
+    rows = _rank_rows(pool.run("dp_boundaries"))
+    assert len({r["M"] for r in rows}) >= 4, rows
+    _assert_dp_verified(rows)
+    _assert_dp_paths(rows)
+
+
+# --- D.11 the sum rule, bitwise -----------------------------------------------------------------------------------
+# Why: the basic tests, the benchmark and the tests above check the outputs against the FP32 reference within its
+# tolerance, which sums in another order pass too. The rule of the ag_rs mode: every token's output is its home
+# rank's sum of the ranks' partials in float32, in rank order 0..world-1, rounded to BF16 once, for every M_r (never
+# RCCL's ring reduce-scatter, which adds in BF16 hop by hop). One M_r per fused exit -- 1 (decode), 4 and 25 (sum_tp,
+# its smallest and largest), 300 (tp_reduce) and 700 (the prefill Down) --: the output must equal bitwise the
+# rank-order float32 sum, rounded once, of every rank's single-GPU op output on the whole batch (its BF16 partial,
+# moe_a8w4.flydsl_moe_a8w4_ptpc); the decode tier sums its float32 partials inside the Down decode kernel, so there
+# the output must equal bitwise this rank's rows of an ar layer on the same weights and batch (whose decode sum
+# follows the same order). No error bits, no RCCL reduce-scatter.
+DP_RULE_TOKENS = (1, 4, 25, 300, 700)
+
+
+def _job_dp_sum_rule(state):
+    from aiter.ops.flydsl import moe_a8w4
+    from aiter.ops.flydsl.mega_moe_tp_gfx942 import MegaMoeTPGfx942
+
+    layer, raw, shared = state.get(DP_SHAPE)
+    world, dev = SHAPES[DP_SHAPE]["world"], state.device
+    group, cpu = state.tp[world]
+    ar = MegaMoeTPGfx942(
+        make_config("ds_layer_tp4", state.rank),
+        **to_megamoe_layout(raw),
+        **shared_kwargs(shared),
+        group=group,
+        device=dev,
+        cpu_group=cpu,
+    )
+    rows = []
+    try:
+        for m in DP_RULE_TOKENS:
+            full = _dp_full(state, m, 1)
+            x, tw, ids = full
+            y = layer.forward(*_dp_mine(state, full)).clone()
+            path = ">".join(layer.last_path)
+            mine = slice(state.rank * m, (state.rank + 1) * m)
+            tier = _want(layer, world * m, dp=True)[0]
+            if tier == "decode":
+                want = ar.forward(*full)[mine]
+            else:
+                part = torch.empty_like(x)
+                moe_a8w4.flydsl_moe_a8w4_ptpc(
+                    x,
+                    layer._weights,
+                    tw.float().contiguous(),
+                    ids.int().contiguous(),
+                    output=part,
+                    swiglu_limit=layer._limit,
+                )
+                parts = [torch.empty_like(part) for _ in range(world)]
+                dist.all_gather(parts, part, group=group)
+                acc = parts[0][mine].float()
+                for p in parts[1:]:
+                    acc += p[mine].float()
+                want = acc.to(torch.bfloat16)
+            rows.append(
+                dict(
+                    M=m,
+                    tier=tier,
+                    path=path,
+                    rule=torch.equal(y, want),
+                    bits=layer.poll_errors() | ar.poll_errors(),
+                    **_dp_verify(state, raw, shared, full, y),
+                )
+            )
+    finally:
+        ar.close()
+    return rows
+
+
+def test_dp_sum_rule(pool):
+    rows = _rank_rows(pool.run("dp_sum_rule"))
+    _assert_dp_verified(rows)
+    assert {r["tier"] for r in rows} == {"decode", "stream", "prefill"}, rows
+    bad = [
+        r
+        for r in rows
+        if not (r["rule"] and r["bits"] == 0 and RS_RCCL not in r["path"].split(">"))
+    ]
+    assert not bad, "off the sum rule:\n" + "\n".join(map(str, bad))
 
 
 # =====================================================================================================================
