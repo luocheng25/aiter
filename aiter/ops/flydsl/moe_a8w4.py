@@ -234,30 +234,32 @@ def prepare_a8w4_weights(w1, w1_scale, w2, w2_scale):
     One result serves every token count of ``fused_moe_a8w4``.
     """
     E, n1, half_h = w1.shape
-    I, H = n1 // 2, half_h * 2
-    if n1 % 2 or H % 512 or I % 32:
-        raise ValueError(f"unsupported shape: H={H} (needs % 512), I={I} (needs % 32)")
-    q1 = _packed(w1, (E, 2 * I, H // 2))
-    q2 = _packed(w2, (E, H, I // 2))
-    c1 = _codes(w1_scale, (E, 2 * I, H // 32))
-    c2 = _codes(w2_scale, (E, H, I // 32))
-    ip = -(-I // _PAD_I) * _PAD_I
-    if ip != I:
-        pad = ip - I
+    inter, H = n1 // 2, half_h * 2
+    if n1 % 2 or H % 512 or inter % 32:
+        raise ValueError(
+            f"unsupported shape: H={H} (needs % 512), I={inter} (needs % 32)"
+        )
+    q1 = _packed(w1, (E, 2 * inter, H // 2))
+    q2 = _packed(w2, (E, H, inter // 2))
+    c1 = _codes(w1_scale, (E, 2 * inter, H // 32))
+    c2 = _codes(w2_scale, (E, H, inter // 32))
+    ip = -(-inter // _PAD_I) * _PAD_I
+    if ip != inter:
+        pad = ip - inter
         q1 = torch.cat(
             [
-                q1[:, :I],
+                q1[:, :inter],
                 q1.new_zeros(E, pad, H // 2),
-                q1[:, I:],
+                q1[:, inter:],
                 q1.new_zeros(E, pad, H // 2),
             ],
             1,
         )
         c1 = torch.cat(
             [
-                c1[:, :I],
+                c1[:, :inter],
                 c1.new_full((E, pad, H // 32), 127),
-                c1[:, I:],
+                c1[:, inter:],
                 c1.new_full((E, pad, H // 32), 127),
             ],
             1,
@@ -266,7 +268,7 @@ def prepare_a8w4_weights(w1, w1_scale, w2, w2_scale):
         c2 = torch.nn.functional.pad(c2, (0, pad // 32))
     w1q, w1d, w1s = _convert(q1.contiguous(), c1.contiguous())
     w2q, w2d, w2s = _convert(q2.contiguous(), c2.contiguous())
-    return A8W4Weights(w1q, w1d, w1s, w2q, w2d, w2s, E, H, I, ip)
+    return A8W4Weights(w1q, w1d, w1s, w2q, w2d, w2s, E, H, inter, ip)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -303,13 +305,15 @@ def _decode_waves(topk, paired):
     )
 
 
-def _decode_fits(H, I, topk, paired):
+def _decode_fits(H, inter, topk, paired):
     """Whether the decode kernels support this shape (Gate/Up and the single-slot or slot-pair Down) and it was
     measured to take them (hidden <= 4096 or in DECODE_WIDE_HIDDEN)."""
     return (
         (H <= 4096 or H in DECODE_WIDE_HIDDEN)
         and a8w4_decode.gateup_decode_fits(H)
-        and a8w4_decode.down_decode_fits(I, topk, _decode_waves(topk, paired), paired)
+        and a8w4_decode.down_decode_fits(
+            inter, topk, _decode_waves(topk, paired), paired
+        )
     )
 
 
@@ -329,14 +333,14 @@ def _gateup_decode_kernel(N1, H, topk, prequant, limit):
 
 
 @functools.cache
-def _down_decode_kernel(H, I, topk, paired):
+def _down_decode_kernel(H, inter, topk, paired):
     if paired:
         # More tokens: 16-byte loads of slot pairs.
         return a8w4_decode.compile_a8w4_down_decode_pq(
-            N=H, K=I, TOPK=topk, WAVES=_decode_waves(topk, True)
+            N=H, K=inter, TOPK=topk, WAVES=_decode_waves(topk, True)
         )
     return a8w4_decode.compile_a8w4_down_decode(
-        N=H, K=I, TOPK=topk, WAVES=_decode_waves(topk, False)
+        N=H, K=inter, TOPK=topk, WAVES=_decode_waves(topk, False)
     )
 
 
@@ -377,11 +381,11 @@ def _fused_moe_decode_wide_dd(
     and the slot-pair Down sums each token's routes."""
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
-    I = weights.inter_padded
+    inter = weights.inter_padded
     group = 2 if M <= DECODE_DEDUP_PAIR_MAX_M else DECODE_DEDUP_GROUP
     device = hidden_states.device
     plan = torch.empty((M * topk, 4), dtype=torch.int32, device=device)
-    mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
+    mid = torch.empty((M, topk, inter), dtype=torch.float32, device=device)
     xq = torch.empty((M, H), dtype=torch.float8_e4m3fnuz, device=device)
     xs = torch.empty((M,), dtype=torch.float32, device=device)
     # ``output`` fills the plan kernel's unused pointer argument.
@@ -398,7 +402,7 @@ def _fused_moe_decode_wide_dd(
     )
     _launch(
         "a8w4_gateup_decode_dd",
-        _gateup_dd_kernel(2 * I, H, topk, group, DECODE_WIDE_DEDUP_WAVES, limit),
+        _gateup_dd_kernel(2 * inter, H, topk, group, DECODE_WIDE_DEDUP_WAVES, limit),
         xq,
         xs,
         topk_ids,
@@ -409,13 +413,13 @@ def _fused_moe_decode_wide_dd(
         mid,
         M,
     )
-    mq, ms = _quantize_decode(mid, M * topk, I, False)
+    mq, ms = _quantize_decode(mid, M * topk, inter, False)
     if decode_down is not None:
         decode_down(True, mq, ms, topk_ids, topk_weight, weights, output)
         return output
     _launch(
         "a8w4_down_decode_pq",
-        _down_decode_kernel(H, I, topk, True),
+        _down_decode_kernel(H, inter, topk, True),
         mq,
         ms,
         topk_ids,
@@ -434,16 +438,18 @@ def _fused_moe_decode(
 ):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
-    I = weights.inter_padded
+    inter = weights.inter_padded
     pq_fits = _down_pq_fits(H, weights, topk)
     if H in DECODE_WIDE_HIDDEN and M >= DECODE_WIDE_DEDUP_MIN_M and pq_fits:
         return _fused_moe_decode_wide_dd(
             hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
         )
     # Few tokens: each workgroup quantizes its own activation rows; more tokens: quantize once.
-    gateup_pq = M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
+    gateup_pq = M * topk * (inter // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
     down_pq = M >= DECODE_PREQUANT_MIN_M and pq_fits
-    mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
+    mid = torch.empty(
+        (M, topk, inter), dtype=torch.float32, device=hidden_states.device
+    )
     if gateup_pq:
         xq, xs = _quantize_decode(hidden_states, M, H, True)
     else:
@@ -451,7 +457,7 @@ def _fused_moe_decode(
     # ``mid`` also fills the Gate/Up kernel's two unused pointer arguments.
     _launch(
         "a8w4_gateup_decode" + ("_pq" if gateup_pq else ""),
-        _gateup_decode_kernel(2 * I, H, topk, gateup_pq, limit),
+        _gateup_decode_kernel(2 * inter, H, topk, gateup_pq, limit),
         xq,
         xs,
         topk_ids,
@@ -464,7 +470,7 @@ def _fused_moe_decode(
         M,
     )
     if down_pq:
-        mq, ms = _quantize_decode(mid, M * topk, I, False)
+        mq, ms = _quantize_decode(mid, M * topk, inter, False)
     else:
         mq, ms = mid, topk_weight
     if decode_down is not None:
@@ -472,7 +478,7 @@ def _fused_moe_decode(
         return output
     _launch(
         "a8w4_down_decode" + ("_pq" if down_pq else ""),
-        _down_decode_kernel(H, I, topk, down_pq),
+        _down_decode_kernel(H, inter, topk, down_pq),
         mq,
         ms,
         topk_ids,
@@ -656,22 +662,29 @@ def _quantize(x, rows, cols, dtype, fill=None, out=None):
 
 
 def _fused_moe_stream(
-    hidden_states, weights, topk_weight, topk_ids, output, limit, reduce, stream_down=None
+    hidden_states,
+    weights,
+    topk_weight,
+    topk_ids,
+    output,
+    limit,
+    reduce,
+    stream_down=None,
 ):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
-    E, I = weights.experts, weights.inter_padded
+    E, inter = weights.experts, weights.inter_padded
     block_m = _stream_block_m(M, topk, E, H)
     device = hidden_states.device
-    atomic = _stream_atomic(I)
+    atomic = _stream_atomic(inter)
     sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
         _stream_prep(hidden_states, topk_weight, topk_ids, E, block_m, output, atomic)
     )
     task_num = sorted_experts.numel()
-    gateup = _stream_gateup_kernel(2 * I, H, topk, block_m, E, limit)
+    gateup = _stream_gateup_kernel(2 * inter, H, topk, block_m, E, limit)
     routing = (sorted_ids, sorted_experts, num_valid)
-    if not _stream_fused_quant(I, block_m, H):
-        mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
+    if not _stream_fused_quant(inter, block_m, H):
+        mid = torch.empty((M, topk, inter), dtype=torch.float32, device=device)
         _launch(
             f"a8w4_gateup_stream_bm{block_m}",
             gateup,
@@ -686,9 +699,9 @@ def _fused_moe_stream(
             M,
             task_num,
         )
-        mq, ms = _quantize(mid, M * topk, I, "f32")
+        mq, ms = _quantize(mid, M * topk, inter, "f32")
     else:
-        mq = torch.empty((M * topk, I), dtype=torch.float8_e4m3fnuz, device=device)
+        mq = torch.empty((M * topk, inter), dtype=torch.float8_e4m3fnuz, device=device)
         ms = torch.empty((M * topk,), dtype=torch.float32, device=device)
         _launch(
             f"a8w4_gateup_quant_stream_bm{block_m}",
@@ -717,10 +730,14 @@ def _fused_moe_stream(
     if stream_down is not None:
         routes = None
         if not atomic:
-            routes = torch.empty((task_num * block_m, H), dtype=torch.bfloat16, device=device)
-        stream_down(mq, ms, down_args[:4], loc_ids, routes, output, weights, block_m, task_num)
+            routes = torch.empty(
+                (task_num * block_m, H), dtype=torch.bfloat16, device=device
+            )
+        stream_down(
+            mq, ms, down_args[:4], loc_ids, routes, output, weights, block_m, task_num
+        )
         return output
-    down = _stream_down_kernel(H, I, topk, block_m, E, atomic)
+    down = _stream_down_kernel(H, inter, topk, block_m, E, atomic)
     if atomic:
         # The prep zeroed output: Down adds every route into its token's row with BF16 atomics.
         _launch(
@@ -817,7 +834,7 @@ def _fused_moe_prefill(
 ):
     M, H = hidden_states.shape
     topk = topk_ids.shape[1]
-    E, I = weights.experts, weights.inter_padded
+    E, inter = weights.experts, weights.inter_padded
     block_m, routes_n = PREFILL_BLOCK_M, M * topk
     device = hidden_states.device
     prep_routes = (
@@ -841,12 +858,12 @@ def _fused_moe_prefill(
         xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
-    mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
+    mid = torch.empty((M, topk, inter), dtype=torch.float32, device=device)
     gateup_xcd = _xcd_chunk(GATEUP_XCD_CHUNK_H5120, H, routes_n)
     if chunks is not None:
         return _prefill_chunks(
             down,
-            _gateup_prefill_kernel(2 * I, H, topk, E, limit, gateup_xcd, True),
+            _gateup_prefill_kernel(2 * inter, H, topk, E, limit, gateup_xcd, True),
             xq,
             xs,
             weights,
@@ -857,7 +874,7 @@ def _fused_moe_prefill(
             grid,
             _xcd_chunk(DOWN_XCD_CHUNK_H5120, H, routes_n),
         )
-    gateup = _gateup_prefill_kernel(2 * I, H, topk, E, limit, gateup_xcd)
+    gateup = _gateup_prefill_kernel(2 * inter, H, topk, E, limit, gateup_xcd)
     _launch(
         f"a8w4_gateup_prefill_bm{block_m}_bn{PREFILL_BLOCK_N}_tk{PREFILL_TILE_K}",
         gateup,
@@ -871,14 +888,14 @@ def _fused_moe_prefill(
         M,
         grid,
     )
-    mq, ms = _quantize(mid, routes_n, I, "f32")
+    mq, ms = _quantize(mid, routes_n, inter, "f32")
     routes = torch.empty((grid * block_m, H), dtype=torch.bfloat16, device=device)
     xcd_chunk = _xcd_chunk(DOWN_XCD_CHUNK_H5120, H, routes_n)
     if down is not None:
         down(mq, ms, routing, loc_ids, routes, output, weights, grid, xcd_chunk)
         return output
     down = _down_prefill_kernel(
-        H, I, topk, E, _down_split(M, topk, E, H, I, block_m), xcd_chunk
+        H, inter, topk, E, _down_split(M, topk, E, H, inter, block_m), xcd_chunk
     )
     _launch(
         f"a8w4_down_prefill_bm{block_m}",
@@ -912,7 +929,7 @@ def _prefill_chunks(
     kernels of a chunk launch the bound of its blocks (``chunks.chunk_bound``)."""
     starts, chunk_desc = down.chunks
     sorted_ids, sorted_weights, sorted_experts, num_valid = routing
-    M, topk, I = mid.shape
+    M, topk, inter = mid.shape
     rows = M * topk
     desc = chunk_desc(grid)
     build = a8w4_chunks.compile_chunk_blocks(
@@ -922,8 +939,8 @@ def _prefill_chunks(
         ROW=desc.shape[1],
     )
     _launch("a8w4_chunk_blocks", build, sorted_ids, num_valid, desc)
-    mid_rows = mid.view(rows, I)
-    mq = torch.empty((rows, I), dtype=torch.float8_e4m3fnuz, device=mid.device)
+    mid_rows = mid.view(rows, inter)
+    mq = torch.empty((rows, inter), dtype=torch.float8_e4m3fnuz, device=mid.device)
     ms = torch.empty((rows,), dtype=torch.float32, device=mid.device)
     routes = torch.empty(
         (grid * PREFILL_BLOCK_M, xq.shape[1]), dtype=torch.bfloat16, device=mid.device
@@ -947,7 +964,7 @@ def _prefill_chunks(
             bound,
         )
         r0 = first * topk
-        _quantize(mid_rows[r0:], rows - r0, I, "f32", out=(mq[r0:], ms[r0:]))
+        _quantize(mid_rows[r0:], rows - r0, inter, "f32", out=(mq[r0:], ms[r0:]))
         down(mq, ms, chunk, loc_ids, routes, output, weights, bound, xcd_chunk, c)
     return output
 
@@ -1065,12 +1082,12 @@ def fused_moe_a8w4(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weight = topk_weight.to(torch.float32).contiguous()
     topk = topk_ids.shape[1]
-    E, I = weights.experts, weights.inter_padded
-    if M <= DECODE_MAX_M and _decode_fits(H, I, topk, False):
+    E, inter = weights.experts, weights.inter_padded
+    if M <= DECODE_MAX_M and _decode_fits(H, inter, topk, False):
         return _fused_moe_decode(
             hidden_states, weights, topk_weight, topk_ids, output, limit, decode_down
         )
-    if M > DECODE_MAX_M and M * topk <= _stream_max_rows(H, I, M * topk) * E:
+    if M > DECODE_MAX_M and M * topk <= _stream_max_rows(H, inter, M * topk) * E:
         return _fused_moe_stream(
             hidden_states,
             weights,

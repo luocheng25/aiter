@@ -248,7 +248,10 @@ STREAM_SPEC = {
 _DOWN_TUNE_TP4 = {"PRO": 1, "SB": 1, "WPE": 4}
 DOWN_TUNE = {
     (2, 2560): {"PRO": 1, "LAS": 1, "WPE": 3},
-    (4, 2560): ((8192, _DOWN_TUNE_TP4), (None, {**_DOWN_TUNE_TP4, "ROUTE_AUX": down_tp.SYS_NT})),
+    (4, 2560): (
+        (8192, _DOWN_TUNE_TP4),
+        (None, {**_DOWN_TUNE_TP4, "ROUTE_AUX": down_tp.SYS_NT}),
+    ),
     (4, 5120): {"SB": 1, "LAS": 1},
 }
 # The same for the fused batches on the stream path (the streaming Down's own column blocks, DownTP.COPY set by the
@@ -420,7 +423,13 @@ class _Workspace:
             dtype=torch.int32,
             device=comm.device,
         )
-        self.rank, self.world, self.sdma, self.tab3, self._sdma_tried = rank, world, None, None, False
+        self.rank, self.world, self.sdma, self.tab3, self._sdma_tried = (
+            rank,
+            world,
+            None,
+            None,
+            False,
+        )
         self.sdma_order = self._sdma_desc = None
         self.dtab = self.heap.p2p_table(self.dinbox).view(torch.int32)
         self.parity = torch.zeros(
@@ -438,7 +447,9 @@ class _Workspace:
             if got is not None:
                 self.sdma, self.sdma_order = got
                 self._sdma_desc = self.sdma.ordered(self.sdma_order)
-                row = torch.zeros(self.world, dtype=torch.int64, device=self.comm.device)
+                row = torch.zeros(
+                    self.world, dtype=torch.int64, device=self.comm.device
+                )
                 row[0] = self._sdma_desc.data_ptr()
                 self.tab3 = torch.cat([self._tab2, row[None]]).view(torch.int32)
         return self.tab3
@@ -486,13 +497,19 @@ def _acquire_sdma(comm, rank, world):
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
     errors = [None] * world
-    dist.all_gather_object(errors, (error, queues.gpu_id if queues is not None else 0), group=comm.cpu_group)
+    dist.all_gather_object(
+        errors,
+        (error, queues.gpu_id if queues is not None else 0),
+        group=comm.cpu_group,
+    )
     failed = [e for e, _ in errors if e is not None]
     if not failed:
         order = tuple(range(len(queues.engines)))
         if not os.environ.get(sdma.ENGINES_ENV):
             peers = [errors[(rank + 1 + k) % world][1] for k in range(world - 1)]
-            order = sdma.push_order(queues.engines, [sdma.recommended(queues.gpu_id, p) for p in peers])
+            order = sdma.push_order(
+                queues.engines, [sdma.recommended(queues.gpu_id, p) for p in peers]
+            )
         return queues, order
     if queues is not None:
         sdma.release(queues)
@@ -659,9 +676,9 @@ class MegaMoeTPGfx942:
         w2_scale: torch.Tensor,
     ) -> None:
         """Run the next forwards on another layer's weights of the same shape (converted here, once)."""
-        E, H, I = self.cfg.experts, self.cfg.model_dim, self.cfg.inter_dim
-        _check_weight("w1", w1, (E, 2 * I, H // 2))
-        _check_weight("w2", w2, (E, H, I // 2))
+        E, H, inter = self.cfg.experts, self.cfg.model_dim, self.cfg.inter_dim
+        _check_weight("w1", w1, (E, 2 * inter, H // 2))
+        _check_weight("w2", w2, (E, H, inter // 2))
         for name, t in (
             ("w1", w1),
             ("w1_scale", w1_scale),
@@ -673,10 +690,10 @@ class MegaMoeTPGfx942:
                     f"MegaMoeTPGfx942: {name} is on {t.device}, expected {self.device}"
                 )
         with torch.no_grad():
-            q1 = _unshuffle_weight(w1, 2 * I, H // 2)
-            c1 = _unshuffle_scale(w1_scale, E, 2 * I, H // 32)
-            q2 = _unshuffle_weight(w2, H, I // 2)
-            c2 = _unshuffle_scale(w2_scale, E, H, I // 32)
+            q1 = _unshuffle_weight(w1, 2 * inter, H // 2)
+            c1 = _unshuffle_scale(w1_scale, E, 2 * inter, H // 32)
+            q2 = _unshuffle_weight(w2, H, inter // 2)
+            c2 = _unshuffle_scale(w2_scale, E, H, inter // 32)
             self._weights = None
             self._weights = moe_a8w4.prepare_a8w4_weights(q1, c1, q2, c2)
 
@@ -837,15 +854,27 @@ class MegaMoeTPGfx942:
             return None
         starts, tab = (), ws.tab2
         entry = CHUNK_SPEC.get((cfg.world_size, cfg.model_dim)) if CHUNK_DOWN else None
-        if entry is not None and M >= entry[0] and cfg.world_size == 2 and ws.sdma_table() is not None:
+        if (
+            entry is not None
+            and M >= entry[0]
+            and cfg.world_size == 2
+            and ws.sdma_table() is not None
+        ):
             starts, tab = _chunk_starts(M, cfg.world_size * spec.TT, entry[1]), ws.tab3
             spec = dataclasses.replace(
-                spec, NY=0, NYT=0, OS=1, STAMP=OS_STAMP, **(entry[2] if len(entry) > 2 else {})
+                spec,
+                NY=0,
+                NYT=0,
+                OS=1,
+                STAMP=OS_STAMP,
+                **(entry[2] if len(entry) > 2 else {}),
             )
         key = (M, starts) if starts else M
         limit = _wait_limit(WAIT_S if key in self._seen else FIRST_WAIT_S)
 
-        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd, c=0):
+        def down(
+            mid, mid_scale, routing, loc_ids, routes, output, weights, grid, xcd, c=0
+        ):
             launch = down_tp.compile_down_tp(
                 N=cfg.model_dim,
                 K=weights.inter_padded,
@@ -886,8 +915,12 @@ class MegaMoeTPGfx942:
             if starts:
                 # Every item: this rank's partial plus the peer's pushed one (down_tp rule 12).
                 firsts = [s // spec.TT for s in starts[1:]]
-                one_shot = dict(OS=1, STAMP=spec.STAMP)
-                extra = (*firsts, *[tiles] * (down_tp.MAX_CHUNKS - 1 - len(firsts)), len(starts))
+                one_shot = {"OS": 1, "STAMP": spec.STAMP}
+                extra = (
+                    *firsts,
+                    *[tiles] * (down_tp.MAX_CHUNKS - 1 - len(firsts)),
+                    len(starts),
+                )
             gather = down_tp.compile_tp_gather(
                 WORLD=cfg.world_size,
                 H=cfg.model_dim,
@@ -923,11 +956,14 @@ class MegaMoeTPGfx942:
     def _chunk_desc(self, M, starts, grid):
         """The chunk descriptors of ``fused_moe_a8w4``'s ``prefill_down.chunks`` for a call of ``grid`` sorted blocks
         (int32 [chunks, ``moe_a8w4.chunks.desc_row_words(grid)``], ``moe_a8w4.chunks``; cached per batch size,
-        split and grid; the host sets the tokens and indices, the sort's block lists the rest)."""
+        split and grid; the host sets the tokens and indices, the sort's block lists the rest).
+        """
         desc = self._chunk_descs.get((M, starts, grid))
         if desc is None:
             words = a8w4_chunks.desc_row_words(grid)
-            desc = torch.zeros((len(starts), words), dtype=torch.int32, device=self.device)
+            desc = torch.zeros(
+                (len(starts), words), dtype=torch.int32, device=self.device
+            )
             for c, (lo, hi) in enumerate(zip(starts, (*starts[1:], M))):
                 desc[c, 1].fill_(lo)
                 desc[c, 2].fill_(hi)
@@ -942,12 +978,21 @@ class MegaMoeTPGfx942:
         ``STREAM_TIER_SPEC``)."""
         cfg, ws = self.cfg, self._ws
         atomic = moe_a8w4._stream_atomic(self._weights.inter_padded)
-        tp = _stream_spec(cfg.world_size, cfg.model_dim, cfg.topk, M, STREAM_TIER_SPEC, COPY=int(atomic))
+        tp = _stream_spec(
+            cfg.world_size,
+            cfg.model_dim,
+            cfg.topk,
+            M,
+            STREAM_TIER_SPEC,
+            COPY=int(atomic),
+        )
         if not (STREAM_DOWN and STREAM_TIER) or tp is None:
             return None
         limit = _wait_limit(WAIT_S if M in self._seen else FIRST_WAIT_S)
 
-        def down(mid, mid_scale, routing, loc_ids, routes, output, weights, block_m, task_num):
+        def down(
+            mid, mid_scale, routing, loc_ids, routes, output, weights, block_m, task_num
+        ):
             H, K = cfg.model_dim, weights.inter_padded
             assert (routes is None) == atomic, (routes is None, atomic)
             launch = down_tp.compile_down_stream_tp(

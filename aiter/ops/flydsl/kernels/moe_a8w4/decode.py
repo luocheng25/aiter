@@ -240,13 +240,15 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, SWIGLU_LIMIT=0.0):
     the kernel-argument layout, and with it the ISA, of the measured kernel (any valid pointer, e.g. ``out``).
     ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common.swiglu_clamp``).
     """
-    I = N // 2
-    assert I % 16 == 0 and K % 512 == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
+    INTER = N // 2
+    assert (
+        INTER % 16 == 0 and K % 512 == 0
+    ), f"unsupported Gate/Up decode shape N={N} K={K}"
     KB = K // 64
     KQ = a8w4.delta_dwords(K)
     KB_HALF = KB // 2
     PAIRS = KB_HALF // 2
-    NJ = I // 16
+    NJ = INTER // 16
     X_DWORDS = K // 2 // 256  # bf16 pairs per thread
     X_CHUNKS = K // 16  # 16-byte pieces of an FP8 row
     X_LOADS = (X_CHUNKS + 255) // 256  # of them per thread (pieces tid + 256 u)
@@ -354,7 +356,7 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, SWIGLU_LIMIT=0.0):
                 fx.make_layout(N, 1),
             )
             ws_gate = ws[channel]
-            ws_up = ws[I + channel]
+            ws_up = ws[INTER + channel]
         rocdl.sched_barrier(0)
 
         if const_expr(PREQUANT):
@@ -438,8 +440,8 @@ def compile_a8w4_gateup_decode(*, N, K, TOPK, PREQUANT=False, SWIGLU_LIMIT=0.0):
             gate, up = a8w4.swiglu_clamp(gate, up, SWIGLU_LIMIT)
             tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
             out = fx.make_view(
-                fxh._as_ptr(p_out, fx.Float32) + fx.Int64(route) * I,
-                fx.make_layout(I, 1),
+                fxh._as_ptr(p_out, fx.Float32) + fx.Int64(route) * INTER,
+                fx.make_layout(INTER, 1),
             )
             out[channel] = (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
 

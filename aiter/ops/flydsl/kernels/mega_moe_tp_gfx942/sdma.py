@@ -39,9 +39,8 @@ import fcntl
 import os
 import struct
 
-import torch
-
 import flydsl.expr as fx
+import torch
 from flydsl.expr import rocdl
 
 from ..moe_a8w4.stream import _DROP, _load, _pack64, _rsrc, _uniform
@@ -88,15 +87,42 @@ def poll(addr, value, mask=0xFFFFFFFF, func=3, interval=4):
     """POLL_REGMEM on memory: wait until ``(*addr & mask) func value`` (3: ==, 5: >=), polling every ``interval``
     (16-clock units), no retry limit. 6 dwords."""
     header = 8 | (func << 28) | (1 << 31)
-    return [_i32(header), _lo(addr), _hi(addr), value, _i32(mask), interval | (0xFFF << 16)]
+    return [
+        _i32(header),
+        _lo(addr),
+        _hi(addr),
+        value,
+        _i32(mask),
+        interval | (0xFFF << 16),
+    ]
 
 
 def copy2d(src, dst, pitch, width, rows):
     """COPY_LINEAR_SUBWIN_LARGE: ``rows`` (>= 1) rows of ``width`` bytes, ``pitch`` bytes apart in both ``src`` and
     ``dst``. 20 dwords."""
     pm1 = fx.Int32(pitch) - 1
-    return [1 | (36 << 8), _lo(src), _hi(src), 0, 0, 0, pm1, 0, 0, _lo(dst), _hi(dst), 0, 0, 0, pm1, 0, 0,
-            fx.Int32(width) - 1, fx.Int32(rows) - 1, 0]
+    return [
+        1 | (36 << 8),
+        _lo(src),
+        _hi(src),
+        0,
+        0,
+        0,
+        pm1,
+        0,
+        0,
+        _lo(dst),
+        _hi(dst),
+        0,
+        0,
+        0,
+        pm1,
+        0,
+        0,
+        fx.Int32(width) - 1,
+        fx.Int32(rows) - 1,
+        0,
+    ]
 
 
 def fence(addr, value):
@@ -106,7 +132,8 @@ def fence(addr, value):
 
 def stamp(addr):
     """TIMESTAMP (GET_GLOBAL_TIMESTAMP): stores the 64-bit global timestamp (the ``s_memrealtime`` clock) at ``addr``
-    (64-byte aligned) once the previous packets are processed (timing analysis). 3 dwords."""
+    (64-byte aligned) once the previous packets are processed (timing analysis). 3 dwords.
+    """
     return [13 | (2 << 8), _lo(addr), _hi(addr)]
 
 
@@ -172,7 +199,12 @@ class Ring:
     def pad(self, wptr, pad):
         """NOPs over the ``pad`` bytes after ``wptr`` (``place``)."""
         start = fx.Int32(wptr) & (RING_BYTES - 1)
-        _loop(self.lane, pad >> 4, 64, lambda i: _store(self.ring, nops(4), start + i * 16))
+        _loop(
+            self.lane,
+            pad >> 4,
+            64,
+            lambda i: _store(self.ring, nops(4), start + i * 16),
+        )
 
     def store(self, offset, words, live=None):
         """Store packet dwords (a multiple of 4) at ring byte ``offset`` (16-byte aligned) on the lanes where
@@ -180,7 +212,11 @@ class Ring:
         assert len(words) % 4 == 0, len(words)
         for i in range(0, len(words), 4):
             at = offset + 4 * i
-            _store(self.ring, words[i : i + 4], at if live is None else live.select(at, fx.Int32(_DROP)))
+            _store(
+                self.ring,
+                words[i : i + 4],
+                at if live is None else live.select(at, fx.Int32(_DROP)),
+            )
 
     def commit(self, new_wptr):
         """Publish the packets stored so far up to ``new_wptr`` and ring the doorbell (rule 2)."""
@@ -219,7 +255,9 @@ def _runtime(name, sonames):
             except OSError:
                 continue
         if lib is None:
-            raise RuntimeError(f"SDMA queues: {name} runtime not loaded in this process")
+            raise RuntimeError(
+                f"SDMA queues: {name} runtime not loaded in this process"
+            )
         _LIBS[name] = lib
     return lib
 
@@ -235,12 +273,28 @@ def _hsa():
     hsa._sdma_typed = True
     hsa.hsa_iterate_agents.argtypes = [_AGENT_CB, ctypes.c_void_p]
     hsa.hsa_agent_get_info.argtypes = [ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p]
-    hsa.hsa_amd_agent_iterate_memory_pools.argtypes = [ctypes.c_uint64, _POOL_CB, ctypes.c_void_p]
-    hsa.hsa_amd_memory_pool_get_info.argtypes = [ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p]
-    hsa.hsa_amd_memory_pool_allocate.argtypes = [ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint32,
-                                                 ctypes.POINTER(ctypes.c_void_p)]
+    hsa.hsa_amd_agent_iterate_memory_pools.argtypes = [
+        ctypes.c_uint64,
+        _POOL_CB,
+        ctypes.c_void_p,
+    ]
+    hsa.hsa_amd_memory_pool_get_info.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    hsa.hsa_amd_memory_pool_allocate.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
     hsa.hsa_amd_memory_pool_free.argtypes = [ctypes.c_void_p]
-    hsa.hsa_amd_memory_fill.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t]
+    hsa.hsa_amd_memory_fill.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+    ]
     return hsa
 
 
@@ -338,7 +392,9 @@ def push_order(engines_, recs):
 
     best, score = tuple(range(len(engines_))), 0
     for perm in itertools.permutations(range(len(engines_))):
-        hits = sum(engines_[perm[k]] in recs[k] for k in range(min(len(recs), len(perm))))
+        hits = sum(
+            engines_[perm[k]] in recs[k] for k in range(min(len(recs), len(perm)))
+        )
         if hits > score:
             best, score = perm, hits
     return best
@@ -350,7 +406,10 @@ def _agent_pool(key):
 
     def visit_agent(agent, _data):
         kind, bdf, dom = ctypes.c_uint32(), ctypes.c_uint32(), ctypes.c_uint32()
-        if hsa.hsa_agent_get_info(agent, _AGENT_INFO_DEVICE, ctypes.byref(kind)) == 0 and kind.value == 1:
+        if (
+            hsa.hsa_agent_get_info(agent, _AGENT_INFO_DEVICE, ctypes.byref(kind)) == 0
+            and kind.value == 1
+        ):
             hsa.hsa_agent_get_info(agent, _AGENT_INFO_BDFID, ctypes.byref(bdf))
             hsa.hsa_agent_get_info(agent, _AGENT_INFO_DOMAIN, ctypes.byref(dom))
             if (dom.value, bdf.value) == key:
@@ -371,8 +430,10 @@ def _agent_pool(key):
     _check_hsa("hsa_iterate_agents", hsa.hsa_iterate_agents(agent_cb, None))
     if not agents:
         raise RuntimeError(f"SDMA queues: no HSA agent at PCI location {key}")
-    _check_hsa("hsa_amd_agent_iterate_memory_pools",
-               hsa.hsa_amd_agent_iterate_memory_pools(agents[0], pool_cb, None))
+    _check_hsa(
+        "hsa_amd_agent_iterate_memory_pools",
+        hsa.hsa_amd_agent_iterate_memory_pools(agents[0], pool_cb, None),
+    )
     if not pools:
         raise RuntimeError("SDMA queues: no coarse-grained VRAM pool")
     return agents[0], pools[0]
@@ -383,7 +444,11 @@ def _mapping_at(offset):
     with open("/proc/self/maps") as f:
         for line in f:
             parts = line.split()
-            if len(parts) >= 6 and parts[5] == "/dev/kfd" and int(parts[2], 16) == offset:
+            if (
+                len(parts) >= 6
+                and parts[5] == "/dev/kfd"
+                and int(parts[2], 16) == offset
+            ):
                 return int(parts[0].split("-")[0], 16)
     return 0
 
@@ -391,12 +456,38 @@ def _mapping_at(offset):
 class _Queue:
     def __init__(self, kfd, gpu_id, pool, engine):
         hsa = _hsa()
-        self.kfd, self.engine, self.ring, self.page, self.qid = kfd, engine, None, None, None
+        self.kfd, self.engine, self.ring, self.page, self.qid = (
+            kfd,
+            engine,
+            None,
+            None,
+            None,
+        )
         try:
             self.ring = self._alloc(hsa, pool, RING_BYTES)
             self.page = self._alloc(hsa, pool, PAGE_BYTES)
-            args = bytearray(struct.pack(_CQ_FMT, self.ring, self.page + WPTR, self.page + RPTR, 0, RING_BYTES,
-                                         gpu_id, _QUEUE_TYPE_SDMA_BY_ENG_ID, 100, 15, 0, 0, 0, 0, 0, 0, engine, 0))
+            args = bytearray(
+                struct.pack(
+                    _CQ_FMT,
+                    self.ring,
+                    self.page + WPTR,
+                    self.page + RPTR,
+                    0,
+                    RING_BYTES,
+                    gpu_id,
+                    _QUEUE_TYPE_SDMA_BY_ENG_ID,
+                    100,
+                    15,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    engine,
+                    0,
+                )
+            )
             fcntl.ioctl(kfd, _KFD_CREATE_QUEUE, args, True)
             fields = struct.unpack(_CQ_FMT, args)
             self.qid = fields[9]
@@ -414,16 +505,24 @@ class _Queue:
     @staticmethod
     def _alloc(hsa, pool, nbytes):
         ptr = ctypes.c_void_p()
-        _check_hsa("hsa_amd_memory_pool_allocate",
-                   hsa.hsa_amd_memory_pool_allocate(pool, nbytes, _POOL_EXECUTABLE | _POOL_UNCACHED,
-                                                    ctypes.byref(ptr)))
+        _check_hsa(
+            "hsa_amd_memory_pool_allocate",
+            hsa.hsa_amd_memory_pool_allocate(
+                pool, nbytes, _POOL_EXECUTABLE | _POOL_UNCACHED, ctypes.byref(ptr)
+            ),
+        )
         _check_hsa("hsa_amd_memory_fill", hsa.hsa_amd_memory_fill(ptr, 0, nbytes // 4))
         return ptr.value
 
     def destroy(self):
         hsa = _hsa()
         if self.qid is not None:
-            fcntl.ioctl(self.kfd, _KFD_DESTROY_QUEUE, bytearray(struct.pack("<II", self.qid, 0)), True)
+            fcntl.ioctl(
+                self.kfd,
+                _KFD_DESTROY_QUEUE,
+                bytearray(struct.pack("<II", self.qid, 0)),
+                True,
+            )
             self.qid = None
         for name in ("ring", "page"):
             ptr = getattr(self, name)
@@ -443,11 +542,15 @@ class SdmaQueues:
         self.gpu_id, xgmi = _kfd_node(key)
         bad = [e for e in self.engines if not 2 <= e < 2 + xgmi]
         if bad:
-            raise RuntimeError(f"SDMA queues: engines {bad} are not xGMI engines (2 .. {1 + xgmi})")
+            raise RuntimeError(
+                f"SDMA queues: engines {bad} are not xGMI engines (2 .. {1 + xgmi})"
+            )
         _, self.pool = _agent_pool(key)
         self.kfd = _kfd_fd()
         self.queues, self._ordered = [], {}
-        self.desc = torch.zeros(len(self.engines), DESC_BYTES // 8, dtype=torch.int64, device=device)
+        self.desc = torch.zeros(
+            len(self.engines), DESC_BYTES // 8, dtype=torch.int64, device=device
+        )
         self._create()
 
     def _create(self):
@@ -496,7 +599,9 @@ def engines():
         return XGMI_ENGINES
     order = tuple(int(x) for x in text.split(","))
     if sorted(order) != sorted(XGMI_ENGINES):
-        raise ValueError(f"{ENGINES_ENV}={text!r}: a permutation of {XGMI_ENGINES} expected")
+        raise ValueError(
+            f"{ENGINES_ENV}={text!r}: a permutation of {XGMI_ENGINES} expected"
+        )
     return order
 
 

@@ -64,7 +64,8 @@ def _popcount(mask):
 @functools.cache
 def compile_chunk_blocks(*, CHUNKS, K, BM, ROW):
     """Launcher ``(sorted_ids, num_valid_ids, desc, stream)``: the block lists of ``CHUNKS`` chunks (module docstring)
-    for up to ``64 * WAVES * K`` sorted blocks of ``BM`` rows; ``desc`` int32 [CHUNKS, ROW] (``desc_row_words``)."""
+    for up to ``64 * WAVES * K`` sorted blocks of ``BM`` rows; ``desc`` int32 [CHUNKS, ROW] (``desc_row_words``).
+    """
     assert 1 <= CHUNKS <= 4 and K >= 1, (CHUNKS, K)
 
     @fx.struct
@@ -72,7 +73,9 @@ def compile_chunk_blocks(*, CHUNKS, K, BM, ROW):
         cnt: fx.Array[fx.Int32, WAVES * CHUNKS, 16]
 
     @flyc.kernel(name="a8w4_chunk_blocks", known_block_size=[64 * WAVES, 1, 1])
-    def chunk_blocks(p_sorted_ids: fx.Pointer, p_num_valid: fx.Pointer, p_desc: fx.Pointer):
+    def chunk_blocks(
+        p_sorted_ids: fx.Pointer, p_num_valid: fx.Pointer, p_desc: fx.Pointer
+    ):
         tid = fx.Int32(gpu.thread_idx.x)
         lane = tid & 63
         wave = fx.Int32(rocdl.readfirstlane(T.i32, _raw(tid >> 6)))
@@ -80,12 +83,22 @@ def compile_chunk_blocks(*, CHUNKS, K, BM, ROW):
         valid = fx.Int32(fx.recast_iter(fx.Int32, fxh._as_ptr(p_num_valid))[0])
         blocks = (valid + (BM - 1)) // BM
         desc = fx.recast_iter(fx.Int32, fxh._as_ptr(p_desc))
-        bounds = [(fx.Int32(desc[c * ROW + 1]), fx.Int32(desc[c * ROW + 2])) for c in range_constexpr(CHUNKS)]
+        bounds = [
+            (fx.Int32(desc[c * ROW + 1]), fx.Int32(desc[c * ROW + 2]))
+            for c in range_constexpr(CHUNKS)
+        ]
         ids_rsrc = _rsrc(_address(p_sorted_ids), fx.Int64(valid) * 4)
         desc_rsrc = _rsrc(_address(p_desc), CHUNKS * ROW * 4)
         block = [(wave * K + j) * 64 + lane for j in range_constexpr(K)]
         token = [
-            fx.Int32(_load(ids_rsrc, (block[j] < blocks).select(block[j] * (BM * 4), fx.Int32(_DROP)), 0, 1)[0])
+            fx.Int32(
+                _load(
+                    ids_rsrc,
+                    (block[j] < blocks).select(block[j] * (BM * 4), fx.Int32(_DROP)),
+                    0,
+                    1,
+                )[0]
+            )
             & fx.Int32(0xFFFFFF)
             for j in range_constexpr(K)
         ]
@@ -127,7 +140,12 @@ def compile_chunk_blocks(*, CHUNKS, K, BM, ROW):
             )
 
     @flyc.jit
-    def launch(p_sorted_ids: fx.Pointer, p_num_valid: fx.Pointer, p_desc: fx.Pointer, stream: fx.Stream):
+    def launch(
+        p_sorted_ids: fx.Pointer,
+        p_num_valid: fx.Pointer,
+        p_desc: fx.Pointer,
+        stream: fx.Stream,
+    ):
         CompilationContext.get_current()
         chunk_blocks(p_sorted_ids, p_num_valid, p_desc).launch(
             grid=(1, 1, 1), block=(64 * WAVES, 1, 1), stream=stream

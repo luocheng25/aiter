@@ -39,7 +39,16 @@ A_TWO_PASS_MIN_K = 512
 
 
 def compile_a8w4_gemm2(
-    *, N, K, TOPK, BLOCK_TILE_SIZE_M=64, E=None, NSPLIT=1, XCD_CHUNK=0, TP=None, CHUNKED=False
+    *,
+    N,
+    K,
+    TOPK,
+    BLOCK_TILE_SIZE_M=64,
+    E=None,
+    NSPLIT=1,
+    XCD_CHUNK=0,
+    TP=None,
+    CHUNKED=False,
 ):
     """Build the A8W4 Down launcher.
 
@@ -99,16 +108,16 @@ def compile_a8w4_gemm2(
 
     def _part(part):
         """This workgroup's part of the hidden dimension (grid x without XCD_CHUNK and TP)."""
-        return (
-            part
-            if XCD_CHUNK > 0 or TP is not None
-            else fx.Int32(fx.gpu.block_idx.x)
-        )
+        return part if XCD_CHUNK > 0 or TP is not None else fx.Int32(fx.gpu.block_idx.x)
 
     def _chunk_tokens(p_desc):
         """TP roles of a ``CHUNKED`` launch: the chunk's tokens ``[desc[1], desc[2])`` and its index ``desc[3]``."""
         desc = fxh.view_as_torch_tensor(p_desc, (4,), fx.Int32)
-        return dict(t_lo=fx.Int32(desc[1]), t_hi=fx.Int32(desc[2]), chunk=fx.Int32(desc[3]))
+        return {
+            "t_lo": fx.Int32(desc[1]),
+            "t_hi": fx.Int32(desc[2]),
+            "chunk": fx.Int32(desc[3]),
+        }
 
     def _rne_bits(value):
         bits = value.bitcast(fx.Uint32)
@@ -388,7 +397,8 @@ def compile_a8w4_gemm2(
                     )
                     sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
                     coord_tensor = fx.make_view(
-                        fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
+                        fx.get_iter(arg_p_sorted_ids),
+                        fx.make_layout((BLOCK_N, bm), (0, 1)),
                     )
                     frag_coord = ops.load_tiled_mma_fragC(
                         mm, coord_tensor, copy_atom_bits=32

@@ -132,10 +132,10 @@ def compile_a8w4_gemm1(
     ):
         # Lane holds channels _chan_base + v of token lane % 16 for each (m, n) MMA tile.
         log2_exp1 = -1.4426950408889634
-        I = N // 2
+        INTER = N // 2
         lane = tid % 64
         wave = tid // 64
-        oob = M * (TOPK * I * 4)
+        oob = M * (TOPK * INTER * 4)
         out = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.recast_iter(fx.Float32, fxh._as_ptr(p_output)), fx.make_layout(1, 1)
@@ -150,7 +150,7 @@ def compile_a8w4_gemm1(
             sorted_id = asc_idx[0, n]
             token = sorted_id & 0xFFFFFF
             slot = (sorted_id >> 24) & 0xFF
-            row_bytes = (token * TOPK + slot) * (I * 4)
+            row_bytes = (token * TOPK + slot) * (INTER * 4)
             for m in range_constexpr(m_reps):
                 gate = gate_frag[None, m, n].load()
                 up = up_frag[None, m, n].load()

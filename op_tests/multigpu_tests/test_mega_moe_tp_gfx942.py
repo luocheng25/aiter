@@ -330,7 +330,7 @@ def reference(
     """
     M, _ = x.shape
     E, n1 = w1.shape[0], w1.shape[1]
-    I, topk = n1 // 2, topk_ids.shape[1]
+    I, topk = n1 // 2, topk_ids.shape[1]  # noqa: E741,RUF100
     xa = quant_rows_fp8(x)
     flat = topk_ids.reshape(-1).long()
     order = torch.argsort(flat, stable=True)
@@ -733,7 +733,7 @@ BASIC = [
     ("tp2", 256, ST16, CA),
     ("ds_tp4", 512, ST16_RS, FUSED_COMM),  # Down writes routes, tp_reduce sums them
     ("tp4", 48, ST32Q, CA),  # Gate/Up quantizes the intermediate itself
-    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),  # Down writes routes and streams their sum out
+    ("ds_tp4", 1024, ST32_RS, FUSED_COMM),  # Down writes routes, streams their sum out
     ("tp4", 2048, ST64Q, FUSED_COMM),  # atomic Down, then streams the ranks' sum out
     # prefill: sorted 64-row blocks
     ("tp2", 2048, PF_PREP, FUSED_COMM),  # sorting by the streaming prep
@@ -1742,15 +1742,15 @@ def _job_sdma_setup(state):
                 y2 = other.forward(*inputs)
             queues = other._ws.sdma
             rows.append(
-                dict(
-                    step=step,
-                    path=">".join(other.last_path),
-                    warned=any("no SDMA queues" in str(w.message) for w in caught),
-                    engines=None if queues is None else queues.engines,
-                    order=other._ws.sdma_order,
-                    same=torch.equal(y, y2),
-                    bits=other.poll_errors(),
-                )
+                {
+                    "step": step,
+                    "path": ">".join(other.last_path),
+                    "warned": any("no SDMA queues" in str(w.message) for w in caught),
+                    "engines": None if queues is None else queues.engines,
+                    "order": other._ws.sdma_order,
+                    "same": torch.equal(y, y2),
+                    "bits": other.poll_errors(),
+                }
             )
         finally:
             if saved_env is None:
@@ -1762,12 +1762,12 @@ def _job_sdma_setup(state):
             sdma._SHARED.update(shared)
     y3 = layer.forward(*inputs)
     rows.append(
-        dict(
-            step="shared_after",
-            path=">".join(layer.last_path),
-            same=torch.equal(y, y3),
-            bits=layer.poll_errors(),
-        )
+        {
+            "step": "shared_after",
+            "path": ">".join(layer.last_path),
+            "same": torch.equal(y, y3),
+            "bits": layer.poll_errors(),
+        }
     )
     return rows
 

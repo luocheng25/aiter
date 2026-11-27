@@ -175,7 +175,10 @@ def _os_submit_bytes(nsplit, stamps=0):
     """Bytes of one-shot SDMA submission of a chunk (``DownTP.OS``): the RDY POLL, per column block POLL, COPY2D
     and two FENCEs, the completion FENCE (``stamps``: ``DownTP.STAMP``, a TIMESTAMP after the RDY POLL and after
     every POLL and COPY2D), NOPs up to a multiple of 64 bytes."""
-    return -(-(4 * (6 + 34 * nsplit + 4 + (3 * (1 + 2 * nsplit) if stamps else 0))) // 64) * 64
+    return (
+        -(-(4 * (6 + 34 * nsplit + 4 + (3 * (1 + 2 * nsplit) if stamps else 0))) // 64)
+        * 64
+    )
 
 
 # DownTP.STAMP (timing analysis of rule 12) from ctr word ctr_words(True): per chunk a row of STAMP_SLOTS 64-byte
@@ -294,7 +297,9 @@ class DownTP:
     compiler hoists the next half's dequantization and MFMAs above it, next to their weight loads, whose wait then
     also waits for the route stores issued before them: ``vmcnt`` counts loads and stores in issue order); ``LAS``
     issues each half's weight loads before its route stores. ``WPE``: the kernel's ``waves_per_eu`` compile hint
-    (0: none); ``SB`` / ``LAS`` raise the VGPRs: with ``WPE`` they keep the occupancy."""
+    (0: none); ``SB`` / ``LAS`` raise the VGPRs: with ``WPE`` they keep the occupancy.
+    """
+
     WORLD: int
     H: int
     TOPK: int
@@ -336,14 +341,20 @@ class DownTP:
         assert self.UX >= 0 and self._upw() % (self.UX or self._upw()) == 0, self.UX
         assert self.GY * self.WORLD <= 64, (self.GY, self.WORLD)
         # OS: two ranks (one SDMA queue), no owner workgroups (rule 12).
-        assert not self.OS or (self.WORLD == 2 and self.NY == 0 and self.NYT == 0 and not self.COPY), (
+        assert not self.OS or (
+            self.WORLD == 2 and self.NY == 0 and self.NYT == 0 and not self.COPY
+        ), (
             self.OS,
             self.WORLD,
             self.NY,
             self.NYT,
             self.COPY,
         )
-        assert not self.STAMP or (self.OS and not self.TRACE), (self.STAMP, self.OS, self.TRACE)
+        assert not self.STAMP or (self.OS and not self.TRACE), (
+            self.STAMP,
+            self.OS,
+            self.TRACE,
+        )
 
     def _rows(self):
         """Rows a reduce workgroup sums per token: the ``TOPK`` routes, one with ``COPY``."""
@@ -360,12 +371,16 @@ class DownTP:
         if isinstance(q, int):
             return (nxt, nyt) if q == S - 1 else (NX, NY)
         last = q == S - 1
-        pick = lambda tail, n: n if tail == n else last.select(fx.Int32(tail), fx.Int32(n))
+
+        def pick(tail, n):
+            return n if tail == n else last.select(fx.Int32(tail), fx.Int32(n))
+
         return pick(nxt, NX), pick(nyt, NY)
 
     def segments(self, task_pad):
         """The grid in launch order: (role, column block, index of the first workgroup within the role's block,
-        count) per segment (``task_pad``: int or run-time Int32; the counts are multiples of 4)."""
+        count) per segment (``task_pad``: int or run-time Int32; the counts are multiples of 4).
+        """
         S, C, X, Y = self.NSPLIT, ROLE_COMPUTE, ROLE_REDUCE, ROLE_OWNER
         n = self._counts
         a = task_pad * self.AX // 32 * 4
@@ -383,7 +398,9 @@ class DownTP:
 
     def grid(self, task_pad):
         nx, ny = self._counts(self.NSPLIT - 1)
-        return self.NSPLIT * task_pad + (self.NSPLIT - 1) * (self.NX + self.NY) + nx + ny
+        return (
+            self.NSPLIT * task_pad + (self.NSPLIT - 1) * (self.NX + self.NY) + nx + ny
+        )
 
     def roles(self, wg, task_pad):
         """(role, index within its role and block, column block) of workgroup ``wg`` (all wave-uniform)."""
@@ -405,7 +422,9 @@ class DownTP:
         _store(
             _rsrc(_address(p_ctr), base + 16 * self.grid(task_pad)),
             [pair[0], pair[1]],
-            (fx.Int32(gpu.thread_id("x")) == 0).select(base + wg * 16 + at, fx.Int32(_DROP)),
+            (fx.Int32(gpu.thread_id("x")) == 0).select(
+                base + wg * 16 + at, fx.Int32(_DROP)
+            ),
             SYS,
         )
 
@@ -446,18 +465,18 @@ class DownTP:
         rps = (tiles + (W - 1)) // W * TT
         slots = a.tpq * NSPLIT_MAX
         tab = _rsrc(_address(a.p_tab), (4 if self.OS else 3) * W * 8)
-        g = dict(
-            ROW=ROW,
-            tiles=tiles,
-            rps=rps,
-            slots=slots,
-            tab=tab,
-            inbox_bytes=rps * (W * ROW),
-            flag_bytes=slots * ((W + 1) * 4),
-            out_bytes=a.M * ROW,
-            tile_lo=0,
-            tile_hi=tiles,
-        )
+        g = {
+            "ROW": ROW,
+            "tiles": tiles,
+            "rps": rps,
+            "slots": slots,
+            "tab": tab,
+            "inbox_bytes": rps * (W * ROW),
+            "flag_bytes": slots * ((W + 1) * 4),
+            "out_bytes": a.M * ROW,
+            "tile_lo": 0,
+            "tile_hi": tiles,
+        }
         if self.OS:
             # The chunk's tiles (its bounds are multiples of WORLD * TT but the call's end).
             g.update(
@@ -510,7 +529,11 @@ class DownTP:
         wave = _uniform(tid >> 6)
         rank, M = a.rank, a.M
         inbox_addr = [] if self.OS else [_entry(tab, W, 1, p) for p in range(W)]
-        flags = [] if self.OS else [_rsrc(_entry(tab, W, 2, p), g["flag_bytes"]) for p in range(W)]
+        flags = (
+            []
+            if self.OS
+            else [_rsrc(_entry(tab, W, 2, p), g["flag_bytes"]) for p in range(W)]
+        )
         ep_rsrc = _rsrc(_address(a.p_epoch), g["slots"] * 4)
         if not self.COPY:
             loc_rsrc = _rsrc(_address(a.p_loc), M * (TOPK * 4))
@@ -549,10 +572,14 @@ class DownTP:
             return _ballot_any((lane < 2) & (seen < a.task_pad))
 
         if self.STAMP:
-            _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 22 + q) * 64, (j == 0) & (tid == 0))
+            _stamp_at(
+                a.p_ctr, (g["chunk"] * STAMP_SLOTS + 22 + q) * 64, (j == 0) & (tid == 0)
+            )
         _wait(a.p_err, a.limit, pending)
         if self.STAMP:
-            _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 17 + q) * 64, (j == 0) & (tid == 0))
+            _stamp_at(
+                a.p_ctr, (g["chunk"] * STAMP_SLOTS + 17 + q) * 64, (j == 0) & (tid == 0)
+            )
         # Lane l < UPW * TOPK holds slot l % TOPK of the token of unit l // TOPK (one load per tile).
         lu = lane // TOPK
         lk = lane - lu * TOPK
@@ -579,7 +606,13 @@ class DownTP:
             for u in range(s * UX, (s + 1) * UX):
                 token, col2, ok = unit(i, u)
                 if self.COPY:
-                    words += _load(src_rsrc, ok.select(token * ROW + col2, fx.Int32(_DROP)), 0, 4, aux=SYS)
+                    words += _load(
+                        src_rsrc,
+                        ok.select(token * ROW + col2, fx.Int32(_DROP)),
+                        0,
+                        4,
+                        aux=SYS,
+                    )
                     continue
                 for k in range(TOPK):
                     loc = fx.Int32(
@@ -592,7 +625,9 @@ class DownTP:
                     live = ok & (loc >= 0)
                     # One row per descriptor from a 64-bit base: routes may exceed the 2 GiB voffset range.
                     row = _rsrc(src_base + fx.Int64(live.select(loc, 0)) * ROW, ROW)
-                    words += _load(row, live.select(col2, fx.Int32(_DROP)), 0, 4, aux=SYS)
+                    words += _load(
+                        row, live.select(col2, fx.Int32(_DROP)), 0, 4, aux=SYS
+                    )
             return words
 
         def release(i):
@@ -601,7 +636,9 @@ class DownTP:
             tile = tile_of(first + tid)
             ok = (tid < G) & (first + tid <= i) & (tile < tiles)
             v = q * a.tpq + tile
-            epoch = fx.Int32(_load(ep_rsrc, ok.select(v * 4, fx.Int32(_DROP)), 0, 1)[0]) + 1
+            epoch = (
+                fx.Int32(_load(ep_rsrc, ok.select(v * 4, fx.Int32(_DROP)), 0, 1)[0]) + 1
+            )
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             owner = tile % W
@@ -629,20 +666,31 @@ class DownTP:
                 dest = _rsrc(address, g["inbox_bytes"])
             loc_far = None
             for s in range(STEPS):
-                rows = [[fx.Uint32(w) for w in words[4 * m : 4 * m + 4]] for m in range(UX * TOPK)]
+                rows = [
+                    [fx.Uint32(w) for w in words[4 * m : 4 * m + 4]]
+                    for m in range(UX * TOPK)
+                ]
                 if self.COPY:
                     partials = rows
                 else:
-                    partials = [_sum_bf16(rows[v * TOPK : (v + 1) * TOPK]) for v in range(UX)]
+                    partials = [
+                        _sum_bf16(rows[v * TOPK : (v + 1) * TOPK]) for v in range(UX)
+                    ]
                 if s + 1 < STEPS:
                     words = step_loads(i, s + 1, loc_i)  # next step of this tile
                 else:
-                    words = step_loads(i + 1, 0, loc_next)  # first step of the next tile
+                    words = step_loads(
+                        i + 1, 0, loc_next
+                    )  # first step of the next tile
                     loc_far = loc_load(i + 2)
                 for v in range(UX):
                     token, col2, ok = unit(i, s * UX + v)
                     if self.DRY == 2:
-                        _store(out_rsrc, partials[v], ok.select(token * ROW + col2, fx.Int32(_DROP)))
+                        _store(
+                            out_rsrc,
+                            partials[v],
+                            ok.select(token * ROW + col2, fx.Int32(_DROP)),
+                        )
                     else:
                         _store(
                             dest,
@@ -695,7 +743,9 @@ class DownTP:
                     parts.append(
                         _load(
                             own_inbox,
-                            (ok & (i < owned)).select(row * ROW + col2, fx.Int32(_DROP)),
+                            (ok & (i < owned)).select(
+                                row * ROW + col2, fx.Int32(_DROP)
+                            ),
                             0,
                             4,
                             aux=SYS,
@@ -709,7 +759,10 @@ class DownTP:
             il = first + lane // W
             ok_l = (lane < G * W) & (il < owned)
             v_l = q * a.tpq + rank + W * il
-            want = fx.Int32(_load(ep_rsrc, ok_l.select(v_l * 4, fx.Int32(_DROP)), 0, 1)[0]) + 1
+            want = (
+                fx.Int32(_load(ep_rsrc, ok_l.select(v_l * 4, fx.Int32(_DROP)), 0, 1)[0])
+                + 1
+            )
 
             def pending():
                 at = ok_l.select((v_l * W + (lane & (W - 1))) * 4, fx.Int32(_DROP))
@@ -740,7 +793,9 @@ class DownTP:
                         )
             ok = (tid < G) & (first + tid < owned)
             v = q * a.tpq + rank + W * (first + tid)
-            epoch = fx.Int32(_load(ep_rsrc, ok.select(v * 4, fx.Int32(_DROP)), 0, 1)[0]) + 1
+            epoch = (
+                fx.Int32(_load(ep_rsrc, ok.select(v * 4, fx.Int32(_DROP)), 0, 1)[0]) + 1
+            )
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             ag = (epoch & _EPOCH_BITS) | poison
@@ -761,12 +816,15 @@ class DownTP:
         this rank's RDY flag on o (this call has started, its landing is free); SDMA queue 0 then (chunk 0: once
         o's RDY flag here holds o's epoch), per column block q: once TRG[q] holds the chunk epoch, one 2-D copy of
         the block's columns of the chunk's rows from ``out`` into o's ``landing``, FENCEs storing the epoch as
-        ARR[q] on o and SNT[q] here; a FENCE on the queue's completion word (rule 12)."""
+        ARR[q] on o and SNT[q] here; a FENCE on the queue's completion word (rule 12).
+        """
         W, S = self.WORLD, self.NSPLIT
         ROW = g["ROW"]
         BLOCK = 2 * (self.H // S)
         NBYTES = _os_submit_bytes(S, self.STAMP)
-        assert MAX_CHUNKS * NBYTES <= sdma.RING_BYTES // 2, NBYTES  # a call's submissions (sdma.py rule 1)
+        assert (
+            MAX_CHUNKS * NBYTES <= sdma.RING_BYTES // 2
+        ), NBYTES  # a call's submissions (sdma.py rule 1)
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid & 63
         wave = _uniform(tid >> 6)
@@ -785,7 +843,9 @@ class DownTP:
         def stamp(slot):
             if not self.STAMP:
                 return []
-            return sdma.stamp(stamp_address + fx.Int64((chunk * STAMP_SLOTS + slot) * 64))
+            return sdma.stamp(
+                stamp_address + fx.Int64((chunk * STAMP_SLOTS + slot) * 64)
+            )
 
         def queue():
             if self.STAMP:
@@ -801,23 +861,43 @@ class DownTP:
             at = (region + CEP + o) * 4
             e = fx.Int32(_uniform(_load(own_flags, at, 0, 1, aux=SYS)[0])) + 1
             _store(own_flags, [e], (lane == 0).select(at, drop), SYS)
-            mine = fx.Int32(_uniform(_load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0])) + 1
+            mine = (
+                fx.Int32(
+                    _uniform(
+                        _load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0]
+                    )
+                )
+                + 1
+            )
             mine = mine & _EPOCH_BITS
             first = chunk == 0
-            _store(peer_flags, [mine], (first & (lane == 0)).select((base + RDY + rank) * 4, drop), SYS)
+            _store(
+                peer_flags,
+                [mine],
+                (first & (lane == 0)).select((base + RDY + rank) * 4, drop),
+                SYS,
+            )
             ready = own_address + fx.Int64((base + RDY + o) * 4)
-            words = sdma.select(first, sdma.poll(ready, e & _EPOCH_BITS, _EPOCH_BITS), sdma.nops(6))
+            words = sdma.select(
+                first, sdma.poll(ready, e & _EPOCH_BITS, _EPOCH_BITS), sdma.nops(6)
+            )
             words += stamp(1)
             rows = g["t_hi"] - g["t_lo"]
             start = fx.Int64(g["t_lo"]) * ROW
             for q in range(S):
                 at_q = start + q * BLOCK
-                words += sdma.poll(own_address + fx.Int64((region + TRG + q) * 4), mine, _EPOCH_BITS)
+                words += sdma.poll(
+                    own_address + fx.Int64((region + TRG + q) * 4), mine, _EPOCH_BITS
+                )
                 words += stamp(2 + 2 * q)
                 words += sdma.copy2d(out_address + at_q, land + at_q, ROW, BLOCK, rows)
                 words += stamp(3 + 2 * q)
-                words += sdma.fence(peer_address + fx.Int64((region + ARR + q) * 4), mine)
-                words += sdma.fence(own_address + fx.Int64((region + SNT + q) * 4), mine)
+                words += sdma.fence(
+                    peer_address + fx.Int64((region + ARR + q) * 4), mine
+                )
+                words += sdma.fence(
+                    own_address + fx.Int64((region + SNT + q) * 4), mine
+                )
             words += sdma.fence(ring.done_address, fx.Int32(new))
             words += sdma.nops(NBYTES // 4 - len(words))
 
@@ -828,7 +908,10 @@ class DownTP:
 
             _when(go, submit)
             # The previous call's copies are not complete (a wait that gave up): no copies this call.
-            _when(stuck & (lane == 0), lambda: atomic_or_global_at(_address(a.p_err), ERR_TIMEOUT))
+            _when(
+                stuck & (lane == 0),
+                lambda: atomic_or_global_at(_address(a.p_err), ERR_TIMEOUT),
+            )
 
         _when(wave == 0, queue)
 
@@ -857,16 +940,31 @@ class DownTP:
             )
 
             def fire():
-                e = fx.Int32(_load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0]) + 1
+                e = (
+                    fx.Int32(
+                        _load(own_flags, (region + CEP + rank) * 4, 0, 1, aux=SYS)[0]
+                    )
+                    + 1
+                )
                 e = e & _EPOCH_BITS
-                failed = fx.Int32(_load(_rsrc(_address(a.p_err), 4), 0, 0, 1, aux=SYS)[0]) != 0
+                failed = (
+                    fx.Int32(_load(_rsrc(_address(a.p_err), 4), 0, 0, 1, aux=SYS)[0])
+                    != 0
+                )
                 poison = failed.select(fx.Int32(POISON), fx.Int32(0))
-                _store(peer_flags, [e | POISON], failed.select((region + PSN + rank) * 4, drop), SYS)
+                _store(
+                    peer_flags,
+                    [e | POISON],
+                    failed.select((region + PSN + rank) * 4, drop),
+                    SYS,
+                )
                 rocdl.s_waitcnt(vmcnt=0)
                 _store(own_flags, [fx.Int32(0)], (region + XCN + q) * 4, SYS)
                 _store(own_flags, [e | poison], (region + TRG + q) * 4, SYS)
                 if self.STAMP:
-                    _stamp_at(a.p_ctr, (g["chunk"] * STAMP_SLOTS + 12 + q) * 64, tid == 0)
+                    _stamp_at(
+                        a.p_ctr, (g["chunk"] * STAMP_SLOTS + 12 + q) * 64, tid == 0
+                    )
 
             _when(old == total - 1, fire)
 
@@ -913,7 +1011,9 @@ def compile_down_tp(*, N, K, TOPK, BLOCK_TILE_SIZE_M, E, XCD_CHUNK, tp):
 
 
 @functools.cache
-def compile_down_stream_tp(*, N, K, TOPK, BLOCK_M, E, ATOMIC, R, SHARE, PREFETCH, W_AUX, tp):
+def compile_down_stream_tp(
+    *, N, K, TOPK, BLOCK_M, E, ATOMIC, R, SHARE, PREFETCH, W_AUX, tp
+):
     """The streamed streaming-tier Down launcher (``compile_a8w4_down_stream`` with four waves and ``TP=tp``): the
     arguments of the streaming Down up to ``task_num``, then ``loc``, ``out``, ``ctr``, ``tab``, ``epoch``, ``err``,
     rank, tpq, limit, stream. With ``ATOMIC`` (``tp.COPY``) the Down adds the routes into its ``out`` argument (the
@@ -959,11 +1059,33 @@ def _sdma_finish_os(W, g, rank, p_err, limit, nags, S):
             def chunk(c):
                 region = base + c * CHUNK_WORDS
                 # The chunk epoch: CEP[o] (advanced by this call's _plan_os) = CEP[rank] + 1.
-                e = fx.Int32(_uniform(_load(own_flags, (region + CEP + o) * 4, 0, 1, aux=SYS)[0])) & _EPOCH_BITS
-                _store(peer_flags, [e | POISON], (lane == 0).select((region + PSN + rank) * 4, drop), SYS)
+                e = (
+                    fx.Int32(
+                        _uniform(
+                            _load(own_flags, (region + CEP + o) * 4, 0, 1, aux=SYS)[0]
+                        )
+                    )
+                    & _EPOCH_BITS
+                )
+                _store(
+                    peer_flags,
+                    [e | POISON],
+                    (lane == 0).select((region + PSN + rank) * 4, drop),
+                    SYS,
+                )
                 rocdl.s_waitcnt(vmcnt=0)
-                _store(own_flags, [e | POISON], (lane < S).select((region + TRG + lane) * 4, drop), SYS)
-                _store(own_flags, [e], ((lane == 0) & (c == 0)).select((base + RDY + o) * 4, drop), SYS)
+                _store(
+                    own_flags,
+                    [e | POISON],
+                    (lane < S).select((region + TRG + lane) * 4, drop),
+                    SYS,
+                )
+                _store(
+                    own_flags,
+                    [e],
+                    ((lane == 0) & (c == 0)).select((base + RDY + o) * 4, drop),
+                    SYS,
+                )
 
             _loop(0, nags, 1, chunk)
             _spin(busy, limit)
@@ -986,7 +1108,9 @@ def _os_gather(spec, G):
     """The body of the one-shot final kernel (``compile_tp_gather(OS=1)``, rule 12)."""
     WORLD, TT, NSPLIT = spec.WORLD, spec.TT, spec.NSPLIT
 
-    def body(p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags):
+    def body(
+        p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags
+    ):
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid & 63
         first = fx.Int32(gpu.block_id("x"))
@@ -1045,20 +1169,32 @@ def _os_gather(spec, G):
             )
             region = base + c * CHUNK_WORDS
             # The chunk epoch: CEP[o], advanced by this call's _plan_os (= CEP[rank] + 1 until this kernel ends).
-            want = fx.Int32(_load(own_flags, live.select((region + CEP + o) * 4, drop), 0, 1, aux=SYS)[0])
+            want = fx.Int32(
+                _load(
+                    own_flags, live.select((region + CEP + o) * 4, drop), 0, 1, aux=SYS
+                )[0]
+            )
             want = want & _EPOCH_BITS
-            at = live.select((region + arr.select(fx.Int32(ARR), fx.Int32(SNT)) + q) * 4, drop)
+            at = live.select(
+                (region + arr.select(fx.Int32(ARR), fx.Int32(SNT)) + q) * 4, drop
+            )
 
             def pending():
                 seen = fx.Int32(_load(own_flags, at, 0, 1, aux=SYS)[0])
                 # Reached: epochs modulo _EPOCH_BITS + 1.
-                return _ballot_any(live & (((seen - want) & _EPOCH_BITS) >= (POISON >> 1)))
+                return _ballot_any(
+                    live & (((seen - want) & _EPOCH_BITS) >= (POISON >> 1))
+                )
 
             _wait(p_err, limit, pending)
             if spec.STAMP:
                 _stamp_at(p_ctr, record + 8, recorded)
             check = live & arr & (tid < 64)
-            psn = fx.Int32(_load(own_flags, check.select((region + PSN + o) * 4, drop), 0, 1, aux=SYS)[0])
+            psn = fx.Int32(
+                _load(
+                    own_flags, check.select((region + PSN + o) * 4, drop), 0, 1, aux=SYS
+                )[0]
+            )
             _when(
                 check & (psn == (want | POISON)),
                 lambda: atomic_or_global_at(_address(p_err), ERR_TIMEOUT),
@@ -1072,7 +1208,11 @@ def _os_gather(spec, G):
                 for token, col2, ok in spec._units(tk * TT, qk, M):
                     offset = (ok & inside).select(token * ROW + col2, drop)
                     rows.append(
-                        (_load(out_rsrc, offset, 0, 4), _load(own_landing, offset, 0, 4, aux=SYS), offset)
+                        (
+                            _load(out_rsrc, offset, 0, 4),
+                            _load(own_landing, offset, 0, 4, aux=SYS),
+                            offset,
+                        )
                     )
             # Two partials: their f32 sum is that of the ranks' order (one rounding, as the owner's in tp_reduce).
             for mine, peer, offset in rows:
@@ -1081,7 +1221,10 @@ def _os_gather(spec, G):
 
         if not spec.DRY:
             _loop(first, (total + (G - 1)) // G, nwg, group)
-            _when(first == 0, lambda: _sdma_finish_os(WORLD, g, rank, p_err, limit, nags, NSPLIT))
+            _when(
+                first == 0,
+                lambda: _sdma_finish_os(WORLD, g, rank, p_err, limit, nags, NSPLIT),
+            )
         if spec.STAMP:
             _stamp_at(p_ctr, record + 16, recorded)
 
@@ -1102,7 +1245,22 @@ def _os_gather(spec, G):
         s3: fx.Int32,
         nags: fx.Int32,
     ):
-        body(p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags)
+        body(
+            p_out,
+            p_tab,
+            p_epoch,
+            p_ctr,
+            p_err,
+            M,
+            rank,
+            tpq,
+            limit,
+            nwg,
+            s1,
+            s2,
+            s3,
+            nags,
+        )
 
     @flyc.jit
     def launch_os(
@@ -1124,7 +1282,20 @@ def _os_gather(spec, G):
     ):
         CompilationContext.get_current()
         a8w4_tp_reduce(
-            p_out, p_tab, p_epoch, p_ctr, p_err, M, rank, tpq, limit, nwg, s1, s2, s3, nags
+            p_out,
+            p_tab,
+            p_epoch,
+            p_ctr,
+            p_err,
+            M,
+            rank,
+            tpq,
+            limit,
+            nwg,
+            s1,
+            s2,
+            s3,
+            nags,
         ).launch(grid=(nwg, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_os
@@ -1142,11 +1313,24 @@ def compile_tp_gather(*, WORLD, H, TT, NSPLIT, DRY=0, G=1, OS=0, STAMP=0):
     not have) and ``nags`` (its chunks). Every item (all ranks') sums this rank's partial in ``out`` and the peer's
     in ``landing`` into ``out`` once both SDMA pushes of its chunk and column block are complete (one bounded poll of
     their ARR and SNT flags for the ``G`` items); workgroup 0 at its end waits for this rank's queue (bounded) and
-    advances the chunks' ``CEP[rank]``. ``STAMP`` (with ``OS``): ``DownTP.STAMP``'s per-workgroup stamps."""
+    advances the chunks' ``CEP[rank]``. ``STAMP`` (with ``OS``): ``DownTP.STAMP``'s per-workgroup stamps.
+    """
     assert 1 <= G <= (32 if OS else 64), G
     assert not STAMP or OS, (STAMP, OS)
     if OS:
-        spec = DownTP(WORLD=WORLD, H=H, TOPK=1, TT=TT, NSPLIT=NSPLIT, NX=4, NY=0, NYT=0, DRY=DRY, OS=1, STAMP=STAMP)
+        spec = DownTP(
+            WORLD=WORLD,
+            H=H,
+            TOPK=1,
+            TT=TT,
+            NSPLIT=NSPLIT,
+            NX=4,
+            NY=0,
+            NYT=0,
+            DRY=DRY,
+            OS=1,
+            STAMP=STAMP,
+        )
         return _os_gather(spec, G)
     spec = DownTP(WORLD=WORLD, H=H, TOPK=1, TT=TT, NSPLIT=NSPLIT, NX=4, NY=4, DRY=DRY)
 

@@ -391,15 +391,15 @@ def compile_a8w4_gateup_stream(
     instructions); ``SYNC`` becomes ``ACT_STEPS``, the loads run two groups ahead and a group is written at the
     end of the group before it. ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common.swiglu_clamp``).
     """
-    I = N // 2
+    INTER = N // 2
     if QUANT:
-        W = I // (16 * G)
-    assert I % (16 * G * W) == 0, f"I={I} must be a multiple of {16 * G * W}"
+        W = INTER // (16 * G)
+    assert INTER % (16 * G * W) == 0, f"I={INTER} must be a multiple of {16 * G * W}"
     assert K % 64 == 0, f"K={K} must be a multiple of 64"
     assert BLOCK_M in (16, 32, 64), f"BLOCK_M={BLOCK_M} must be 16, 32 or 64"
     KB, KQ = K // 64, a8w4.delta_dwords(K)
     W_BYTES, D_BYTES = a8w4.weight_bytes(N, K), a8w4.delta_bytes(N, K)
-    UP = I // 16
+    UP = INTER // 16
     # Several waves share the block's activations through LDS: each lane of the first LOADERS waves loads
     # LOADER bytes per 64-K step; with more waves the rest write a scratch slot that nobody reads.
     SHARE = SHARE and W > 1
@@ -440,7 +440,9 @@ def compile_a8w4_gateup_stream(
         values = []
         for j in range(G):
             gate_scale = [_f32(v) for v in _load(ws_rsrc, channels[j] * 4, 0, 4)]
-            up_scale = [_f32(v) for v in _load(ws_rsrc, (channels[j] + I) * 4, 0, 4)]
+            up_scale = [
+                _f32(v) for v in _load(ws_rsrc, (channels[j] + INTER) * 4, 0, 4)
+            ]
             per_sub = []
             for s in range(S):
                 gate, up = acc[j][s], acc[G + j][s]
@@ -456,11 +458,11 @@ def compile_a8w4_gateup_stream(
         return channels, values
 
     def store_f32(S, block, channels, values, M, p_out):
-        out_rsrc = _rsrc(_address(p_out), M * (TOPK * I * 4))
+        out_rsrc = _rsrc(_address(p_out), M * (TOPK * INTER * 4))
         for j in range(G):
             for s in range(S):
                 token = block.token[s]
-                offset = ((token * TOPK + block.slot[s]) * I + channels[j]) * 4
+                offset = ((token * TOPK + block.slot[s]) * INTER + channels[j]) * 4
                 offset = (token < M).select(offset, fx.Int32(_DROP))
                 _store(
                     out_rsrc,
@@ -472,7 +474,7 @@ def compile_a8w4_gateup_stream(
         S, block, channels, values, lane, wave, M, amax_lds, p_out, p_out_scale
     ):
         """Row amax over this wave's channels -> LDS -> amax over the workgroup -> FP8 bytes + scale."""
-        out_rsrc = _rsrc(_address(p_out), M * (TOPK * I))
+        out_rsrc = _rsrc(_address(p_out), M * (TOPK * INTER))
         scale_rsrc = _rsrc(_address(p_out_scale), M * (TOPK * 4))
         row_lane = lane & 15
         for s in range(S):
@@ -511,7 +513,7 @@ def compile_a8w4_gateup_stream(
                 _store(
                     out_rsrc,
                     [_pack_bytes(q[4 * j : 4 * j + 4])],
-                    live.select(route * I + channels[j], fx.Int32(_DROP)),
+                    live.select(route * INTER + channels[j], fx.Int32(_DROP)),
                 )
             first = live & (lane < 16) & (wave == 0)
             _store(
@@ -793,7 +795,9 @@ def compile_a8w4_gateup_stream(
             M,
             rows,
         ).launch(
-            grid=(I // (16 * G * W), task_num, 1), block=(64 * W, 1, 1), stream=stream
+            grid=(INTER // (16 * G * W), task_num, 1),
+            block=(64 * W, 1, 1),
+            stream=stream,
         )
 
     return launch

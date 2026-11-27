@@ -286,7 +286,7 @@ def _gateup_group(
 ):
     """Leader workgroup: Gate/Up of channel block ``j`` for the ``count`` routes ``members``."""
     xq_base, part_base, lut_base = bases
-    G, K, TOPK, I, N, NJ, KB, KQ, KB_PART, PAIRS, XS, X_PIECES, X_LOADS, WAVES = (
+    G, K, TOPK, INTER, N, NJ, KB, KQ, KB_PART, PAIRS, XS, X_PIECES, X_LOADS, WAVES = (
         c["GROUP"],
         c["K"],
         c["TOPK"],
@@ -352,7 +352,9 @@ def _gateup_group(
     ws_rsrc = _rsrc(_address(p_w_scale) + fx.Int64(expert) * (N * 4), N * 4)
     channel = j * 16 + tid % 16
     ws_gate = fx.Uint32(_load(ws_rsrc, channel * 4, 0, 1)[0]).bitcast(fx.Float32)
-    ws_up = fx.Uint32(_load(ws_rsrc, (channel + I) * 4, 0, 1)[0]).bitcast(fx.Float32)
+    ws_up = fx.Uint32(_load(ws_rsrc, (channel + INTER) * 4, 0, 1)[0]).bitcast(
+        fx.Float32
+    )
     rocdl.sched_barrier(0)
     for u in range(X_LOADS):
         _lds_store(
@@ -410,11 +412,11 @@ def _gateup_group(
     gate, up = a8w4.swiglu_clamp(gate, up, c["SWIGLU_LIMIT"])
     tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
     value = fx.Float32((gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up)
-    out_rsrc = _rsrc(_address(p_out), M * (TOPK * I * 4))
+    out_rsrc = _rsrc(_address(p_out), M * (TOPK * INTER * 4))
     _store(
         out_rsrc,
         [value.bitcast(fx.Uint32)],
-        e_ok.select((e_route * I + j * 16 + cr) * 4, fx.Int32(_DROP)),
+        e_ok.select((e_route * INTER + j * 16 + cr) * 4, fx.Int32(_DROP)),
     )
 
 
@@ -426,9 +428,9 @@ def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=
     [M, TOPK]; out f32 [M, TOPK, I]. ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K.
     ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common.swiglu_clamp``).
     """
-    I = N // 2
+    INTER = N // 2
     assert (
-        I % 16 == 0 and K % (128 * WAVES) == 0
+        INTER % 16 == 0 and K % (128 * WAVES) == 0
     ), f"unsupported Gate/Up decode shape N={N} K={K}"
     assert 1 <= GROUP <= 3 and WAVES in (4, 8)
     KB = K // 64
@@ -438,9 +440,9 @@ def compile_a8w4_gateup_decode_dd(*, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=
         "GROUP": GROUP,
         "K": K,
         "TOPK": TOPK,
-        "I": I,
+        "I": INTER,
         "N": N,
-        "NJ": I // 16,
+        "NJ": INTER // 16,
         "KB": KB,
         "KQ": a8w4.delta_dwords(K),
         "KB_PART": KB_PART,
