@@ -22,16 +22,20 @@ One file, four regions:
      ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag, and the
      shared expert: prepare's bit-exact conversions, the real checkpoints, errors, the stream-mode threshold, graph,
      in-place output, TP8 padding, and the mixed decode: its threshold, the FP8 bytes of its fast row quantization,
-     masks, reads and other shapes): ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
+     masks, reads and other shapes, and the launch records behind the benchmark's per-kernel roofline: kernels per
+     stream against the profiler, FLOPs, bytes, graph capture, and the benchmark's matching of the profiled events
+     onto them): ``pytest op_tests/test_flydsl_moe_a8w4.py -m "not basic"``;
   3. benchmark (``main``, not collected by pytest): Qwen3.8 TP2 / TP4 (against aiter's FP8 per-token
      ``fused_moe``), MiMo-V2.6-Flash TP8 / TP4 and DeepSeek-V4.1-Flash TP4 x M = 1, 2, 4, ..., 32768 and 48 (85
      cases), then the DeepSeek-V4.1-Flash main and MTP layers with the shared expert, TP4 / TP8, at the same token
-     counts and M = 6, the MTP TP4 layer also at M = 1280 (73 cases, against aiter's FP8 per-token ``fused_moe`` and
-     ATOM's split): ``python op_tests/test_flydsl_moe_a8w4.py`` (``--quick``: the layers at 6 token counts).
+     counts and M = 6, the MTP TP4 layer also at M = 1280, and 22 cases at the boundaries of the dispatch (95 cases,
+     against aiter's FP8 per-token ``fused_moe`` and ATOM's split), with the per-kernel roofline of each case in INFO
+     lines: ``python op_tests/test_flydsl_moe_a8w4.py`` (``--quick``: the layers at 6 token counts).
 ``MF_SEED`` seeds the benchmark's weights and inputs.
 """
 
 import argparse
+import contextlib
 import copy
 import functools
 import gc
@@ -1099,7 +1103,7 @@ def test_layer_masked_routes():
 # The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
 # benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
 # The shared expert (2.10) is covered by the basic layer tests (one case per routed tier, TP8, the MTP layer in the
-# 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 73 layer cases (graded); here what they
+# 32x32-block format, fused_moe's E385 / topk-7 call) and the benchmark's 95 layer cases (graded); here what they
 # cannot show: the bit-exact conversions of prepare (E4M3FN -> FNUZ, -0, the block folding, the I padding), the
 # folding of the real checkpoints (byte-identical to FP4PTPC@97cc9b32; needs AITER_MOE_A8W4_DSV41_DIR, else skipped)
 # and the accuracy on real weights, input errors and the debug checks, CUDA graph replays, in-place output, the
@@ -1107,7 +1111,8 @@ def test_layer_masked_routes():
 # order, and fused_moe's shared_expert_id and raw shared tensors. The layer cases check that the shared expert ran and
 # grade the output, but not how it ran (_assert_shared / _assert_layer_path): later milestones change where the op
 # folds it. The cases about the split itself (_assert_split, moe_a8w4._shared_split) pin it with SHARED_FOLD = 0; the
-# mixed decode (2.12) and the fold (2.13) have their own sections.
+# mixed decode (2.12) and the fold (2.13) have their own sections, and so have the launch records behind the
+# benchmark's per-kernel roofline lines (2.14).
 # =================================================================================================
 
 
@@ -2101,7 +2106,8 @@ def test_h5120_decode_limit(tokens):
     shapes still take the decode tier at M 11 (end to end up to M 32 in test_decode_dispatch_boundaries).
 
     The other H 5120 decode cases pin the limit to pyhip M17's 32 (they test the kernels, not where the default lies);
-    the benchmark runs M 8 and 16 (no 10 / 11) without asserting kernels; the basic tests decode H 5120 at M 8 only.
+    the benchmark runs ds_tp4 at M 8 and 16 and the layers at M 10 / 11 without asserting kernels; the basic tests
+    decode H 5120 at M 8 only.
     """
     limit = moe_a8w4.DECODE_WIDE_MAX_M
     assert moe_a8w4.DECODE_WIDE_DEDUP_MIN_M <= limit < moe_a8w4.DECODE_MAX_M
@@ -5189,11 +5195,11 @@ def test_entry_checks(monkeypatch):
 # kernels quantizing in the kernel, they take one IEEE reciprocal per row and correct each product with FMAs
 # (_quant_fast), which must give the FP8 bytes of the IEEE division; rows whose abs-max is outside _fast_div_ok
 # divide. The basic tests run the mixed decode at main TP4 M 1 and TP8 M 4 (main TP4 M 4, masked, now folds), the
-# benchmark at every layer shape at M 1 and 2 and all but main TP4 at M 4 (graded; shared weight 1, the clamp seldom
-# hit), test_layer_graph_replay and test_layer_inplace_output at main TP4 M 1; none of them asserts which kernels run
-# the shared expert. Here: the thresholds (tokens, work), the FP8 bytes of the fast quantization at the edges of its
-# range and at rounding ties, a shared expert dropped by its last id, the reads of the mixed Gate/Up, and shapes
-# beyond the layers'.
+# benchmark at every layer shape at M 1 and 2, all but main TP4 at M 4 and main TP4 at M 3 (graded; shared weight 1,
+# the clamp seldom hit), test_layer_graph_replay and test_layer_inplace_output at main TP4 M 1; none of them asserts
+# which kernels run the shared expert. Here: the thresholds (tokens, work), the FP8 bytes of the fast quantization at
+# the edges of its range and at rounding ties, a shared expert dropped by its last id, the reads of the mixed Gate/Up,
+# and shapes beyond the layers'.
 
 _MIXED_PATH = ["a8w4_gateup_decode_mixed", "a8w4_down_decode_mixed", "shared_mixed"]
 
@@ -5209,8 +5215,8 @@ def test_layer_mixed_decode_boundary(tokens):
     layer TP4 (the official block format), inputs x 10 (the shared expert's clamp hit), a random shared weight per
     token; both sides graded against reference_layer. Only the threshold is pinned, not what takes over past it.
 
-    The basic tests and the benchmark accept any path for the shared expert; the benchmark has no M 5 and runs the MTP
-    layers with shared weight 1 and the clamp seldom hit.
+    The basic tests and the benchmark (its M 4 and M 5 cases too) accept any path for the shared expert, and the
+    benchmark runs the MTP layers with shared weight 1 and the clamp seldom hit.
     """
     experts, topk, inter = LAYER_SHAPES["mtp_layer_tp4"]
     _layer_check(experts, topk, inter, tokens, seed=700, fmt="block", amplify=10.0)
@@ -5243,7 +5249,7 @@ def test_layer_mixed_decode_work_limit(monkeypatch, case):
     fold, the routed decode tier without a final add (_assert_folded). The MTP layers at M 4 (6912 / 3840) mix in
     test_layer_mixed_decode_boundary and test_layer_mixed_decode_masked.
 
-    The basic tests and the benchmark accept any path for the shared expert; the benchmark has no M 3.
+    The basic tests and the benchmark (its main TP4 M 3 and M 4 too) accept any path for the shared expert.
     """
     shape, tokens, limit, mixed = _MIXED_WORK_CASES[case]
     if limit is not None:
@@ -5822,7 +5828,8 @@ def test_layer_fold_max_m(over):
     (E 8, H 512, I 64, routed topk 2) in the per-row format: prepare folds the 32x32-block format into per-row scales,
     so the runtime path and the limit do not depend on the format.
 
-    The benchmark's largest M is 32768 and the basic tests' 2048, below the limit.
+    The benchmark runs M 32768 and 98304 (ATOM's split) without asserting the path, the basic tests at most M 2048:
+    neither is at the limit.
     """
     from aiter.ops.flydsl import gemm_kernels
 
@@ -5852,7 +5859,7 @@ def test_layer_fold_prefill_min_m(over):
     against reference_layer.
 
     The default dispatch of the layer shapes first reaches prefill above M 1024 (MTP M 1366, DeepSeek M 1537), so the
-    benchmark (M 1024 streams, M 2048 prefill) and the basic tests (prefill M 2048) never run the prefill tier at or
+    benchmark (M 1024-1536 stream, M 2048 prefill) and the basic tests (prefill M 2048) never run the prefill tier at or
     below the boundary; test_layer_fold_tiers folds MTP M 1366 by default.
     """
     tokens = moe_a8w4.SHARED_FOLD_PREFILL_MIN_M - 1 + over
@@ -5937,11 +5944,326 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
     ], built
 
 
+# -- 2.14 launch records: the bytes and FLOPs of each kernel behind the benchmark's roofline lines -------------------
+# Inside moe_a8w4.recording_launches() (off by default) moe_a8w4.last_launches records every device kernel of a call
+# (its stream, minimal bytes, useful FLOPs); the benchmark prints them per kernel next to the profiler's device times
+# of its unrecorded timed calls (INFO lines, not graded), matched by launch order per stream, so a kernel recorded
+# twice or not at all would shift every line after it, and wrong totals would skew the roofline. Neither the basic
+# tests nor the benchmark assert the records. Here, on one call of each kind: the records against the profiler's
+# kernels of unrecorded calls (count per stream), the closed forms of the call's FLOPs and of the op's minimal bytes,
+# an empty record after a call outside the recording, and the same records under CUDA graph capture (recording
+# synchronizes nothing). Kernel names are not asserted (later milestones rename and merge kernels). Then the
+# benchmark's own matching of the profiler's events onto the records (_kernel_us), on synthetic events: real profiles
+# seldom show the cases it has to resolve, and a wrong match prints another kernel's time without any error.
+
+# case: (weights, tokens, options, module constants, routing). Weights: "layer:<shape>" (_layer_weights of a
+# LAYER_SHAPES shape, with the shared expert), "routed:<shape>" (its routed experts alone), "small" (_fold_small_weights:
+# E 8, H 512, I 64, routed topk 2, with the shared expert; a tile option prefills with Opus below H 2560), "mimo"
+# (_mimo_small_weights(256): E 12, H 4096, topk 8). Routing "converted": int64 ids and strided weights (the copies
+# into contiguous int32 / float32 are kernels too).
+_LAUNCH_CASES = {
+    # Per-route decode: Gate/Up reading x and the single-slot Down.
+    "decode_route": ("routed:mtp_layer_tp8", 2, {}, {}, "converted"),
+    # Expert-deduplicated decode: the plan Gate/Up and the atomic Down; then the plan kernel, the deduplicated Gate/Up,
+    # the row quantization and the atomic Down.
+    "decode_dedup_two": ("mimo", 5, {}, {}, None),
+    "decode_dedup_four": ("mimo", 24, {}, {}, None),
+    # The shared expert inside the two mixed decode kernels.
+    "mixed": ("layer:mtp_layer_tp8", 1, {}, {}, None),
+    # Folded shared expert on the side stream: pre-quantized per-route decode, wide deduplicated decode, streaming
+    # with the atomic Down and with route_sum, and streaming whose Gate/Up quantizes the intermediate itself (blocks of
+    # 32 below H 4096: 15 rows per expert).
+    "fold_decode_pq": ("layer:mtp_layer_tp8", 6, {}, {}, None),
+    "fold_decode_wide": ("layer:mtp_layer_tp8", 8, {}, {}, None),
+    "fold_stream_atomic": ("layer:mtp_layer_tp8", 64, {}, {}, None),
+    "fold_stream_route_sum": ("layer:mtp_layer_tp4", 128, {}, {}, "converted"),
+    "fold_stream_fused_quant": ("small", 60, {}, {}, None),
+    # Folded, serial: streaming blocks of 64 into the prefill Down (30 rows per expert), prefill sorted by the prep,
+    # prefill sorted by Opus (four phases from 2048 tokens; the routed columns copied out for it).
+    "fold_stream_prefill_down": ("layer:mtp_layer_tp4", 1280, {}, {}, None),
+    "fold_prefill_prep": ("layer:mtp_layer_tp8", 1366, {}, {}, None),
+    "fold_prefill_opus": ("small", 2048, {"block_m": 64}, {}, None),
+    # ATOM's split (prefill below the fold's first M, or SHARED_FOLD = 0): on the side and aux streams with Opus in two
+    # phases (below 2048 tokens) and in one kernel (few tokens), and serial.
+    "split_opus_phases": ("small", 1024, {"block_m": 64}, {}, None),
+    "split_opus_oneshot": ("small", 40, {"block_m": 64}, {}, None),
+    "split_decode_streams": ("layer:mtp_layer_tp8", 8, {}, {"SHARED_FOLD": 0}, None),
+    "split_stream_serial": ("layer:mtp_layer_tp8", 1100, {}, {"SHARED_FOLD": 0}, None),
+}
+
+
+def _launch_call(monkeypatch, case):
+    """``(call, weight, topk_ids)`` of a _LAUNCH_CASES case: ``call()`` runs flydsl_moe_a8w4_ptpc once into one output."""
+    import dataclasses
+
+    source, tokens, options, constants, routing = _LAUNCH_CASES[case]
+    for name, value in constants.items():
+        monkeypatch.setattr(moe_a8w4, name, value)
+    kind, _, shape = source.partition(":")
+    if kind == "mimo":
+        weight, hidden, topk = _mimo_small_weights(256)[1], MIMO_HIDDEN, 8
+        x, topk_weight, topk_ids = make_inputs(
+            tokens, hidden, weight.experts, topk, seed=930, shared=False
+        )
+        limit = 0.0
+    else:
+        if kind == "small":
+            weight, hidden, topk = _fold_small_weights()[2], 512, 2
+        else:
+            experts, topk, inter = LAYER_SHAPES[shape]
+            weight, hidden = _layer_weights(experts, inter, 700)[2], LAYER_HIDDEN
+            if kind == "routed":
+                weight = dataclasses.replace(
+                    weight,
+                    shared_w1=None,
+                    shared_w1_scale=None,
+                    shared_w2=None,
+                    shared_w2_scale=None,
+                )
+        x, topk_weight, topk_ids = make_layer_inputs(
+            tokens, hidden, weight.experts, topk, seed=931
+        )
+        if kind == "routed":
+            topk_weight = topk_weight[:, :-1].contiguous()
+            topk_ids = topk_ids[:, :-1].contiguous()
+        limit = LAYER_SWIGLU_LIMIT
+    if routing == "converted":
+        topk_ids = topk_ids.long()
+        topk_weight = topk_weight.t().contiguous().t()
+        assert not topk_weight.is_contiguous()
+    out = torch.empty_like(x)
+
+    def call():
+        return flydsl_moe_a8w4_ptpc(
+            x,
+            weight,
+            topk_weight,
+            topk_ids,
+            output=out,
+            swiglu_limit=limit,
+            **options,
+        )
+
+    return call, weight, topk_ids
+
+
+def _profiled_streams(call, expected, calls=3, attempts=5):
+    """Device kernels per call of each stream that ``calls`` calls of ``call`` run under the profiler, as a sorted
+    list. Profiled again (up to ``attempts`` times) while it differs from ``expected``: the ROCm profiler may record no
+    kernel for ~0.1 s while another process starts on the GPU, or drop the last kernels' records.
+    """
+    import time
+
+    for attempt in range(attempts):
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            for _ in range(calls):
+                call()
+            torch.cuda.synchronize()
+        streams = {}
+        for e in prof.events():
+            if e.device_type == torch.autograd.DeviceType.CUDA:
+                streams[e.device_resource_id] = streams.get(e.device_resource_id, 0) + 1
+        found = sorted(n / calls for n in streams.values())
+        if found == expected:
+            break
+        time.sleep(0.1 * (attempt + 1))
+    return found
+
+
+@pytest.mark.parametrize("case", list(_LAUNCH_CASES))
+def test_launch_records(monkeypatch, case):
+    """``moe_a8w4.last_launches`` of one call of each kind (_LAUNCH_CASES: every tier, both streaming Gate/Up kernels
+    and the three streaming Downs, the mixed and the folded shared expert on and off the side stream, ATOM's split on
+    the side and aux streams and serial, Opus in one, two and four kernels, routing tensors converted first) inside
+    ``moe_a8w4.recording_launches()`` holds exactly the device kernels the profiler sees per call on each stream when
+    calls run outside it (the main / side / aux labels onto the profiler's streams); its FLOPs sum to
+    6 * M * H * (topk * I_pad + I_shared); every kernel moves bytes, the shared expert's weights count once and the
+    kernels' minimal bytes cover the op's (the distinct experts' weights, the shared expert's, x read and the output
+    written); a call outside the recording leaves the record empty; a CUDA graph capture of the call inside it records
+    the same launches (no host synchronization; no GPU data read).
+
+    The benchmark prints these records per kernel without asserting them (an INFO line per kernel, its mismatch line
+    only as a log), and the basic tests do not look at them.
+    """
+    call, weight, topk_ids = _launch_call(monkeypatch, case)
+    with moe_a8w4.recording_launches() as recorded:
+        call()
+    assert recorded is moe_a8w4.last_launches
+    launches = list(recorded)
+    assert launches
+    # Off by default: a call outside the recording clears the record and adds nothing.
+    call()
+    assert moe_a8w4.last_launches == []
+    labels = {}
+    for launch in launches:
+        assert launch.stream in ("main", "side", "aux"), launch
+        labels[launch.stream] = labels.get(launch.stream, 0) + 1
+    expected = sorted(float(n) for n in labels.values())
+    assert _profiled_streams(call, expected) == expected, (case, launches)
+
+    M, H = topk_ids.shape[0], weight.hidden
+    topk = topk_ids.shape[1] - weight.has_shared
+    shared_inter = weight.shared_w1.shape[0] // 2 if weight.has_shared else 0
+    assert sum(launch.flops for launch in launches) == 6 * M * H * (
+        topk * weight.inter_padded + shared_inter
+    )
+    routed = topk_ids[:, :topk]
+    experts = int(routed[routed >= 0].unique().numel())
+    per_expert = sum(
+        t.numel() // t.shape[0] * t.element_size()
+        for t in (
+            weight.w1,
+            weight.w1_delta,
+            weight.w1_scale,
+            weight.w2,
+            weight.w2_delta,
+            weight.w2_scale,
+        )
+    )
+    shared_bytes = sum(
+        t.numel() * t.element_size()
+        for t in (
+            weight.shared_w1,
+            weight.shared_w1_scale,
+            weight.shared_w2,
+            weight.shared_w2_scale,
+        )
+        if t is not None
+    )
+    assert all(launch.bytes(experts) > 0 for launch in launches), launches
+    assert sum(launch.expert_bytes for launch in launches) >= per_expert
+    assert sum(launch.shared_bytes for launch in launches) == shared_bytes
+    io = 2 * 2 * M * H
+    assert sum(launch.bytes(experts) for launch in launches) >= (
+        experts * per_expert + shared_bytes + io
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with moe_a8w4.recording_launches(), torch.cuda.graph(graph):
+        call()
+    assert moe_a8w4.last_launches == launches
+    del graph
+
+
+def _mapping_events(kernels, calls, us=lambda c, k: 1.0 + k + c / 100, order=None):
+    """Synthetic device events ``(stream, start, end, us, name)``, as _keep_device_events keeps them, of ``calls``
+    calls that each run ``kernels`` (``(stream, name)`` pairs in launch order) one after another: ``us(call, kernel)``
+    a kernel's time, ``order(call)`` the order in which the call runs its kernels (default: as launched).
+    """
+    events, t = [], 0.0
+    for c in range(calls):
+        for k in order(c) if order else range(len(kernels)):
+            stream, name = kernels[k]
+            events.append((stream, t, t + us(c, k), us(c, k), name))
+            t += 10.0
+    return events
+
+
+_MAPPING_ABC = [(1, "a"), (1, "b"), (1, "c")]
+# case: (stream label of each recorded kernel, calls, events, the expected (times, calls used, mismatch)). The times
+# are the means over the calls used without the first (1 + kernel + call / 100 unless the case sets them).
+_MAPPING_CASES = {
+    # Three streams told apart by their kernels per call.
+    "streams": (
+        ["main", "side", "main", "side", "aux", "main"],
+        4,
+        _mapping_events(
+            [(3, "a"), (7, "s1"), (3, "b"), (7, "s2"), (5, "x"), (3, "c")], 4
+        ),
+        ([1.02, 2.02, 3.02, 4.02, 5.02, 6.02], 4, None),
+    ),
+    # Two streams of one equal kernel per call, the side stream's listed first: main is the stream that ends last.
+    "main_ends_last": (
+        ["main", "side"],
+        4,
+        _mapping_events([(7, "k"), (3, "k")], 4, us=lambda c, k: 1.0 + k),
+        ([2.0, 1.0], 4, None),
+    ),
+    # The profiler lost the records of the last calls, the last kept one cut short: the 7 whole calls.
+    "dropped_tail": (
+        ["main"] * 3,
+        10,
+        _mapping_events(_MAPPING_ABC, 10)[:23],
+        ([1.035, 2.035, 3.035], 7, None),
+    ),
+    # One call ran its kernels in another order: left out.
+    "misplaced_call": (
+        ["main"] * 3,
+        6,
+        _mapping_events(
+            _MAPPING_ABC, 6, order=lambda c: (0, 2, 1) if c == 2 else (0, 1, 2)
+        ),
+        ([1.0325, 2.0325, 3.0325], 5, None),
+    ),
+    # The profile lists the events out of order: matched by their start times.
+    "start_order": (
+        ["main"] * 3,
+        6,
+        sorted(_mapping_events(_MAPPING_ABC, 6), key=lambda e: (e[4], e[1])),
+        ([1.03, 2.03, 3.03], 6, None),
+    ),
+    # More than 30 calls: the call whose total is an IQR outlier is left out of the means.
+    "outliers": (
+        ["main"] * 2,
+        40,
+        _mapping_events(
+            _MAPPING_ABC[:2], 40, us=lambda c, k: (500.0 if c == 10 else 5.0) + 2 * k
+        ),
+        ([5.0, 7.0], 40, None),
+    ),
+    # A kernel per call that the record lacks: a mismatch (recorded, profiled per call, per label | per stream).
+    "extra_kernel": (
+        ["main"] * 2,
+        5,
+        _mapping_events(_MAPPING_ABC, 5),
+        (None, 0, (2, 3.0, "main:2|3")),
+    ),
+    # Most calls run their kernels in another order: fewer than half usable, a mismatch.
+    "scattered_calls": (
+        ["main"] * 3,
+        6,
+        _mapping_events(
+            _MAPPING_ABC, 6, order=lambda c: [(0, 2, 1), (1, 0, 2), (0, 1, 2)][c // 2]
+        ),
+        (None, 0, (3, 3.0, "main:3|3")),
+    ),
+    "no_events": (["main"] * 3, 5, [], (None, 0, None)),
+}
+
+
+@pytest.mark.parametrize("case", list(_MAPPING_CASES))
+def test_kernel_us_mapping(case):
+    """The benchmark's matching of the profiled device events onto a call's launch records (``_kernel_us``, region 3:
+    the time of each ``INFO kernel`` line), on synthetic events (_MAPPING_CASES): streams assigned to the main / side
+    / aux labels by their kernels per call, and between equal streams main as the one that ends last; the calls whose
+    records the profiler lost at the end or put out of place left out, as long as half of them remain; events out of
+    the profile's order matched by start time; IQR outlier calls left out of the means; a mismatch (no times) when the
+    record lacks a kernel or most calls are out of place; nothing without events.
+
+    The benchmark only prints the result (an ``INFO kernel_map`` line when calls are dropped or nothing fits), and its
+    real profiles seldom lose or misplace records, never in a chosen way; the basic tests do not profile.
+    """
+    labels, calls, events, (times, used, mismatch) = _MAPPING_CASES[case]
+    launches = [
+        moe_a8w4.KernelLaunch(f"k{i}", label, 0, 0, 0, 0)
+        for i, label in enumerate(labels)
+    ]
+    got = _kernel_us(launches, events, calls)
+    assert got[1:] == (used, mismatch), got
+    if times is None:
+        assert got[0] is None, got
+    else:
+        assert got[0] == pytest.approx(times), got
+
+
 # =================================================================================================
 # Region 3: benchmark (script entry, not collected by pytest)
-# 158 cases, named <shape>_m<M> with M = 1, 2, 4, ..., 32768 and 48 (the layer cases also M 6, and 1280 for
-# mtp_layer_tp4; see BENCH_LAYER_EXTRA_CASES); SiLU, BF16 in and out. First the 85 cases of
-# moe-a8w4 (unchanged: names, seeds, timing, output), 5 shapes:
+# 180 cases, named <shape>_m<M> with M = 1, 2, 4, ..., 32768 and 48 (the layer cases also M 6, 1280 for mtp_layer_tp4,
+# see BENCH_LAYER_EXTRA_CASES, and the 22 dispatch boundaries of BENCH_LAYER_BOUNDARY_CASES); SiLU, BF16 in and out.
+# First the 85 cases of moe-a8w4 (unchanged: names, seeds, timing, output), 5 shapes:
 #   tp2 / tp4: Qwen3.8-Flash-Next, H 2560, E 513 (512 routed + a fused shared expert that every token's last slot
 #     selects), topk 11, I 320 / 160 (padded to 192 by prepare; aiter gets the same BF16 weights padded to 192);
 #     against aiter's FP8 per-token fused_moe with the shipped tuned table.
@@ -5954,7 +6276,7 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
 # output is graded against the fp32 reference, aiter's must be finite. Per case: MF_METRIC (A8W4) and, for Qwen,
 # MF_REF (aiter) with flops = 6 * M * topk * I_pad * H and each implementation's minimal bytes (the selected
 # experts' weights and scales, the input read and the output write), and an INFO line with the launched kernels.
-# Then 73 whole-layer cases of DeepSeek-V4.1-Flash with its shared expert (bench_moe_a8w4_layer): LAYER_SHAPES (main
+# Then 95 whole-layer cases of DeepSeek-V4.1-Flash with its shared expert (bench_moe_a8w4_layer): LAYER_SHAPES (main
 # layer E 384 + shared, topk 6 + 1; MTP layer E 128 + shared, topk 3 + 1; TP4 I 576, TP8 I 288 padded to 320), H 5120,
 # swiglu_limit 10, synthetic weights (routed MXFP4, shared FP8 per row), uniform routing with routed weights normalized
 # and times 1.5, the shared expert E in the last column with weight 1 (ATOM's routing); seeds MF_SEED * 1000 + 500 +
@@ -5973,6 +6295,14 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
 # scales of the experts the call reads in its own format, the input read and the output write. INFO: routed time, the
 # shared increment (a8w4 - routed) with its TB/s and TFLOPS, the routed TB/s and TFLOPS, a8w4's kernel time summed by
 # bench_time_us, a8w4's kernels, the kernels aiter resolved and a8w4's error. At the end one markdown table of all cases.
+# Per-kernel roofline of the a8w4 call (INFO only: not aggregated, no MF_METRIC / MF_REF of its own; _kernel_info): one
+# "INFO kernel" line per device kernel that moe_a8w4.last_launches records (stream, minimal bytes at the case's distinct
+# routed experts, useful FLOPs) with its device time from the run_perftest profile that bench_time_us already runs (the
+# timed run of the first 85 cases, the kernel_sum run of the layer cases; no extra timed run), matched by launch order
+# per stream ("INFO kernel_map ... mismatch" when they do not fit, "... dropped_calls" when the profiler lost or
+# misplaced some calls' kernels); the record comes from one more untimed a8w4 call inside moe_a8w4.recording_launches()
+# after the timed runs (_recorded_launches: the timed calls record nothing); one "INFO gaps" line (the MF_METRIC time
+# against the kernels' sum on the main stream); after the summary table a roofline table, one row per case.
 # main: -s / -m select shapes and token counts; --quick runs the layer shapes at BENCH_QUICK_TOKENS only.
 # =================================================================================================
 
@@ -6026,10 +6356,46 @@ BENCH_RETRY_S = (0.05, 0.1, 0.2, 0.4)
 BENCH_LAYER_EXTRA_CASES = [f"{shape}_m6" for shape in LAYER_SHAPES] + [
     "mtp_layer_tp4_m1280"
 ]
+# Layer cases at the boundaries of the dispatch that the cases above skip (the last M of a tier or the first of the
+# next; moe-a8w4-roofline SPEC 7.1), appended after them so that every earlier case keeps its seed.
+BENCH_LAYER_BOUNDARY_CASES = [
+    # The main TP4 layer's last mixed decode M (its M 4 folds: M * topk * I_pad 13824 > DECODE_SHARED_MIXED_MAX_WORK).
+    "ds_layer_tp4_m3",
+    # The first folded decode M of the other layers (the mixed decode ends at DECODE_SHARED_MIXED_MAX_M 4): the
+    # pre-quantized per-route Gate/Up and the slot-pair Down, the shared chain on the side stream.
+    "ds_layer_tp8_m5",
+    "mtp_layer_tp4_m5",
+    "mtp_layer_tp8_m5",
+    # The last decode M at H 5120 (DECODE_WIDE_MAX_M 10: the deduplicated Gate/Up) and the first streaming M (blocks
+    # of 16), each layer shape.
+    *[f"{shape}_m{m}" for shape in LAYER_SHAPES for m in (10, 11)],
+    # Main layers: the last M of streaming blocks of 16 (12 rows per expert), and the last streaming M (24 rows per
+    # expert, STREAM_MAX_ROWS_H5120; blocks of 32 past SHARED_FOLD_DUAL_STREAM_MAX_M, the shared chain serial).
+    "ds_layer_tp4_m768",
+    "ds_layer_tp8_m768",
+    "ds_layer_tp4_m1536",
+    "ds_layer_tp8_m1536",
+    # MTP layers: blocks of 32 with the shared chain serial (M 1025-1194), and the last streaming M (blocks of 64:
+    # TP4 into the prefill Down, TP8 the atomic Down; M 1195-1365).
+    "mtp_layer_tp4_m1152",
+    "mtp_layer_tp8_m1152",
+    "mtp_layer_tp4_m1365",
+    "mtp_layer_tp8_m1365",
+    # Past SHARED_FOLD_MAX_M 65536 (the fold's GEMMs' row limit): the prefill tier with ATOM's split of the shared
+    # expert, serial (65536 + 32768 rows: one whole block of 65536 rows and a half one).
+    "ds_layer_tp4_m98304",
+    "mtp_layer_tp8_m98304",
+]
 # The layer cases, after the 85 above; the order gives each case's input seed.
-BENCH_LAYER_CASES = [
-    f"{shape}_m{m}" for shape in LAYER_SHAPES for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS
-] + BENCH_LAYER_EXTRA_CASES
+BENCH_LAYER_CASES = (
+    [
+        f"{shape}_m{m}"
+        for shape in LAYER_SHAPES
+        for m in BENCH_TOKENS + BENCH_EXTRA_TOKENS
+    ]
+    + BENCH_LAYER_EXTRA_CASES
+    + BENCH_LAYER_BOUNDARY_CASES
+)
 # --quick (bench_quick): the layer shapes at these token counts only.
 BENCH_QUICK_TOKENS = (1, 4, 16, 64, 512, 4096)
 # bench_graph_us: at most this many argument sets (run_perftest's num_iters) and at least this many timed replays.
@@ -6039,7 +6405,7 @@ BENCH_GRAPH_MIN_REPLAYS = 5
 BENCH_SPLIT_DUAL_STREAM_MAX_M = 1024
 
 
-def bench_time_us(fn, args):
+def bench_time_us(fn, args, events=None):
     """Device time of one ``fn(*args)`` call in microseconds, the protocol of every timed candidate.
 
     The warm-up count is the fewest calls taking longer than BENCH_WARMUP_MS (at least 2), each call timed with
@@ -6047,7 +6413,9 @@ def bench_time_us(fn, args):
     the launch latency after the synchronization out; the first also compiles). Then
     ``run_perftest(fn, *args, num_warmup=..., **BENCH_PERFTEST_KW)``, repeated after BENCH_RETRY_S pauses while
     the profiler returns no time. Uses only the standard library, torch, ``run_perftest`` and the BENCH_*
-    constants, so another process can time another implementation with the same protocol.
+    constants, so another process can time another implementation with the same protocol. With ``events`` (a list)
+    the device events of the profile behind the returned time are left in it (``_keep_device_events``: read once the
+    profiler has stopped; the protocol and the time are the same).
     """
     import math
     import time
@@ -6070,7 +6438,10 @@ def bench_time_us(fn, args):
     num_warmup = max(2, int(BENCH_WARMUP_MS / min(ms)) + 1)
     for pause in BENCH_RETRY_S + (None,):
         torch.cuda.synchronize()
-        _, us = run_perftest(fn, *args, num_warmup=num_warmup, **BENCH_PERFTEST_KW)
+        with (
+            contextlib.nullcontext() if events is None else _keep_device_events(events)
+        ):
+            _, us = run_perftest(fn, *args, num_warmup=num_warmup, **BENCH_PERFTEST_KW)
         if math.isfinite(us) and us > 0:
             return float(us)
         if pause is None:
@@ -6136,6 +6507,246 @@ def bench_graph_us(fn, args):
     del graph, sets
     torch.cuda.empty_cache()
     return statistics.median(times), result
+
+
+# Per-kernel roofline (_kernel_info): the 100% lines of moe-a8w4-roofline (its SPEC Q1), 4 TB/s and 450 TFLOPS; a
+# kernel of fewer than 450 / 4 = 112.5 FLOPs per byte is memory bound.
+BENCH_ROOF_TBPS = 4.0
+BENCH_ROOF_TFLOPS = 450.0
+# Share of a profile's calls that _kernel_us needs intact: the ROCm profiler may drop the records of the last kernels
+# when it stops (seen on MI308X: a few calls' kernels), and a call whose kernel names differ from the other calls' (a
+# record out of place) is dropped too.
+BENCH_PROFILE_MIN_CALLS = 0.5
+# The roofline table: one row per case run (_kernel_info), printed at the end of main.
+_ROOFLINE_ROWS = []
+
+
+@contextlib.contextmanager
+def _keep_device_events(sink):
+    """While active, each profile that ``run_perftest`` evaluates also leaves its device events in ``sink`` (replacing
+    its contents), read from the finished profile where run_perftest's ``get_trace_perf`` reads it: (stream, start us,
+    end us, device us) per kernel, the stream being the profiler's ``device_resource_id``.
+    """
+    from aiter import test_common
+
+    evaluate = test_common.get_trace_perf
+
+    def keep(prof, *args, **kwargs):
+        sink[:] = [
+            (
+                e.device_resource_id,
+                e.time_range.start,
+                e.time_range.end,
+                e.self_device_time_total,
+                e.name,
+            )
+            for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        return evaluate(prof, *args, **kwargs)
+
+    test_common.get_trace_perf = keep
+    try:
+        yield
+    finally:
+        test_common.get_trace_perf = evaluate
+
+
+def _recorded_launches(fn, args):
+    """``moe_a8w4.last_launches`` of one more ``fn(*args)`` call made inside ``moe_a8w4.recording_launches()``, after
+    the timed ones: those record nothing (recording is off by default; on, it costs host time per kernel). A call's
+    kernels depend on its shapes, options and the module's constants, not on the tensors' values, so this call's
+    record describes the timed calls' kernels."""
+    with moe_a8w4.recording_launches() as launches:
+        fn(*args)
+    return list(launches)
+
+
+def _kernel_us(launches, events, calls):
+    """Device time (us) of each kernel of ``launches`` (``moe_a8w4.last_launches`` of a call) from the device
+    ``events`` of ``calls`` such calls under the profiler (``_keep_device_events``). Returns ``(times, calls used,
+    None)``, ``(None, 0, (registered, profiled, detail))`` when the profile does not fit the record (kernels per call,
+    per stream in ``detail``), or ``(None, 0, None)`` without events.
+
+    Each stream's events, in the profile's order (else by start time), are its kernels of the calls in turn. The
+    recorded kernels of each stream label (main / side / aux), in launch order, take the events of one stream: the
+    assignment under which every stream holds as many kernels per call as its label, at most ``calls`` calls, with the
+    same sequence of kernel names in at least BENCH_PROFILE_MIN_CALLS of the calls (the calls used: the others lost at
+    the end of the profile or holding a record out of place); of several, the one whose "main" stream ends last (a call
+    joins its side streams before its last kernel). A kernel's time is its mean over the calls used that run_perftest
+    keeps: the first (warm) call dropped, then the calls whose total is an IQR outlier (k = 1.5, more than 30 calls),
+    so that the kernels of one stream sum to run_perftest's time.
+    """
+    if not events:
+        return None, 0, None
+    labels = {}
+    for i, launch in enumerate(launches):
+        labels.setdefault(launch.stream, []).append(i)
+    order = sorted(labels, key=lambda name: labels[name][0])
+
+    def calls_used(found, k):
+        # Calls whose k kernels on the stream have the most common sequence of names.
+        if len(found) > calls * k:
+            return set()
+        names = [
+            tuple(e[4] for e in found[c * k : (c + 1) * k])
+            for c in range(len(found) // k)
+        ]
+        if not names:
+            return set()
+        common = max(set(names), key=names.count)
+        return {c for c, seq in enumerate(names) if seq == common}
+
+    fit = None
+    for ordered in (events, sorted(events, key=lambda e: (e[1], e[2]))):
+        streams = {}
+        for e in ordered:
+            streams.setdefault(e[0], []).append(e)
+        if len(streams) != len(labels) or "main" not in labels:
+            break
+        fits = []
+        for chosen in itertools.permutations(streams):
+            assign = dict(zip(order, chosen))
+            used = set.intersection(
+                *(
+                    calls_used(streams[assign[label]], len(labels[label]))
+                    for label in order
+                )
+            )
+            if len(used) > 1 and len(used) >= calls * BENCH_PROFILE_MIN_CALLS:
+                fits.append((assign, used))
+        if fits:
+            last = max(streams, key=lambda s: max(e[2] for e in streams[s]))
+            fit = next((f for f in fits if f[0]["main"] == last), fits[0])
+            break
+    if fit is None:
+        detail = (
+            ",".join(f"{label}:{len(index)}" for label, index in labels.items())
+            + "|"
+            + ",".join(f"{len(found) / calls:g}" for found in streams.values())
+        )
+        return None, 0, (len(launches), len(events) / calls, detail)
+    assign, used = fit
+    per_call = {}
+    for c in used:
+        durations = [0.0] * len(launches)
+        for label, index in labels.items():
+            found = streams[assign[label]]
+            for j, i in enumerate(index):
+                durations[i] = found[c * len(index) + j][3]
+        per_call[c] = durations
+    kept = sorted(c for c in used if c > 0) or sorted(used)
+    if len(kept) > 30:
+        totals = pd.Series([sum(per_call[c]) for c in kept])
+        q1, q3 = totals.quantile(0.25), totals.quantile(0.75)
+        low, high = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+        kept = [c for c, total in zip(kept, totals) if low <= total <= high]
+    times = [
+        sum(per_call[c][i] for c in kept) / len(kept) for i in range(len(launches))
+    ]
+    return times, len(used), None
+
+
+def _distinct_experts(ids):
+    """Distinct routed experts of routing ids (ids >= 0; a host synchronization)."""
+    return int(ids[ids >= 0].unique().numel())
+
+
+def _kernel_info(case, launches, events, experts, wall_us, op_bytes, op_flops):
+    """Print the per-kernel roofline of a case's a8w4 call (``INFO kernel`` lines, ``INFO gaps``; ``INFO kernel_map
+    ... mismatch`` when the profile and ``launches`` disagree) and add its row to the roofline table (_ROOFLINE_ROWS).
+
+    ``launches``: ``moe_a8w4.last_launches`` of the profiled calls; ``events``: their device events
+    (``bench_time_us(..., events)``, BENCH_PERFTEST_KW's num_iters calls); ``experts``: the distinct routed experts of
+    the case's routing (each kernel's bytes ``KernelLaunch.bytes``); ``wall_us``: the case's MF_METRIC time;
+    ``op_bytes`` / ``op_flops``: its MF_METRIC bytes and flops, the op's minimal traffic (weights, input, output).
+    The table: kernels per stream (side "s", aux "a"), the times, the kernels' bytes summed against the op's, "roof us"
+    the kernels' roofline times max(bytes / 4 TB/s, FLOPs / 450 TFLOPS) summed over every stream (as if serial) and
+    "op roof us" the op's, each against the wall time, and the longest kernel with its share of its bound line.
+    """
+    calls = BENCH_PERFTEST_KW["num_iters"]
+    times, used_calls, mismatch = _kernel_us(launches, events, calls)
+    if mismatch is not None:
+        registered, profiled, detail = mismatch
+        print(
+            f"INFO kernel_map case={case} mismatch registered={registered} profiled={profiled:g} "
+            f"streams={detail}",
+            flush=True,
+        )
+    elif times is not None and used_calls < calls:
+        # Calls whose records the profiler dropped or put out of place: the times are means over the other calls.
+        print(
+            f"INFO kernel_map case={case} dropped_calls={calls - used_calls}",
+            flush=True,
+        )
+    ridge = BENCH_ROOF_TFLOPS / BENCH_ROOF_TBPS
+    total_bytes, roof_us, top = 0, 0.0, (None, -1.0, math.nan)
+    for i, launch in enumerate(launches):
+        nbytes = launch.bytes(experts)
+        total_bytes += nbytes
+        roof = max(nbytes / BENCH_ROOF_TBPS, launch.flops / BENCH_ROOF_TFLOPS) / 1e6
+        roof_us += roof
+        ai = launch.flops / nbytes if nbytes else math.inf
+        bound = "mem" if ai < ridge else "compute"
+        us = times[i] if times is not None else None
+        if us is not None and us > 0:
+            tbps, tflops = nbytes / us / 1e6, launch.flops / us / 1e6
+            rates = (
+                f"tbps={tbps:.3f}({tbps / BENCH_ROOF_TBPS:.1%}) "
+                f"tflops={tflops:.2f}({tflops / BENCH_ROOF_TFLOPS:.1%})"
+            )
+            share = (
+                tbps / BENCH_ROOF_TBPS if bound == "mem" else tflops / BENCH_ROOF_TFLOPS
+            )
+        else:
+            rates, share = "tbps=unavailable tflops=unavailable", math.nan
+        rank = us if us is not None else roof
+        if rank > top[1]:
+            top = (launch.name, rank, share)
+        print(
+            f"INFO kernel case={case} idx={i} name={launch.name} stream={launch.stream} "
+            f"us={'unavailable' if us is None else f'{us:.2f}'} bytes={nbytes} flops={launch.flops} {rates} "
+            f"ai={ai:.2f} bound={bound}",
+            flush=True,
+        )
+    if times is None:
+        kernel_sum = main_sum = gap = math.nan
+        sums = "kernel_sum_us=unavailable main_sum_us=unavailable gap_us=unavailable"
+    else:
+        kernel_sum = sum(times)
+        main_sum = sum(
+            us for us, launch in zip(times, launches) if launch.stream == "main"
+        )
+        # Rounded to the printed 0.01 us (+ 0.0: no "-0.00" where the times agree).
+        gap = round(wall_us - main_sum, 2) + 0.0
+        sums = f"kernel_sum_us={kernel_sum:.2f} main_sum_us={main_sum:.2f} gap_us={gap:.2f}"
+    print(f"INFO gaps case={case} wall_us={wall_us:.2f} {sums}", flush=True)
+    counts = {}
+    for launch in launches:
+        counts[launch.stream] = counts.get(launch.stream, 0) + 1
+    op_roof = max(op_bytes / BENCH_ROOF_TBPS, op_flops / BENCH_ROOF_TFLOPS) / 1e6
+    _ROOFLINE_ROWS.append(
+        {
+            "case": case,
+            "kernels": "+".join(
+                f"{n}{'' if stream == 'main' else stream[0]}"
+                for stream, n in counts.items()
+            ),
+            "wall us": wall_us,
+            "kernel sum us": kernel_sum,
+            "main sum us": main_sum,
+            "gap us": gap,
+            "MB": total_bytes / 1e6,
+            "op MB": op_bytes / 1e6,
+            "roof us": roof_us,
+            "op roof us": op_roof,
+            "roof / wall": roof_us / wall_us,
+            "op roof / wall": op_roof / wall_us,
+            "longest kernel": top[0],
+            "its us": top[1] if times is not None else math.nan,
+            "its % of line": top[2] * 100,
+        }
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -6376,8 +6987,9 @@ def bench_moe_a8w4(shape, m):
 
     ret = {"gfx": get_gfx_runtime()}
     lines = []
+    events = []
     for name, (fn, args, nbytes) in candidates.items():
-        us = bench_time_us(fn, args)
+        us = bench_time_us(fn, args, events if name == "a8w4" else None)
         if name == "a8w4":
             path = list(moe_a8w4.last_path)
             result = out  # written by the timed calls of the original arguments (the last rotation slot)
@@ -6410,6 +7022,15 @@ def bench_moe_a8w4(shape, m):
         f"a8w4_check=calc_diff:{metric['calc_diff']:.2e},err_ratio:{metric['err_ratio'] * 100:.2f}%"
         + (f" aiter_kernels={aiter_kernels}" if aiter_kernels else ""),
         flush=True,
+    )
+    _kernel_info(
+        case,
+        _recorded_launches(*candidates["a8w4"][:2]),
+        events,
+        _distinct_experts(topk_ids),
+        ret["a8w4 us"],
+        candidates["a8w4"][2],
+        flops,
     )
     return ret
 
@@ -6684,7 +7305,9 @@ def bench_moe_a8w4_layer(shape, m):
             assert graded["ok"], f"{case}: A8W4 output out of tolerance: {graded}"
             metric = graded
         ret[f"{name} err"] = graded["err"]
-    kernel_sum = bench_time_us(a8w4, candidates["a8w4"][1])
+    events = []
+    kernel_sum = bench_time_us(a8w4, candidates["a8w4"][1], events)
+    launches = _recorded_launches(a8w4, candidates["a8w4"][1])
     ret["a8w4 kernel_sum us"] = kernel_sum
     for name, kind in (
         ("a8w4", "MF_METRIC"),
@@ -6711,6 +7334,15 @@ def bench_moe_a8w4_layer(shape, m):
         f"a8w4_path={'>'.join(path)} aiter_kernels={aiter_kernels} "
         f"err=calc_diff:{metric['calc_diff']:.2e},err_ratio:{metric['err_ratio'] * 100:.2f}%",
         flush=True,
+    )
+    _kernel_info(
+        case,
+        launches,
+        events,
+        _distinct_experts(routed_ids),
+        times["a8w4"],
+        candidates["a8w4"][2] + io,
+        flops,
     )
     return ret
 
@@ -6744,7 +7376,7 @@ def main():
     )
     tokens = sorted(
         set(BENCH_TOKENS + BENCH_EXTRA_TOKENS)
-        | {int(c.rsplit("_m", 1)[1]) for c in BENCH_LAYER_EXTRA_CASES}
+        | {int(c.rsplit("_m", 1)[1]) for c in BENCH_LAYER_CASES}
     )
     parser.add_argument(
         "-m",
@@ -6752,8 +7384,9 @@ def main():
         nargs="*",
         choices=tokens,
         default=None,
-        help="token counts M (default 1, 2, 4, ..., 32768, 48; the layer shapes also 6, mtp_layer_tp4 also 1280; "
-        "a shape runs only the counts of its cases)",
+        help="token counts M (default 1, 2, 4, ..., 32768, 48; the layer shapes also 6, mtp_layer_tp4 also 1280, and "
+        "the boundaries of BENCH_LAYER_BOUNDARY_CASES: 3, 5, 10, 11, 768, 1152, 1365, 1536, 98304; a shape runs only "
+        "the counts of its cases)",
     )
     parser.add_argument(
         "--quick",
@@ -6810,6 +7443,14 @@ def main():
     aiter.logger.info(
         "flydsl_moe_a8w4_ptpc summary (markdown):\n%s", df.to_markdown(index=False)
     )
+    if _ROOFLINE_ROWS:
+        aiter.logger.info(
+            "flydsl_moe_a8w4_ptpc roofline per case (markdown; 100%% lines %g TB/s and %g TFLOPS; every kernel in the "
+            "INFO kernel lines):\n%s",
+            BENCH_ROOF_TBPS,
+            BENCH_ROOF_TFLOPS,
+            pd.DataFrame(_ROOFLINE_ROWS).to_markdown(index=False, floatfmt=".4g"),
+        )
 
 
 if __name__ == "__main__":

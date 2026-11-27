@@ -53,12 +53,14 @@ the routed Down then adds onto. Elsewhere it runs ATOM's split (aiter's per-toke
 to ``SHARED_DUAL_STREAM_MAX_M`` tokens, and is added with its routing weight.
 """
 
+import contextlib
 import functools
 import inspect
 import math
 import numbers
 import os
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -77,7 +79,12 @@ from .kernels.moe_gemm_2stage.gfx9_fp8.common import _TORCH_TO_FX
 from .kernels.moe_gemm_2stage.gfx9_fp8.gemm1_a8w4 import compile_a8w4_gemm1
 from .kernels.moe_gemm_2stage.gfx9_fp8.moe_reduce import sorted_sum
 from .kernels.moe_gemm_2stage.gfx9_fp8.quant_a8w4 import compile_row_quant_fp8
-from .kernels.tensor_shim import _run_compiled, current_stream_arg, ptr_arg
+from .kernels.tensor_shim import (
+    _run_compiled,
+    current_raw_stream,
+    current_stream_arg,
+    ptr_arg,
+)
 
 __all__ = [
     "MoeA8W4PtpcWeight",
@@ -293,6 +300,181 @@ DEBUG_CHECKS = os.environ.get("AITER_MOE_A8W4_DEBUG", "0") == "1"
 # and join of the side streams), or ``shared_mixed`` after the two kernels (``*_mixed``) of the mixed decode, which runs
 # the shared expert inside them.
 last_path = []
+
+# The device kernels of the most recent ``flydsl_moe_a8w4_ptpc`` call made inside ``recording_launches()``, in launch
+# order, one ``KernelLaunch`` each (host-side record; every call clears it, as ``last_path``, and only a recording call
+# fills it): the steps of ``last_path`` that are one kernel, one entry per kernel of the steps that launch several and
+# of the copies and small ops ``last_path`` does not name; its markers (``shared_fork``, ``shared_join``,
+# ``shared_mixed``) launch nothing. Only ``DEBUG_CHECKS``' host checks of the routing are left out. The benchmark's
+# per-kernel roofline lines read it (the minimal bytes and useful FLOPs of each kernel). Recording reads no GPU data
+# and synchronizes nothing, so a call under CUDA graph capture records its kernels too.
+last_launches = []
+# Whether calls fill ``last_launches`` (``recording_launches``). Off, each launch site only tests it (``if _recording:``
+# after the launch) and computes nothing: a call costs the host what it did without the record.
+_recording = False
+
+
+@contextlib.contextmanager
+def recording_launches():
+    """Context in which ``flydsl_moe_a8w4_ptpc`` calls record their device kernels in ``last_launches`` (each call
+    replaces the record of the previous one); yields that list. Outside it calls record nothing (``last_launches``
+    stays empty) and pay one flag test per launch for it; inside it each kernel costs a few microseconds of host time
+    (its bytes and FLOPs, its stream). Nests; not thread-safe (as ``last_path``)."""
+    global _recording
+    outer, _recording = _recording, True
+    try:
+        yield last_launches
+    finally:
+        _recording = outer
+
+
+class KernelLaunch(NamedTuple):
+    """One device kernel of a ``flydsl_moe_a8w4_ptpc`` call (``last_launches``), recorded on the host as the call
+    launches it inside ``recording_launches()``: its stream, minimal bytes and useful FLOPs (the roofline model of the
+    kernel's interface).
+
+    - ``name``: the step's name in ``last_path`` for a step of one kernel; ``<step>/<part>`` for each kernel of a step
+      that launches several (aiter's Opus ``moe_sorting`` in phases, the zero padding of the split's Down input) and for
+      kernels of steps ``last_path`` does not name (``routing_copy/*``: routing tensors made contiguous int32 / float32,
+      ``shared_gate/*``: the split's shared-expert weight per token).
+    - ``stream``: ``"main"``, the stream current at the call, or ``"side"`` / ``"aux"``, the device's two side streams of
+      the shared expert (``_side_streams``: its folded or split chain; the split's weight per token).
+    - ``expert_bytes``: minimal bytes per distinct routed expert of the call's routing (the caller counts the distinct
+      ids >= 0 of the routed columns): the kernel's weights, deltas and channel scales of one expert in storage format
+      (I padded), plus 4 bytes of a sorting block's expert id where the kernel writes or reads sorting blocks (at least
+      one block per expert).
+    - ``shared_bytes``: the shared expert's FP8 weights and per-row scales the kernel reads, in storage format (I padded,
+      the Down's K padded to 128).
+    - ``fixed_bytes``: the rest of the kernel's interface traffic, every distinct byte once however often the kernel
+      touches it, no cache hit subtracted: activations, intermediates and outputs in their stored dtypes (x BF16, xq
+      FP8 and xs f32, mid f32, mq FP8 and ms f32, routes BF16, out BF16; an output the kernel also reads first counts
+      as a read and a write, an atomic add into it as one write), the routing tensors' columns it reads (int32 ids,
+      f32 weights), the sorting metadata at its minimum (4 bytes per route of sorted ids and of sorted weights, 8 of
+      num_valid; no padding rows), loc_ids, the dedup plan, Opus' workspace.
+    - ``flops``: useful FLOPs, 2 * rows * N * K of each GEMM: rows = M * topk routes (masked ids included: the host
+      does not read the ids) or M for the shared expert, N and K at the padded I (the shared expert's padded I, its
+      Down's K padding to 128 not counted), MXFP4 counted as the FP8 MFMA it is decoded for, sorting-block and MFMA
+      padding not counted; 0 for every other kernel. A call sums to 6 * M * H * (topk * I_pad + I_shared) (I_shared the
+      shared expert's padded I, 0 without one).
+    """
+
+    name: str
+    stream: str
+    expert_bytes: int
+    shared_bytes: int
+    fixed_bytes: int
+    flops: int
+
+    def bytes(self, experts):
+        """Minimal bytes of the kernel when the call's routing selects ``experts`` distinct routed experts."""
+        return experts * self.expert_bytes + self.shared_bytes + self.fixed_bytes
+
+
+class _Cost(NamedTuple):
+    """The bytes and FLOPs of a ``KernelLaunch`` (its fields after ``stream``)."""
+
+    expert: int = 0
+    shared: int = 0
+    fixed: int = 0
+    flops: int = 0
+
+
+def _nbytes(*tensors):
+    """Bytes of ``tensors`` (None skipped), each read or written once in full."""
+    total = 0
+    for t in tensors:
+        if t is not None:
+            total += t.nbytes
+    return total
+
+
+def _expert_bytes(q, delta, scale):
+    """Bytes of one expert of a weight's per-expert tensors [E, ...]: codes, deltas and channel scales."""
+    return (
+        q.nbytes // q.shape[0]
+        + delta.nbytes // delta.shape[0]
+        + scale.nbytes // scale.shape[0]
+    )
+
+
+def _gateup_cost(weight, routes, fixed, blocks=False, shared_rows=0):
+    """``_Cost`` of a routed Gate/Up kernel of ``routes`` routes: one expert's w1, deltas and channel scales (and a
+    sorting block's expert id with ``blocks``), ``fixed`` bytes, 2 * routes * 2I * H FLOPs; with ``shared_rows`` also the
+    shared expert's on that many rows (its w1 and scales, 2 * rows * 2I_s * H FLOPs)."""
+    H = weight.hidden
+    shared = flops = 0
+    if shared_rows:
+        shared = _nbytes(weight.shared_w1, weight.shared_w1_scale)
+        flops = 2 * shared_rows * weight.shared_w1.shape[0] * H
+    return _Cost(
+        _expert_bytes(weight.w1, weight.w1_delta, weight.w1_scale) + 4 * blocks,
+        shared,
+        fixed,
+        flops + 4 * routes * weight.inter_padded * H,
+    )
+
+
+def _down_cost(weight, routes, fixed, blocks=False, shared_rows=0):
+    """``_Cost`` of a routed Down kernel of ``routes`` routes: one expert's w2, deltas and channel scales (and a
+    sorting block's expert id with ``blocks``), ``fixed`` bytes, 2 * routes * H * I FLOPs; with ``shared_rows`` also the
+    shared expert's on that many rows (its w2 and scales, 2 * rows * H * I_s FLOPs, I_s its padded I).
+    """
+    H = weight.hidden
+    shared = flops = 0
+    if shared_rows:
+        shared = _nbytes(weight.shared_w2, weight.shared_w2_scale)
+        flops = 2 * shared_rows * H * (weight.shared_w1.shape[0] // 2)
+    return _Cost(
+        _expert_bytes(weight.w2, weight.w2_delta, weight.w2_scale) + 4 * blocks,
+        shared,
+        fixed,
+        flops + 2 * routes * H * weight.inter_padded,
+    )
+
+
+def _record(device, name, cost=None):
+    """Append the ``KernelLaunch`` of a kernel just launched on the current stream of ``device`` to ``last_launches``
+    (callers check ``_recording`` first). ``cost``: its ``_Cost``, None for zeros (``_launch``, whose caller sets them
+    with ``_cost``). The stream is "side" / "aux" on the device's side streams (``_side_streams``), else "main".
+    """
+    label = "main"
+    streams = _SIDE_STREAMS.get(device.index)
+    if streams:
+        current = current_raw_stream(device)
+        label = next(
+            (n for n, s in zip(("side", "aux"), streams) if s.cuda_stream == current),
+            label,
+        )
+    last_launches.append(KernelLaunch(name, label, *(cost or _Cost())))
+
+
+def _cost(cost):
+    """Set the bytes and FLOPs of the kernel recorded last (by ``_launch``) to ``cost``, a ``_Cost``. Callers check
+    ``_recording`` first, right after the launch: outside the recording nothing is computed.
+    """
+    last_launches[-1] = KernelLaunch(*last_launches[-1][:2], *cost)
+
+
+def _record_copy(device, name, src, dst):
+    """Record ``routing_copy/<name>`` when ``dst`` (``src``'s columns made contiguous) is a copy, not ``src``'s
+    memory: one read and one write of its bytes."""
+    if dst.data_ptr() != src.data_ptr():
+        _record(device, f"routing_copy/{name}", _Cost(fixed=2 * dst.nbytes))
+
+
+def _routing_input(t, dtype, name):
+    """Routing tensor ``t`` as a contiguous ``dtype`` tensor (``t.to(dtype).contiguous()``; callers take this path only
+    when ``t`` is not one already), recording each copy kernel this launches as ``routing_copy/<name>``.
+    """
+    if t.dtype != dtype:
+        src, t = t, t.to(dtype)
+        if _recording:
+            _record(t.device, f"routing_copy/{name}", _Cost(fixed=_nbytes(src, t)))
+    if not t.is_contiguous():
+        src, t = t, t.contiguous()
+        if _recording:
+            _record(t.device, f"routing_copy/{name}", _Cost(fixed=_nbytes(src, t)))
+    return t
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1235,14 @@ def _fused_moe_decode_dd(
             output,
             M,
         )
+        if _recording:
+            _cost(
+                _gateup_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(xq, xs if gateup_pq else None, topk_ids, mid, plan, output),
+                )
+            )
         quant = True
     else:
         xq = torch.empty((M, H), dtype=torch.float8_e4m3fnuz, device=device)
@@ -1075,6 +1265,8 @@ def _fused_moe_decode_dd(
             output,
             M,
         )
+        if _recording:
+            _cost(_Cost(fixed=_nbytes(hidden_states, xq, xs, topk_ids, plan, output)))
         waves = 8 if M <= DECODE_DEDUP_GATEUP_WIDE_MAX_M and H % 1024 == 0 else 4
         _launch(
             "a8w4_gateup_decode_dd",
@@ -1089,6 +1281,8 @@ def _fused_moe_decode_dd(
             mid,
             M,
         )
+        if _recording:
+            _cost(_gateup_cost(weight, M * topk, _nbytes(xq, xs, topk_ids, plan, mid)))
         quant = False
     mq, ms = (mid, topk_weight) if quant else _quantize_decode(mid, M * topk, I, False)
     _launch(
@@ -1105,6 +1299,16 @@ def _fused_moe_decode_dd(
         output,
         M,
     )
+    if _recording:
+        # With ``quant`` the Down reads the f32 intermediate (ms is the routing weight, read once); its atomic adds
+        # are one write of the output.
+        _cost(
+            _down_cost(
+                weight,
+                M * topk,
+                _nbytes(mq, None if quant else ms, topk_ids, topk_weight, plan, output),
+            )
+        )
     return output
 
 
@@ -1146,6 +1350,9 @@ def _fused_moe_decode_wide_dd(
         output,
         M,
     )
+    if _recording:
+        # The routed columns' ids: 4 bytes per route.
+        _cost(_Cost(fixed=_nbytes(hidden_states, xq, xs, plan) + 4 * M * topk))
     if shared is not None:
         shared.start(xq, xs, output)
     _launch(
@@ -1163,6 +1370,8 @@ def _fused_moe_decode_wide_dd(
         mid,
         M,
     )
+    if _recording:
+        _cost(_gateup_cost(weight, M * topk, _nbytes(xq, xs, plan, mid) + 4 * M * topk))
     if shared is not None:
         shared.fork()
     mq, ms = _quantize_decode(mid, M * topk, I, False)
@@ -1181,6 +1390,17 @@ def _fused_moe_decode_wide_dd(
         output,
         M,
     )
+    if _recording:
+        # The SHARED variant reads the shared expert's output from ``output`` before writing it.
+        _cost(
+            _down_cost(
+                weight,
+                M * topk,
+                _nbytes(mq, ms)
+                + 8 * M * topk
+                + _nbytes(output) * (1 + (shared is not None)),
+            )
+        )
     return output
 
 
@@ -1274,6 +1494,15 @@ def _fused_moe_decode(
         mid,
         M,
     )
+    if _recording:
+        # Without pre-quantized rows the kernel reads x (xs is a placeholder); the routed columns' ids.
+        _cost(
+            _gateup_cost(
+                weight,
+                M * topk,
+                _nbytes(xq, xs if gateup_pq else None, mid) + 4 * M * topk,
+            )
+        )
     if shared is not None:
         shared.release()
     if down_pq:
@@ -1297,6 +1526,18 @@ def _fused_moe_decode(
         output,
         M,
     )
+    if _recording:
+        # The single-slot Down quantizes the f32 intermediate itself (ms is the routing weight); the SHARED variant
+        # reads the shared expert's output from ``output`` before writing it.
+        _cost(
+            _down_cost(
+                weight,
+                M * topk,
+                _nbytes(mq, ms if down_pq else None)
+                + 8 * M * topk
+                + _nbytes(output) * (1 + (shared is not None)),
+            )
+        )
     return output
 
 
@@ -1311,9 +1552,9 @@ def _fused_moe_decode_mixed(
     topk = topk_ids.shape[1]
     I = weight.inter_padded
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_ids = _routing_input(topk_ids, torch.int32, "topk_ids")
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
-        topk_weight = topk_weight.to(torch.float32).contiguous()
+        topk_weight = _routing_input(topk_weight, torch.float32, "topk_weight")
     gateup, down = _decode_mixed_kernels(
         2 * I,
         H,
@@ -1338,6 +1579,16 @@ def _fused_moe_decode_mixed(
         mid,
         M,
     )
+    if _recording:
+        # The routed columns' GEMMs plus the shared expert's on the M rows; both kernels read every column.
+        _cost(
+            _gateup_cost(
+                weight,
+                M * (topk - 1),
+                _nbytes(hidden_states, topk_ids, mid),
+                shared_rows=M,
+            )
+        )
     _launch(
         "a8w4_down_decode_mixed",
         down,
@@ -1352,6 +1603,15 @@ def _fused_moe_decode_mixed(
         output,
         M,
     )
+    if _recording:
+        _cost(
+            _down_cost(
+                weight,
+                M * (topk - 1),
+                _nbytes(mid, topk_ids, topk_weight, output),
+                shared_rows=M,
+            )
+        )
     # The shared expert ran inside the two kernels: a marker as the split's steps are.
     last_path.append("shared_mixed")
     return output
@@ -1375,6 +1635,8 @@ def _quantize_decode(x, rows, cols, bf16):
         scale,
         rows,
     )
+    if _recording:
+        _cost(_Cost(fixed=_nbytes(x, q, scale)))
     return q, scale
 
 
@@ -1502,6 +1764,18 @@ def _stream_prep(
         n_sort,
         rows,
     )
+    if _recording:
+        # Reads the sorted columns' ids and weights and x; writes each route's sorted id and weight, the blocks'
+        # experts, num_valid, loc_ids, xq / xs and, with ``zero``, the output.
+        _cost(
+            _Cost(
+                4,
+                0,
+                16 * M * (routed if shared else topk)
+                + 8
+                + _nbytes(hidden_states, loc_ids, xq, xs, output if zero else None),
+            )
+        )
     return sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs
 
 
@@ -1616,6 +1890,8 @@ def _quantize(x, rows, cols, dtype, fill=None):
     _launch(
         "a8w4_row_quant_fp8", kernel, x, q, scale, scale if fill is None else fill, rows
     )
+    if _recording:
+        _cost(_Cost(fixed=_nbytes(x, q, scale, fill)))
     return q, scale
 
 
@@ -1625,7 +1901,10 @@ def _arg(t):
 
 
 def _launch(name, kernel, *args):
-    """Launch ``kernel`` on the current stream of the first tensor argument's device; record ``name``."""
+    """Launch ``kernel`` on the current stream of the first tensor argument's device; record ``name`` in ``last_path``
+    and, inside ``recording_launches()``, its ``KernelLaunch`` in ``last_launches`` with zero bytes and FLOPs, which
+    the caller then sets with ``_cost`` under ``if _recording:`` (so that a call outside the recording computes
+    nothing for it)."""
     device = next(a.device for a in args if isinstance(a, torch.Tensor))
     _run_compiled(
         kernel,
@@ -1633,6 +1912,8 @@ def _launch(name, kernel, *args):
         current_stream_arg(device),
     )
     last_path.append(name)
+    if _recording:
+        _record(device, name)
 
 
 def _fused_moe_stream(
@@ -1697,6 +1978,16 @@ def _fused_moe_stream(
             M,
             task_num,
         )
+        if _recording:
+            # The routes' sorted ids (4 bytes each) and num_valid (8 bytes).
+            _cost(
+                _gateup_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(xq, xs, mid) + 4 * M * topk + 8,
+                    blocks=True,
+                )
+            )
         if shared is not None:
             shared.fork()
         mq, ms = _quantize(mid, M * topk, I, "f32")
@@ -1717,6 +2008,15 @@ def _fused_moe_stream(
             M,
             task_num,
         )
+        if _recording:
+            _cost(
+                _gateup_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(xq, xs, mq, ms) + 4 * M * topk + 8,
+                    blocks=True,
+                )
+            )
         if shared is not None:
             shared.fork()
     down_args = (
@@ -1745,6 +2045,17 @@ def _fused_moe_stream(
             output,
             *down_args,
         )
+        if _recording:
+            # The routes' sorted ids and weights (8 bytes each) and num_valid; the atomic adds are one write of the
+            # output.
+            _cost(
+                _down_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(mq, ms, output) + 8 * M * topk + 8,
+                    blocks=True,
+                )
+            )
         return output
     if routes is None:
         routes = torch.empty((rows, H), dtype=torch.bfloat16, device=device)
@@ -1771,6 +2082,17 @@ def _fused_moe_stream(
             M,
             task_num,
         )
+        if _recording:
+            # The routes' sorted ids and weights and num_valid; the routes' BF16 rows written (not the padding rows)
+            # and their loc_ids.
+            _cost(
+                _down_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(mq, ms) + 12 * M * topk + 8 + 2 * M * topk * H,
+                    blocks=True,
+                )
+            )
     else:
         _launch(
             f"a8w4_down_stream_bm{block_m}",
@@ -1783,6 +2105,15 @@ def _fused_moe_stream(
             routes,
             *down_args,
         )
+        if _recording:
+            _cost(
+                _down_cost(
+                    weight,
+                    M * topk,
+                    _nbytes(mq, ms) + 8 * M * topk + 8 + 2 * M * topk * H,
+                    blocks=True,
+                )
+            )
     if shared is not None:
         shared.join()
     _launch(
@@ -1794,6 +2125,9 @@ def _fused_moe_stream(
         M,
         routes.shape[0],
     )
+    if _recording:
+        # loc_ids and the rows it points to (the routes and the folded shared expert's), the output.
+        _cost(_Cost(fixed=_nbytes(loc_ids, output) + 2 * M * cols * H))
     return output
 
 
@@ -1955,6 +2289,7 @@ def flydsl_moe_a8w4_ptpc(
     if output is None:
         output = torch.empty_like(hidden_states)
     last_path.clear()
+    last_launches.clear()
     if hidden_states.shape[0] == 0:
         return output
     routed_topk = topk_ids.shape[1] - (1 if weight.has_shared else 0)
@@ -2028,7 +2363,48 @@ def _shared_split(hidden_states, weight, limit):
         mq, weight.shared_w2, ms, weight.shared_w2_scale, None, torch.bfloat16
     )
     last_path.append("shared_gemm_down")
+    if _recording:
+        _record_shared_split(hidden_states, weight, xq, xs, gate_up, mid, mq, ms, out)
     return out
+
+
+def _record_shared_split(x, weight, xq, xs, gate_up, mid, mq, ms, out):
+    """``last_launches`` entries of ``_shared_split``'s kernels, which model aiter's untuned dispatch of these shapes
+    (gfx942 has no tuned rows for them): one kernel per step, the Down's input padded to the weight's K first by
+    ``F.pad`` (a fill and a copy kernel)."""
+    device = x.device
+    M, H = x.shape
+    _record(device, "shared_quant_x", _Cost(fixed=_nbytes(x, xq, xs)))
+    _record(
+        device,
+        "shared_gemm_gateup",
+        _Cost(
+            0,
+            _nbytes(weight.shared_w1, weight.shared_w1_scale),
+            _nbytes(xq, xs, gate_up),
+            2 * M * gate_up.shape[1] * H,
+        ),
+    )
+    _record(device, "shared_silu_and_mul", _Cost(fixed=_nbytes(gate_up, mid)))
+    _record(device, "shared_quant_mid", _Cost(fixed=_nbytes(mid, mq, ms)))
+    k, kw = mq.shape[1], weight.shared_w2.shape[1]
+    if kw > k:
+        _record(
+            device,
+            "shared_gemm_down/pad_fill",
+            _Cost(fixed=M * kw * mq.element_size()),
+        )
+        _record(device, "shared_gemm_down/pad_copy", _Cost(fixed=2 * _nbytes(mq)))
+    _record(
+        device,
+        "shared_gemm_down",
+        _Cost(
+            0,
+            _nbytes(weight.shared_w2, weight.shared_w2_scale),
+            M * max(k, kw) * mq.element_size() + _nbytes(ms, out),
+            2 * M * H * k,
+        ),
+    )
 
 
 def _shared_gate(topk_weight, topk_ids, experts):
@@ -2036,7 +2412,25 @@ def _shared_gate(topk_weight, topk_ids, experts):
     ``topk_ids[:, 0] >= 0`` and ``topk_ids[:, -1] == experts``, else 0."""
     live = (topk_ids[:, 0] >= 0) & (topk_ids[:, -1] == experts)
     gate = torch.where(live, topk_weight[:, -1], torch.zeros_like(topk_weight[:, -1]))
+    if _recording:
+        _record_shared_gate(topk_weight, topk_ids)
     return gate.to(torch.bfloat16).unsqueeze(1)
+
+
+def _record_shared_gate(topk_weight, topk_ids):
+    """``last_launches`` entries of ``_shared_gate``'s kernels, one per torch op (``shared_gate/*``): the two id
+    comparisons (one bool byte per token each), their and, the zeros, the select, and the BF16 conversion for another
+    weight dtype."""
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    ids, w = M * topk_ids.element_size(), M * topk_weight.element_size()
+    _record(device, "shared_gate/first", _Cost(fixed=ids + M))
+    _record(device, "shared_gate/last", _Cost(fixed=ids + M))
+    _record(device, "shared_gate/live", _Cost(fixed=3 * M))
+    _record(device, "shared_gate/zero", _Cost(fixed=w))
+    _record(device, "shared_gate/where", _Cost(fixed=M + 3 * w))
+    if topk_weight.dtype != torch.bfloat16:
+        _record(device, "shared_gate/bf16", _Cost(fixed=w + 2 * M))
 
 
 @functools.cache
@@ -2130,6 +2524,8 @@ class _SharedFold:
                 xs,
                 x.shape[0],
             )
+            if _recording:
+                _cost(_Cost(fixed=_nbytes(x, xq, xs)))
         M = xq.shape[0]
         device = xq.device
         gate_up = torch.empty(
@@ -2137,6 +2533,17 @@ class _SharedFold:
         )
         _shared_gemm(xq, w.shared_w1, xs.view(M, 1), w.shared_w1_scale, gate_up)
         last_path.append("shared_fold_gemm_gateup")
+        if _recording:
+            _record(
+                device,
+                "shared_fold_gemm_gateup",
+                _Cost(
+                    0,
+                    _nbytes(w.shared_w1, w.shared_w1_scale),
+                    _nbytes(xq, xs, gate_up),
+                    2 * M * gate_up.shape[1] * xq.shape[1],
+                ),
+            )
         kp = w.shared_w2.shape[1]
         mq = torch.empty((M, kp), dtype=torch.float8_e4m3fnuz, device=device)
         ms = torch.empty((M, 1), dtype=torch.float32, device=device)
@@ -2160,12 +2567,33 @@ class _SharedFold:
             M,
             base,
         )
+        if _recording:
+            # Per token: the first and the last id, the last weight (12 bytes) and, with ``loc``, its last column.
+            _cost(
+                _Cost(
+                    fixed=_nbytes(gate_up, mq, ms)
+                    + 12 * M
+                    + (0 if loc is None else 4 * M)
+                )
+            )
         return mq, ms
 
     def _down(self, mq, ms, out):
         w = self.weight
         _shared_gemm(mq, w.shared_w2, ms, w.shared_w2_scale, out)
         last_path.append("shared_fold_gemm_down")
+        if _recording:
+            # Useful K: the shared expert's padded I, not the weight's K padded to 128.
+            _record(
+                mq.device,
+                "shared_fold_gemm_down",
+                _Cost(
+                    0,
+                    _nbytes(w.shared_w2, w.shared_w2_scale),
+                    _nbytes(mq, ms, out),
+                    2 * mq.shape[0] * out.shape[1] * (w.shared_w1.shape[0] // 2),
+                ),
+            )
 
     def start(self, xq, xs, out, loc=None, base=0, hold=False):
         """Run (or fork) the chain: ``xq`` / ``xs`` FP8 [M, H] / f32 [M] (the routed path's quantized input; None: the
@@ -2271,9 +2699,9 @@ def _moe_shared_fold(
     else on the current stream."""
     M = hidden_states.shape[0]
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_ids = _routing_input(topk_ids, torch.int32, "topk_ids")
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
-        topk_weight = topk_weight.to(torch.float32).contiguous()
+        topk_weight = _routing_input(topk_weight, torch.float32, "topk_weight")
     side = (
         _side_streams(hidden_states.device)[0]
         if M <= SHARED_FOLD_DUAL_STREAM_MAX_M
@@ -2359,6 +2787,13 @@ def _moe_shared(hidden_states, weight, topk_weight, topk_ids, output, limit, til
         gate = _shared_gate(topk_weight, topk_ids, E)
     output.addcmul_(shared, gate)
     last_path.append("shared_add")
+    if _recording:
+        # Reads the output, the shared expert's output and the gate, writes the output.
+        _record(
+            output.device,
+            "shared_add",
+            _Cost(fixed=_nbytes(output, shared, gate, output)),
+        )
     return output
 
 
@@ -2465,9 +2900,9 @@ def _moe_routed(
     E, I = weight.experts, weight.inter_padded
     device = hidden_states.device
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_ids = _routing_input(topk_ids, torch.int32, "topk_ids")
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
-        topk_weight = topk_weight.to(torch.float32).contiguous()
+        topk_weight = _routing_input(topk_weight, torch.float32, "topk_weight")
     tier = _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k)
     if tier == "decode":
         return _fused_moe_decode(
@@ -2508,6 +2943,10 @@ def _moe_routed(
             sort_ids, sort_weight, E, H, hidden_states.dtype, block_m, accumulate=False
         )[:4]
         last_path.append("moe_sorting_opus")
+        if _recording:
+            _record_copy(device, "sort_weight", topk_weight, sort_weight)
+            _record_copy(device, "sort_ids", topk_ids, sort_ids)
+            _record_opus_sorting(device, M, topk, E)
         # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
         # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
         loc_ids = torch.empty((M, cols), dtype=torch.int32, device=device)
@@ -2548,6 +2987,13 @@ def _moe_routed(
         M,
         grid,
     )
+    if _recording:
+        # The routes' sorted ids (4 bytes each) and num_valid (8 bytes).
+        _cost(
+            _gateup_cost(
+                weight, M * topk, _nbytes(xq, xs, mid) + 4 * M * topk + 8, blocks=True
+            )
+        )
     if shared is not None:
         shared.fork()
     mq, ms = _quantize(mid, M * topk, I, "f32")
@@ -2575,11 +3021,52 @@ def _moe_routed(
         M,
         grid,
     )
+    if _recording:
+        _cost(
+            _down_cost(
+                weight,
+                M * topk,
+                _nbytes(mq, ms) + 12 * M * topk + 8 + 2 * M * topk * H,
+                blocks=True,
+            )
+        )
     if shared is not None:
         shared.join()
     sorted_sum(cols, H)(loc_ids, routes, output, M)
     last_path.append("sorted_sum")
+    if _recording:
+        # loc_ids and the rows it points to (the routes and the folded shared expert's), the output.
+        _record(
+            device,
+            "sorted_sum",
+            _Cost(fixed=_nbytes(loc_ids, output) + 2 * M * cols * H),
+        )
     return output
+
+
+def _record_opus_sorting(device, tokens, topk, experts):
+    """``last_launches`` entries of aiter's Opus ``moe_sorting`` on ``tokens`` x ``topk`` routes (its default
+    dispatch, which ``_moe_routed`` takes): without a workspace one kernel (``moe_sorting_opus``), else the multi-phase
+    sort, from 2048 tokens on the workspace clear, P0, P1 and P23, below it P0 and P23 (``moe_sorting_opus/<phase>``).
+    Each phase reads or writes the workspace once (``moe_sorting_opus_get_workspace_size`` bytes); P0 reads the ids,
+    the last kernel the ids and weights and writes the sorted ids, weights, blocks' experts and num_valid.
+    """
+    import aiter
+
+    routes = tokens * topk
+    sort = _Cost(4, 0, 16 * routes + 8)
+    ws = aiter.moe_sorting_opus_get_workspace_size(
+        tokens, experts, topk, 0, device.index
+    )
+    if ws == 0:
+        _record(device, "moe_sorting_opus", sort)
+        return
+    if tokens >= 2048:
+        _record(device, "moe_sorting_opus/clear_ws", _Cost(fixed=ws))
+    _record(device, "moe_sorting_opus/p0", _Cost(fixed=4 * routes + ws))
+    if tokens >= 2048:
+        _record(device, "moe_sorting_opus/p1", _Cost(fixed=ws))
+    _record(device, "moe_sorting_opus/p23", sort._replace(fixed=sort.fixed + ws))
 
 
 # fused_moe parameters that _fused_moe_route reads; every other one must keep its fused_moe default, except these

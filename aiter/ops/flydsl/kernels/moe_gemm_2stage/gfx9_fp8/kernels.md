@@ -1338,3 +1338,46 @@ M8–32 为 0.89–0.99 倍）；读 shared 结果的 kernel 之前 join。输�
 
 **不变量**：丢弃 shared 的行 mq 全 0、ms = 0 → Down 输出 +0，整行屏蔽仍逐位 +0；route_sum / sorted_sum 对 shared 行的 f32
 求和顺序在 routed 之后、只舍入一次；除原子 Down 外结果逐位确定（graph 重放 = eager）。
+
+## 逐 kernel 的 roofline 口径（[moe_a8w4.py](../../../moe_a8w4.py) 的 `KernelLaunch`）
+在 `moe_a8w4.recording_launches()` 里（默认关闭）调用时，发射的每个 device kernel 在 host 侧登记一条 `KernelLaunch`
+（`moe_a8w4.last_launches`，与 `last_path` 并列；每次调用都清空它，只有开关内的调用写入）：名字、stream、最少字节的三项与有用
+运算量；不读 GPU 数据、不同步（graph 捕获时照样登记）。关闭时发射点只多一次 `if _recording` 判断，不求字节与运算量（eager
+调用的 host 时间不变）；打开时每个 kernel 多约 4–9 µs host 时间。kernel 改名 / 合并时随代码改登记与本节，bench 不用改。
+外部 kernel 也逐个登记：Opus 排序的各相、底座 sorted_sum、preshuffle GEMM、split 链（含 Down 输入补零的 fill + copy）、
+`_shared_gate` 的小 kernel、`addcmul_`、路由张量的转换拷贝（`routing_copy/*`）；fork / join / mixed 标记与 `DEBUG_CHECKS`
+的 host 检查不登记。
+
+**字节** = 唯一 routed expert 数 × 每 expert 字节 + shared 字节 + 固定字节（唯一 expert 数由调用方在 host 上从路由列数出）。
+按 kernel 接口的必需流量，每个不同字节算一次，不扣 cache 命中：权重、delta、通道因子按存储格式（含 I 补零）；激活、中间量、
+输出按存储 dtype（x bf16、xq fp8 + xs f32、mid f32、mq fp8 + ms f32、routes bf16、out bf16）；先读后写的 out 算读 + 写，
+原子加算一次写；排序元数据取最少（每条路由的 sorted id、sorted weight 各 4 B，num_valid 8 B，每个 expert 一个块的 expert 号
+4 B，不计填充行）。**运算量**只算 GEMM 的有用部分 2·行数·N·K：routed 的行数为 M·topk，含屏蔽的路由（host 不读 ids），
+shared 为 M；MXFP4 按解码后的 FP8 MFMA 算；N、K 用 I_pad，shared 用它自己的 I_pad，Down 的 K 补到 128 的部分不算；不计排序块
+与 MFMA 列的填充；其余 kernel 为 0。一次调用合计 6·M·H·(topk·I_pad + I_s)（I_s 为 shared 的 I_pad，无 shared 时为 0）。
+两种 shared I 口径：登记用 I_pad（TP8 为 320），bench 整层例的 MF_METRIC flops 仍用 shared 的原始 I（TP8 为 288），所以 TP8
+层例的登记合计比 MF_METRIC 的 flops 多 6·M·H·32。
+
+记号：R = M·topk 条 routed 路由，C 为路由张量列数（带 shared 时 topk+1），W1 / W2 = 一个 expert 的 w1 / w2 及其 delta、通道因子，
+S1 / S2 = shared_w1 / shared_w2 及其行 scale，B = 4 B（块的 expert 号）。每个家族：每 expert 字节；shared 字节；固定字节；运算量。
+- Gate/Up（decode、去重、流式、prefill）：W1（流式、prefill 加 B）；0；读 x 2MH 或 xq MH + xs 4M、ids 4R（去重加 plan 16R，
+  流式与 prefill 换成 sorted id 4R + num_valid 8），写 mid 4RI 或尾部量化的 mq RI + ms 4R（计划版另写 plan、清零 out 2MH）；4·R·I·H。
+- Down（decode、去重、流式、prefill）：W2（流式、prefill 加 B）；0；读 mq + ms 或 mid 4RI、ids 与 weights 各 4R（流式与 prefill 为
+  sorted 8R + 8，去重加 plan），写 out 2MH（SHARED 版先读后写，计 2 份）或 routes 2RH（prefill Down 另写 loc 4R）；2·R·H·I。
+- 混合 Gate/Up / Down：W1 / W2；S1 / S2；x 2MH + ids 4MC + 写 mid 4MCI / 读 mid、ids、weights + 写 out；routed 部分 +
+  4·M·I_s·H / 2·M·H·I_s。
+- 行量化（decode、prefill、计划）：0；0；输入 + q + scale，fill 版加 loc，计划版加 ids 4R、plan 16R（H4096 去重另清零 out 2MH）；0。
+- 流式 prep：B；0；读 ids、weights 8R 与 x 2MH，写 sorted 8R + 8、loc 4MC、xq + xs，清零时加 out 2MH；0。
+- route_sum、sorted_sum：0；0；loc 4MC + 它指向的 routes 2MCH（含 shared 行）+ out 2MH；0。
+- Opus 排序（无 workspace 时 1 个 kernel；有时 P0 + P23，≥ 2048 token 再加清零与 P1）：末个 B；0；单 kernel 16R + 8，分相时
+  每相 + workspace 一次，P0 + ids 4R，末相 + 16R + 8；0。
+- shared 折叠（GEMM、shared_mid、GEMM）：0；S1 / 0 / S2；xq + xs + gate_up、gate_up + mq + ms + 12M（+ loc 4M）、mq + ms + out；
+  2·M·2I_s·H / 0 / 2·M·H·I_s。split 链同样逐步算（补零：fill M·K_w、copy 2M·I_s）。
+- 小 kernel（routing_copy、shared_gate、addcmul_）：0；0；读 + 写（addcmul_ 读 out、shared、gate，写 out）；0。
+
+bench 计时的调用都不登记：计时之后在开关内再调一次 a8w4 取登记（`_recorded_launches`；kernel 只取决于形状、选项与模块常量，
+与计时的调用相同）。`_kernel_us` 把它与 run_perftest 那一遍的 profiler 事件对齐：每个 stream 的事件按 profile 的顺序
+（对不上再按开始时间），登记的 main / side / aux 各取一个 stream，每次调用的条数相同、kernel 名序列与多数调用相同才算对上；
+几种取法都对得上时，最后结束的 stream 为 main（调用在末个 kernel 之前 join 侧流）。profiler 停止时丢了末尾几次调用的记录、
+或个别调用的记录错位时，这些调用不用（`INFO kernel_map ... dropped_calls`），能用的不到一半就打印 `mismatch`；时间取能用的
+调用去掉首次（多于 30 次时再去掉总时间的 IQR 离群）后的均值。bound：运算量 / 字节 < 112.5（450 TF ÷ 4 TB/s）为 mem。
