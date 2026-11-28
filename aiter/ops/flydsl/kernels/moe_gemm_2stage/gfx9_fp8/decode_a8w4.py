@@ -3,7 +3,7 @@
 
 """A8W4 MoE decode kernels for small token counts (gfx942): no moe_sorting, one workgroup per route / token.
 
-``aiter.ops.flydsl.moe_a8w4`` runs them up to ``DECODE_MAX_M`` tokens. The kernels read the ``common_a8w4``
+``aiter.ops.flydsl.moe_a8w4`` runs them in its decode tier (``_decode_range``). The kernels read the ``common_a8w4``
 weight layout, decode MXFP4 to FP8 in registers and run MFMA 16x16x32 FP8 with the activation of one token
 broadcast to all 16 rows of the A operand. One Gate/Up kernel and two Down kernels:
 
@@ -890,7 +890,6 @@ def compile_a8w4_gateup_decode_mixed(
     SHARED=True,
     PREQUANT=False,
     ID_COLS=None,
-    PLAN=None,
 ):
     """The Gate/Up decode kernel: grid ``(I / 16, M * SLOTS)``, a workgroup per 16 channels of one routing column of
     one token. ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``);
@@ -898,14 +897,10 @@ def compile_a8w4_gateup_decode_mixed(
     gate and up before SiLU (``common_a8w4.swiglu_clamp``).
 
     Without ``SHARED`` (the per-route Gate/Up) every column is a routed expert's and the launcher is ``(x, x_scale,
-    topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``, grid rows ``M * TOPK`` (row = route = token * TOPK +
-    slot). x BF16 [M, K] is quantized per row inside every workgroup (``x_scale`` unused), or with ``PREQUANT`` x is
+    topk_ids, w, w_delta, w_scale, out, M, stream)``, grid rows ``M * TOPK`` (row = route = token * TOPK + slot). x BF16 [M, K] is quantized per row inside every workgroup (``x_scale`` unused), or with ``PREQUANT`` x is
     FP8 [M, K] with x_scale f32 [M] (the row kernel's) and every block pair's loads go out first. topk_ids int32
     [M, TOPK] (-1: a masked route, its out row 0, no weight read), or [M, ID_COLS] with ``ID_COLS`` > TOPK, the columns
-    past TOPK unread (a folded shared expert's, see ``common_a8w4.id_index``). ``PLAN = (GROUP, MAX_M, ZERO_COLS)``:
-    the workgroups of channel block 0 also write the expert-dedup plan entry of their route (``decode_dedup_a8w4``,
-    plan int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its share of its token's row of y BF16
-    [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without ``PLAN`` plan / y are unused.
+    past TOPK unread (a folded shared expert's, see ``common_a8w4.id_index``).
 
     With ``SHARED`` (the mixed Gate/Up) the launcher is ``(x, topk_ids, w, w_delta, w_scale, shared_w, shared_scale,
     out, M, stream)`` (x BF16, quantized in the kernel): a shared FP8 expert in the last of the ``TOPK`` routing columns
@@ -932,11 +927,9 @@ def compile_a8w4_gateup_decode_mixed(
     assert (
         I % 16 == 0 and K % 512 == 0 and TOPK >= (2 if SHARED else 1)
     ), f"unsupported {'mixed ' if SHARED else ''}Gate/Up decode shape N={N} K={K} TOPK={TOPK}"
-    assert ID_COLS >= TOPK and (PLAN is None or ID_COLS == TOPK)
+    assert ID_COLS >= TOPK
     # The mixed kernel quantizes its token rows itself and reads ids of TOPK columns.
-    assert not SHARED or (
-        E is not None and not PREQUANT and PLAN is None and ID_COLS == TOPK
-    )
+    assert not SHARED or (E is not None and not PREQUANT and ID_COLS == TOPK)
     E = 0 if E is None else E  # traced in the folded-away shared branches only
     R = TOPK - 1 if SHARED else TOPK  # routed columns
     SLOTS = TOPK + 1 if SHARED else TOPK  # grid rows per token
@@ -954,16 +947,6 @@ def compile_a8w4_gateup_decode_mixed(
     S_BLOCK = 2 * a8w4.W_BLOCK_BYTES  # one 16-row x 64-K FP8 block
     S_UP = NJ * KB * S_BLOCK  # from a gate row's block to the same up row's block
     PREFETCH = PAIRS if PREQUANT else min(PAIRS, GATEUP_PREFETCH_PAIRS)
-    if PLAN is not None:
-        from .decode_dedup_a8w4 import _plan_route
-
-        GROUP, MAX_M, ZERO_COLS = PLAN
-        SEGS = (MAX_M * TOPK + 63) // 64
-        ZERO_PIECES = ZERO_COLS // 8  # 16-byte pieces of a y row
-        ZPW = (ZERO_PIECES + NJ * TOPK - 1) // (
-            NJ * TOPK
-        )  # of them zeroed per workgroup
-        assert ZERO_COLS % 8 == 0 and ZPW <= 256
 
     @fx.struct
     class SharedStorage:
@@ -973,7 +956,7 @@ def compile_a8w4_gateup_decode_mixed(
         lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
 
     # The pointers a variant reads lie at the start of the kernel arguments (one scalar load fetches them): the shared
-    # FP8 expert's weight and scales (SHARED) or x_scale and the plan (without SHARED) take the slots p_aux0 .. 2.
+    # FP8 expert's weight and scales (SHARED) or x_scale (without SHARED) take the slots p_aux0 / p_aux1.
     @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode", SWIGLU_LIMIT))
     def a8w4_gateup_decode(
         p_x: fx.Pointer,
@@ -984,14 +967,13 @@ def compile_a8w4_gateup_decode_mixed(
         p_out: fx.Pointer,
         p_aux0: fx.Pointer,
         p_aux1: fx.Pointer,
-        p_aux2: fx.Pointer,
         M: fx.Int32,
     ):
         if const_expr(SHARED):
             p_shared, p_shared_scale = p_aux0, p_aux1
-            p_x_scale = p_plan = p_y = p_aux0  # unread
+            p_x_scale = p_aux0  # unread
         else:
-            p_x_scale, p_plan, p_y = p_aux0, p_aux1, p_aux2
+            p_x_scale = p_aux0
             p_shared, p_shared_scale = p_weight, p_w_scale  # traced in the folded-away shared branches only
         tid = gpu.thread_idx.x
         lane = tid % 64
@@ -1245,24 +1227,6 @@ def compile_a8w4_gateup_decode_mixed(
                     fx.make_layout(I, 1),
                 )
                 out[j * 16 + tid] = _silu_mul(gate, up)
-        if const_expr(PLAN is not None):
-            # This workgroup's share of the token's y row, then (channel block 0, wave 0) the route's plan entry.
-            y_row = _global_ptr(p_y, fx.Int64, 16) + fx.Int64(token) * (ZERO_COLS // 4)
-            piece = (s * NJ + j) * ZPW + fx.Int32(tid)
-            if (fx.Int32(tid) < ZPW) & (piece < ZERO_PIECES):
-                fx.ptr_store(fx.full(2, 0, fx.Int64), y_row + piece * 2)
-            if (j == 0) & (wave == 0):
-                routes = M * TOPK
-                _plan_route(
-                    y,
-                    fx.Int32(lane),
-                    routes,
-                    _rsrc(_address(p_ids), routes * 4),
-                    ids,
-                    _rsrc(_address(p_plan), routes * 16),
-                    SEGS,
-                    GROUP,
-                )
 
     if SHARED:
 
@@ -1289,7 +1253,6 @@ def compile_a8w4_gateup_decode_mixed(
                 p_out,
                 p_shared,
                 p_shared_scale,
-                p_out,  # unread
                 M,
             ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
 
@@ -1304,8 +1267,6 @@ def compile_a8w4_gateup_decode_mixed(
             p_w_delta: fx.Pointer,
             p_w_scale: fx.Pointer,
             p_out: fx.Pointer,
-            p_plan: fx.Pointer,
-            p_y: fx.Pointer,
             M: fx.Int32,
             stream: fx.Stream,
         ):
@@ -1318,8 +1279,7 @@ def compile_a8w4_gateup_decode_mixed(
                 p_w_scale,
                 p_out,
                 p_x_scale,
-                p_plan,
-                p_y,
+                p_out,  # unread
                 M,
             ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
 

@@ -1,41 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""A8W4 MoE decode Gate/Up and Down (gfx942) that read each expert's weights once per group of routes (expert
+"""A8W4 MoE decode Gate/Up (gfx942) that reads each expert's weights once per pair of its routes (expert
 deduplication).
 
-``aiter.ops.flydsl.moe_a8w4`` runs them in its decode path from ``DECODE_DEDUP_MIN_M`` tokens on for hidden sizes
-from ``DECODE_DEDUP_MIN_H`` on with padded I a multiple of 128 (Down; Gate/Up too once tokens times padded I reach
-``DECODE_DEDUP_GATEUP_MIN_MI``), and from ``DECODE_WIDE_DEDUP_MIN_M`` tokens on for the ``DECODE_WIDE_HIDDEN`` sizes
-(Gate/Up only).
+``aiter.ops.flydsl.moe_a8w4`` runs it in its decode path from ``DECODE_WIDE_DEDUP_MIN_M`` tokens on for the
+``DECODE_WIDE_HIDDEN`` sizes, between ``compile_a8w4_row_quant_plan`` and the row kernel and slot-pair Down of
+``decode_a8w4``.
 
 ``compile_a8w4_row_quant_plan`` is the decode path's per-row FP8 quantization of the token rows
 (``decode_a8w4.compile_a8w4_row_quant``, BF16 input) that also writes a dedup plan for the routes of its
 row's token: wave ``t`` loads all ``M * TOPK`` expert ids and, for each route ``r = t * TOPK + s``, ranks
-it among the routes of the same expert (route order) with ballots. ``plan[r] = [count, r, r1, ...]``:
-the route of rank ``GROUP * g`` leads a group of ``count`` routes (itself and the next ``count - 1``
-routes of the expert), every other route gets ``count = 0``; a masked route (id -1) leads and joins no group, so no
-kernel here computes it. (``decode_a8w4.compile_a8w4_gateup_decode_mixed`` with ``PLAN`` writes the same plan from its
-per-route workgroups.)
+it among the routes of the same expert (route order) with ballots. ``plan[r] = [count, r, r1, _NONE]``:
+the route of even rank ``2 g`` leads a group of ``count`` (1 or 2) routes (itself and the next route of the expert),
+every other route gets ``count = 0``; a masked route (id -1) leads and joins no group, so no kernel here computes it.
 
 ``compile_a8w4_gateup_decode_dd`` keeps the grid of the per-route Gate/Up (``(I / 16, M * TOPK)``, workgroup
 ``(j, route)``) and its block-pair weight loads; a workgroup reads its plan entry and exits unless it leads. A leader
 stages the group's FP8 token rows in LDS, reads the expert's 16-channel block once and runs the MFMAs with route ``m``
-of the group in A rows ``m`` and ``8 + m``
-(see "Block pairs" in ``decode_a8w4``), so a fused shared expert chosen by every token is read
-``ceil(M / GROUP)`` times instead of ``M`` times. Outputs are ``SiLU(gate) * up`` as float32 per route. With
-4 waves (two halves of K, as in the per-route kernel) they are bit-identical to the per-route kernel (with the
-same SwiGLU limit); with 8 waves the four parts of K round differently and some outputs differ by a few ulp
-(measured on the MiMo four-kernel path, M <= 16: 0.3-2.3% of the elements, at most 3.6e-7 apart).
-
-``compile_a8w4_down_decode_dd`` is the Down counterpart on the same plan: grid ``(N / (64 * CB), M * TOPK)``,
-four waves of ``CB`` 16-channel blocks each read the expert's blocks once (block-pair 16-byte loads) for the
-group's pre-quantized intermediate rows (A rows ``m`` and ``8 + m``, staged in LDS; with ``QUANT`` wave ``m``
-quantizes member ``m``'s f32 row itself). The K halves of output rows ``m`` and ``8 + m`` are joined with one
-``ds_bpermute``; lanes 0..7 then hold channels ``2c, 2c + 1`` of every member and add them, scaled by the
-channel factor, the row scale and the routing weight, into the token's BF16 output row with one agent-scope
-BF16x2 atomic each. The output is zeroed by the kernel that wrote the plan, so the sum order (and the BF16
-rounding of the partial sums) is not deterministic.
+of the group in A rows ``m`` and ``8 + m`` (see "Block pairs" in ``decode_a8w4``), so an expert chosen by two tokens
+is read once instead of twice. Outputs are ``SiLU(gate) * up`` as float32 per route; its 4 waves split K in two
+halves as the per-route kernel does, so they are bit-identical to it (with the same SwiGLU limit).
 
 The leader check depends on scalar loads (plan entry, expert id, kernel arguments); ``_pin`` makes them issue
 together before the branch instead of one round trip after another.
@@ -80,6 +65,11 @@ from .decode_a8w4 import (
 from .stream_a8w4 import _DROP, _address, _load, _rsrc, _store
 
 _NONE = 0x7FFFFFFF  # "no further route" in a plan entry
+# Routes per group of the plan, and waves of the deduplicated Gate/Up (gate / up times two halves of K). Measured at
+# DeepSeek-V4.1 H5120 (moe_a8w4.DECODE_WIDE_DEDUP_MIN_M): an expert rarely takes three of M <= 10 tokens' routes, and 8
+# waves (four parts of K) were 3-11% slower.
+GROUP = 2
+WAVES = 4
 
 
 def _pin(values):
@@ -136,9 +126,7 @@ def _ids_bytes(rows, routes, TOPK, ID_COLS):
     return rows * (ID_COLS * 4)
 
 
-def _plan_route(
-    r, lane, routes, ids_rsrc, ids_ptr, plan_rsrc, SEGS, GROUP, TOPK=0, ID_COLS=0
-):
+def _plan_route(r, lane, routes, ids_rsrc, ids_ptr, plan_rsrc, SEGS, TOPK, ID_COLS):
     """Plan entry of route ``r`` (one wave): lane l compares the ids of routes ``l + 64 k`` with route r's
     expert; one ballot per segment of 64 routes gives the rank, the expert's route count and the next members.
     ``ID_COLS`` > ``TOPK``: topk_ids has ID_COLS columns per token (``common_a8w4.id_index``).
@@ -193,23 +181,19 @@ def _plan_route(
     )
 
 
-def compile_a8w4_row_quant_plan(
-    *, COLS, TOPK, MAX_M, GROUP=2, ZERO_COLS=0, ID_COLS=None
-):
-    """Launcher ``(x, q, scale, topk_ids, plan, out, rows, stream)``: ``decode_a8w4.compile_a8w4_row_quant(BF16=True)``
+def compile_a8w4_row_quant_plan(*, COLS, TOPK, MAX_M, ID_COLS=None):
+    """Launcher ``(x, q, scale, topk_ids, plan, rows, stream)``: ``decode_a8w4.compile_a8w4_row_quant(BF16=True)``
     (x BF16 [rows, COLS] -> q FP8 [rows, COLS], scale f32 [rows], same bytes) plus the dedup plan
     int32 [rows * TOPK, 4] of the routes in topk_ids int32 [rows, TOPK] (``rows <= MAX_M``; [rows, ID_COLS] with
     ``ID_COLS`` > TOPK, the columns past TOPK unread: a fused shared expert's, ``common_a8w4.id_index``). Four-wave
-    workgroups: the first ``rows`` quantize a row each (and with ``ZERO_COLS`` zero that row of out BF16
-    [rows, ZERO_COLS] for ``compile_a8w4_down_decode_dd``), the next ``rows * ceil(TOPK / 4)`` write the plan
-    entries of one token's routes, a wave per route."""
-    assert COLS % 8 == 0 and 1 <= GROUP <= 3 and ZERO_COLS % 8 == 0
+    workgroups: the first ``rows`` quantize a row each, the next ``rows * ceil(TOPK / 4)`` write the plan entries of
+    one token's routes, a wave per route."""
+    assert COLS % 8 == 0
     ID_COLS = TOPK if ID_COLS is None else ID_COLS
     assert ID_COLS >= TOPK
     PIECES = COLS // 8
     LOADS = (PIECES + 255) // 256
     SEGS = (MAX_M * TOPK + 63) // 64
-    ZERO_PIECES = ZERO_COLS // 8  # 16-byte pieces of an output row
     PW = (TOPK + 3) // 4  # plan workgroups per token
 
     @fx.struct
@@ -223,7 +207,6 @@ def compile_a8w4_row_quant_plan(
         p_scale: fx.Pointer,
         p_ids: fx.Pointer,
         p_plan: fx.Pointer,
-        p_out: fx.Pointer,
         rows: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
@@ -245,7 +228,6 @@ def compile_a8w4_row_quant_plan(
                     fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids)),
                     _rsrc(_address(p_plan), routes * 16),
                     SEGS,
-                    GROUP,
                     TOPK,
                     ID_COLS,
                 )
@@ -306,17 +288,6 @@ def compile_a8w4_row_quant_plan(
                     fx.make_layout(1, 1),
                 )
                 scale_out[0] = scale
-            if const_expr(ZERO_COLS > 0):
-                out_row = _global_ptr(p_out, fx.Int64, 16) + fx.Int64(row) * (
-                    ZERO_COLS // 4
-                )
-                for m in range_constexpr((ZERO_PIECES + 255) // 256):
-                    piece = tid + 256 * m
-                    if const_expr(256 * (m + 1) <= ZERO_PIECES):
-                        fx.ptr_store(fx.full(2, 0, fx.Int64), out_row + piece * 2)
-                    else:
-                        if piece < ZERO_PIECES:
-                            fx.ptr_store(fx.full(2, 0, fx.Int64), out_row + piece * 2)
 
     @flyc.jit
     def launch(
@@ -325,12 +296,11 @@ def compile_a8w4_row_quant_plan(
         p_scale: fx.Pointer,
         p_ids: fx.Pointer,
         p_plan: fx.Pointer,
-        p_out: fx.Pointer,
         rows: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        a8w4_row_quant_plan(p_in, p_q, p_scale, p_ids, p_plan, p_out, rows).launch(
+        a8w4_row_quant_plan(p_in, p_q, p_scale, p_ids, p_plan, rows).launch(
             grid=(rows * (1 + PW), 1, 1), block=(256, 1, 1), stream=stream
         )
 
@@ -365,8 +335,8 @@ def _gateup_group(
 ):
     """Leader workgroup: Gate/Up of channel block ``j`` for the ``count`` routes ``members``."""
     xq_base, part_base, lut_base = bases
-    G, K, TOPK, I, N, NJ, KB, KQ, KB_PART, PAIRS, XS, X_PIECES, X_LOADS, WAVES = (
-        c["GROUP"],
+    G, K, TOPK, I, N, NJ, KB, KQ, KB_PART, PAIRS, XS, X_PIECES, X_LOADS = (
+        GROUP,
         c["K"],
         c["TOPK"],
         c["I"],
@@ -379,7 +349,6 @@ def _gateup_group(
         c["XS"],
         c["X_PIECES"],
         c["X_LOADS"],
-        c["WAVES"],
     )
     # Token rows of the group first (they do not wait for the weights): 16-byte pieces, rows past the
     # group read as zero.
@@ -511,18 +480,16 @@ def _gateup_group(
 
 
 def compile_a8w4_gateup_decode_dd(
-    *, N, K, TOPK, GROUP=2, WAVES=4, SWIGLU_LIMIT=0.0, ID_COLS=None, PREFETCH=None
+    *, N, K, TOPK, SWIGLU_LIMIT=0.0, ID_COLS=None, PREFETCH=None
 ):
     """Launcher ``(x, x_scale, topk_ids, plan, w, w_delta, w_scale, out, M, stream)``.
 
     Arguments and output of the per-route Gate/Up with ``PREQUANT`` (``decode_a8w4``) plus ``plan`` from
-    ``compile_a8w4_row_quant_plan`` (same ``GROUP``): x FP8 [M, K] with x_scale f32 [M]; topk_ids int32
-    [M, TOPK] ([M, ID_COLS] with ``ID_COLS`` > TOPK, as ``compile_a8w4_row_quant_plan``); out f32 [M, TOPK, I].
-    ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K
-    (8: a few ulp off the per-route kernel in some outputs, see the module docstring).
-    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``). ``PREFETCH``: block pairs per
-    wave whose loads go out before the group's token rows are staged, each further one as the MFMA loop consumes one
-    (default all; see ``decode_a8w4.GATEUP_PREFETCH_PAIRS``).
+    ``compile_a8w4_row_quant_plan``: x FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK] ([M, ID_COLS] with
+    ``ID_COLS`` > TOPK, as ``compile_a8w4_row_quant_plan``); out f32 [M, TOPK, I]. ``SWIGLU_LIMIT`` > 0 clamps gate
+    and up before SiLU (``common_a8w4.swiglu_clamp``). ``PREFETCH``: block pairs per wave whose loads go out before
+    the group's token rows are staged, each further one as the MFMA loop consumes one (default all; see
+    ``decode_a8w4.GATEUP_PREFETCH_PAIRS``).
     """
     I = N // 2
     ID_COLS = TOPK if ID_COLS is None else ID_COLS
@@ -530,12 +497,10 @@ def compile_a8w4_gateup_decode_dd(
     assert (
         I % 16 == 0 and K % (128 * WAVES) == 0
     ), f"unsupported Gate/Up decode shape N={N} K={K}"
-    assert 1 <= GROUP <= 3 and WAVES in (4, 8)
     KB = K // 64
     KB_PART = KB // (WAVES // 2)
     X_PIECES = K // 16
     c = dict(  # noqa: C408
-        GROUP=GROUP,
         K=K,
         TOPK=TOPK,
         I=I,
@@ -548,7 +513,6 @@ def compile_a8w4_gateup_decode_dd(
         PREFETCH=KB_PART // 2 if PREFETCH is None else min(KB_PART // 2, PREFETCH),
         XS=K + 16,
         X_PIECES=X_PIECES,
-        WAVES=WAVES,
         X_LOADS=(GROUP * X_PIECES + 64 * WAVES - 1) // (64 * WAVES),
         W_BYTES=a8w4.weight_bytes(N, K),
         D_BYTES=a8w4.delta_bytes(N, K),
@@ -650,332 +614,5 @@ def compile_a8w4_gateup_decode_dd(
             p_out,
             M,
         ).launch(grid=(NJ, M * TOPK, 1), block=(64 * WAVES, 1, 1), stream=stream)
-
-    return launch
-
-
-@flyc.jit
-def _atomic_pair(address, pair, ok):
-    """``*address += pair`` (two BF16, one agent-scope atomic) where ``ok``."""
-    if ok:
-        # fx.atomic_add of a BF16 pair on a global pointer from fx.inttoptr (one global_atomic_pk_add_bf16 without
-        # return): the typed buffer atomic (fx.rocdl.BufferAtomicPkAdd with fx.copy) addresses through a buffer
-        # descriptor and a view layout, while lanes 0..7 each add one channel pair at a 64-bit address in their
-        # token's output row.
-        ptr = fx.inttoptr(
-            fx.PointerType.get(fx.BFloat16.ir_type, fx.AddressSpace.Global, 4), address
-        )
-        fx.atomic_add(ptr, pair, syncscope="agent")
-
-
-def _down_group(
-    c,
-    tid,
-    lane,
-    wave,
-    jj,
-    count,
-    members,
-    expert,
-    M,
-    p_mid,
-    p_mid_scale,
-    p_topk_weight,
-    p_weight,
-    p_w_delta,
-    p_w_scale,
-    p_out,
-    bases,
-):
-    """Leader workgroup: Down of channel blocks ``(4 jj + wave) CB + cb`` for the ``count`` routes ``members``."""
-    xq_base, scale_base, lut_base = bases
-    G, N, K, TOPK, KB, KQ, PAIRS, XS, PIECES, X_LOADS, CB, QUANT = (
-        c["GROUP"],
-        c["N"],
-        c["K"],
-        c["TOPK"],
-        c["KB"],
-        c["KQ"],
-        c["PAIRS"],
-        c["XS"],
-        c["PIECES"],
-        c["X_LOADS"],
-        c["CB"],
-        c["QUANT"],
-    )
-    # Per member (uniform): route, token, routing weight and (pre-quantized rows) row scale, loaded first.
-    routes = [(count > g).select(members[g], members[0]) for g in range(G)]
-    tokens = [r // TOPK for r in routes]
-    tw_ptr = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
-    tws = [tw_ptr[r] for r in routes]
-    if not QUANT:
-        ms_ptr = fx.recast_iter(fx.Float32, fxh._as_ptr(p_mid_scale))
-        row_scales = [ms_ptr[r] for r in routes]
-    # Intermediate rows of the group first (they do not wait for the weights), rows past the group read as zero.
-    if QUANT:
-        # f32 rows: wave w < GROUP loads member w's row, 16-byte pieces lane + 64 u.
-        m_rsrc = _rsrc(_address(p_mid), M * (TOPK * K * 4))
-        row_off = (wave < count).select(_pick(members, wave) * (K * 4), fx.Int32(_DROP))
-        pieces = [
-            _load(m_rsrc, row_off + (lane + 64 * u) * 16, 0, 4) for u in range(K // 256)
-        ]
-    else:
-        # FP8 rows: thread t loads 16-byte piece t (+ 256 u) of the GROUP staged rows.
-        m_rsrc = _rsrc(_address(p_mid), M * (TOPK * K))
-        pieces, dsts = [], []
-        for u in range(X_LOADS):
-            g = tid + 256 * u
-            m = g // PIECES
-            piece = g - m * PIECES
-            ok = (m < count) & (g < G * PIECES)
-            pieces.append(
-                _load(
-                    m_rsrc,
-                    ok.select(_pick(members, m) * K + piece * 16, fx.Int32(_DROP)),
-                    0,
-                    4,
-                )
-            )
-            dsts.append((g < G * PIECES).select(m * XS + piece * 16, fx.Int32(G * XS)))
-    rocdl.sched_barrier(0)
-    w_buf = a8w4.expert_bytes(p_weight, expert, c["W_BYTES"])
-    d_buf = a8w4.expert_bytes(p_w_delta, expert, c["D_BYTES"])
-    s_rsrc = _rsrc(_address(p_w_scale) + fx.Int64(expert) * (N * 4), N * 4)
-    w_voff = fx.Int32(lane * 16)
-    d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
-    d_shift = fx.Uint32((lane // 32) * 8)
-    blocks = [(jj * 4 + wave) * CB + cb for cb in range(CB)]
-    raws, deltas, scales = [], [], []
-    for cb in range(CB):
-        raws.append([])
-        deltas.append([])
-        for p in range(PAIRS):
-            if p % 2 == 0:
-                deltas[cb].append(
-                    a8w4.load_dwordx2(
-                        d_buf,
-                        d_voff,
-                        fx.Int32((blocks[cb] * KQ + p // 2) * a8w4.D_BLOCK_BYTES),
-                    )
-                )
-            raws[cb].append(
-                _load_dwordx4(
-                    w_buf,
-                    w_voff,
-                    fx.Int32((blocks[cb] * KB + 2 * p) * a8w4.W_BLOCK_BYTES),
-                )
-            )
-        # Channel factors of channels 2 (l % 8) and 2 (l % 8) + 1 (lanes 0..7 use them).
-        scales.append(_load(s_rsrc, fx.Int32((lane % 8) * 8), blocks[cb] * 64, 2))
-    rocdl.sched_barrier(0)
-    if QUANT:
-        # Per-row FP8 quantization of wave w's row (the arithmetic of decode_a8w4.compile_a8w4_row_quant) into LDS
-        # row w; its scale into slot w.
-        values = [
-            fx.Uint32(word).bitcast(fx.Float32) for piece in pieces for word in piece
-        ]
-        scale = _row_scale(_wave_max(_abs_max(values)))
-        for u in range(K // 256):
-            _lds_store(
-                xq_base,
-                wave * XS + (lane + 64 * u) * 4,
-                _fp8_words(values[4 * u : 4 * u + 4], scale),
-                fx.Uint32,
-                4,
-            )
-        # The scale is wave-uniform: every lane writes the same value.
-        _lds_store(
-            scale_base, wave * 4, Vec.from_elements([scale], fx.Float32), fx.Float32, 4
-        )
-        _pin(tws)
-    else:
-        for u in range(X_LOADS):
-            _lds_store(
-                xq_base, dsts[u], Vec.from_elements(pieces[u], fx.Uint32), fx.Uint32, 16
-            )
-        _pin(tws + row_scales)
-    gpu.barrier()
-    if QUANT:
-        row_scales = [
-            _lds_load(scale_base, g * 4, fx.Float32, 1, 4)[0] for g in range(G)
-        ]
-    # Uniform per member: row scale x routing weight.
-    factors = [row_scales[g] * tws[g] for g in range(G)]
-
-    # A operand of lane l: member l % 8 (clamped into the staged rows), K group (l % 32) // 8 of block l // 32.
-    x_off = ((lane % 8) % G) * XS + (lane // 32) * 64 + ((lane % 32) // 8) * 16
-    xops = [
-        _lds_load(xq_base, x_off + 2 * p * 64, fx.Int64, 2, 16) for p in range(PAIRS)
-    ]
-    src = (lane + 40) * 4
-    out_addr = _address(p_out)
-    for cb in range(CB):
-        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-        for p in range(PAIRS):
-            shift = d_shift + fx.Uint32(16 * (p % 2))
-            ops = [
-                _decode_block(
-                    Vec.from_elements(
-                        [raws[cb][p][2 * h], raws[cb][p][2 * h + 1]], fx.Uint32
-                    ),
-                    _lut_at(lut_base, deltas[cb][p // 2][h], shift),
-                )
-                for h in range(2)
-            ]
-            for cc in range(2):
-                for h in range(2):
-                    accs[h] = _mfma(xops[p][cc], ops[h][cc], accs[h])
-        # Lane c < 8 holds rows 0..3 (members) of column c (K groups 0, 2), lane c + 40 rows 8..11 of column
-        # c + 8 (K groups 1, 3): both are channel 2c + h of accumulator h.
-        cs = [fx.Uint32(scales[cb][h]).bitcast(fx.Float32) for h in range(2)]
-        for g in range(G):
-            vals = []
-            for h in range(2):
-                a = Vec(accs[h])[g]
-                # Raw ds_bpermute with the fixed byte address of lane + 40: fx.gpu.shuffle_idx scales the lane and
-                # range-checks it on every call.
-                other = fx.Int32(
-                    rocdl.ds_bpermute(T.i32, _raw(src), _raw(a.bitcast(fx.Int32)))
-                ).bitcast(fx.Float32)
-                vals.append((a + other) * cs[h] * factors[g])
-            pair = Vec.from_elements(vals, fx.Float32).to(fx.BFloat16)
-            offset = (tokens[g] * N + blocks[cb] * 16 + (lane % 8) * 2) * 2
-            _atomic_pair(out_addr + fx.Int64(offset), pair, (lane < 8) & (count > g))
-
-
-def compile_a8w4_down_decode_dd(*, N, K, TOPK, GROUP=2, CB=1, QUANT=False):
-    """Launcher ``(mid, mid_scale, topk_ids, topk_weight, plan, w, w_delta, w_scale, out, M, stream)``.
-
-    ``N`` = hidden, ``K`` = padded I (``K % 128 == 0``). mid FP8 [M * TOPK, K] with mid_scale f32 [M * TOPK]
-    (``decode_a8w4.compile_a8w4_row_quant``), or with ``QUANT`` f32 [M * TOPK, K] quantized per row inside the
-    workgroup (same arithmetic; ``mid_scale`` unused, ``K % 256 == 0``); topk_ids int32 / topk_weight f32
-    [M, TOPK]; ``plan`` from ``compile_a8w4_row_quant_plan`` (same ``GROUP``); w_scale f32 [E, N]; out BF16
-    [M, N], zeroed beforehand (the routes are added with atomics). ``CB`` 16-channel blocks per wave.
-    """
-    assert (
-        N % (64 * CB) == 0 and K % (256 if QUANT else 128) == 0
-    ), f"unsupported Down dedup shape N={N} K={K}"
-    assert 1 <= GROUP <= 3
-    KB = K // 64
-    PIECES = K // 16
-    c = dict(  # noqa: C408
-        GROUP=GROUP,
-        N=N,
-        K=K,
-        TOPK=TOPK,
-        KB=KB,
-        KQ=a8w4.delta_dwords(K),
-        PAIRS=KB // 2,
-        XS=K + 16,
-        PIECES=PIECES,
-        X_LOADS=(GROUP * PIECES + 255) // 256,
-        CB=CB,
-        QUANT=QUANT,
-        W_BYTES=a8w4.weight_bytes(N, K),
-        D_BYTES=a8w4.delta_bytes(N, K),
-    )
-    ROWS = 4 if QUANT else GROUP  # staged rows (QUANT: one per wave)
-
-    @fx.struct
-    class SharedStorage:
-        xq: fx.Array[fx.Uint8, ROWS * (K + 16) + 16, 16]
-        scale: fx.Array[fx.Float32, 4, 16]
-        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
-
-    @flyc.kernel
-    def a8w4_down_decode_dd(
-        p_mid: fx.Pointer,
-        p_mid_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_topk_weight: fx.Pointer,
-        p_plan: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-    ):
-        tid = fx.Int32(gpu.thread_idx.x)
-        lane = tid % 64
-        wave = _wave_index(tid)
-        jj = fx.Int32(gpu.block_idx.x)
-        route = fx.Int32(gpu.block_idx.y)
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        xq_base = fx.recast_iter(fx.Uint8, lds.xq.ptr)
-        scale_base = fx.recast_iter(fx.Uint8, lds.scale.ptr)
-        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
-        _lut_table_init(lut_base, tid)
-
-        plan_ptr = fx.recast_iter(fx.Int32, fxh._as_ptr(p_plan))
-        expert = fx.Int32(fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))[route])
-        count = fx.Int32(plan_ptr[route * 4])
-        members = []
-        for g in range_constexpr(GROUP):
-            members.append(fx.Int32(plan_ptr[route * 4 + 1 + g]))
-        _pin(
-            [count, expert, M]
-            + members
-            + [
-                _address(p)
-                for p in (
-                    p_mid,
-                    p_mid_scale,
-                    p_topk_weight,
-                    p_weight,
-                    p_w_delta,
-                    p_w_scale,
-                    p_out,
-                )
-            ]
-        )
-        if count > 0:
-            _down_group(
-                c,
-                tid,
-                lane,
-                wave,
-                jj,
-                count,
-                members,
-                expert,
-                M,
-                p_mid,
-                p_mid_scale,
-                p_topk_weight,
-                p_weight,
-                p_w_delta,
-                p_w_scale,
-                p_out,
-                (xq_base, scale_base, lut_base),
-            )
-
-    @flyc.jit
-    def launch(
-        p_mid: fx.Pointer,
-        p_mid_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_topk_weight: fx.Pointer,
-        p_plan: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        a8w4_down_decode_dd(
-            p_mid,
-            p_mid_scale,
-            p_ids,
-            p_topk_weight,
-            p_plan,
-            p_weight,
-            p_w_delta,
-            p_w_scale,
-            p_out,
-            M,
-        ).launch(grid=(N // (64 * CB), M * TOPK, 1), block=(256, 1, 1), stream=stream)
 
     return launch
