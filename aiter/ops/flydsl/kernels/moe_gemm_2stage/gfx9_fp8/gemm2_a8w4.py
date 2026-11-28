@@ -11,9 +11,11 @@ channel factor, the activation scale and the routing weight. Rows are written by
 position as BF16 for ``sorted_sum``; each workgroup also stores the sorted row of every valid
 route of its block into ``loc`` [M, TOPK] (the sort's own inverse output costs more). From
 ``K`` = 256 on (MFMA-heavier steps) packed FP32 VALU ops are disabled, as in the base Down kernels
-(``gemm2_8x1``): measured 1–2.5% faster there, 1–3% slower at ``K`` = 192. With ``NSPLIT`` > 1 the
-hidden dimension is split over ``NSPLIT`` workgroups per sorted block (grid x; each gathers the
-block's activations again): few sorted blocks then still fill the machine in several rounds.
+(``gemm2_8x1``): measured 1–2.5% faster there, 1–3% slower at ``K`` = 192 (with the row scale below 3–7%
+slower again). Without them the row scale (activation scale x routing weight) takes one VGPR per 16-row MMA
+tile instead of a whole C fragment: 12 VGPRs fewer, so ``K`` = 256 keeps 4 waves per SIMD (6% faster). With
+``NSPLIT`` > 1 the hidden dimension is split over ``NSPLIT`` workgroups per sorted block (grid x; each gathers
+the block's activations again): few sorted blocks then still fill the machine in several rounds.
 """
 
 import flydsl.compiler as flyc
@@ -235,6 +237,15 @@ def compile_a8w4_gemm2(
                 max_size=False,
                 num_records_bytes=fx.Int64(M) * TOPK * 4,
             )
+            # The same scales by route (token * TOPK + slot); padding rows (token >= M) read 0 past the end.
+            arg_a_scale_flat = fx.rocdl.make_buffer_tensor(
+                fx.make_view(
+                    fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
+                    fx.make_layout(M * TOPK, 1),
+                ),
+                max_size=False,
+                num_records_bytes=fx.Int64(M) * TOPK * 4,
+            )
 
             def body(bm, ops):
                 # Computes the first bm sorted rows; ops is a fresh builder cache per variant.
@@ -278,34 +289,49 @@ def compile_a8w4_gemm2(
                     )
                 fx.gpu.barrier()  # Finish reading ldsA before ldsC reuses its storage.
 
-                sorted_weights = fx.make_view(
-                    fx.get_iter(arg_p_sorted_weights),
-                    fx.make_layout((BLOCK_N, bm), (0, 1)),
-                )
-                frag_sorted_weight = ops.load_tiled_mma_fragC(
-                    mm, sorted_weights, copy_atom_bits=32
-                )
-                sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
-                coord_tensor = fx.make_view(
-                    fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
-                )
-                frag_coord = ops.load_tiled_mma_fragC(
-                    mm, coord_tensor, copy_atom_bits=32
-                )
-                frag_row_scale = mm.make_fragment_C(coord_tensor)
-                frag_row_scale_r = ops.get_tiled_mma_retile(
-                    mm, frag_row_scale, "C", copy_atom=sc_atom
-                )
-                for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
-                    sorted_id = coord[0].bitcast(fx.Uint32)
-                    atom = fxh.atom_tensor(
-                        arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
+                if const_expr(no_packed):
+                    # Without packed FP32 ops: one row scale (activation scale x routing weight) per 16-row MMA
+                    # tile, as every value of a lane's C fragment in tile n belongs to token 16 n + lane % 16.
+                    lane = fx.Int32(tid) % 64
+                    row_scale = []
+                    for n in range_constexpr(bm // 16):
+                        row = lane % 16 + n * 16
+                        sorted_id = arg_p_sorted_ids[row].bitcast(fx.Uint32)
+                        a_sc = arg_a_scale_flat[
+                            fx.Int32(sorted_id & 0xFFFFFF) * TOPK
+                            + fx.Int32(sorted_id >> 24)
+                        ]
+                        row_scale.append(a_sc * arg_p_sorted_weights[row])
+                else:
+                    # With them the products pair into v_pk_mul_f32 against a whole C fragment of row scales.
+                    sorted_weights = fx.make_view(
+                        fx.get_iter(arg_p_sorted_weights),
+                        fx.make_layout((BLOCK_N, bm), (0, 1)),
                     )
-                    fx.copy(sc_atom, atom, dst)
-                for frag_pt, frag_sw in fxh.all_elements(
-                    frag_row_scale, frag_sorted_weight
-                ):
-                    frag_pt.store(frag_pt.load() * frag_sw.load())
+                    frag_sorted_weight = ops.load_tiled_mma_fragC(
+                        mm, sorted_weights, copy_atom_bits=32
+                    )
+                    sc_atom = ops.get_buffer_copy_atom(p_a_scale.dtype, 32)
+                    coord_tensor = fx.make_view(
+                        fx.get_iter(arg_p_sorted_ids), fx.make_layout((BLOCK_N, bm), (0, 1))
+                    )
+                    frag_coord = ops.load_tiled_mma_fragC(
+                        mm, coord_tensor, copy_atom_bits=32
+                    )
+                    frag_row_scale = mm.make_fragment_C(coord_tensor)
+                    frag_row_scale_r = ops.get_tiled_mma_retile(
+                        mm, frag_row_scale, "C", copy_atom=sc_atom
+                    )
+                    for dst, coord in fxh.all_elements(frag_row_scale_r, frag_coord):
+                        sorted_id = coord[0].bitcast(fx.Uint32)
+                        atom = fxh.atom_tensor(
+                            arg_a_scale, (sorted_id & 0xFFFFFF, sorted_id >> 24), 32
+                        )
+                        fx.copy(sc_atom, atom, dst)
+                    for frag_pt, frag_sw in fxh.all_elements(
+                        frag_row_scale, frag_sorted_weight
+                    ):
+                        frag_pt.store(frag_pt.load() * frag_sw.load())
 
                 # Decoded FP8 weight operand of one 64-row block: (8, 1, 2, KB).
                 w_fake = fx.make_view(
@@ -388,8 +414,18 @@ def compile_a8w4_gemm2(
                 thrv_ldsCt = ops.get_partition_D(tcopy, ldsCt)
 
                 def postprocess_store2lds(fragC, ldsc_idx):
-                    for fc, fsw in fxh.all_elements(fragC, frag_row_scale):
-                        fc.store(fc.load() * fsw.load())
+                    if const_expr(no_packed):
+                        for n in range_constexpr(bm // 16):
+                            vals = fragC[None, 0, n].load()
+                            fragC[None, 0, n].store(
+                                Vec.from_elements(
+                                    [vals[v] * row_scale[n] for v in range_constexpr(4)],
+                                    fx.Float32,
+                                )
+                            )
+                    else:
+                        for fc, fsw in fxh.all_elements(fragC, frag_row_scale):
+                            fc.store(fc.load() * fsw.load())
                     fragC_bf16.store(_pack_bf16_rne(fragC.load()))
                     fx.copy(
                         copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx]

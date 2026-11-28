@@ -24,7 +24,9 @@ row R is channel 2 * (R % 8) + p of the gate (R < 8) or up (R >= 8) block. The e
 accumulators between lanes l and l ^ 32 so each lane holds gate and up of 4 consecutive channels.
 
 Occupancy: BN 128 / TILE_K 128 pins ``rocdl.waves_per_eu`` = 4 (128 VGPRs, a few spilled); left
-alone the register allocator settles at 132 VGPRs and 3 waves per SIMD, which is slower.
+alone the register allocator settles at 132 VGPRs and 3 waves per SIMD, which is slower. ``WGS_PER_CU`` = n
+pads the LDS to the largest 512-byte multiple of which n fit in a CU (4 waves per workgroup, one per SIMD: n
+waves per SIMD) and sets ``waves_per_eu`` = n (no spills at n = 3).
 
 K step (tile k of TILE_K = 64 * k_iters, ``buf = k % 2``; weights in VGPR slot ``k % 2``, staged
 A in slot ``k % A_AHEAD``):
@@ -37,11 +39,12 @@ A in slot ``k % A_AHEAD``):
 Pipeline rules:
 1. ``W(k+2)`` reuses tile k's slot, so it is issued in the last region, after ``W(k,l)`` is
    decoded; the decode of ``W(k+1,0)`` then waits on loads issued a whole stage earlier.
-2. ``A_AHEAD`` = 2 for K <= 2560: ``A(k+2)`` is issued first in stage k into A slot k % 2 (``A(k)``
-   left it for LDS at the end of stage k-1) and written to LDS at the end of stage k+1; larger K
-   keeps one slot (``A(k+1)`` issued first and written at the end of the same stage). ``vmcnt``
-   leaves the younger loads in flight; the closing barrier orders that write before the next
-   stage's reads of ``buf^1`` and this stage's reads of ``buf`` before their refill.
+2. ``A_AHEAD`` = 2 for K <= 2560 and with ``WGS_PER_CU`` (its VGPR budget holds the second slot; at 4
+   waves per SIMD larger K spill and run 2-5% slower with it): ``A(k+2)`` is issued first in stage k
+   into A slot k % 2 (``A(k)`` left it for LDS at the end of stage k-1) and written to LDS at the end
+   of stage k+1; otherwise one slot (``A(k+1)`` issued first and written at the end of the same
+   stage). ``vmcnt`` leaves the younger loads in flight; the closing barrier orders that write before
+   the next stage's reads of ``buf^1`` and this stage's reads of ``buf`` before their refill.
 3. The prologue loads ``A(0)``, ``W(0)``, waits, then issues ``W(1)`` (and ``A(1)``); the last
    ``A_AHEAD`` stages issue no A, the last one writes none and the one before it no ``W(k+2)``.
 4. With TILE_K 128 tiles 2j and 2j+1 share one 256-K delta dwordx2 (the lane's two rows): only
@@ -73,6 +76,7 @@ def compile_a8w4_gemm1(
     E=None,
     SWIGLU_LIMIT=0.0,
     XCD_CHUNK=0,
+    WGS_PER_CU=0,
 ):
     """Build the A8W4 Gate/Up launcher.
 
@@ -85,6 +89,7 @@ def compile_a8w4_gemm1(
     ``XCD_CHUNK`` > 0: a 1-D grid whose workgroup ``L`` (dispatched to XCD ``L % XCDS``) takes the next
     (sorted block, N tile) of chunks of ``XCD_CHUNK`` consecutive blocks dealt to the XCDs in turn, so the N tiles
     of a block (same activation rows) and neighbouring blocks of an expert (same weights) share an L2.
+    ``WGS_PER_CU`` > 0: at most that many workgroups per CU (LDS padding, see the module docstring).
     Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     BM, BN = BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N
@@ -101,18 +106,38 @@ def compile_a8w4_gemm1(
     KB = K // 64
     KQ = a8w4.delta_dwords(K)
     KB_PER_TILE = TILE_K // 64
-    A_AHEAD = 2 if K <= 2560 else 1  # rule 2
+    A_AHEAD = 2 if K <= 2560 or WGS_PER_CU else 1  # rule 2
     WAVES_PER_EU = 4 if BN == 128 and TILE_K == 128 else None  # occupancy
+    # LDS per workgroup that lets WGS_PER_CU workgroups share a CU but not one more (gfx942 allocates LDS in
+    # 512-byte granules).
+    lds_pad = 0
+    if WGS_PER_CU:
+        lds_total = a8w4.LDS_BYTES // WGS_PER_CU // 512 * 512
+        assert (
+            2 * a_lds_size <= lds_total and a8w4.LDS_BYTES // lds_total == WGS_PER_CU
+        ), f"{WGS_PER_CU} workgroups per CU do not fit {2 * a_lds_size} B of LDS each"
+        lds_pad = lds_total - 2 * a_lds_size
+        WAVES_PER_EU = WGS_PER_CU
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     fp8 = fx.Float8E4M3FNUZ
     NUM_N_BLOCKS = (N + BN - 1) // BN
     CHUNK = XCD_CHUNK * NUM_N_BLOCKS  # workgroups of one XCD chunk
 
-    @fx.struct
-    class GemmBuffers:
-        a_ping: fx.Array[fp8, a_lds_size, 16]
-        a_pong: fx.Array[fp8, a_lds_size, 16]
+    if lds_pad:
+
+        @fx.struct
+        class GemmBuffers:
+            a_ping: fx.Array[fp8, a_lds_size, 16]
+            a_pong: fx.Array[fp8, a_lds_size, 16]
+            pad: fx.Array[fp8, lds_pad, 16]
+
+    else:
+
+        @fx.struct
+        class GemmBuffers:
+            a_ping: fx.Array[fp8, a_lds_size, 16]
+            a_pong: fx.Array[fp8, a_lds_size, 16]
 
     @fx.union
     class SharedStorage:

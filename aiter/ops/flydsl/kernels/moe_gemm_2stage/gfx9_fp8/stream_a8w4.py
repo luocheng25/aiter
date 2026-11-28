@@ -133,28 +133,38 @@ def _uniform(value):
     return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value()))
 
 
-def _atomic_add_bf16x2_if(cond, base, offset, word):
-    """``*(base + offset) += word`` (two BF16, one agent-scope atomic, no return) on the lanes where ``cond``."""
+def _atomic_add_bf16x2(address, word):
+    """``*address += word`` (two BF16, one agent-scope atomic, no return)."""
+    # Raw llvm.inttoptr + llvm.AtomicRMWOp (fadd on <2 x bf16>, no return: global_atomic_pk_add_bf16): the typed
+    # fx.inttoptr + fx.atomic_add take the alignment from an fx.PointerType, the address here is a per-lane 64-bit
+    # integer with the 4-byte alignment given per access.
+    pointer = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), fx.Int64(address).ir_value())
+    pair = Vec.from_elements([fx.Int32(word)], fx.Int32).bitcast(fx.BFloat16)
+    llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.fadd,
+        pointer,
+        _raw(pair),
+        llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+        alignment=4,
+    )
+
+
+def _if(cond, then_fn, else_fn=None):
+    """``then_fn()`` where ``cond`` holds (per lane, or a wave-uniform branch), else ``else_fn()``, as one scf.if."""
     # Raw scf.IfOp: FlyDSL 0.5.3 lowers a dynamic `if` only in the AST of a @flyc.kernel / @flyc.jit function and
-    # has no typed if builder for a plain helper. Raw llvm.inttoptr + llvm.AtomicRMWOp (fadd on <2 x bf16>, no
-    # return: global_atomic_pk_add_bf16): the typed fx.inttoptr + fx.atomic_add take the alignment from an
-    # fx.PointerType, the address here is a per-lane 64-bit integer with the 4-byte alignment given per access.
+    # has no typed if builder for a plain helper.
     loc = ir.Location.unknown()
-    if_op = scf.IfOp(_raw(cond), [], has_else=False, loc=loc)
+    if_op = scf.IfOp(_raw(cond), [], has_else=else_fn is not None, loc=loc)
     with ir.InsertionPoint(if_op.regions[0].blocks[0]):
-        pointer = llvm.inttoptr(
-            ir.Type.parse("!llvm.ptr<1>"), (base + fx.Int64(offset)).ir_value()
-        )
-        pair = Vec.from_elements([fx.Int32(word)], fx.Int32).bitcast(fx.BFloat16)
-        llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.fadd,
-            pointer,
-            _raw(pair),
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        )
+        then_fn()
         scf.YieldOp([], loc=loc)
+    if else_fn is not None:
+        if len(if_op.regions[1].blocks) == 0:
+            if_op.regions[1].blocks.append(*[])
+        with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+            else_fn()
+            scf.YieldOp([], loc=loc)
 
 
 def _f32(word):
@@ -246,7 +256,7 @@ def _clamp240(q):
 
 def _uniform_if(cond, then_fn, else_words):
     """``then_fn()`` (dwords) when the wave-uniform ``cond`` holds, else ``else_words``, as one scf.if."""
-    # Raw scf.IfOp with results: no typed if builder for a plain helper (see _atomic_add_bf16x2_if).
+    # Raw scf.IfOp with results: no typed if builder for a plain helper (see _if).
     loc = ir.Location.unknown()
     if_op = scf.IfOp(_raw(cond), [T.i32] * len(else_words), has_else=True, loc=loc)
     with ir.InsertionPoint(if_op.regions[0].blocks[0]):
@@ -1328,24 +1338,22 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
     return launch
 
 
-def _down_scratch(K, BLOCK_M, W):
-    """Whether some loader lane of the shared Down falls past the block's rows (S * K bytes over W * 64 lanes of
-    16 bytes) for some live sub-block count S and needs the scratch slot."""
-    return any((s * K) % (W * 64) for s in range(1, BLOCK_M // 16 + 1))
+def _down_rows_table(W, SHARE, ATOMIC, ROWS_LDS):
+    """Whether the atomic Down keeps each row's output offset and factor in an LDS table (one per workgroup: the
+    shared tile writes it before its barrier, a one-wave workgroup reads its own writes) instead of VGPRs."""
+    return ROWS_LDS and ATOMIC and (SHARE and W > 1 or W == 1)
 
 
-def down_stream_lds(K, BLOCK_M, W=1, SHARE=True):
-    """LDS bytes of ``compile_a8w4_down_stream``: the FP8 LUT table (``_LUT_LDS``) and 1 KiB of channel factors per
-    wave, plus with ``SHARE`` and ``W > 1`` the block's activation rows (stride ``K + 16``) and, when some loader lane
-    falls past the rows, one 16-byte slot per lane."""
+def down_stream_lds(K, BLOCK_M, W=1, SHARE=True, R=16, ATOMIC=False, ROWS_LDS=False):
+    """LDS bytes of ``compile_a8w4_down_stream``: the FP8 LUT table (``_LUT_LDS``) and the channel factors of every
+    wave (1 KiB, or with ``SHARE`` and ``W > 1`` its ``R * 64`` bytes), then with ``SHARE`` and ``W > 1`` the block's
+    activation rows (stride ``K + 16``: a loader lane past the rows, or past the wave's factors, writes into the 16
+    unread bytes at the end of a row), and with ``ATOMIC`` and ``ROWS_LDS`` the rows' offsets and factors
+    (``8 * BLOCK_M``)."""
+    table = 8 * BLOCK_M if _down_rows_table(W, SHARE, ATOMIC, ROWS_LDS) else 0
     if not (SHARE and W > 1):
-        return _LUT_LDS + W * 1024
-    return (
-        _LUT_LDS
-        + W * 1024
-        + BLOCK_M * (K + 16)
-        + (W * 64 * 16 if _down_scratch(K, BLOCK_M, W) else 0)
-    )
+        return _LUT_LDS + W * 1024 + table
+    return _LUT_LDS + W * R * 64 + BLOCK_M * (K + 16) + table
 
 
 def compile_a8w4_down_stream(
@@ -1362,6 +1370,7 @@ def compile_a8w4_down_stream(
     ATOMIC=False,
     LDS_ACTS=False,
     W_AUX=0,
+    ROWS_LDS=False,
 ):
     """Build the streaming A8W4 Down launcher.
 
@@ -1373,14 +1382,15 @@ def compile_a8w4_down_stream(
     per lane. The wave takes its 16-row blocks in pairs: one 16-byte load per lane and 64-K step reads two
     adjacent rows of either block (lanes ``16b .. 16b+7`` the first, ``16b+8 .. 16b+15`` the second), MFMA chain p
     takes row p of every lane's pair, and each sub-block accumulates the pair in four chains (row p x the two MMAs
-    of every 64-K step, the latter summed at the end as one block's two chains were). With
+    of every 64-K step, the latter summed at the end as one block's two chains were; with ``ATOMIC``, whose sums are
+    not bit-reproducible anyway, in two: row p, the MMAs of a step one after the other). With
     ``SHARE`` and ``W > 1`` the waves of a workgroup load the block's activation rows once into LDS; with
     ``LDS_ACTS`` as well they stay there and each 64-K step reads them again (fewer VGPRs for many rows / long K).
     Without ``ATOMIC`` lane ``16q + t`` then holds channels ``8q .. 8q+7`` of the pair for sorted row t, one
     16-byte BF16 store. With ``ATOMIC`` out is BF16 [M, N], zeroed by the caller, and each route is added into its
     token's row with agent-scope BF16x2 atomics: the MFMA takes the rows as A, so lane ``16b + j`` holds
     channels ``2j`` and ``2j + 1`` of the pair (chains 0 and 1) of rows ``4b .. 4b+3``, and one atomic instruction
-    covers 64 contiguous bytes of four rows.
+    covers 64 contiguous bytes of four rows (unpredicated where the sub-block has no padding row).
     """
     assert K % 64 == 0, f"Down K={K} must be a multiple of 64"
     assert N % (16 * R * W) == 0, f"Down N={N} must be a multiple of {16 * R * W}"
@@ -1394,19 +1404,17 @@ def compile_a8w4_down_stream(
     # Block pairs of the wave and pairs in flight (P blocks).
     PAIRS, PP = R // 2, max(P // 2, 1)
     W_BYTES, D_BYTES = a8w4.weight_bytes(N, K), a8w4.delta_bytes(N, K)
-    REGION = 1024
     SHARE = SHARE and W > 1
+    # Channel factors of a wave in LDS: R * 16 f32 (with SHARE; else a whole 1 KiB, one 16-byte slot per lane).
+    REGION = R * 64 if SHARE else 1024
     LDS_ACTS = LDS_ACTS and SHARE
     KP = K + 16  # LDS row stride: 16-byte reads of 16 rows hit distinct banks
     SUBS = BLOCK_M // 16
-    # Activation rows, then (if some loader lane can fall past the rows) one 16-byte scratch slot per lane.
-    ACT_LDS = (
-        SUBS * 16 * KP + (W * 64 * 16 if _down_scratch(K, BLOCK_M, W) else 0)
-        if SHARE
-        else 0
-    )
-    LDS = _LUT_LDS + W * REGION + ACT_LDS
-    assert LDS == down_stream_lds(K, BLOCK_M, W, SHARE)
+    ACT_LDS = SUBS * 16 * KP if SHARE else 0
+    # Rows' output offsets, then their factors (one i32 / f32 per sorted row of the block).
+    TABLE = _down_rows_table(W, SHARE, ATOMIC, ROWS_LDS)
+    LDS = _LUT_LDS + W * REGION + ACT_LDS + (8 * BLOCK_M if TABLE else 0)
+    assert LDS == down_stream_lds(K, BLOCK_M, W, SHARE, R, ATOMIC, ROWS_LDS)
     assert LDS <= a8w4.LDS_BYTES, f"Down needs {LDS} B of LDS (K={K})"
 
     def body(
@@ -1516,15 +1524,28 @@ def compile_a8w4_down_stream(
                 words = _load(
                     x_rsrc, live.select(src * K + chunk * 16, fx.Int32(_DROP)), 0, 4
                 )
+                # A lane past the rows writes into the unread 16 bytes at the end of a row (stride KP = K + 16).
+                pad = act_lds + ((wave * 64 + lane) & (SUBS * 16 - 1)) * KP + K
                 pending.append(
                     (
                         live.select(
-                            act_lds + sub * (16 * KP) + row * KP + chunk * 16,
-                            act_lds + SUBS * 16 * KP + (wave * 64 + lane) * 16,
+                            act_lds + sub * (16 * KP) + row * KP + chunk * 16, pad
                         ),
                         words,
                     )
                 )
+        row_scale = []
+        for r, p in zip(route, block.position):
+            a_scale = _f32(_load(xs_rsrc, r * 4, 0, 1)[0])
+            row_scale.append(a_scale * _f32(_load(sw_rsrc, p * 4, 0, 1)[0]))
+        if TABLE:
+            # Each lane writes row lane & 15 of every sub-block: its output offset (token * 2N, -1 for a padding row)
+            # and factor; every wave writes the same values.
+            table = act_lds + ACT_LDS
+            for s, (token, scale) in enumerate(zip(block.token, row_scale)):
+                row = table + (s * 16 + (lane & 15)) * 4
+                _lds_store(row, [(token < M).select(token * (2 * N), fx.Int32(-1))])
+                _lds_store(row + BLOCK_M * 4, [scale.bitcast(fx.Uint32)])
         factors = _load(
             ws_rsrc,
             (lane * 16 < R * 64).select(rb0 * 64 + lane * 16, fx.Int32(_DROP)),
@@ -1534,10 +1555,16 @@ def compile_a8w4_down_stream(
         # The first PP pairs in flight; pair u + PP is issued during pair u, one 64-K block per 64-K block.
         weights = {u: [load_w(u, kb) for kb in range(KB)] for u in range(PP)}
         delta_loads = {u: load_d(u) for u in range(PP)}
+        factor_slot = region + lane * 16
+        if SHARE:
+            # Lanes past the wave's R * 16 factors write into the unread end of a row (see the loaders above).
+            factor_slot = (lane * 16 < R * 64).select(
+                factor_slot, act_lds + ((wave * 64 + lane) & (SUBS * 16 - 1)) * KP + K
+            )
         # Raw llvm.store / llvm.load of the channel factors at LDS byte addresses (see _lds).
         llvm.store(
             Vec.from_elements(factors, fx.Uint32).bitcast(fx.Int32).ir_value(),
-            _lds(region + lane * 16),
+            _lds(factor_slot),
             alignment=16,
         )
         acts = []
@@ -1560,33 +1587,52 @@ def compile_a8w4_down_stream(
                     for kb in range(KB)
                 ]
                 acts.append([(_pack64(x[0], x[1]), _pack64(x[2], x[3])) for x in words])
-        row_scale = []
-        for r, p in zip(route, block.position):
-            a_scale = _f32(_load(xs_rsrc, r * 4, 0, 1)[0])
-            row_scale.append(a_scale * _f32(_load(sw_rsrc, p * 4, 0, 1)[0]))
         if ATOMIC:
-            # Rows 4b .. 4b+3 of lane 16b + j (the MFMA's C layout with the rows as A). Raw ds_bpermute (byte
-            # address = 4 * source lane, see the Gate/Up loaders).
+            # Rows 4b .. 4b+3 of lane 16b + j (the MFMA's C layout with the rows as A): per row the byte offset in out
+            # of its token's row plus the lane's channel pair in the wave's first pair (below lane_bytes for a padding
+            # row) and its factor, read from the LDS table at each pair's epilogue (TABLE), else held in VGPRs.
+            # Raw ds_bpermute (byte address = 4 * source lane, see the Gate/Up loaders).
             src = [((lane >> 4) * 4 + v) * 4 for v in range(4)]
-            row_token = [
-                [
-                    fx.Int32(
-                        rocdl.ds_bpermute(T.i32, _raw(src[v]), _raw(block.token[s]))
-                    )
-                    for v in range(4)
-                ]
-                for s in range(S)
-            ]
-            row_factor = [
-                [
-                    fx.Uint32(
-                        rocdl.ds_bpermute(
-                            T.i32, _raw(src[v]), _raw(row_scale[s].bitcast(fx.Uint32))
-                        )
-                    ).bitcast(fx.Float32)
-                    for v in range(4)
-                ]
-                for s in range(S)
+            lane_bytes = (rb0 * 16 + (lane & 15) * 2) * 2
+
+            def rows_of(s):
+                """(offsets, factors) of rows 4b .. 4b + 3 of sub-block s from the table."""
+                at = table + (s * 16 + (lane >> 4) * 4) * 4
+                offs = _lds_load4(at)
+                facs = _lds_load4(at + BLOCK_M * 4)
+                return (
+                    [fx.Int32(offs[v]) + lane_bytes for v in range(4)],
+                    [_f32(facs[v]) for v in range(4)],
+                )
+
+            row_off, row_factor = [], []
+            for s in range(0 if TABLE else S):
+                token = block.token[s]
+                own = (token < M).select(token * (2 * N), fx.Int32(-1))
+                row_off.append(
+                    [
+                        fx.Int32(rocdl.ds_bpermute(T.i32, _raw(src[v]), _raw(own)))
+                        + lane_bytes
+                        for v in range(4)
+                    ]
+                )
+                row_factor.append(
+                    [
+                        fx.Uint32(
+                            rocdl.ds_bpermute(
+                                T.i32, _raw(src[v]), _raw(row_scale[s].bitcast(fx.Uint32))
+                            )
+                        ).bitcast(fx.Float32)
+                        for v in range(4)
+                    ]
+                )
+            # Raw readlane (see _block_head): whether row 15 of a sub-block, and so every row, is a real one.
+            full = [
+                fx.Int32(
+                    rocdl.readlane(fx.Int32.ir_type, t.ir_value(), fx.Int32(15).ir_value())
+                )
+                < M
+                for t in block.token
             ]
             out_base = _address(p_out)
         deltas = {0: resolve(delta_loads.pop(0))}
@@ -1600,8 +1646,12 @@ def compile_a8w4_down_stream(
                 deltas[u + 1] = resolve(delta_loads.pop(u + 1))
             w = weights.pop(u)
             d = deltas.pop(u)
-            # Chains [p][c]: row p of the lanes' pairs, MMA c of every 64-K block (summed at the end).
-            acc = [[[_zeros() for _ in range(S)] for _ in range(2)] for _ in range(2)]
+            # Chains [p][c]: row p of the lanes' pairs, MMA c of every 64-K block (summed at the end); with ATOMIC
+            # chains [p][0] only.
+            acc = [
+                [[_zeros() for _ in range(S)] for _ in range(1 if ATOMIC else 2)]
+                for _ in range(2)
+            ]
             for kb in range(KB):
                 if ahead:
                     weights[u + PP].append(load_w(u + PP, kb))
@@ -1610,15 +1660,26 @@ def compile_a8w4_down_stream(
                     if LDS_ACTS
                     else [acts[s][kb] for s in range(S)]
                 )
+                if ATOMIC:
+                    # Both rows decoded first: the two MMAs of a row run one after the other into its chain.
+                    ops = [
+                        _decode_row(
+                            w[kb][2 * p : 2 * p + 2],
+                            _lut_at(lut_lds, d[kb // 4][p], kb % 4),
+                        )
+                        for p in range(2)
+                    ]
+                    for c in range(2):
+                        for p in range(2):
+                            for s in range(S):
+                                acc[p][0][s] = _mfma(b[s][c], ops[p][c], acc[p][0][s])
+                    continue
                 for p in range(2):
                     lut = _lut_at(lut_lds, d[kb // 4][p], kb % 4)
                     ops = _decode_row(w[kb][2 * p : 2 * p + 2], lut)
                     for c in range(2):
                         for s in range(S):
-                            if ATOMIC:
-                                acc[p][c][s] = _mfma(b[s][c], ops[c], acc[p][c][s])
-                            else:
-                                acc[p][c][s] = _mfma(ops[c], b[s][c], acc[p][c][s])
+                            acc[p][c][s] = _mfma(ops[c], b[s][c], acc[p][c][s])
             if ATOMIC:
                 # Lane 16b + j holds channels 2j and 2j + 1 of the pair (chains 0 and 1) for rows 4b .. 4b + 3: one
                 # BF16x2 atomic per row adds a channel pair, 64 contiguous bytes of four rows per instruction.
@@ -1629,20 +1690,32 @@ def compile_a8w4_down_stream(
                         alignment=8,
                     )
                 )
-                channel = (rb0 + 2 * u) * 16 + (lane & 15) * 2
-                for s in range(S):
+
+                def add_rows(s, predicated, u=u, ws=ws, acc=acc):
+                    offs, facs = rows_of(s) if TABLE else (row_off[s], row_factor[s])
                     for v in range(4):
-                        pair = [
-                            ((acc[p][0][s][v] + acc[p][1][s][v]) * ws[p])
-                            * row_factor[s][v]
-                            for p in range(2)
-                        ]
-                        _atomic_add_bf16x2_if(
-                            row_token[s][v] < M,
-                            out_base,
-                            (row_token[s][v] * N + channel) * 2,
-                            _bf16_pair(pair[0], pair[1]),
-                        )
+                        pair = Vec.from_elements(
+                            [acc[0][0][s][v], acc[1][0][s][v]], fx.Float32
+                        ) * ws
+                        pair = pair * Vec.from_elements([facs[v], facs[v]], fx.Float32)
+                        word = _bf16_pair(pair[0], pair[1])
+                        # The pair's channels: 64 bytes past the previous pair's.
+                        address = out_base + fx.Int64(fx.Uint32(offs[v])) + u * 64
+
+                        def add(address=address, word=word):
+                            _atomic_add_bf16x2(address, word)
+
+                        if predicated:
+                            _if(offs[v] >= lane_bytes, add)
+                        else:
+                            add()
+
+                for s in range(S):
+                    _if(
+                        full[s],
+                        lambda s=s: add_rows(s, False),
+                        lambda s=s: add_rows(s, True),
+                    )
                 rocdl.sched_barrier(0)
                 continue
             # Lane 16q + t holds channels 8q .. 8q + 7 of the pair (chain p the ones of parity p) for row t: one

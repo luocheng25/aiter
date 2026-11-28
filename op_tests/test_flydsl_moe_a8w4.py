@@ -16,8 +16,9 @@ One file, four regions:
      every change: ``pytest op_tests/test_flydsl_moe_a8w4.py -m basic``;
   2. other coverage: what regions 1 and 3 cannot cover (weight layout and delta flush, bit-exact row
      quantization, dedup plan, streaming prep and fused quantization, decode dispatch boundaries (per route and
-     expert-deduplicated), streaming boundaries and variants, the prefill sorting front end, prefill tile options and
-     the half-block / XCD / two-pass / Down-split variants, CUDA graph, input errors and the gfx942 gate, compile-cache
+     expert-deduplicated), streaming boundaries and variants (the atomic Down's epilogue branches and LDS budget
+     among them), the prefill sorting front end, prefill tile options and the half-block / XCD / few-waves / two-pass
+     / Down-split variants, CUDA graph, input errors and the gfx942 gate, compile-cache
      keys, repeated expert ids, in-place output, routing input dtypes, M = 0, the SwiGLU limit, the
      ``aiter.fused_moe`` entry: its tiers, arguments and errors, untagged weights, CUDA graph, the weight tag, and the
      shared expert: prepare's bit-exact conversions, the real checkpoints, errors, graph, in-place output, the mixed
@@ -1073,8 +1074,9 @@ def test_layer_masked_routes():
 # The streaming tier (M > 32, at H 5120 M > DECODE_WIDE_MAX_M, with at most STREAM_MAX_ROWS* rows per expert) follows
 # pyhip M17's cases too: the basic tests stream blocks of 16 and 32, the benchmark 16 / 32 / 64 without asserting
 # kernels; here its boundaries with decode and prefill, the bit-exact prep and fused quantization, ACT_STEPS, the
-# Gate/Up and Down tiles (bit-exact), the prefill Down behind the streaming Gate/Up, grid shrinking, the sorting block,
-# CUDA graph, compile-cache keys, repeated ids, in-place output and the SwiGLU limit.
+# Gate/Up and Down tiles (bit-exact), the atomic Down's two epilogue branches, rows' table and LDS budget, the prefill
+# Down behind the streaming Gate/Up, grid shrinking, the sorting block, CUDA graph, compile-cache keys, repeated ids,
+# in-place output and the SwiGLU limit.
 # The aiter.fused_moe entry (2.9; its gfx942 gate in 2.6) is covered by the basic test with one decode case and by no
 # benchmark case (the benchmark calls flydsl_moe_a8w4_ptpc directly).
 # The shared expert (2.10) is covered by the basic layer tests (one case per routed tier, TP8, the MTP layer in the
@@ -2251,33 +2253,44 @@ def test_prefill_half_block_boundary(filler, options, block_m, tile_k):
 
 
 @pytest.mark.parametrize(
-    "kernel, nsplit, two_pass, xcd",
+    "kernel, nsplit, two_pass, xcd, wgs",
     [
-        ("gateup", None, None, moe_a8w4.GATEUP_XCD_CHUNK_H5120),
-        ("down", 4, True, 0),
-        ("down", 4, True, moe_a8w4.DOWN_XCD_CHUNK_H5120),
-        ("down", 1, True, moe_a8w4.DOWN_XCD_CHUNK_H5120),
+        ("gateup", None, None, moe_a8w4.GATEUP_XCD_CHUNK_H5120, 0),
+        (
+            "gateup",
+            None,
+            None,
+            moe_a8w4.GATEUP_FEW_WAVES_XCD_CHUNK,
+            moe_a8w4.GATEUP_FEW_WAVES,
+        ),
+        ("down", 4, True, 0, 0),
+        ("down", 4, True, moe_a8w4.DOWN_XCD_CHUNK_H5120, 0),
+        ("down", 1, True, moe_a8w4.DOWN_XCD_CHUNK_H5120, 0),
     ],
     ids=[
         "gateup_xcd",
+        "gateup_xcd_few_waves",
         "down_two_pass",
         "down_two_pass_xcd_split4",
         "down_two_pass_xcd_split1",
     ],
 )
-def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd):
-    """The two H5120 prefill grid variants equal the plain kernels bit for bit on one sort and one input: the
+def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd, wgs):
+    """The H5120 prefill grid variants equal the plain kernels bit for bit on one sort and one input: the
     XCD-chunked 1-D grid (XCD_CHUNK > 0: Gate/Up chunks of one sorted block's 9 N tiles, Down chunks of 4
     neighbouring sorted blocks with their hidden parts, dealt to the 4 XCDs in turn) for mid, routes and loc_ids,
-    and Down's activation tile staged in two passes through LDS (TWO_PASS: K = 576 as 5 + 4 blocks of 64). The
-    baseline is the 2-D grid with one pass and the hidden dimension split in 4.
+    the Gate/Up kept to GATEUP_FEW_WAVES workgroups per CU (WGS_PER_CU: LDS padded, the activation tile staged two
+    tiles ahead at K 5120) with chunks of GATEUP_FEW_WAVES_XCD_CHUNK blocks, and Down's activation tile staged in two
+    passes through LDS (TWO_PASS: K = 576 as 5 + 4 blocks of 64). The baseline is the 2-D grid with one pass, as many
+    workgroups per CU as fit and the hidden dimension split in 4.
 
     The routes are built per expert (E 24 with 32, 33, 64, 65, 96, 97, 1, 20 and 16 x 12 rows, M = 100): both
     sides of Down's half-block branch and every valid-row count of Gate/Up occur; the Opus sort's 34 tasks are no
-    multiple of 4 or 16, so workgroups the chunked grid maps past the task count must exit; Down runs split in 4
+    multiple of 4, 8 or 16, so workgroups the chunked grid maps past the task count must exit; Down runs split in 4
     and unsplit. The basic tests and the benchmark only grade errors, so a chunk computed twice, skipped or
     missing its loc_ids may go unnoticed (XCD chunking only starts at 16384 routes, the benchmark's ds_tp4
-    M >= 4096); the one-pass K = 576 tile only runs below 81 estimated workgroups.
+    M >= 4096, the few-waves Gate/Up at 98304, M >= 16384); the one-pass K = 576 tile only runs below 81 estimated
+    workgroups.
     """
     from aiter.fused_moe import moe_sorting
 
@@ -2305,10 +2318,21 @@ def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd):
     )
     device, constants = x.device.index, moe_a8w4._trace_constants()
 
-    def gateup(chunk):
+    def gateup(chunk, wgs=0):
         mid = torch.full((M, topk, inter), float("nan"))
         kernel = moe_a8w4._gateup_kernel(
-            2 * inter, H, topk, 64, 128, 128, E, 0.0, chunk, device, constants
+            2 * inter,
+            H,
+            topk,
+            64,
+            128,
+            128,
+            E,
+            0.0,
+            chunk,
+            device,
+            constants,
+            **({"wgs_per_cu": wgs} if wgs else {}),
         )
         moe_a8w4._launch(
             "gateup",
@@ -2350,7 +2374,7 @@ def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd):
     mid = gateup(0)
     assert not bool(mid.isnan().any())
     if kernel == "gateup":
-        assert torch.equal(gateup(xcd).view(torch.int32), mid.view(torch.int32))
+        assert torch.equal(gateup(xcd, wgs).view(torch.int32), mid.view(torch.int32))
         return
     mq, ms = moe_a8w4._quantize(mid, M * topk, inter, "f32")
     routes, loc = down(4, False, 0)
@@ -2600,6 +2624,145 @@ def test_stream_down_tiles_bitexact(monkeypatch, tokens, block_m, tile):
         assert torch.equal(_bits(routes[0]), _bits(other_routes))
 
 
+# Rows per expert of the atomic streaming Down cases (topk 2, E 8, M 134): 16 / 32 / 48 / 64 rows fill every live
+# sub-block of their blocks, 8 / 17 / 33 / 50 leave the last one partly padding, so that with sorting blocks of 16, 32
+# and 64 alike there are blocks of every live sub-block count without padding and with it (asserted in the case).
+_ATOMIC_DOWN_COUNTS = (16, 32, 48, 64, 8, 17, 33, 50)
+
+
+def _atomic_down_case(w, prepared, seed):
+    """The routes of ``_ATOMIC_DOWN_COUNTS`` (sorted by expert and folded into two columns: no expert has more than M
+    rows, so the two experts of a token differ), an input and routing weights, a random FP8 intermediate and the f32
+    reference of the Down alone: per token the sum over its routes of weight x (mq x ms) . w2[e]^T, with w2
+    dequantized exactly."""
+    E, H, inter = prepared.experts, prepared.hidden, prepared.inter_padded
+    flat = torch.repeat_interleave(torch.arange(E), torch.tensor(_ATOMIC_DOWN_COUNTS))
+    M = flat.numel() // 2
+    topk_ids = flat.view(2, M).T.to(torch.int32).contiguous()
+    x, topk_weight, _ = make_inputs(M, H, E, 2, seed=seed, shared=False)
+    gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    mid = torch.randn((2 * M, inter), generator=gen)
+    mq, ms = moe_a8w4._quantize(mid, 2 * M, inter, "f32")
+    act, ids = mq.float() * ms.unsqueeze(1), topk_ids.flatten().long()
+    ref = torch.zeros((M, H))
+    for e in range(E):
+        rows = (ids == e).nonzero().flatten()
+        y = act[rows] @ dequant_mxfp4(w["w2"][e], w["w2_scale"][e]).T
+        ref.index_add_(0, rows // 2, y * topk_weight.flatten()[rows].unsqueeze(1))
+    return x, topk_weight, topk_ids, mq, ms, ref
+
+
+@pytest.mark.parametrize(
+    "hidden, inter", [(5120, 320), (4096, 256)], ids=["h5120_i320", "h4096_i256"]
+)
+def test_stream_atomic_down_epilogue(monkeypatch, hidden, inter):
+    """The atomic streaming Down adds a sub-block's rows without predicates when its last row, and so every row, is a
+    real one, else with them; blocks of 64 at K 256 keep the rows' output offsets and factors in an LDS table
+    (ROWS_LDS) and read the activations from LDS. The routes of _ATOMIC_DOWN_COUNTS give, for blocks of 16, 32 and
+    64, blocks of every live sub-block count with and without padding in the last one; with topk 2 a token's BF16x2
+    atomics are two adds onto zero, whose sum does not depend on their order, so the dispatch's atomic launchers of
+    the three block sizes (H 5120 with I 320: the DeepSeek and MTP TP8 layers' routed shape; H 4096 with I 256: MiMo
+    TP8's; E 8) and, at K 256, blocks of 64 without the table and also without the LDS activations give the same
+    bits, and the first is graded against the f32 reference of the Down.
+
+    Random routing (the basic tests, test_stream_rows_limits, the benchmark) rarely gives an expert of exactly 16 k
+    rows, runs one block size and tile per shape, and with topk > 2 can only be graded; no other case builds the Down
+    without the table where the dispatch uses it.
+    """
+    for block_m in (16, 32, 64):
+        kinds = set()
+        for count in _ATOMIC_DOWN_COUNTS:
+            for start in range(0, count, block_m):
+                rows = min(block_m, count - start)
+                kinds.add((-(-rows // 16), rows % 16 == 0))
+        subs = range(1, block_m // 16 + 1)
+        assert kinds == set(itertools.product(subs, (True, False))), (block_m, kinds)
+    compile_down, seen = _spy_build(monkeypatch, "compile_a8w4_down_stream")
+    w, prepared = _weights(len(_ATOMIC_DOWN_COUNTS), hidden, inter, 490)
+    assert prepared.inter_padded == inter
+    x, topk_weight, topk_ids, mq, ms, ref = _atomic_down_case(w, prepared, seed=495)
+    device, constants = torch.cuda.current_device(), moe_a8w4._stream_down_constants()
+    kernels = []
+    for block_m in (16, 32, 64):
+        args = (hidden, inter, 2, block_m, prepared.experts, True, device, constants)
+        # Builds the dispatch's launcher uncached, only to read its tile (nothing is launched with it).
+        moe_a8w4._stream_down_kernel.__wrapped__(*args)
+        base = dict(seen)
+        table = base.get("ROWS_LDS", False)
+        assert base["ATOMIC"] and table == (block_m == 64 and inter == 256), base
+        kernels.append((block_m, moe_a8w4._stream_down_kernel(*args)))
+        if table:
+            for other in ({"ROWS_LDS": False}, {"ROWS_LDS": False, "LDS_ACTS": False}):
+                kernels.append((block_m, compile_down(**{**base, **other})))
+    outs = []
+    for block_m, kernel in kernels:
+        out = torch.full_like(x, float("nan"))
+        sorted_ids, sorted_weights, sorted_experts, num_valid, _, _, _ = (
+            moe_a8w4._stream_prep(
+                x, topk_weight, topk_ids, prepared.experts, block_m, out, zero=True
+            )
+        )
+        moe_a8w4._launch(
+            "down",
+            kernel,
+            mq,
+            prepared.w2,
+            prepared.w2_delta,
+            out,
+            sorted_ids,
+            sorted_weights,
+            sorted_experts,
+            num_valid,
+            prepared.w2_scale,
+            ms,
+            x.shape[0],
+            sorted_experts.numel(),
+        )
+        outs.append(out)
+    assert_close(outs[0], ref)
+    for out in outs[1:]:
+        assert torch.equal(_bits(outs[0]), _bits(out))
+
+
+def test_stream_down_lds_budget(monkeypatch):
+    """``stream_a8w4.down_stream_lds``, the LDS estimate by which the dispatch shares a block's activation rows through
+    LDS (``_stream_down_shared``), equals what ``compile_a8w4_down_stream`` lays out and asserts against the 64 KiB of
+    a CU, for both tiles (R 8 x W 4 sharing, R 16 x W 1), with and without atomics and the rows' table (ROWS_LDS): a
+    launcher builds where the estimate fits and fails with exactly that byte count where it does not. At I 1024 (H 512)
+    the dispatch shares the rows of the atomic Down with blocks of 32 but not 16 or 64 and builds all three; blocks of
+    64 at I 256 also fit the table. Building a launcher does not trace it.
+
+    The basic tests and the benchmark build only the dispatch's tile of their shapes, within the budget; no case
+    builds one past it, where an estimate below the kernel's layout would fail only when the launcher is built
+    (test_shape_fallbacks checks the estimate of the default tile without atomics against the path its call takes).
+    """
+    compile_down, seen = _spy_build(monkeypatch, "compile_a8w4_down_stream")
+    for (K, block_m), (R, W), atomic, table in itertools.product(
+        ((1024, 16), (1024, 32), (1024, 64), (256, 64)),
+        ((8, 4), (16, 1)),
+        (False, True),
+        (False, True),
+    ):
+        lds = stream_a8w4.down_stream_lds(
+            K, block_m, W=W, R=R, ATOMIC=atomic, ROWS_LDS=table
+        )
+        options = {"N": 512, "K": K, "TOPK": 2, "BLOCK_M": block_m, "E": 5}
+        options.update(R=R, W=W, ATOMIC=atomic, ROWS_LDS=table)
+        if lds <= common_a8w4.LDS_BYTES:
+            compile_down(**options)
+        else:
+            with pytest.raises(AssertionError, match=f"Down needs {lds} B of LDS"):
+                compile_down(**options)
+    device, constants = torch.cuda.current_device(), moe_a8w4._stream_down_constants()
+    for block_m, shared in ((16, False), (32, True), (64, False)):
+        assert moe_a8w4._stream_down_shared(512, 1024, block_m) == shared, block_m
+        # Builds the dispatch's atomic launcher uncached (nothing is launched with it).
+        moe_a8w4._stream_down_kernel.__wrapped__(
+            512, 1024, 2, block_m, 5, True, device, constants
+        )
+        assert seen["ATOMIC"] and (seen.get("W", 1) > 1) == shared, seen
+
+
 @pytest.mark.parametrize(
     "tokens, block_m", [(62, 32), (120, 64)], ids=["m62_bm32", "m120_bm64"]
 )
@@ -2748,6 +2911,55 @@ def test_h5120_dispatch_limits(monkeypatch, case):
     else:
         assert (gateup[-1][8], down[-1][6], down[-1][7]) == built, (gateup, down)
     assert_close(out, ref)
+
+
+def test_gateup_few_waves_grid(monkeypatch):
+    """The prefill Gate/Up keeps GATEUP_FEW_WAVES workgroups per CU (gemm1_a8w4 WGS_PER_CU) and deals XCD chunks of
+    GATEUP_FEW_WAVES_XCD_CHUNK sorted blocks (``_gateup_grid``) only from hidden 5120 on with at least
+    GATEUP_FEW_WAVES_MIN_E experts and GATEUP_FEW_WAVES_MIN_ROUTES routes and the default tile (64, 128, 128), each on
+    both sides: the DeepSeek-V4.1 main layer (E 384, topk 6) from M 16384 on, not the MTP layer (E 128); elsewhere
+    the XCD chunk of ``_xcd_chunk`` and no limit. A call passes both to the Gate/Up's launcher: with the thresholds
+    moved onto DeepSeek E 24 (24 routes, the tile given), M 4 builds the limited Gate/Up and M 3 (18 routes) the plain
+    one, both graded.
+
+    The benchmark runs the limited Gate/Up only from ds_tp4 / ds_layer M 16384 on and checks neither the boundary nor
+    the build parameters; the basic tests and the other cases never reach 98304 routes.
+    """
+    few = (moe_a8w4.GATEUP_FEW_WAVES_XCD_CHUNK, moe_a8w4.GATEUP_FEW_WAVES)
+    tile, grid = (64, 128, 128), moe_a8w4._gateup_grid
+    experts = moe_a8w4.GATEUP_FEW_WAVES_MIN_E
+    routes = moe_a8w4.GATEUP_FEW_WAVES_MIN_ROUTES
+    plain = (moe_a8w4._xcd_chunk(moe_a8w4.GATEUP_XCD_CHUNK_H5120, 5120, routes), 0)
+    assert grid(5120, experts, routes, tile) == few
+    assert grid(5120, experts - 1, routes, tile) == plain
+    assert grid(5120, experts, routes - 1, tile) == plain
+    for other in ((64, 128, 256), (128, 128, 128), (64, 256, 128)):
+        assert grid(5120, experts, routes, other) == plain, other
+    assert grid(4096, experts, routes, tile) == (0, 0)
+    assert grid(5120, 384, 16384 * 6, tile) == few
+    assert grid(5120, 384, 16383 * 6, tile) == plain
+    assert grid(5120, 128, 65536 * 3, tile) == plain
+    monkeypatch.setattr(moe_a8w4, "GATEUP_FEW_WAVES_MIN_E", DS_EXPERTS)
+    monkeypatch.setattr(moe_a8w4, "GATEUP_FEW_WAVES_MIN_ROUTES", 4 * DS_TOPK)
+    original, built = moe_a8w4._gateup_kernel, []
+
+    def spy(*args, **options):
+        built.append((args[8], options.get("wgs_per_cu", 0)))
+        return original(*args, **options)
+
+    monkeypatch.setattr(moe_a8w4, "_gateup_kernel", spy)
+    w, prepared = _ds_weights()
+    for tokens, expected in ((4, few), (3, (0, 0))):
+        x, topk_weight, topk_ids = make_inputs(
+            tokens, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=460 + tokens, shared=False
+        )
+        out, ref = _a8w4_run(
+            w, prepared, x, topk_weight, topk_ids, block_m=64, tile_k=128
+        )
+        _assert_path(_prefill_path(128))
+        assert built == [expected], (tokens, built)
+        built.clear()
+        assert_close(out, ref)
 
 
 @pytest.mark.parametrize(
@@ -3076,11 +3288,14 @@ def test_compile_cache_keys(monkeypatch):
     """The launcher caches are keyed by the device (a compiled FlyDSL handle runs on one GPU only) and, for the GEMM
     kernels, by the kernel-module constants read while building and tracing (``common_a8w4.XCDS``,
     ``gemm2_a8w4.A_TWO_PASS_MIN_K``): another device or another constant gets its own launcher, and a call passes
-    its inputs' device and the current constants. Building a launcher does not trace it, so the other device need
-    not exist. The call passes block_m=64 to run the prefill launchers (pyhip M17 decodes M 16 by default).
+    its inputs' device and the current constants. The Gate/Up limited to GATEUP_FEW_WAVES workgroups per CU
+    (``wgs_per_cu``, ``_gateup_grid``) has a launcher of its own too. Building a launcher does not trace it, so the
+    other device need not exist. The call passes block_m=64 to run the prefill launchers (pyhip M17 decodes M 16 by
+    default).
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
-    passes as well.
+    passes as well; the benchmark builds the limited Gate/Up only for its M >= 16384 DeepSeek cases, never the
+    unlimited one of the same shape.
     """
     constants = moe_a8w4._trace_constants()
     gateup = (512, 512, 2, 64, 128, 256, 5, 0.0, 0)
@@ -3088,6 +3303,12 @@ def test_compile_cache_keys(monkeypatch):
     first = moe_a8w4._gateup_kernel(*gateup, 0, constants)
     assert moe_a8w4._gateup_kernel(*gateup, 0, constants) is first
     assert moe_a8w4._gateup_kernel(*gateup, 1, constants) is not first
+    # The K tile 128: three workgroups' LDS fit a CU.
+    few_args = (*gateup[:5], 128, *gateup[6:], 0, constants)
+    few = {"wgs_per_cu": moe_a8w4.GATEUP_FEW_WAVES}
+    limited = moe_a8w4._gateup_kernel(*few_args, **few)
+    assert moe_a8w4._gateup_kernel(*few_args, **few) is limited
+    assert moe_a8w4._gateup_kernel(*few_args) is not limited
     assert moe_a8w4._down_kernel(*down, 1, constants) is not moe_a8w4._down_kernel(
         *down, 0, constants
     )

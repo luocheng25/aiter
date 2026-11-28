@@ -175,9 +175,11 @@ STREAM_ATOMIC = 1
 # time, MiMo TP8 M1024 with blocks of 64 1.05x).
 STREAM_DOWN_PREFETCH = 4
 STREAM_DOWN_PREFETCH_SMALL = 2
-# The shared streaming Down of 32-row blocks reads the activations from LDS at every 64-K step instead of holding
-# them in VGPRs when K % 256 == 0 (no loader scratch slot: LDS and VGPRs then allow 4 workgroups per CU, MiMo TP8
-# M512 94 -> 90 us; with K = 320 or blocks of 64 LDS still bounds the occupancy and the extra reads cost 6-8%).
+# The shared streaming Down reads the activations from LDS at every 64-K step instead of holding them in VGPRs where
+# that buys a workgroup per CU: blocks of 32 except 256 < K < 512 (MiMo TP8 M512 94 -> 90 us; DeepSeek I576 M1024
+# 2 -> 3 workgroups, 0.89-0.91x the Down's time with and without atomics, lab), blocks of 64 when K <= 256 (the atomic
+# Down, 2 -> 3 waves per SIMD: Qwen TP4 M2048 0.89x, MiMo TP8 M1024 with the rows' table in LDS 0.90x); elsewhere
+# (K = 320) LDS still bounds the occupancy or the VGPRs saved do not reach the next wave and the extra reads cost 3-4%.
 STREAM_DOWN_LDS_ACTS = 1
 # 64-K steps per workgroup barrier of the light-wave streaming Gate/Up's LDS activation ring (2: about 1% faster;
 # the fused-quantization tile keeps 1, Qwen TP4 M1024 +1.5% with 2).
@@ -231,6 +233,20 @@ STREAM_GATEUP_ACT_BYTES_H5120 = 16
 GATEUP_XCD_CHUNK_H5120 = 1
 DOWN_XCD_CHUNK_H5120 = 4
 XCD_MIN_ROUTES_H5120 = 16384
+# From hidden 5120 on with at least GATEUP_FEW_WAVES_MIN_E experts and GATEUP_FEW_WAVES_MIN_ROUTES routes (the
+# DeepSeek-V4.1 main layer from M 16384 on) the prefill Gate/Up keeps GATEUP_FEW_WAVES workgroups of 4 waves per CU
+# (gemm1_a8w4 WGS_PER_CU: its LDS padded, and the VGPRs this frees hold a second staged activation tile; 0: as many
+# as its LDS and VGPRs allow, 4) and deals XCD chunks of GATEUP_FEW_WAVES_XCD_CHUNK sorted blocks: with fewer tiles in
+# flight per XCD the experts' weights stay in its L2. Measured in one process against 4 workgroups and chunks of 1
+# (Gate/Up time): DeepSeek TP4 M8192 / 16384 / 32768 1.04x / 0.97x / 0.92x, the main TP8 layer's routed experts M8192 /
+# 16384 / 32768 1.04x / 0.96x / 0.88x, the main TP4 layer's M16384 0.96x (chunks of 2 alone: 0.99x / 0.98-0.99x /
+# 0.93-0.95x); the second activation tile then 0.96-0.97x again (M8192 with both still 1.01x); latency-bound shapes
+# are slower with 12 waves per CU (M1: MiMo H4096 M16384 / 32768 1.06x / 1.05x, the MTP layer (E128) M32768 1.03x,
+# DeepSeek M4096 1.06x).
+GATEUP_FEW_WAVES = 3
+GATEUP_FEW_WAVES_XCD_CHUNK = 2
+GATEUP_FEW_WAVES_MIN_E = 256
+GATEUP_FEW_WAVES_MIN_ROUTES = 98304
 # The prefill Down stages a large activation tile in two passes (gemm2_a8w4 TWO_PASS) only for grids of more
 # workgroups (estimated blocks times the split) than one per CU.
 DOWN_TWO_PASS_MIN_WGS = 80
@@ -904,10 +920,22 @@ def _trace_constants():
 
 @functools.cache
 def _gateup_kernel(
-    N, K, topk, block_m, block_n, tile_k, experts, limit, xcd_chunk, device, constants
+    N,
+    K,
+    topk,
+    block_m,
+    block_n,
+    tile_k,
+    experts,
+    limit,
+    xcd_chunk,
+    device,
+    constants,
+    *,
+    wgs_per_cu=0,
 ):
     """Prefill Gate/Up launcher. ``device`` (a compiled handle runs on one GPU) and ``constants``
-    (``_trace_constants()``) only key the cache."""
+    (``_trace_constants()``) only key the cache; ``wgs_per_cu``: gemm1_a8w4's WGS_PER_CU (``_gateup_grid``)."""
     return compile_a8w4_gemm1(
         N=N,
         K=K,
@@ -918,6 +946,7 @@ def _gateup_kernel(
         E=experts,
         SWIGLU_LIMIT=limit,
         XCD_CHUNK=xcd_chunk,
+        WGS_PER_CU=wgs_per_cu,
     )
 
 
@@ -981,6 +1010,19 @@ def _prefill_down(tokens, topk, experts, hidden, inter, block_m, device, loc_top
 def _xcd_chunk(chunk, hidden, routes):
     """XCD_CHUNK of a prefill kernel (see ``GATEUP_XCD_CHUNK_H5120``)."""
     return chunk if hidden >= 5120 and routes >= XCD_MIN_ROUTES_H5120 else 0
+
+
+def _gateup_grid(hidden, experts, routes, tile):
+    """(XCD_CHUNK, WGS_PER_CU) of the prefill Gate/Up (see ``GATEUP_FEW_WAVES``; ``tile`` = (block_m, block_n,
+    tile_k), the measured (64, 128, 128) only)."""
+    if (
+        hidden >= 5120
+        and experts >= GATEUP_FEW_WAVES_MIN_E
+        and routes >= GATEUP_FEW_WAVES_MIN_ROUTES
+        and tile == (64, 128, 128)
+    ):
+        return GATEUP_FEW_WAVES_XCD_CHUNK, GATEUP_FEW_WAVES
+    return _xcd_chunk(GATEUP_XCD_CHUNK_H5120, hidden, routes), 0
 
 
 def _down_split(tokens, topk, experts, hidden, inter, block_m):
@@ -1748,9 +1790,9 @@ def _stream_sum_kernel(topk, cols, device):
     return stream_a8w4.compile_route_sum(topk, cols)
 
 
-def _stream_down_shared(N, K, block_m):
+def _stream_down_shared(N, K, block_m, rows_lds=False):
     """Whether the streaming Down runs four waves of 8 row blocks that share the block's activation rows
-    through LDS (``down_stream_lds``)."""
+    through LDS (``down_stream_lds``; ``rows_lds``: plus the atomic Down's table of the rows' offsets and factors)."""
     # Blocks of 32 and 64 rows: four waves of 8 row blocks each share the block's activation rows
     # through LDS when they fit (with a single sub-block the sharing costs more than it saves, except for
     # a wide hidden dimension over a short K: MiMo TP8 M256 103 -> 91 us).
@@ -1758,7 +1800,8 @@ def _stream_down_shared(N, K, block_m):
     return (
         (block_m >= 32 or wide)
         and N % 512 == 0
-        and stream_a8w4.down_stream_lds(K, block_m, W=4) <= layout.LDS_BYTES
+        and stream_a8w4.down_stream_lds(K, block_m, W=4, R=8, ATOMIC=True, ROWS_LDS=rows_lds)
+        <= layout.LDS_BYTES
     )
 
 
@@ -1780,7 +1823,11 @@ def _stream_down_constants():
 def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants):
     """Streaming Down launcher. ``device`` (a compiled handle runs on one GPU) and ``constants``
     (``_stream_down_constants()``) only key the cache."""
-    tile = dict(R=8, W=4) if _stream_down_shared(N, K, block_m) else {}  # noqa: C408
+    # The atomic Down of blocks of 64 at K = 256 keeps the rows' offsets and factors in LDS: with the activations read
+    # from LDS that lifts it from 2 to 3 waves per SIMD (178 -> 134 VGPRs; MiMo TP8 M1024 0.90x the Down's time, lab);
+    # K <= 192 already reaches 3 and from K = 320 LDS bounds 2 workgroups, where the extra LDS reads only cost 1-2%.
+    rows_lds = atomic and block_m == 64 and K == 256
+    tile = dict(R=8, W=4) if _stream_down_shared(N, K, block_m, rows_lds) else {}  # noqa: C408
     w_aux = STREAM_DOWN_W_AUX_H5120 if N >= 5120 else STREAM_DOWN_W_AUX
     return stream_a8w4.compile_a8w4_down_stream(
         N=N,
@@ -1791,7 +1838,9 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants)
         ATOMIC=atomic,
         PREFETCH=STREAM_DOWN_PREFETCH if block_m == 64 else STREAM_DOWN_PREFETCH_SMALL,
         W_AUX=w_aux,
-        LDS_ACTS=bool(STREAM_DOWN_LDS_ACTS) and block_m == 32 and K % 256 == 0,
+        LDS_ACTS=bool(STREAM_DOWN_LDS_ACTS)
+        and (K <= 256 if block_m == 64 else block_m == 32 and not 256 < K < 512),
+        ROWS_LDS=rows_lds,
         **tile,
     )
 
@@ -2781,6 +2830,7 @@ def _moe_routed(
         shared.start(xq, xs, routes[rows:], loc_ids, rows)
 
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=device)
+    xcd_chunk, wgs_per_cu = _gateup_grid(H, E, M * topk, (block_m, block_n, tile_k))
     gateup = _gateup_kernel(
         2 * I,
         H,
@@ -2790,9 +2840,10 @@ def _moe_routed(
         tile_k,
         E,
         limit,
-        _xcd_chunk(GATEUP_XCD_CHUNK_H5120, H, M * topk),
+        xcd_chunk,
         device.index,
         _trace_constants(),
+        **({"wgs_per_cu": wgs_per_cu} if wgs_per_cu else {}),
     )
     _launch(
         f"a8w4_gateup_prefill_bm{block_m}_bn{block_n}_tk{tile_k}",
