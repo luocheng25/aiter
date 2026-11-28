@@ -13,7 +13,8 @@ each expert's weights once per pair of its routes from ``DECODE_WIDE_DEDUP_MIN_M
 ``gfx9_fp8/decode_dedup_a8w4.py``). Larger token
 counts with at most ``STREAM_MAX_ROWS`` rows per expert (M * topk / E; ``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096,
 ``STREAM_MAX_ROWS_H5120`` for hidden >= 5120 with many routes, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of
-blocks of 64 quantizes the intermediate; at most ``STREAM_BM32_ROWS`` from padded I 512 on) use the
+blocks of 64 quantizes the intermediate; from padded I 512 on at most ``STREAM_MAX_ROWS``, or ``STREAM_BM32_ROWS``
+where the Down's tile of blocks of 64 does not fit in LDS) use the
 weight-streaming kernels of ``gfx9_fp8/stream_a8w4.py``: one prep launch sorts the routes into small blocks,
 quantizes the input and zeroes the output, the Gate/Up writes SiLU(gate) * up (with larger blocks quantized to FP8 in
 the same kernel), and the Down adds each route into the output with BF16x2 atomics. The rest run the prefill kernels:
@@ -141,23 +142,25 @@ DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I = 3072
 # bimodal, 150-171 us, the streaming 151 us).
 DECODE_WIDE_MAX_M = 10
 # Above the decode tier the weight-streaming kernels run while the mean rows per expert
-# (M * topk / E) stay at or below this, the prefill kernels (TILE_K 128) beyond: measured crossover
-# between 22.0 and 24.7 rows per expert for TP2 and TP4 alike (E513, topk 11: M = 1024 / 1152); with blocks of 64
-# Qwen TP2 (I=320) streams 27% slower at 33 and 44 rows.
-STREAM_MAX_ROWS = 22
-# The same with hidden >= 4096 (MiMo TP8; padded I >= 512 stops at STREAM_BM32_ROWS): measured in one process against
-# the prefill kernels, 48 rows (M1536) 0.94x the time, 64 rows (M2048) 1.04x.
-STREAM_MAX_ROWS_WIDE = 48
+# (M * topk / E) stay at or below this, the prefill kernels (TILE_K 128) beyond: Qwen TP2 (E513, topk 11, I 320), one
+# process, the bench's routed protocol, streaming / prefill at 24.7 / 33 / 43.9 rows (M1152 / 1536 / 2048) 0.95 / 0.96
+# / 0.93x the time, at 87.8 rows (M4096) 1.00x (cached weights, as the dispatch would load them there).
+STREAM_MAX_ROWS = 44
+# The same with hidden >= 4096 (MiMo TP8, I 256; padded I >= 512 at most STREAM_MAX_ROWS, ``_stream_max_rows``): one
+# process, the bench's routed protocol, streaming (cached weights from a block of rows per expert on,
+# ``_fused_moe_stream``) / prefill at 64 / 128 / 256 rows (M2048 / 4096 / 8192) 0.97 / 0.97 / 0.98x the time, at 512 /
+# 1024 rows (M16384 / 32768) 0.99 / 1.04x.
+STREAM_MAX_ROWS_WIDE = 256
 # The same for hidden 2560 to 4095 (measured at 2560) when the Gate/Up of blocks of 64 quantizes the intermediate
 # itself (``_stream_fused_quant``, Qwen TP4 I=192): 33 / 44 / 55 rows (M1536 / 2048 / 2560) 0.96x / 0.92x / 0.98x.
 STREAM_MAX_ROWS_FUSED_QUANT = 56
-# Most mean rows per expert sorted in blocks of 32 (more: blocks of 64), and the most the streaming kernels take from
-# padded I 512 on (``_stream_max_rows``): the streaming Down always adds atomically, and with blocks of 64 that costs
-# registers from K 512 on (MiMo TP4 M1024: 1.27x the time of the prefill Down and route_sum), so there the prefill
-# kernels follow blocks of 32. Measured against streaming blocks of 64 into the prefill Down (same-GPU ABBA): MiMo TP4
-# M1024 1.01x the summed kernel time, the MTP TP4 layer (CUDA graph) M1365 0.98x. Below padded I 512 blocks of 64
-# stream with the atomic Down (MiMo TP8, Qwen TP4, the MTP TP8 layer up to M1365: the prefill kernels instead 1.06x /
-# 1.10x / 1.05x the time).
+# Most mean rows per expert sorted in blocks of 32 (more: blocks of 64), and from padded I 512 on the most the
+# streaming kernels take where the Down's tile of blocks of 64 does not fit in LDS (I_pad > 960, ``_stream_max_rows``).
+# Where it fits, the eight-wave Down of ``_stream_down_kernel`` streams blocks of 64 up to STREAM_MAX_ROWS rows: the
+# bench against the prefill kernels (same-GPU ABBA, streaming / prefill): MiMo TP4 M1024 (32 rows) 0.98x, the MTP TP4
+# layer (CUDA graph) M1280 / 1365 (30 / 32 rows) 0.97 / 0.96x; at 64 rows (MiMo TP4 M2048) the prefill kernels stay
+# faster (about 1.03x). Below padded I 512 blocks of 64 stream with the atomic Down (MiMo TP8, Qwen TP2, Qwen TP4, the
+# MTP TP8 layer up to M1365: the prefill kernels instead 1.02-1.04x / 1.07x / 1.10x / 1.05x the time).
 STREAM_BM32_ROWS = 28
 # 16-row weight blocks the streaming Down keeps in flight (it loads them in pairs: half as many block pairs) with
 # sorting blocks of 64 rows, and with smaller sorting blocks (STREAM_DOWN_PREFETCH_SMALL: one pair ahead, fewer VGPRs;
@@ -179,6 +182,7 @@ STREAM_GATEUP_SYNC = 2
 STREAM_GATEUP_PREFETCH = 5
 # Cache policy bits of the streaming kernels' weight loads (0 cached, 2 non-temporal): non-temporal weights make
 # the Gate/Up 10-24% faster (MiMo TP8 M64 / M512 / M1024 122 / 148 / 191 -> 93 / 126 / 163 us), the Down no faster.
+# From a block of rows per expert on the Gate/Up loads them cached instead (``_fused_moe_stream``).
 STREAM_GATEUP_W_AUX = 2
 STREAM_DOWN_W_AUX = 0
 # The prefill Down splits the hidden dimension over 2 or 4 workgroups per sorted block while the
@@ -194,8 +198,7 @@ DOWN_MIN_WGS = 1000
 #   2048, 0.92 / 0.94 / 0.97 / 0.99 / 1.04 / 1.03x the time; the main TP4 / TP8 layers (CUDA graph, the shared expert
 #   folded on both paths) at 17 / 24 / 26 / 28 / 30 rows 0.92 / 0.97 / 1.00 / 1.04 / 1.04x and 0.87 / 0.92 / 0.94 /
 #   0.97 / 1.10x; fewer routes keep STREAM_MAX_ROWS_WIDE (the MTP layer, E128 topk 3, up to M1365; TP4's padded I
-#   576 stops at STREAM_BM32_ROWS: at 24 / 27 / 30 / 32 rows 0.96 / 1.00 / 1.02 / 1.02x at TP4, 0.94 / 0.93 / 1.07 /
-#   1.06x at TP8);
+#   576 at most STREAM_MAX_ROWS, see STREAM_BM32_ROWS; at 24 / 27 / 30 / 32 rows 0.94 / 0.93 / 1.07 / 1.06x at TP8);
 # - the streaming Down's weight loads are non-temporal (M48-1536 2-4% faster).
 STREAM_MAX_ROWS_H5120 = 24
 STREAM_H5120_MIN_ROUTES = 4096
@@ -1462,9 +1465,13 @@ def _stream_gateup_constants():
 
 
 @functools.cache
-def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants):
+def _stream_gateup_kernel(
+    N, K, topk, block_m, experts, limit, device, constants, *, reuse=False
+):
     """Streaming Gate/Up launcher. ``device`` (a compiled handle runs on one GPU) and ``constants``
-    (``_stream_gateup_constants()``) only key the cache."""
+    (``_stream_gateup_constants()``) only key the cache; ``reuse``: the experts' weights are read by more than one
+    block each on average, so they are loaded cached (policy 0) instead of with STREAM_GATEUP_W_AUX.
+    """
     # Fused quantization: one workgroup of four waves per block covers all of I and quantizes the intermediate
     # in the epilogue; with up to 4 + 4 row blocks per wave the activations are a large share of the traffic, so
     # the waves share them in LDS. Otherwise many light waves (one gate and one up block each, four per
@@ -1499,7 +1506,7 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants
         TOPK=topk,
         BLOCK_M=block_m,
         E=experts,
-        W_AUX=STREAM_GATEUP_W_AUX,
+        W_AUX=0 if reuse else STREAM_GATEUP_W_AUX,
         SWIGLU_LIMIT=limit,
         **tile,
     )
@@ -1629,8 +1636,14 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants)
     # The atomic Down of blocks of 64 at K = 256 keeps the rows' offsets and factors in LDS: with the activations read
     # from LDS that lifts it from 2 to 3 waves per SIMD (178 -> 134 VGPRs; MiMo TP8 M1024 0.90x the Down's time, lab);
     # K <= 192 already reaches 3 and from K = 320 LDS bounds 2 workgroups, where the extra LDS reads only cost 1-2%.
+    # Blocks of 64 from K = 512 on: the block's activation rows (36-40 KiB of LDS at K 512 / 576) allow one workgroup
+    # per CU, and the 4-wave tile holding them in VGPRs needs 313 / 338 (+ 57 / 82 AGPRs): 1 wave per SIMD. Eight
+    # waves of 4 row blocks (the same LDS and grid) reading the rows from LDS at every 64-K step need 182 / 188: 2 waves
+    # per SIMD (MiMo TP4 / DeepSeek TP4 M1024-32768 0.84-0.91x the Down's time, lab).
     rows_lds = atomic and block_m == 64 and K == 256
-    tile = dict(R=8, W=4) if _stream_down_shared(N, K, block_m, rows_lds) else {}  # noqa: C408
+    shared = _stream_down_shared(N, K, block_m, rows_lds)
+    eight = shared and block_m == 64 and K >= 512 and bool(STREAM_DOWN_LDS_ACTS)
+    tile = dict(R=4, W=8) if eight else dict(R=8, W=4) if shared else {}  # noqa: C408
     w_aux = STREAM_DOWN_W_AUX_H5120 if N >= 5120 else STREAM_DOWN_W_AUX
     return stream_a8w4.compile_a8w4_down_stream(
         N=N,
@@ -1642,16 +1655,19 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants)
         PREFETCH=STREAM_DOWN_PREFETCH if block_m == 64 else STREAM_DOWN_PREFETCH_SMALL,
         W_AUX=w_aux,
         LDS_ACTS=bool(STREAM_DOWN_LDS_ACTS)
-        and (K <= 256 if block_m == 64 else block_m == 32 and not 256 < K < 512),
+        and (
+            eight
+            or (K <= 256 if block_m == 64 else block_m == 32 and not 256 < K < 512)
+        ),
         ROWS_LDS=rows_lds,
         **tile,
     )
 
 
 def _stream_max_rows(hidden, inter, routes=0):
-    """Most mean rows per expert (M * topk / E) for the streaming kernels (``routes`` = M * topk): at most
-    STREAM_BM32_ROWS from padded I 512 on, where the atomic streaming Down of blocks of 64 is
-    slow."""
+    """Most mean rows per expert (M * topk / E) for the streaming kernels (``routes`` = M * topk): from padded I 512
+    on at most STREAM_MAX_ROWS (blocks of 64 with the eight-wave Down of ``_stream_down_kernel``), or STREAM_BM32_ROWS
+    where that Down's tile does not fit in LDS (I_pad > 960)."""
     if hidden >= 5120 and hidden % 512 == 0 and routes >= STREAM_H5120_MIN_ROUTES:
         rows = STREAM_MAX_ROWS_H5120
     elif hidden >= 4096 and hidden % 512 == 0:
@@ -1662,7 +1678,8 @@ def _stream_max_rows(hidden, inter, routes=0):
     else:
         rows = STREAM_MAX_ROWS
     if inter >= 512:
-        return min(rows, STREAM_BM32_ROWS)
+        shared = _stream_down_shared(hidden, inter, 64)
+        return min(rows, STREAM_MAX_ROWS if shared else STREAM_BM32_ROWS)
     return rows
 
 
@@ -1752,8 +1769,20 @@ def _fused_moe_stream(
     task_num = sorted_experts.numel()
     if shared is not None:
         shared.start(xq, xs, output)
+    # From a block of rows per expert on (blocks of 64 only) the Gate/Up reads every expert's weights in more than one
+    # block on average: cached loads (MiMo TP8 M2048 / 4096 / 8192, 64 / 128 / 256 rows: 0.99 / 0.97 / 0.96x the chain's
+    # time of the non-temporal ones; below a block they cost 2-4%, Qwen TP2 M1536 / 2048 and MiMo TP8 M1536).
+    reuse = M * topk >= block_m * E
     gateup = _stream_gateup_kernel(
-        2 * I, H, topk, block_m, E, limit, device.index, _stream_gateup_constants()
+        2 * I,
+        H,
+        topk,
+        block_m,
+        E,
+        limit,
+        device.index,
+        _stream_gateup_constants(),
+        **({"reuse": True} if reuse else {}),
     )
     routing = (sorted_ids, sorted_experts, num_valid)
     if not _stream_fused_quant(I, block_m, H):
@@ -1963,7 +1992,8 @@ def flydsl_moe_a8w4_ptpc(
     (``DECODE_WIDE_MAX_M`` for the ``DECODE_WIDE_HIDDEN`` sizes); other calls with at most
     ``STREAM_MAX_ROWS`` rows per expert (``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096, ``STREAM_MAX_ROWS_H5120`` for
     hidden >= 5120 with many routes, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of blocks of 64 quantizes the
-    intermediate; at most ``STREAM_BM32_ROWS`` from padded I 512 on) the streaming kernels and the
+    intermediate; from padded I 512 on at most ``STREAM_MAX_ROWS``, or ``STREAM_BM32_ROWS`` where the Down's tile of
+    blocks of 64 does not fit in LDS) the streaming kernels and the
     rest the prefill kernels (TILE_K 128 when chosen for having more
     rows per expert, else 256). ``block_m`` / ``block_n`` / ``tile_k`` select the prefill kernels' tiles: ``block_m``
     (default 64) is the sorting block and M tile of both kernels (``block_m * I_padded % 4096 == 0``, e.g. 64 or

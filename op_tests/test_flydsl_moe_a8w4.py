@@ -2158,18 +2158,18 @@ def test_stream_block_m_any_route_count():
 
 @pytest.mark.parametrize(
     "tokens, path",
-    [(66, _stream_path(32, True)), (67, _prefill_path(128))],
-    ids=["m66", "m67"],
+    [(132, _stream_path(64, False)), (133, _prefill_path(128))],
+    ids=["m132", "m133"],
 )
 def test_stream_dispatch_boundary(monkeypatch, tokens, path):
     """The boundary between streaming and prefill (streaming while M * topk <= STREAM_MAX_ROWS * E at H 2560 with
-    I 320), with the limit set to 22 rows per expert (the case tests the rule, not the tuned value): with E 33 and
-    topk 11, M 66 (22 rows) still streams (blocks of 32, the Gate/Up quantizing the intermediate) and M 67 takes
-    prefill with the default K tile 128; both sort with the prep.
+    I 320), with the limit set here to the module's 44 rows per expert (the case tests the rule, not the tuned value):
+    with E 33 and topk 11, M 132 (44 rows) still streams (blocks of 64, the row kernel quantizing the intermediate)
+    and M 133 takes prefill with the default K tile 128; both sort with the prep.
 
     The basic tests (streaming M 64 / 300, prefill M 257 / 1031 / 1600) and the benchmark are not on this boundary.
     """
-    monkeypatch.setattr(moe_a8w4, "STREAM_MAX_ROWS", 22)
+    monkeypatch.setattr(moe_a8w4, "STREAM_MAX_ROWS", 44)
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = make_inputs(tokens, HIDDEN, EXPERTS, TOPK, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
@@ -2178,50 +2178,68 @@ def test_stream_dispatch_boundary(monkeypatch, tokens, path):
 
 
 @pytest.mark.parametrize(
-    "hidden, inter, tokens, path",
+    "hidden, inter, tokens, path, reuse",
     [
-        (2560, 160, 140, _stream_path(64, True)),
-        (2560, 160, 141, _prefill_path(128)),
-        (4096, 256, 62, _stream_path(32, False)),
-        (4096, 256, 120, _stream_path(64, False)),
-        (4096, 256, 121, _prefill_path(128)),
-        (4096, 512, 70, _stream_path(32, False)),
-        (4096, 512, 71, _prefill_path(128)),
-        (5120, 320, 71, _stream_path(64, False)),
+        (2560, 160, 140, _stream_path(64, True), False),
+        (2560, 160, 141, _prefill_path(128), None),
+        (4096, 256, 62, _stream_path(32, False), False),
+        (4096, 256, 159, _stream_path(64, False), False),
+        (4096, 256, 160, _stream_path(64, False), True),
+        (4096, 256, 640, _stream_path(64, False), True),
+        (4096, 256, 641, _prefill_path(128), None),
+        (4096, 512, 110, _stream_path(64, False), False),
+        (4096, 512, 111, _prefill_path(128), None),
+        (512, 1024, 70, _stream_path(32, False), False),
+        (512, 1024, 71, _prefill_path(128), None),
+        (5120, 320, 71, _stream_path(64, False), False),
     ],
     ids=[
         "h2560_i192_m140",
         "h2560_i192_m141",
         "h4096_i256_m62_bm32",
-        "h4096_i256_m120",
-        "h4096_i256_m121",
-        "h4096_i512_m70_bm32",
-        "h4096_i512_m71",
+        "h4096_i256_m159",
+        "h4096_i256_m160_reuse",
+        "h4096_i256_m640_reuse",
+        "h4096_i256_m641",
+        "h4096_i512_m110",
+        "h4096_i512_m111",
+        "h512_i1024_m70_bm32",
+        "h512_i1024_m71",
         "h5120_i320_m71_bm64",
     ],
 )
-def test_stream_rows_limits(monkeypatch, hidden, inter, tokens, path):
-    """The streaming limit by shape, both sides each, with the limits set here (the cases test the rules, not the tuned
-    values): 48 rows per expert from H 4096 on (STREAM_MAX_ROWS_WIDE) and 56 at H 2560 when the Gate/Up of blocks of 64
-    quantizes the intermediate (I_pad 192, STREAM_MAX_ROWS_FUSED_QUANT); with E 5 and topk 2, M 140 / 141 give 56 / 56.4
-    rows and M 120 / 121 48 / 48.4. H 4096 with I 256 streams with the atomic Down, which reads the activations from
-    LDS at blocks of 32 (M 62, K % 256 == 0). From padded I 512 on streaming stops at a lower cap, 28 rows here
-    (STREAM_MAX_ROWS and STREAM_BM32_ROWS both 28), the last of blocks of 32: M 70 (28 rows) streams, M 71 (28.4) takes
-    prefill; below I 512 the H 5120 shapes with fewer than STREAM_H5120_MIN_ROUTES routes still stream past 28 rows in
-    blocks of 64 (I 320, M 71). Every streaming Down adds the routes atomically (no a8w4_route_sum), the prefill Down
-    writes them for a8w4_route_sum.
+def test_stream_rows_limits(monkeypatch, hidden, inter, tokens, path, reuse):
+    """The streaming limit by shape, both sides each, with the limits set here to the module's values (the cases test
+    the rules, not the tuned values): 256 rows per expert from H 4096 on (STREAM_MAX_ROWS_WIDE) and 56 at H 2560 when
+    the Gate/Up of blocks of 64 quantizes the intermediate (I_pad 192, STREAM_MAX_ROWS_FUSED_QUANT); with E 5 and
+    topk 2, M 140 / 141 give 56 / 56.4 rows and M 640 / 641 256 / 256.4. From padded I 512 on the cap is
+    STREAM_MAX_ROWS (44) where the Down's tile of blocks of 64 fits in LDS (I 512 with the eight-wave Down: M 110 / 111,
+    44 / 44.4 rows) and STREAM_BM32_ROWS (28) where it does not (I 1024 at H 512, the last of blocks of 32: M 70 / 71).
+    H 4096 with I 256 streams with the atomic Down, which reads the activations from LDS at blocks of 32 (M 62,
+    K % 256 == 0); below I 512 the H 5120 shapes with fewer than STREAM_H5120_MIN_ROUTES routes still stream past 28
+    rows in blocks of 64 (I 320, M 71). Every streaming Down adds the routes atomically (no a8w4_route_sum), the
+    prefill Down writes them for a8w4_route_sum. The streaming Gate/Up is built to load its weights cached (``reuse``)
+    exactly from one block of rows per expert on (M * topk >= block_m * E): M 160 (64 rows) and M 640, not M 159
+    (63.6 rows) nor the other streaming cases.
 
-    The basic tests and the benchmark are not on these boundaries (the 22-row one is test_stream_dispatch_boundary);
-    the benchmark's MiMo TP8 M512 / 1024 run both atomic Downs, without asserting kernels. E 5 and topk 2 keep this
-    fast.
+    The basic tests and the benchmark are not on these boundaries (the STREAM_MAX_ROWS one is
+    test_stream_dispatch_boundary); the benchmark's MiMo TP8 M1024-8192 run both sides of the cached loads and MiMo TP4
+    M1024 the eight-wave Down, without asserting kernels or build options. E 5 and topk 2 keep this fast.
     """
     for name, rows in (
-        ("STREAM_MAX_ROWS", 28),
-        ("STREAM_MAX_ROWS_WIDE", 48),
+        ("STREAM_MAX_ROWS", 44),
+        ("STREAM_MAX_ROWS_WIDE", 256),
         ("STREAM_MAX_ROWS_FUSED_QUANT", 56),
         ("STREAM_BM32_ROWS", 28),
     ):
         monkeypatch.setattr(moe_a8w4, name, rows)
+    built, gateup = [], moe_a8w4._stream_gateup_kernel
+
+    def spy(*args, **options):
+        built.append(options.get("reuse", False))
+        return gateup(*args, **options)
+
+    monkeypatch.setattr(moe_a8w4, "_stream_gateup_kernel", spy)
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = make_inputs(
         tokens, hidden, 5, 2, seed=300 + tokens, shared=False
@@ -2230,6 +2248,7 @@ def test_stream_rows_limits(monkeypatch, hidden, inter, tokens, path):
     _assert_path(path)
     sums = "a8w4_route_sum" in moe_a8w4.last_path
     assert sums == (_path_tier(moe_a8w4.last_path) == "prefill"), moe_a8w4.last_path
+    assert built == ([] if reuse is None else [reuse]), built
     assert_close(out, ref)
 
 
@@ -2907,25 +2926,34 @@ def test_stream_atomic_down_epilogue(monkeypatch, hidden, inter):
 def test_stream_down_lds_budget(monkeypatch):
     """``stream_a8w4.down_stream_lds``, the LDS estimate by which the dispatch shares a block's activation rows through
     LDS (``_stream_down_shared``), equals what ``compile_a8w4_down_stream`` lays out and asserts against the 64 KiB of
-    a CU, for both tiles (R 8 x W 4 sharing, R 16 x W 1), with and without atomics and the rows' table (ROWS_LDS): a
-    launcher builds where the estimate fits and fails with exactly that byte count where it does not. At I 1024 (H 512)
-    the dispatch shares the rows of the atomic Down with blocks of 32 but not 16 or 64 and builds all three; blocks of
-    64 at I 256 also fit the table. Building a launcher does not trace it.
+    a CU, for the three tiles (R 8 x W 4 and R 4 x W 8 sharing, R 16 x W 1), with and without atomics and the rows'
+    table (ROWS_LDS): a launcher builds where the estimate fits and fails with exactly that byte count where it does
+    not. The eight-wave tile lays out what the dispatch estimates for the four-wave one (W * R channel blocks the
+    same). At I 1024 (H 512) the dispatch shares the rows of the atomic Down with blocks of 32 but not 16 or 64 and
+    builds all three; blocks of 64 at I 256 also fit the table, and at I 960, the largest padded I whose block of 64
+    rows fits, take the eight-wave Down: so from padded I 512 on streaming goes up to STREAM_MAX_ROWS rows per expert
+    at I 960 and STREAM_BM32_ROWS at I 1024 (``_stream_max_rows``, both limits set here). Building a launcher does not
+    trace it.
 
-    The basic tests and the benchmark build only the dispatch's tile of their shapes, within the budget; no case
-    builds one past it, where an estimate below the kernel's layout would fail only when the launcher is built
-    (test_shape_fallbacks checks the estimate of the default tile without atomics against the path its call takes).
+    The basic tests and the benchmark build only the dispatch's tile of their shapes, within the budget, and have no
+    padded I between 576 and 1024; no case builds one past it, where an estimate below the kernel's layout would fail
+    only when the launcher is built (test_shape_fallbacks checks the estimate of the default tile without atomics
+    against the path its call takes).
     """
     compile_down, seen = _spy_build(monkeypatch, "compile_a8w4_down_stream")
     for (K, block_m), (R, W), atomic, table in itertools.product(
-        ((1024, 16), (1024, 32), (1024, 64), (256, 64)),
-        ((8, 4), (16, 1)),
+        ((1024, 16), (1024, 32), (1024, 64), (960, 64), (256, 64)),
+        ((8, 4), (4, 8), (16, 1)),
         (False, True),
         (False, True),
     ):
         lds = stream_a8w4.down_stream_lds(
             K, block_m, W=W, R=R, ATOMIC=atomic, ROWS_LDS=table
         )
+        if (R, W) == (4, 8):
+            assert lds == stream_a8w4.down_stream_lds(
+                K, block_m, W=4, R=8, ATOMIC=atomic, ROWS_LDS=table
+            ), (K, block_m)
         options = {"N": 512, "K": K, "TOPK": 2, "BLOCK_M": block_m, "E": 5}
         options.update(R=R, W=W, ATOMIC=atomic, ROWS_LDS=table)
         if lds <= common_a8w4.LDS_BYTES:
@@ -2934,13 +2962,90 @@ def test_stream_down_lds_budget(monkeypatch):
             with pytest.raises(AssertionError, match=f"Down needs {lds} B of LDS"):
                 compile_down(**options)
     device, constants = torch.cuda.current_device(), moe_a8w4._stream_down_constants()
-    for block_m, shared in ((16, False), (32, True), (64, False)):
-        assert moe_a8w4._stream_down_shared(512, 1024, block_m) == shared, block_m
+    for K, block_m, waves in (
+        (1024, 16, 1),
+        (1024, 32, 4),
+        (1024, 64, 1),
+        (960, 64, 8),
+    ):
+        assert moe_a8w4._stream_down_shared(512, K, block_m) == (waves > 1), block_m
         # Builds the dispatch's atomic launcher uncached (nothing is launched with it).
         moe_a8w4._stream_down_kernel.__wrapped__(
-            512, 1024, 2, block_m, 5, True, device, constants
+            512, K, 2, block_m, 5, True, device, constants
         )
-        assert seen["ATOMIC"] and (seen.get("W", 1) > 1) == shared, seen
+        assert seen["ATOMIC"] and seen.get("W", 1) == waves, seen
+    monkeypatch.setattr(moe_a8w4, "STREAM_MAX_ROWS", 44)
+    monkeypatch.setattr(moe_a8w4, "STREAM_BM32_ROWS", 28)
+    assert moe_a8w4._stream_max_rows(512, 960) == 44
+    assert moe_a8w4._stream_max_rows(512, 1024) == 28
+
+
+@pytest.mark.parametrize(
+    "hidden, inter", [(4096, 512), (5120, 576)], ids=["h4096_i512", "h5120_i576"]
+)
+def test_stream_down_eight_waves_bitexact(monkeypatch, hidden, inter):
+    """Blocks of 64 from K 512 on, where the block's activation rows fit in LDS (``_stream_down_shared``), take the
+    eight-wave Down: R 4 x W 8 reading the rows from LDS at every 64-K step (LDS_ACTS) instead of R 8 x W 4 holding
+    them in VGPRs; a workgroup covers the same 32 channel blocks with the same loads and MFMA chains per block, so only
+    the wave that computes a block and where its activations come from change. On one sort of the routes of
+    _ATOMIC_DOWN_COUNTS (E 8, topk 2: blocks of 64 with every live sub-block count, with and without padding) the
+    dispatch's launchers (asserted: R4W8 with LDS_ACTS, with and without atomics) give the bits of R8W4 with the rows
+    in VGPRs, both writing the routes by sorted row and adding them atomically (two adds onto zero per token, whose
+    sum does not depend on their order); the atomic output is graded against the f32 reference of the Down. H 4096
+    with I 512 and H 5120 with I 576: the routed shapes of MiMo TP4 and of the DeepSeek / MTP TP4 layers.
+
+    The benchmark's MiMo TP4 M1024 and MTP TP4 layer M1280 / 1365 run the eight-wave Down graded end to end only,
+    which does not show a few differing elements, and no dispatch runs the four-wave tile there.
+    """
+    compile_down, seen = _spy_build(monkeypatch, "compile_a8w4_down_stream")
+    w, prepared = _weights(len(_ATOMIC_DOWN_COUNTS), hidden, inter, 500)
+    assert prepared.inter_padded == inter
+    x, topk_weight, topk_ids, mq, ms, ref = _atomic_down_case(w, prepared, seed=505)
+    E, tokens = prepared.experts, x.shape[0]
+    sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, _, _ = (
+        moe_a8w4._stream_prep(
+            x, topk_weight, topk_ids, E, 64, torch.empty_like(x), zero=False
+        )
+    )
+    task_num = sorted_experts.numel()
+    device, constants = torch.cuda.current_device(), moe_a8w4._stream_down_constants()
+    for atomic in (False, True):
+        args = (hidden, inter, 2, 64, E, atomic, device, constants)
+        # Builds the dispatch's launcher uncached, only to read its tile (nothing is launched with it).
+        moe_a8w4._stream_down_kernel.__wrapped__(*args)
+        base = dict(seen)
+        assert (base["R"], base["W"], base["LDS_ACTS"]) == (4, 8, True), base
+        four = {**base, "R": 8, "W": 4, "LDS_ACTS": False}
+        outs = []
+        for kernel in (moe_a8w4._stream_down_kernel(*args), compile_down(**four)):
+            shape = x.shape if atomic else (task_num * 64, hidden)
+            outs.append(
+                torch.zeros(shape, dtype=torch.bfloat16)
+                if atomic
+                else torch.full(shape, float("nan"), dtype=torch.bfloat16)
+            )
+            moe_a8w4._launch(
+                "down",
+                kernel,
+                mq,
+                prepared.w2,
+                prepared.w2_delta,
+                outs[-1],
+                sorted_ids,
+                sorted_weights,
+                sorted_experts,
+                num_valid,
+                prepared.w2_scale,
+                ms,
+                tokens,
+                task_num,
+            )
+        if atomic:
+            assert_close(outs[0], ref)
+        else:
+            live = outs[0][loc_ids.flatten().long()]
+            assert not bool(live.isnan().any()) and bool((live != 0).any())
+        assert torch.equal(_bits(outs[0]), _bits(outs[1])), atomic
 
 
 @pytest.mark.parametrize(
@@ -2953,12 +3058,14 @@ def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
     8-15) with one 16-byte load, MFMA chain p takes row p of the pair, and the epilogue swaps the pairs back between
     lanes l and l ^ 32 (ds_bpermute) into 4 channels of gate and up per lane. H 4096 with I 256 (E 5, topk 2): M 62 /
     120 sort in blocks of 32 / 64 and take the dispatch's 8 waves (I % 128 == 0, asserted), compared with 4 waves and
-    the unshared tile; up to 2 / 4 live sub-blocks.
+    the unshared tile; up to 2 / 4 live sub-blocks. With blocks of 64 also the launcher the dispatch builds from one
+    block of rows per expert on (``reuse``: the weights loaded cached, W_AUX 0 instead of STREAM_GATEUP_W_AUX, all
+    other options the same, asserted): the load policy does not change the bits.
 
     The 4-wave tile of H 5120 is compared with ACT_STEPS 1 by test_stream_act_steps_bitexact, the tail-quantizing tile
     of 5 gate blocks per wave (TP2, activations not shared) with the unshared tile by test_stream_fused_quant_bitexact;
-    the basic tests and the benchmark (MiMo TP8 M512 / 1024 take 8 waves) only grade end to end, which does not show a
-    few differing elements.
+    the basic tests and the benchmark (MiMo TP8 M512 / 1024 take 8 waves, M2048-8192 the cached loads) only grade end
+    to end, which does not show a few differing elements.
     """
     compile_gateup, seen = _spy_build(monkeypatch, "compile_a8w4_gateup_stream")
     _, prepared = _small_weights(4096, 256)
@@ -2970,11 +3077,16 @@ def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
     moe_a8w4._stream_gateup_kernel.__wrapped__(*args)
     base = dict(seen)
     assert (base["G"], base["W"], base.get("QUANT", False)) == (1, 8, False), base
+    assert base["W_AUX"] == moe_a8w4.STREAM_GATEUP_W_AUX, base
     kernels = [
         moe_a8w4._stream_gateup_kernel(*args),
         compile_gateup(**{**base, "W": 4}),
         compile_gateup(**{**base, "G": 4, "W": 1}),
     ]
+    if block_m == 64:
+        moe_a8w4._stream_gateup_kernel.__wrapped__(*args, reuse=True)
+        assert seen == {**base, "W_AUX": 0}, seen
+        kernels.append(moe_a8w4._stream_gateup_kernel(*args, reuse=True))
     x, topk_weight, topk_ids = make_inputs(
         tokens, 4096, E, 2, seed=490 + tokens, shared=False
     )
@@ -4012,7 +4124,7 @@ def test_swiglu_limit_kernels(case):
     M 8: the slot-pair Down on rows quantized by the row kernel), the streaming Gate/Up quantizing the intermediate in
     its epilogue (Qwen M 64, blocks of 32), the light-wave streaming
     Gate/Up with blocks of 16 (DeepSeek M 40, ACT_STEPS 4) and 64 (MiMo M 60, I 256: blocks of 64 with the atomic
-    Down, which the streaming tier keeps where it stops earlier at I >= 512), the prefill Gate/Up with the K tile 256
+    Down), the prefill Gate/Up with the K tile 256
     (block_m=64), and the H 5120 decode quantizing in the kernel (M = 3: 10 bf16 pairs per thread over K = 5120);
     inputs scaled by 10 so that more than 10% of the gate and of the up values exceed the limit, graded against the
     reference with the limit.
@@ -6251,7 +6363,8 @@ def _fold_fallback_weights(experts, hidden, inter, seed):
 # I 1088: a row's 68 16-byte pieces exceed the slot-pair Down's lanes at topk 2; blocks of 16), "w2_4gib" (the small
 # shape, E 8, H 512, I 64, with w2 one byte past what the slot-pair Down's 32-bit offsets reach, through a stride-0
 # view, as test_decode_down_fallback_w2_4gib), "h4096_i1088" (E 2, H 4096, I 1088: 30 rows per expert sort in blocks
-# of 64, which the routed-only dispatch never streams at I >= 512; the prefill Down holds at most I 1024).
+# of 64, past the 28 rows the dispatch streams where the Down's tile of blocks of 64 does not fit in LDS; the prefill
+# Down holds at most I 1024).
 _FOLD_FALLBACK_CASES = {
     "i1088_m16": ("i1088", 16, "a8w4_down_stream_bm16"),
     "w2_4gib_m16": ("w2_4gib", 16, "a8w4_down_stream_bm16"),

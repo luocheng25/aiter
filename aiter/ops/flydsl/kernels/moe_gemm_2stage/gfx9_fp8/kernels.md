@@ -88,9 +88,11 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #       （两种 Down 都放不下时该形状走流式档）
 #     只去重 Gate/Up（H5120、8 ≤ M ≤ 10、w2 加一个 expert ≤ 4 GiB；Down 不去重，逐 token 直接写 out）：
 #       row_quant_plan(x；写计划) → gateup_decode_dd → row_quant_decode(mid) → down_decode_pq
-#   流式（decode 档之外且 M·TOPK ≤ R·E 或 I > 1024；R = 22，H ≥ 4096 为 48，H5120 且 M·TOPK ≥ 4096 为 24，H2560–4095
-#     且排序块 64 尾部量化为 56，I ≥ 512 时至多 28；排序块：每 expert 平均 ≤ 12 行为 16，≤ 28 行为 32，其余 64）：
-#     stream_prep(排序 + 量化 x + 清零 out；折叠 shared 时不清零) → gateup_stream（尾部量化，或另跑 row_quant_fp8(mid)）
+#   流式（decode 档之外且 M·TOPK ≤ R·E 或 I > 1024；R = 44，H ≥ 4096 为 256，H5120 且 M·TOPK ≥ 4096 为 24，H2560–4095
+#     且排序块 64 尾部量化为 56；I ≥ 512 时至多 44（块 64 的 Down tile 放不进 LDS、即 I > 960 时至多 28）；
+#     排序块：每 expert 平均 ≤ 12 行为 16，≤ 28 行为 32，其余 64）：
+#     stream_prep(排序 + 量化 x + 清零 out；折叠 shared 时不清零) → gateup_stream（尾部量化，或另跑 row_quant_fp8(mid)；
+#     每 expert 平均行数 ≥ 排序块时权重缓存读）
 #     → down_stream（原子加进 out）→ out
 #   prefill（其余；任意 M 与 H）：stream_prep(排序 + 量化 x + loc_ids、不清零 out)
 #     → gateup_prefill → row_quant_fp8(mid) → down_prefill（再写一遍有效路由的 loc_ids）→ route_sum → out；
@@ -781,7 +783,7 @@ decode 档、TOPK ≤ 16 时用，其余一律折叠（下文 shared 折叠一�
 与 I 增长，折叠的 shared 链在侧流上与 routed 并行；整层 graph 同进程实测（混合 / 折叠）10368 及以下混合快（MTP TP8 M5–10
 0.61–0.94×、MTP TP4 M5 / 6 0.85 / 0.90–0.96×、主干 TP8 M5 0.92×），主干 TP8 M6（11520）与 MTP TP4 M7（12096）持平，主干 TP4 M4
 （13824）起折叠快（混合 1.05–1.22×）；所以整层 DS TP4 到 M3、TP8 到 M5、MTP TP4 到 M6、MTP TP8 到 M10 走混合
-（[`_mixed_decode`](../../../moe_a8w4.py#L2402)，档位只按 routed 列判断）：shared（topk_ids 的末列，id = E）和 routed 列在同一个 launch
+（[`_mixed_decode`](../../../moe_a8w4.py#L2432)，档位只按 routed 列判断）：shared（topk_ids 的末列，id = E）和 routed 列在同一个 launch
 里算 Gate/Up，接着混合 Down（下一节）在同一个 launch 里把每列加进 out，没有 side stream、没有最后相加。
 shared 权重直接用 prepare 存的 `shuffle_weight(16,16)`：K%64 = 0 时它就是 `[N/16][K/64][4][16 行][16 B]`（routed 块的两倍字节、
 K 自然序），lane 16g+n 一条 16 B 加载拿到行 n 的 K 组 g，字节直接作 MFMA 的 B（不读 delta、不查 LUT），每行 scale 代替通道因子。
@@ -1101,8 +1103,8 @@ x 片 → LDS [组员, H+16]；barrier
   → f32 写 mid[组员路由, 16j + t%16]（条数以外的线程不写）
 ```
 关键代码：[组首判断](decode_dedup_a8w4.py#L572)、[x 行与权重](decode_dedup_a8w4.py#L353)、[主循环](decode_dedup_a8w4.py#L422)、
-[收尾](decode_dedup_a8w4.py#L438)、[pin](decode_dedup_a8w4.py#L75)、[host 分派](../../../moe_a8w4.py#L1225)、
-[H5120 路径](../../../moe_a8w4.py#L1129)。
+[收尾](decode_dedup_a8w4.py#L438)、[pin](decode_dedup_a8w4.py#L75)、[host 分派](../../../moe_a8w4.py#L1228)、
+[H5120 路径](../../../moe_a8w4.py#L1132)。
 
 **命名与不变量**：count / members / expert 组首条目与本路由的 expert；G = GROUP = 2；XS = H+16 LDS 行距；KB_PART 本 wave 的 64-K 块数；
 P = PREFETCH 序言先发的块对数（全部或 6）；
@@ -1131,7 +1133,8 @@ mid[token, slot, :]，或在尾部量化成 fp8 mq[route, :] 与 ms[route]。
 **Gluon 风格**
 ```python
 # grid = (I/(16·G·W), 排序块数)，64·W 线程；排序块 BM = 16 / 32 / 64，G、W 见任务划分
-# 放置：权重与激活都 global → VGPR 直读（权重只读一次，带 non-temporal 位），没有 prefill 那种整块 LDS 双缓冲；
+# 放置：权重与激活都 global → VGPR 直读（权重带 non-temporal 位；每 expert 平均行数 ≥ BM 时一个 expert 的权重被多个块重读，
+#       改缓存读），没有 prefill 那种整块 LDS 双缓冲；
 #       SHARE（W > 1；尾部量化时还要 G ≤ 4）时激活由全 WG 分片只读一份，经 LDS 环（2·SYNC 槽，每槽一个 64-K 步；
 #       轻 wave SYNC = 2，尾部量化 1）分给各 wave。预取距离 P 个 64-K 步，由分派给：
 #       尾部量化 S = 1 为 4、否则 3（子块多时少预取，省 VGPR）；其余为 5。
@@ -1233,7 +1236,7 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B；排
 ```
 关键代码：[前导](stream_a8w4.py#L430)、[按 S 特化](stream_a8w4.py#L911)、[共享激活](stream_a8w4.py#L736)、[ACT_STEPS 取址](stream_a8w4.py#L688)、
 [分组发与写](stream_a8w4.py#L803)、[预取](stream_a8w4.py#L785)、[主循环](stream_a8w4.py#L802)、[SiLU 与截断](stream_a8w4.py#L539)、
-[尾部量化](stream_a8w4.py#L580)、[夹逼与回退](stream_a8w4.py#L278)、[分派的 tile](../../../moe_a8w4.py#L1465)。
+[尾部量化](stream_a8w4.py#L580)、[夹逼与回退](stream_a8w4.py#L278)、[分派的 tile](../../../moe_a8w4.py#L1468)。
 
 **命名与不变量**：S 有效子块数；P 预取步数；SYNC / RING = 2·SYNC 激活环的步数与槽数；LOADER 每 lane 每步读的激活字节，
 LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
@@ -1275,9 +1278,10 @@ BM·W·4 B amax；BM64 4 wave 带 LUT 表是 16.1 KiB ⇒ 每 CU 3 个 WG，去�
 
 **Gluon 风格**
 ```python
-# grid = (H/(16·R·W), 排序块数)，64·W 线程（R8·W4 或 R16·W1，见任务划分）
+# grid = (H/(16·R·W), 排序块数)，64·W 线程（R8·W4、R4·W8 或 R16·W1，见任务划分）
 # 放置：本块激活（16·S 行 mq，每行 I B）整块常驻 VGPR：W4（SHARE）时全 WG 分片只读一份进 LDS 再各自读回
-#       （LDS_ACTS：BM32 且 I 不在 (256, 512) 内，或 BM64 且 I ≤ 256 时留在 LDS、每个 64-K 步再读，省 VGPR、每 CU 多放一个 WG），
+#       （LDS_ACTS：BM32 且 I 不在 (256, 512) 内，或 BM64 且 I ≤ 256 时留在 LDS、每个 64-K 步再读，省 VGPR、每 CU 多放一个 WG；
+#       BM64 且 I ≥ 512 时 R4·W8 也留在 LDS），
 #       W1 时直接从 global 读；通道因子一条 16 B 加载后放 LDS（每 wave R·64 B，W1 为 1 KiB）；权重按 16 通道块对 global → VGPR（每 lane
 #       每 64-K 块一条 16 B：lane 0–7 读块 2u、8–15 读块 2u+1 的相邻两行；H ≥ 5120 时带 non-temporal 位），预取 P/2 个块对
 #       （块对 u 算到第 kb 个 64-K 块时发块对 u+P/2 的第 kb 个）；结果不经 LDS：写 routes 每 lane 16 B，或每行一条 bf16x2 原子加
@@ -1329,7 +1333,8 @@ def a8w4_down_stream(mq, ms, w2, w2_delta, w2_scale, sorted_ids, sorted_weights,
                                                      # full 的子块不加谓词，否则 off4 < 本 lane 通道字节（填充行）的 lane 不发
 ```
 
-**任务划分**（R、W 由分派选：排序块 ≥ 32，或 H ≥ 4096 且 I ≤ 256，且共享激活行放得进 64 KiB LDS 时 R8·W4，否则 R16·W1）
+**任务划分**（R、W 由分派选：排序块 ≥ 32，或 H ≥ 4096 且 I ≤ 256，且共享激活行放得进 64 KiB LDS 时 R8·W4，否则 R16·W1；
+BM64 且 I ≥ 512 时（放得进 LDS 即 I ≤ 960）R4·W8：同样的 LDS 与网格，8 个 wave 各管 4 块，激活每步从 LDS 读）
 | 层级 | 形状 / 数量 | 负责的数据 |
 |---|---|---|
 | grid | (H/(16·R·W), 排序块数) | x：W·R 个 16 通道输出块；y：1 个排序块 |
@@ -1366,7 +1371,7 @@ for u in 0 … R/2−1：
 关键代码：[共享激活](stream_a8w4.py#L1574)、[行表](stream_a8w4.py#L1610)、[通道因子](stream_a8w4.py#L1618)、[权重与 delta](stream_a8w4.py#L1534)、
 [delta 交换](stream_a8w4.py#L1551)、[主循环](stream_a8w4.py#L1708)、[写 routes](stream_a8w4.py#L1790)、[原子累加](stream_a8w4.py#L1752)、
 [行偏移与整块判断](stream_a8w4.py#L1698)、[bf16x2 原子加](stream_a8w4.py#L139)、[LDS 预算](stream_a8w4.py#L1416)、
-[H5120 的权重缓存位](../../../moe_a8w4.py#L1634)。
+[H5120 的权重缓存位](../../../moe_a8w4.py#L1647)。
 
 **命名与不变量**：S 有效子块数；P = min(PREFETCH, R) 预取的通道块数（PP = P/2 个块对）；PAIRS = R/2；REGION 每 wave 的
 通道因子区（共享时 R·64 B，否则 1 KiB）；KP = I+16 LDS 行距。
@@ -1385,8 +1390,10 @@ for u in 0 … R/2−1：
 I256 LDS_ACTS + ROWS_LDS 134 / 3（不用表时 178 / 2）、I192 LDS_ACTS 164 / 3；
 BM32 I320 125 / 4、I256 LDS_ACTS 108 / 4、I192 LDS_ACTS 90 / 5、I576 LDS_ACTS 134 / 3（LDS 限 3）；BM16 R16W1 I320 85 / 5、
 R8W4 I256 78 / 6；写 routes 的 BM32 I576 LDS_ACTS 116 / 3（LDS 限 3；不读 LDS 时 180 / 2）。块 16 / 32 在 I ≥ 512 也用原子
-（DS I576、MiMo TP4 I512：Down 加求和对写 routes + route_sum 0.94–1.04，诊断）；块 64 只给 I < 512 的形状：
-I512 时原子收尾加 K512 激活的寄存器让 Down 慢约 27%，这些形状流式止于 28 行（`STREAM_BM32_ROWS`），其后走 prefill。
+（DS I576、MiMo TP4 I512：Down 加求和对写 routes + route_sum 0.94–1.04，诊断）。BM64、I ≥ 512：激活 36 / 40 KiB（I512 / 576）
+每 CU 只放一个 WG，R8W4 把激活放 VGPR 要 313 / 338 + AGPR 57 / 82 → 1 wave/SIMD；R4W8 + LDS_ACTS 182 / 188、0 溢出，
+一个 8-wave 的 WG = 2 wave/SIMD，Down 快 9–16%（MiMo TP4 / DS TP4 M1024–32768，诊断）。所以这些形状流式到 44 行
+（`STREAM_MAX_ROWS`）；I > 960 时 tile 放不进 LDS，仍止于 28 行（`STREAM_BM32_ROWS`），其后走 prefill。
 
 **roofline 与分解**（官方 = 冻结基线（M0）bench 中位数，分区 76 例；诊断：消融（单项 Δ）、ATT、合成访存）
 - memory bound（BM64 H2560 的 AI 141 为 compute）。族中位：BM16 59–64% 线（单例 1.78–3.00 TB/s）、BM32 36–53%、BM64 原子 20–27%。
@@ -1469,7 +1476,7 @@ def a8w4_route_sum(loc_ids, routes, out, M, rows):
 
 排序 CTA 数由 [stream_prep_sizes](stream_a8w4.py#L1077) 给出（launch 参数，不是编译变体）：每个排序 CTA 都要统计全部 R 条路由，
 CTA 数随 R 增长时排序总量 ∝ R²，封顶 64 后排序段随 R 线性。排序块 BM 由 host 选
-（[_stream_block_m](../../../moe_a8w4.py#L1669)：每 expert 平均 ≤ 12 行一律 16，与路由数和 H 无关）。
+（[_stream_block_m](../../../moe_a8w4.py#L1686)：每 expert 平均 ≤ 12 行一律 16，与路由数和 H 无关）。
 
 **流水线**
 ```text
