@@ -1070,9 +1070,8 @@ def test_layer_masked_routes():
 # Cases about the prefill kernels pass a tile option where the default dispatch takes another tier for their M
 # (decode for few tokens, streaming while the routes per expert are few) or another default K tile (128 once the
 # routes per expert are many); a tile option selects the prefill kernels with the K tile 256 up to M 2048, else 128.
-# They assert the Gate/Up and Down kernels (_assert_path); the sorting front end (the streaming prep from H 2560 on,
-# H % 512 == 0, while M * topk <= PREFILL_PREP_MAX_ROUTES, 12288 from H 5120 on; else Opus) is asserted by the
-# streaming and front-end cases of 2.4.
+# They assert the Gate/Up and Down kernels (_assert_path); the sorting front end (the streaming prep at every H and M)
+# is asserted by the streaming and front-end cases of 2.4.
 # Cases about the per-route decode kernels use shapes and token counts that pyhip M17 decodes per route too (H 2560 up
 # to M 32, H 4096 with I_pad % 128 != 0, H 512, DeepSeek H 5120 up to M 7) and assert the decode kernels by name. The
 # expert-deduplicated decode (H 4096 with I_pad % 128 == 0 from M 2 on, the MiMo shapes; DeepSeek H 5120 from M 8 on,
@@ -1097,23 +1096,6 @@ def test_layer_masked_routes():
 # mixed decode (2.12) and the fold (2.13) have their own sections, and so have the launch records behind the
 # benchmark's per-kernel roofline lines (2.14).
 # =================================================================================================
-
-
-# The prefill front end and internal signatures that M8 changes (notes/M8-test-impact.md), read before any spy wraps
-# them: M6 sorts with Opus past PREFILL_PREP_MAX_ROUTES(_H5120) and below hidden 2560, M8 always with the prep; M6's
-# _stream_prep_kernel takes the quantization layout ``qw`` and _quantize / _row_quant_kernel the loc fill, M8 neither.
-_OPUS_PREFILL = hasattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES")
-_PREP_QW = "qw" in inspect.signature(moe_a8w4._stream_prep_kernel).parameters
-_RQ_FILL = "fill" in inspect.signature(moe_a8w4._quantize).parameters
-_PREFILL_SORT_H512 = "moe_sorting_opus" if _OPUS_PREFILL else "a8w4_stream_prep"
-
-
-def _prep_kernel(hidden, topk, experts, block_m, zero, device, qw=4, **kw):
-    """moe_a8w4._stream_prep_kernel under its M6 (with ``qw``) and M8 (without) signatures."""
-    extra = (qw,) if _PREP_QW else ()
-    return moe_a8w4._stream_prep_kernel(
-        hidden, topk, experts, block_m, zero, *extra, device, **kw
-    )
 
 
 # The decode dispatch that M7 changes (notes/M7-test-impact.md): M7 renames DECODE_GATEUP_PREQUANT_MIN_WGS to
@@ -1318,31 +1300,6 @@ def test_row_quant_bitexact(dtype, cols):
     )
     assert bool((exact[6] != naive[6]).any()) and bool((exact[7] != naive[7]).any())
     assert float(scale[7]) < 2.0**-64 <= float(scale[6])
-
-
-@pytest.mark.skipif(not _RQ_FILL, reason="M8: the input quantization sets no loc_ids")
-@pytest.mark.parametrize(
-    "dtype, cols, fill",
-    [("bf16", 2560, 11), ("f32", 512, 40)],
-    ids=["bf16_fill11", "f32_fill40"],
-)
-def test_row_quant_fill(dtype, cols, fill):
-    """The input quantization also sets loc_ids [rows, fill] to -1 (Down then writes only the sorted rows of valid
-    routes): q and scale are bit-identical to the call without ``fill``, and the -1s cover exactly ``rows`` rows,
-    nothing past them; with fill = 40 against 32 lanes per f32 row of 512 columns each lane writes two rounds.
-
-    End to end these -1s only show with a repeated expert id of a token
-    (test_prefill_duplicate_ids_keep_last_route), and an out-of-range write does not show at all.
-    """
-    gen = torch.Generator(device="cuda").manual_seed(91)
-    rows = 997
-    x = torch.randn((rows, cols), generator=gen)
-    x = x.to(torch.bfloat16) if dtype == "bf16" else x
-    q0, s0 = moe_a8w4._quantize(x, rows, cols, dtype)
-    aux = torch.full((rows + 1, fill), 7, dtype=torch.int32)
-    q, s = moe_a8w4._quantize(x, rows, cols, dtype, fill=aux[:rows])
-    assert torch.equal(q.view(torch.uint8), q0.view(torch.uint8)) and torch.equal(s, s0)
-    assert bool((aux[:rows] == -1).all()) and bool((aux[rows] == 7).all())
 
 
 @pytest.mark.parametrize(
@@ -1560,18 +1517,22 @@ def _ieee_quant(x):
     return (xf / scale).to(torch.float8_e4m3fnuz), scale
 
 
-@pytest.mark.parametrize("kernel", ["decode_bf16", "decode_f32", "plan_bf16"])
+@pytest.mark.parametrize(
+    "kernel", ["decode_bf16", "decode_f32", "plan_bf16", "prep_bf16"]
+)
 def test_fast_row_quant_bitexact(kernel):
-    """The decode row-quantization kernels divide once per row (the reciprocal) and correct each product with FMAs
+    """The row-quantization kernels that divide once per row (the reciprocal) and correct each product with FMAs
     (decode_a8w4._quant_fast: one correction for BF16 rows, two for f32; rows outside _fast_div_ok divide per value):
     their FP8 bytes and scale bits equal the IEEE division's (_ieee_quant) on _fast_quant_rows, i.e. on both sides of
     both ends of the fast range (2**-60, 2**127), on zero and subnormal rows and on rounding ties, where a bare
     reciprocal product rounds values of every tie row the other way. a8w4_row_quant_decode on BF16 x (H 5120) and on
     f32 intermediate rows (I 576), a8w4_row_quant_plan_decode on BF16 x (H 5120, topk 6; its plan is
-    test_decode_plan_quant_bitexact's).
+    test_decode_plan_quant_bitexact's) and the streaming prep (a8w4_stream_prep, one row per wave) on BF16 x (H 5120;
+    its sort is test_stream_row_quant_bitexact's).
 
-    test_decode_row_quant_bitexact and test_decode_plan_quant_bitexact use random rows with zero, subnormal and -0
-    rows, none at the ends of the fast range or at ties; end to end a few flipped FP8 values stay within the tolerance.
+    test_decode_row_quant_bitexact, test_decode_plan_quant_bitexact and test_stream_row_quant_bitexact use random
+    rows with zero, subnormal and -0 rows, none at the ends of the fast range; end to end a few flipped FP8 values
+    stay within the tolerance.
     """
     cols = DS_INTER if kernel == "decode_f32" else DS_HIDDEN
     rows, _ = _fast_quant_rows(cols)
@@ -1579,7 +1540,12 @@ def test_fast_row_quant_bitexact(kernel):
     n = x.shape[0]
     q = torch.full((n, cols), 0x5A, dtype=torch.uint8)
     scale = torch.full((n,), -1.0)
-    if kernel == "plan_bf16":
+    if kernel == "prep_bf16":
+        _, topk_weight, topk_ids = make_inputs(
+            n, 512, 40, DS_TOPK, seed=786, shared=False
+        )
+        *_, q, scale = _prep_launch(x, topk_weight, topk_ids, 40, 16, True)
+    elif kernel == "plan_bf16":
         _, _, topk_ids = make_inputs(n, 512, 40, DS_TOPK, seed=785, shared=False)
         plan_kernel, out_args = _row_quant_plan_kernel(
             cols,
@@ -1617,29 +1583,134 @@ def test_fast_row_quant_bitexact(kernel):
     assert bool((naive[9:] != q[9:]).any(dim=1).all())
 
 
-@pytest.mark.parametrize(
-    "cols, qw",
-    [(512, 4), (2560, 4), (2560, 1), (4096, 4)],
-    ids=["h512_qw4", "h2560_qw4", "h2560_qw1", "h4096_qw4"],
-)
-def test_stream_row_quant_bitexact(cols, qw):
-    """The streaming prep (a8w4_stream_prep: one launch sorts the routes, quantizes x and zeroes out): q and scale
-    equal ``_quantize`` and the reference bit for bit, the first ``rows`` rows of out are zero and no row past
-    ``rows`` is written; the sort has aiter moe_sorting's format (each route's loc_ids holds its own sorted row,
-    experts ascending, each padded to whole blocks, padding rows token M and weight 0, num_valid [padded rows, M]).
+def _prep_launch(x, topk_weight, topk_ids, experts, block_m, zero, shared=False):
+    """One a8w4_stream_prep launch on BF16 ``x`` [M, H] (``_stream_prep_kernel`` with the sizes of
+    ``stream_prep_sizes``, as ``moe_a8w4._stream_prep`` passes them; ``shared``: the last column is a folded shared
+    expert's) into sentinel-filled buffers with guard elements past their ends, then a synchronization. Asserts that
+    nothing past the outputs is written and that out is zeroed (``zero``) or not written at all. Returns
+    ``(sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, q, scale)``, q as bytes [M, H].
+    """
+    M, H = x.shape
+    topk = topk_ids.shape[1]
+    n_sort, rows, blocks = stream_a8w4.stream_prep_sizes(M, topk, experts, block_m)
+    if shared:
+        _, rows, blocks = stream_a8w4.stream_prep_sizes(M, topk - 1, experts, block_m)
+    guard = 64
+    sorted_ids = torch.full((rows + guard,), -7, dtype=torch.int32)
+    sorted_weights = torch.full((rows + guard,), -7.0)
+    sorted_experts = torch.full((blocks + guard,), -7, dtype=torch.int32)
+    num_valid = torch.full((2 + guard,), -7, dtype=torch.int32)
+    loc_ids = torch.full((M * topk + guard,), -7, dtype=torch.int32)
+    q = torch.full((M + 2, H), 0x5A, dtype=torch.uint8)
+    scale = torch.full((M + 2,), -1.0)
+    out = torch.full((M + 2, H), float("nan"), dtype=torch.bfloat16)
+    kernel = moe_a8w4._stream_prep_kernel(
+        H,
+        topk,
+        experts,
+        block_m,
+        zero,
+        x.device.index,
+        **({"shared": True} if shared else {}),
+    )
+    outputs = (
+        sorted_ids[:rows],
+        sorted_weights[:rows],
+        sorted_experts[:blocks],
+        num_valid[:2],
+        loc_ids[: M * topk].view(M, topk),
+        q[:M],
+        scale[:M],
+    )
+    moe_a8w4._launch(
+        "a8w4_stream_prep",
+        kernel,
+        topk_ids,
+        topk_weight,
+        x,
+        *outputs[:5],
+        q[:M].view(torch.float8_e4m3fnuz),
+        scale[:M],
+        out[:M],
+        M,
+        n_sort,
+        rows,
+    )
+    torch.cuda.synchronize()
+    for buf, end, sentinel in (
+        (sorted_ids, rows, -7),
+        (sorted_weights, rows, -7.0),
+        (sorted_experts, blocks, -7),
+        (num_valid, 2, -7),
+        (loc_ids, M * topk, -7),
+        (q, M, 0x5A),
+        (scale, M, -1.0),
+    ):
+        assert bool((buf[end:] == sentinel).all()), sentinel
+    assert bool(out[M:].isnan().all())
+    if zero:
+        assert bool((out[:M] == 0).all())
+    else:
+        assert bool(out[:M].isnan().all())
+    return outputs
 
-    Both quantization layouts: QW 4 takes a row per workgroup, its 4 waves splitting the 512-column chunks (H 512:
-    wave 0 only; H 2560: 5 chunks, uneven), the amax merged in LDS, a reciprocal product checked at x(1 -+ 2**-20)
-    that falls back to IEEE division near a rounding boundary or for a subnormal scale; QW 1 (the dispatch's choice
-    for H 2560 past M 256) takes a row per wave and divides per element. Special rows: zero, a subnormal scale, -0
-    and negatives rounding to -0 (stored as +0), quotients exactly at rounding midpoints with the scale 2**-2, and
-    midpoints that a plain reciprocal product rounds the wrong way with the scale 7/32; 37 rows (QW 1: the last
-    workgroup holds one row). E 513 and topk 11: 2 sorting workgroups, 3 experts per thread.
+
+def _assert_prep_sort(sort, topk_weight, topk_ids, experts, block_m, shared=False):
+    """The prep's ``sort`` (sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids) in aiter moe_sorting's
+    format: the routes with an id in [0, E) (with ``shared`` not the last column, whatever its id) grouped by expert
+    in ascending order, each expert padded to whole blocks with rows of token M and weight 0; the blocks' experts;
+    num_valid [padded rows, M]; each such route's loc_ids its own sorted row (unique, within its expert's rows,
+    holding ``token | slot << 24`` and the bits of its weight), every other route's -1.
+    """
+    sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids = sort
+    M, topk = topk_ids.shape
+    live = (topk_ids >= 0) & (topk_ids < experts)
+    if shared:
+        live[:, -1] = False
+    ids = topk_ids[live].long()
+    counts = torch.bincount(ids, minlength=experts)
+    padded = (counts + block_m - 1) // block_m * block_m
+    offsets = torch.cumsum(padded, 0) - padded
+    total = int(padded.sum())
+    assert num_valid.tolist() == [total, M]
+    assert torch.equal(
+        sorted_experts[: total // block_m],
+        torch.repeat_interleave(
+            torch.arange(experts, dtype=torch.int32), padded // block_m
+        ),
+    )
+    assert bool((loc_ids[~live] == -1).all())
+    loc = loc_ids[live].long()
+    assert torch.unique(loc).numel() == loc.numel()
+    assert bool(((loc >= offsets[ids]) & (loc < offsets[ids] + counts[ids])).all())
+    route = torch.arange(M * topk, dtype=torch.int32).view(M, topk)[live]
+    assert torch.equal(sorted_ids[loc], (route // topk) | ((route % topk) << 24))
+    assert torch.equal(
+        sorted_weights[loc].view(torch.int32), topk_weight[live].view(torch.int32)
+    )
+    filler = torch.ones(total, dtype=torch.bool)
+    filler[loc] = False
+    assert bool((sorted_ids[:total][filler] == M).all())
+    assert bool((sorted_weights[:total][filler] == 0).all())
+
+
+@pytest.mark.parametrize("cols", [512, 2560, 4096], ids=["h512", "h2560", "h4096"])
+def test_stream_row_quant_bitexact(cols):
+    """The streaming prep (a8w4_stream_prep: one launch sorts the routes, quantizes x and zeroes out): q and scale
+    equal ``_quantize`` and the reference bit for bit, the first ``rows`` rows of out are zero and nothing past the
+    outputs is written (_prep_launch); the sort has aiter moe_sorting's format (_assert_prep_sort).
+
+    The quantization takes a row per wave, each lane 16-byte pieces of every 512-column chunk (H 512: 1 chunk, H 2560:
+    5, H 4096: 8), one reciprocal per row and one FMA correction per value, the whole wave dividing per value for a
+    row outside the fast range (whose ends test_fast_row_quant_bitexact covers). Special rows: zero, a subnormal
+    scale, -0 and negatives rounding to -0 (stored as +0), quotients exactly at rounding midpoints with the scale
+    2**-2, and midpoints that a plain reciprocal product rounds the wrong way with the scale 7/32; 37 rows (the last
+    quantizing workgroup holds one row). E 513 and topk 11: 2 sorting workgroups, 3 experts per thread.
 
     End to end the tolerance does not show a few flipped FP8 values, and the basic tests and the benchmark only
     quantize random rows and never look at the sort format.
     """
-    rows, guard, experts, block_m = 37, 3, 513, 16
+    rows, experts, block_m = 37, 513, 16
     gen = torch.Generator(device="cuda").manual_seed(85)
     x = torch.randn((rows, cols), generator=gen) * 3
     x[1].zero_()
@@ -1668,73 +1739,25 @@ def test_stream_row_quant_bitexact(cols, qw):
     x[5, 0] = 52.5
     x = x.to(torch.bfloat16)
     _, topk_weight, topk_ids = make_inputs(rows, 512, experts, TOPK, seed=86)
-    n_sort, capacity, blocks = stream_a8w4.stream_prep_sizes(
-        rows, TOPK, experts, block_m
-    )
-    sorted_ids = torch.full((capacity,), -1, dtype=torch.int32)
-    sorted_weights = torch.full((capacity,), -1.0)
-    sorted_experts = torch.full((blocks,), -1, dtype=torch.int32)
-    num_valid = torch.full((2,), -1, dtype=torch.int32)
-    loc_ids = torch.full((rows, TOPK), -2, dtype=torch.int32)
-    q = torch.full((rows + guard, cols), 0x5A, dtype=torch.uint8)
-    scale = torch.full((rows + guard,), -1.0)
-    out = torch.full((rows + guard, cols), float("nan"), dtype=torch.bfloat16)
-    moe_a8w4._launch(
-        "a8w4_stream_prep",
-        _prep_kernel(cols, TOPK, experts, block_m, True, x.device.index, qw=qw),
-        topk_ids,
-        topk_weight,
-        x,
-        sorted_ids,
-        sorted_weights,
-        sorted_experts,
-        num_valid,
-        loc_ids,
-        q.view(torch.float8_e4m3fnuz),
-        scale,
-        out,
-        rows,
-        n_sort,
-        capacity,
-    )
-    assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
-    assert bool((out[:rows] == 0).all()) and bool(out[rows:].isnan().all())
+    *sort, q, scale = _prep_launch(x, topk_weight, topk_ids, experts, block_m, True)
+    _assert_prep_sort(sort, topk_weight, topk_ids, experts, block_m)
     q0, scale0 = moe_a8w4._quantize(x, rows, cols, "bf16")
-    assert torch.equal(q[:rows], q0.view(torch.uint8))
-    assert torch.equal(scale[:rows].view(torch.int32), scale0.view(torch.int32))
+    assert torch.equal(q, q0.view(torch.uint8))
+    assert torch.equal(scale.view(torch.int32), scale0.view(torch.int32))
     xf = x.float()
     amax = xf.abs().amax(-1, keepdim=True)
     ref_scale = amax / torch.full_like(amax, 240.0)
     ref_scale = torch.where(ref_scale == 0, torch.ones_like(ref_scale), ref_scale)
     assert float(ref_scale[2]) < 2.0**-126
     assert float(ref_scale[4]) == 0.25 and float(ref_scale[5]) == 7 / 32
-    assert torch.equal(scale[:rows].view(-1, 1), ref_scale)
+    assert torch.equal(scale.view(-1, 1), ref_scale)
     exact = (xf / ref_scale).to(torch.float8_e4m3fnuz).view(torch.uint8)
     naive = (
         (xf * (torch.ones_like(ref_scale) / ref_scale))
         .to(torch.float8_e4m3fnuz)
         .view(torch.uint8)
     )
-    assert torch.equal(q[:rows], exact) and bool((exact[5] != naive[5]).any())
-    counts = torch.bincount(topk_ids.flatten().long(), minlength=experts)
-    padded = (counts + block_m - 1) // block_m * block_m
-    total = int(padded.sum())
-    assert num_valid.tolist() == [total, rows]
-    loc = loc_ids.flatten().long()
-    route = torch.arange(rows * TOPK, dtype=torch.int32)
-    assert torch.equal(sorted_ids[loc], (route // TOPK) | ((route % TOPK) << 24))
-    assert torch.equal(sorted_weights[loc], topk_weight.flatten())
-    assert torch.equal(sorted_experts[loc // block_m], topk_ids.flatten())
-    assert torch.equal(
-        sorted_experts[: total // block_m],
-        torch.repeat_interleave(
-            torch.arange(experts, dtype=torch.int32), padded // block_m
-        ),
-    )
-    filler = torch.ones(total, dtype=torch.bool)
-    filler[loc] = False
-    assert bool((sorted_ids[:total][filler] == rows).all())
-    assert bool((sorted_weights[:total][filler] == 0).all())
+    assert torch.equal(q, exact) and bool((exact[5] != naive[5]).any())
 
 
 @pytest.mark.parametrize(
@@ -2685,45 +2708,58 @@ def test_route_sum_routes_past_4gib(hidden):
     assert torch.equal(_bits(out), _bits(want))
 
 
-@pytest.mark.parametrize(
-    "tokens, first, duplicate",
-    [
-        (200, "a8w4_stream_prep", False),
-        (201, "moe_sorting_opus", False),
-        (200, "a8w4_stream_prep", True),
-    ],
-    ids=["m200_prep", "m201_opus", "m200_prep_duplicate_ids"],
-)
-def test_prefill_prep_routes_limit(monkeypatch, tokens, first, duplicate):
-    """From hidden 2560 on the prefill path sorts with the streaming prep (one launch: sorting, the input
-    quantization, loc_ids) instead of Opus moe_sorting and the row kernel while M * topk <= PREFILL_PREP_MAX_ROUTES,
-    with Opus past it: the limit lowered to 400, H 2560, E 5 and topk 2 put M 200 / 201 (400 / 402 routes) on both
-    sides; the prep gives each slot of a token that repeats an expert its own row, so the result equals the reference
-    that sums every slot (the Opus front end keeps the later slot only, test_prefill_duplicate_ids_keep_last_route).
+# case: (M, topk, E, H, sorting block, zero the output, the last column a folded shared expert's). The M * topk routes
+# split into pieces of stream_a8w4._PREP_PIECE (256); past _PREP_SORT_WGS (64) pieces each sorting workgroup takes
+# ``span`` of them. Every case leaves the last piece and the last workgroup's range partly filled.
+_PREP_LARGE_CASES = {
+    # 16484 routes: 65 pieces, span 2, 33 workgroups, the last one 100 routes.
+    "r16484_span2": (4121, 4, 33, 512, 64, True, False),
+    # 200000 routes: 782 pieces, span 13, 61 workgroups, the last one 1.25 pieces.
+    "r200000_e256": (25000, 8, 256, 512, 64, False, False),
+    # 210003 routes (140002 routed): 821 pieces, span 13, 64 workgroups; E 8, so thousands of routes per LDS counter.
+    "r210003_e8_shared": (70001, 3, 8, 512, 64, False, True),
+}
 
-    The prefill cases of the basic tests and the benchmark are not on this boundary, assert no sorting kernel and
-    never repeat an expert within a token; the real limit 24576 needs M 12288 at topk 2. M7 decodes this shape up to
-    M 319 (its decode limit DECODE_MAX_WGS), so these cases set that limit to 0 there.
+
+@pytest.mark.parametrize("case", list(_PREP_LARGE_CASES))
+def test_stream_prep_large_routes_bitexact(case):
+    """The prep at many routes (the prefill tier sorts with it at every M): past _PREP_SORT_WGS pieces each sorting
+    workgroup places ``span`` pieces (span derived in the kernel from the workgroup count of the launch, the next
+    piece's ids and weights in flight), histograms all routes in rounds with the next round in flight and skips the
+    before-count past its own range start. The sort has moe_sorting's format (_assert_prep_sort, with 10% of the ids
+    masked, token 1 all masked, one id out of range, and in the shared case repeated ids and a shared column with
+    in-range ids), xq / xs equal ``_quantize`` bit for bit and nothing past the outputs is written (_prep_launch).
+
+    The basic tests sort at most 14336 routes (one piece per workgroup); the benchmark's prefill cases reach 688128
+    routes but only grade the output within the tolerance and never look at the sort format.
     """
-    if _OPUS_PREFILL:
-        monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", 400)
-    else:
-        first = "a8w4_stream_prep"
-    if _M7:
-        # M7 decodes this shape up to M 319: a decode limit of 0 keeps it on prefill. M7's review deletes the M6
-        # branch.
-        monkeypatch.setattr(moe_a8w4, "DECODE_MAX_WGS", 0)
-    w, prepared = _small_weights(2560, 64)
-    x, topk_weight, topk_ids = make_inputs(
-        tokens, 2560, 5, 2, seed=330 + tokens, shared=False
+    tokens, topk, experts, hidden, block_m, zero, shared = _PREP_LARGE_CASES[case]
+    routes = tokens * topk
+    n_sort = stream_a8w4.stream_prep_sizes(tokens, topk, experts, block_m)[0]
+    pieces = -(-routes // stream_a8w4._PREP_PIECE)
+    span = -(-pieces // n_sort)
+    assert n_sort <= stream_a8w4._PREP_SORT_WGS < pieces and span > 1
+    assert routes % stream_a8w4._PREP_PIECE and pieces < n_sort * span
+    gen = torch.Generator(device="cuda").manual_seed(890 + topk)
+    routed = topk - shared
+    ids = torch.rand((tokens, experts), generator=gen).argsort(dim=1)[:, :routed]
+    ids = ids.to(torch.int32)
+    ids[torch.rand((tokens, routed), generator=gen) < 0.1] = -1
+    ids[1] = -1
+    ids[2, 0] = experts
+    if shared:
+        ids[::2, 1] = ids[::2, 0]
+        last = torch.randint(0, experts + 1, (tokens, 1), generator=gen)
+        ids = torch.cat([ids, last.to(torch.int32)], dim=1)
+    topk_weight = torch.rand((tokens, topk), generator=gen)
+    x = (torch.randn((tokens, hidden), generator=gen) * 3).to(torch.bfloat16)
+    *sort, q, scale = _prep_launch(
+        x, topk_weight, ids.contiguous(), experts, block_m, zero, shared
     )
-    if duplicate:
-        topk_ids[::2, 1] = topk_ids[::2, 0]
-    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    _assert_path([first] + _prefill_path(128))
-    other = "moe_sorting_opus" if first == "a8w4_stream_prep" else "a8w4_stream_prep"
-    assert other not in moe_a8w4.last_path, moe_a8w4.last_path
-    assert_close(out, ref)
+    _assert_prep_sort(sort, topk_weight, ids, experts, block_m, shared)
+    q0, scale0 = moe_a8w4._quantize(x, tokens, hidden, "bf16")
+    assert torch.equal(q, q0.view(torch.uint8))
+    assert torch.equal(scale.view(torch.int32), scale0.view(torch.int32))
 
 
 # case: (H, I, E, topk, M, sorting block, ACT_STEPS and waves of the dispatch's tile). DeepSeek TP4 (E 24, I 576)
@@ -3133,10 +3169,7 @@ def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
 # estimated Down workgroups; M=4: 24 routes and 96). The streaming cases follow the H 5120 row limit (M = limit * E /
 # topk; blocks of 32 from 13 to 28 rows per expert), their Down adding the routes atomically.
 _H5120_ROWS_M = moe_a8w4.STREAM_MAX_ROWS_H5120 * DS_EXPERTS // DS_TOPK
-_H5120_PREFILL_LIMITS = {
-    **({"PREFILL_PREP_MAX_ROUTES_H5120": 18} if _OPUS_PREFILL else {}),
-    "XCD_MIN_ROUTES_H5120": 24,
-}
+_H5120_PREFILL_LIMITS = {"XCD_MIN_ROUTES_H5120": 24}
 _H5120_STREAM_BM32 = ["a8w4_stream_prep"] + _stream_path(32, False)
 _H5120_LIMIT_CASES = {
     "rows_limit_stream": (
@@ -3167,12 +3200,11 @@ _H5120_LIMIT_CASES = {
         ["a8w4_stream_prep"] + _prefill_path(128),
         (0, None, 0),
     ),
-    "opus_xcd_two_pass": (
+    "xcd_two_pass": (
         4,
         {"block_m": 64, "tile_k": 128},
         _H5120_PREFILL_LIMITS,
-        ["moe_sorting_opus" if _OPUS_PREFILL else "a8w4_stream_prep"]
-        + _prefill_path(128),
+        ["a8w4_stream_prep"] + _prefill_path(128),
         (moe_a8w4.GATEUP_XCD_CHUNK_H5120, True, moe_a8w4.DOWN_XCD_CHUNK_H5120),
     ),
 }
@@ -3185,13 +3217,12 @@ def test_h5120_dispatch_limits(monkeypatch, case):
     ``STREAM_H5120_MIN_ROUTES`` the streaming limit drops from ``STREAM_MAX_ROWS_WIDE`` (48) to
     ``STREAM_MAX_ROWS_H5120`` rows per expert (24 by default: M 96 with exactly 24 rows still streams, M 97 with
     24.25 takes prefill, and with the threshold one route above M 97 still streams, the limit 48 again); prefill
-    sorts with the streaming prep up to ``PREFILL_PREP_MAX_ROUTES_H5120`` routes and
-    with Opus past it, and Gate/Up and Down chunk their grids by XCD from ``XCD_MIN_ROUTES_H5120`` routes on. Down
-    stages its activation tile in two passes with many estimated workgroups (M 4: 96; M 97: 96): the prep-sorted M 3
+    Gate/Up and Down chunk their grids by XCD from ``XCD_MIN_ROUTES_H5120`` routes on. Down
+    stages its activation tile in two passes with many estimated workgroups (M 4: 96; M 97: 96): M 3
     (72) takes the Down's pass count as the dispatch decides, and the same call with one pass and with two passes
     forced gives the same bits (prep sort, routes and a8w4_route_sum unchanged).
 
-    The real thresholds (4096, 12288 and 16384 routes) need M >= 683 on E 24, where both sides are prefill, so they
+    The real thresholds (4096 and 16384 routes) need M >= 683 on E 24, where both sides are prefill, so they
     are moved onto the M 3-97 boundaries to keep this fast; the benchmark's ds_tp4 runs E 384 at powers of two and 48
     without asserting kernels or build parameters (M 1024: 16 rows, M 2048: 32); the basic tests are not on these
     boundaries.
@@ -3360,28 +3391,22 @@ def test_decode_down_needs_hidden_multiple_of_32():
 
 
 @pytest.mark.parametrize(
-    "options, limit, path",
+    "options, path",
     [
-        ({}, None, ["a8w4_stream_prep"] + _stream_path(32, True)),
-        ({"block_m": 64}, None, ["a8w4_stream_prep"] + _prefill_path(256)),
-        ({"block_m": 64}, 0, ["moe_sorting_opus"] + _prefill_path(256)),
+        ({}, ["a8w4_stream_prep"] + _stream_path(32, True)),
+        ({"block_m": 64}, ["a8w4_stream_prep"] + _prefill_path(256)),
     ],
-    ids=["stream", "prefill", "prefill_opus"],
+    ids=["stream", "prefill"],
 )
-def test_graph_replay(monkeypatch, options, limit, path):
+def test_graph_replay(options, path):
     """The whole call can be captured in a CUDA graph (no host synchronization) and replayed, and the replay reads
     newly written inputs (the workspaces allocated in the call belong to the graph's pool). The shape is compiled
     by an eager call outside the capture first. Qwen M 64 streams by default (the prep, blocks of 32, the Gate/Up
     quantizing the intermediate, the atomic Down); block_m=64 selects the prefill kernels (K tile 256) behind the
-    streaming prep, or, with PREFILL_PREP_MAX_ROUTES lowered to ``limit`` = 0, behind Opus moe_sorting and the row
-    kernel (pyhip M17 has the first two).
+    same prep (pyhip M17 has both).
 
     The basic tests and the benchmark call eagerly and never capture a graph.
     """
-    if limit is not None:
-        if not _OPUS_PREFILL:
-            pytest.skip("M8: prefill always sorts with the prep ([prefill] covers it)")
-        monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", limit)
     w, prepared = _weights(33, HIDDEN, 320, 51)
     x, topk_weight, topk_ids = make_inputs(64, HIDDEN, 33, TOPK, seed=52)
     out = torch.empty_like(x)
@@ -3644,8 +3669,9 @@ def test_compile_cache_keys(monkeypatch):
     assert moe_a8w4._down_kernel(*down, 1, constants) is not moe_a8w4._down_kernel(
         *down, 0, constants
     )
-    rq = (512, "bf16", 2) if _RQ_FILL else (512, "bf16")
-    assert moe_a8w4._row_quant_kernel(*rq, 1) is not moe_a8w4._row_quant_kernel(*rq, 0)
+    assert moe_a8w4._row_quant_kernel(512, "bf16", 1) is not moe_a8w4._row_quant_kernel(
+        512, "bf16", 0
+    )
     for module, name, value in (
         (common_a8w4, "XCDS", 8),
         (gemm2_a8w4, "A_TWO_PASS_MIN_K", 256),
@@ -3675,9 +3701,8 @@ def test_compile_cache_keys(monkeypatch):
     assert [args[-2:] for args in calls["_gateup_kernel"] + calls["_down_kernel"]] == [
         (device, constants)
     ] * 2
-    # x by the row kernel behind Opus (M6), by the prep (M8); mid by the row kernel.
-    rq_calls = 1 + ("moe_sorting_opus" in moe_a8w4.last_path)
-    assert [args[-1] for args in calls["_row_quant_kernel"]] == [device] * rq_calls
+    # x quantized by the prep, mid by the row kernel.
+    assert [args[-1] for args in calls["_row_quant_kernel"]] == [device]
     assert calls["_stream_sum_kernel"] == [(2, 512, device)]
 
 
@@ -3833,9 +3858,9 @@ def test_stream_compile_cache_keys(monkeypatch):
     assert moe_a8w4._stream_down_kernel(
         *down, 1, d0
     ) is not moe_a8w4._stream_down_kernel(*down, 0, d0)
-    assert _prep_kernel(2560, 11, 33, 32, True, 1) is not _prep_kernel(
-        2560, 11, 33, 32, True, 0
-    )
+    assert moe_a8w4._stream_prep_kernel(
+        2560, 11, 33, 32, True, 1
+    ) is not moe_a8w4._stream_prep_kernel(2560, 11, 33, 32, True, 0)
     assert moe_a8w4._stream_sum_kernel(11, 2560, 1) is not moe_a8w4._stream_sum_kernel(
         11, 2560, 0
     )
@@ -3898,8 +3923,8 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
     and the slots are summed, as the reference does.
 
     The generated routes never repeat an expert within a token, so the basic tests and the benchmark never get here;
-    test_decode_duplicate_and_int64_ids covers the per-route decode, test_prefill_prep_routes_limit the prefill
-    sorted by the prep (every slot summed too), test_prefill_duplicate_ids_keep_last_route the Opus-sorted prefill.
+    test_decode_duplicate_and_int64_ids covers the per-route decode, test_prefill_duplicate_ids_keep_every_route the
+    prefill.
     The H 5120 case pins the H 5120 decode limit to pyhip M17's 32 tokens (so that M 24 stays on the dedup decode
     whatever the default limit), its kernels within it and the streaming kernels past it (_assert_h5120). M7 has no
     MiMo dedup decode: the MiMo cases run its per-route decode (M 5) and streaming (M 24) there.
@@ -3954,26 +3979,21 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
     assert_close(out, ref)
 
 
-def test_prefill_duplicate_ids_keep_last_route():
-    """Two slots of a token select the same expert: the Opus sort keeps only the later slot, the earlier slot's loc
-    keeps the -1 of the input quantization and a8w4_route_sum skips it (no uninitialized row read, nothing added
-    twice); the result equals the reference with the earlier slot's routing weight set to 0. block_m=64 selects
-    the prefill kernels (by default M 200 takes the K tile 128, as in pyhip M17); H 512 keeps the Opus sort (from
-    H 2560 on the streaming prep sorts and keeps every slot, test_prefill_prep_routes_limit).
+def test_prefill_duplicate_ids_keep_every_route():
+    """Two slots of a token select the same expert on the prefill tier (H 512, below the hidden sizes of the target
+    shapes, which the prep sorts like every other): the prep gives each slot its own sorted row and loc_ids, Down
+    writes both routes and a8w4_route_sum adds them; the result equals the reference that sums every slot.
+    block_m=64 selects the prefill kernels (by default M 200 takes the K tile 128, as in pyhip M17).
 
     The generated routes never repeat an expert within a token, so the basic tests and the benchmark never get
-    here.
+    here; neither has H 512.
     """
     w, prepared = _small_weights(512, 64)
     x, topk_weight, topk_ids = make_inputs(200, 512, 5, 2, seed=320, shared=False)
     topk_ids[::2, 1] = topk_ids[::2, 0]
-    out, _ = _a8w4_run(w, prepared, x, topk_weight, topk_ids, block_m=64)
-    _assert_path([_PREFILL_SORT_H512] + _prefill_path(256))
-    kept = topk_weight.clone()
-    if _OPUS_PREFILL:
-        kept[::2, 0] = 0
-    ref = reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], kept, topk_ids)
-    assert_close(out, ref)
+    assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids, block_m=64))
+    _assert_path(["a8w4_stream_prep"] + _prefill_path(256))
+    assert "a8w4_route_sum" in moe_a8w4.last_path, moe_a8w4.last_path
 
 
 @pytest.mark.parametrize("case", ["dedup", "wide", "stream", "prefill"])
@@ -5503,9 +5523,9 @@ def test_fused_moe_shared_expert_id():
             2,
             False,
             {"block_m": 64},
-            [_PREFILL_SORT_H512] + _prefill_path(256),
+            ["a8w4_stream_prep"] + _prefill_path(256),
             (8, 299),
-            id="prefill_opus_h512",
+            id="prefill_prep_h512",
         ),
         pytest.param(
             (5, 512, 64, 576),
@@ -5513,9 +5533,9 @@ def test_fused_moe_shared_expert_id():
             2,
             False,
             {"block_m": 64},
-            [_PREFILL_SORT_H512] + _prefill_path(256),
+            ["a8w4_stream_prep"] + _prefill_path(256),
             "all",
-            id="prefill_opus_all",
+            id="prefill_prep_h512_all",
         ),
     ],
 )
@@ -5526,10 +5546,10 @@ def test_masked_routes(monkeypatch, weights, tokens, topk, fused, options, path,
     the slot-pair Down; the dedup plan and its forms (H 5120 wide, the MiMo two- and four-kernel ones; groups of 2 and
     3); streaming (DeepSeek I 576, blocks of 32: its Down adds only the sorted routes atomically, no a8w4_route_sum);
     prefill sorted by the prep (DeepSeek M 200 with block_m; MiMo TP4 M 1200, I 512 at 37.5 rows per expert, past the
-    28 rows where I >= 512 stops streaming: its Down writes loc_ids only for sorted routes) and by Opus (moe_sorting,
-    which skips ids outside [0, E); the input quantization sets loc_ids to -1, which a8w4_route_sum skips). Behind the
+    28 rows where I >= 512 stops streaming; H 512, E 5, topk 2 M 300 with block_m): its Down writes loc_ids only for
+    sorted routes, the prep sets the others to -1, which a8w4_route_sum skips. Behind the
     prefill Down a8w4_route_sum is asserted (_ROUTE_SUMS), behind the streaming Down its absence. The ``_all``
-    cases mask every route: the dedup plan has no leader, the sortings no row (num_valid 0), and the output is all
+    cases mask every route: the dedup plan has no leader, the prep no row (num_valid 0), and the output is all
     zero. The H 5120 decode limit is pinned to pyhip M17's 32 tokens, so that the wide case (M 24) masks the H 5120
     dedup decode whatever the default limit (the other H 5120 cases run M 3 or more than 32 tokens). M7 runs the Qwen
     pp case and the MiMo M 24 cases on its streaming kernels and MiMo M 5 per route.
@@ -6225,13 +6245,12 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, tokens, mixed):
 # graded.
 
 # case: (shape, tokens, options, routed tier as _path_tier names it, or the tiers it may take). Shape: a LAYER_SHAPES
-# name, or "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus
-# below H 2560). The tiers: the pre-quantized per-route Gate/Up with the slot-pair Down (main TP4 M 6), the wide decode
+# name, or "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2). The tiers: the pre-quantized per-route Gate/Up with the slot-pair Down (main TP4 M 6), the wide decode
 # (deduplicated Gate/Up, M 16), streaming with the atomic Down at I 576 (blocks of 16) and at I 320 (blocks of 16, and
 # MTP TP8 M 1365: 32 rows per expert in blocks of 64, below 4096 routes, past 1024 tokens still on the side stream),
 # prefill sorted by the prep (MTP TP4 M 1280: 30 rows per expert, past the 28 where I >= 512 stops streaming; MTP TP8
-# M 1366: 4098 routes, 24 rows from 4096 routes on) and by Opus, prefill with a tile option at M 40 (Opus in one
-# kernel).
+# M 1366: 4098 routes, 24 rows from 4096 routes on; the small shape at M 2048 with a tile option), prefill with a
+# tile option at M 40.
 _FOLD_CASES = {
     "decode_pq_ds_tp4_m6": ("ds_layer_tp4", 6, {}, "decode"),
     "wide_dd_mtp_tp8_m16": ("mtp_layer_tp8", 16, {}, "dedup"),
@@ -6240,7 +6259,7 @@ _FOLD_CASES = {
     "stream_atomic_mtp_tp8_m64": ("mtp_layer_tp8", 64, {}, "stream"),
     "stream_bm64_mtp_tp8_m1365": ("mtp_layer_tp8", 1365, {}, "stream"),
     "prefill_prep_mtp_tp8_m1366": ("mtp_layer_tp8", 1366, {}, "prefill"),
-    "prefill_opus_small_m2048": ("small", 2048, {"block_m": 64}, "prefill"),
+    "prefill_prep_small_m2048": ("small", 2048, {"block_m": 64}, "prefill"),
     "prefill_tile_small_m40": ("small", 40, {"block_m": 64}, "prefill"),
 }
 
@@ -6302,7 +6321,7 @@ def test_layer_fold_tiers(monkeypatch, case):
     """Every folded tier (_FOLD_CASES) on poisoned routed weights with _fold_routing's masks and dropped shared
     experts: graded against reference_layer, the rows without a live routed id bitwise 0 (row 1: the shared expert's
     +0 plus nothing), no final add and the side stream by tier (_assert_folded; MTP TP8 M 1365 also asserts the blocks
-    of 64, the Opus case Opus). The same call with output = hidden_states gives the bits of the separate output (the
+    of 64). The same call with output = hidden_states gives the bits of the separate output (the
     chain writes the
     output, or the routes buffer, only after the kernel that quantizes the input), and a CUDA graph of the call replays
     other inputs with the masks moved with the bits of an eager call on them; where a Down adds the routes atomically
@@ -6346,8 +6365,6 @@ def test_layer_fold_tiers(monkeypatch, case):
     exact = not _path_atomic(moe_a8w4.last_path)
     if case.startswith("stream_bm64"):
         assert "a8w4_down_stream_bm64" in moe_a8w4.last_path, moe_a8w4.last_path
-    if case.startswith("prefill_opus") and _OPUS_PREFILL:
-        assert "moe_sorting_opus" in moe_a8w4.last_path, moe_a8w4.last_path
     assert_close(out, ref(x, topk_weight, topk_ids))
     dead = (topk_ids[:, :-1] < 0).all(dim=1).nonzero().flatten().tolist()
     assert 1 in dead and _zero_rows(out, dead)
@@ -6645,7 +6662,7 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
     limit and whether it writes loc_ids; the routed launchers' fold variants (routing tensors of topk + 1 columns, the
     slot-pair Down adding the output it finds, the prep never sorting the last column, the prefill Down's loc_ids of
     topk + 1 columns) are cached apart from the plain ones; and a call passes its inputs' device and whether it writes
-    loc_ids (the small shape's folded decode M 16, past DECODE_SHARED_MIXED_MAX_M: no; its Opus prefill M 2048: yes).
+    loc_ids (the small shape's folded decode M 16, past DECODE_SHARED_MIXED_MAX_M: no; its prefill M 2048: yes).
     Building a launcher does not trace it, so the other device need not exist.
 
     The basic tests and the benchmark run one GPU, and a cache keyed by shape alone could hand a call with the shared
@@ -6685,7 +6702,7 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
         ("_down_pq_kernel", (5120, 576, 6, 0), "shared", True),
         (
             "_stream_prep_kernel",
-            (5120, 7, 128, 16, False, *((4,) if _PREP_QW else ()), 0),
+            (5120, 7, 128, 16, False, 0),
             "shared",
             True,
         ),
@@ -6888,7 +6905,7 @@ def test_shared_down_bitexact(monkeypatch, case):
 
 # case: (weights, tokens, options, module constants, routing). Weights: "layer:<shape>" (_layer_weights of a
 # LAYER_SHAPES shape, with the shared expert), "routed:<shape>" (its routed experts alone), "small" (_fold_small_weights:
-# E 8, H 512, I 64, routed topk 2, with the shared expert; a tile option prefills with Opus below H 2560), "mimo"
+# E 8, H 512, I 64, routed topk 2, with the shared expert), "mimo"
 # (_mimo_small_weights(256): E 12, H 4096, topk 8). Routing "converted": int64 ids and strided weights (the copies
 # into contiguous int32 / float32 are kernels too); "unaligned": an output 8 bytes past a 16-byte boundary; "odd": 2
 # bytes past a 4-byte boundary.
@@ -6914,17 +6931,14 @@ _LAUNCH_CASES = {
     "fold_decode_unaligned": ("layer:ds_layer_tp4", 6, {}, {}, "unaligned"),
     # Into an output 2 bytes past a 4-byte boundary: the call writes an aligned buffer, then output_copy.
     "decode_dedup_two_odd": ("mimo", 5, {}, {}, "odd"),
-    # Folded, serial (the prefill tier): sorted by the prep (I 576 past 28 rows per expert, and I 320 from 4096
-    # routes), sorted by Opus (four phases from 2048 tokens; the routed columns copied out for it), and past the
-    # GEMM's 65536 rows each shared GEMM in two chunks (one launch each, the weight's bytes counted on the first).
+    # Folded, serial (the prefill tier, sorted by the prep): I 576 past 28 rows per expert, I 320 from 4096 routes, and
+    # past the GEMM's 65536 rows each shared GEMM in two chunks (one launch each, the weight's bytes counted on the
+    # first).
     "fold_prefill_prep_i576": ("layer:mtp_layer_tp4", 1280, {}, {}, None),
     "fold_prefill_prep": ("layer:mtp_layer_tp8", 1366, {}, {}, None),
-    "fold_prefill_opus": ("small", 2048, {"block_m": 64}, {}, None),
     "fold_prefill_chunks": ("small", 65537, {}, {}, None),
-    # Folded, serial: prefill with a tile option at few tokens with Opus in two phases (below 2048 tokens) and in one
-    # kernel (few tokens).
-    "tile_prefill_opus_phases": ("small", 1024, {"block_m": 64}, {}, None),
-    "tile_prefill_opus_oneshot": ("small", 40, {"block_m": 64}, {}, None),
+    # Folded, serial: prefill with a tile option at few tokens.
+    "tile_prefill": ("small", 40, {"block_m": 64}, {}, None),
 }
 
 
@@ -7021,7 +7035,7 @@ def _profiled_streams(call, expected, calls=3, attempts=5):
 def test_launch_records(monkeypatch, case):
     """``moe_a8w4.last_launches`` of one call of each kind (_LAUNCH_CASES: every tier, both streaming Gate/Up kernels
     and the three streaming Downs, the mixed and the folded shared expert on and off the side stream, the fold's GEMMs
-    in row chunks and the copies into unaligned outputs, Opus in one, two and four kernels, routing tensors converted
+    in row chunks and the copies into unaligned outputs, prefill with a tile option, routing tensors converted
     first) inside ``moe_a8w4.recording_launches()`` holds exactly the device kernels the profiler sees per call on
     each stream when calls run outside it (the main / side labels onto the profiler's streams); its FLOPs sum to
     6 * M * H * (topk * I_pad + I_shared); every kernel moves bytes, the shared expert's weights count once and the

@@ -73,11 +73,10 @@ def _pack_fp8x4(q):
     return ((low + fx.Uint32(0x7F7F7F7F)) & packed) | low
 
 
-def compile_row_quant_fp8(cols, in_dtype, fill=0):
-    """Launcher ``(x, q, scale, aux, rows, stream)``: x ``in_dtype`` [rows, cols] -> q FP8 [rows, cols], scale f32 [rows].
+def compile_row_quant_fp8(cols, in_dtype):
+    """Launcher ``(x, q, scale, rows, stream)``: x ``in_dtype`` [rows, cols] -> q FP8 [rows, cols], scale f32 [rows].
 
-    ``in_dtype`` is ``"bf16"`` or ``"f32"``; ``cols % 64 == 0``. All-zero rows get scale 1. With ``fill`` > 0
-    the kernel also sets int32 ``aux`` [rows, fill] to -1 (otherwise ``aux`` is not accessed).
+    ``in_dtype`` is ``"bf16"`` or ``"f32"``; ``cols % 64 == 0``. All-zero rows get scale 1.
     Not cached here: ``aiter.ops.flydsl.moe_a8w4`` caches the launcher per device.
     """
     assert cols % 64 == 0, f"cols={cols} must be a multiple of 64"
@@ -94,7 +93,6 @@ def compile_row_quant_fp8(cols, in_dtype, fill=0):
         p_in: fx.Pointer,
         p_out: fx.Pointer,
         p_scale: fx.Pointer,
-        p_aux: fx.Pointer,
         rows: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
@@ -103,15 +101,6 @@ def compile_row_quant_fp8(cols, in_dtype, fill=0):
         in_rsrc = _buffer_rsrc(p_in, fx.Int64(rows) * (cols * esize))
         out_rsrc = _buffer_rsrc(p_out, fx.Int64(rows) * cols)
         scale_rsrc = _buffer_rsrc(p_scale, fx.Int64(rows) * 4)
-        if const_expr(fill):
-            aux_rsrc = _buffer_rsrc(p_aux, fx.Int64(rows) * (fill * 4))
-            for i in range_constexpr((fill + lanes - 1) // lanes):
-                j = sub + i * lanes
-                _store(
-                    aux_rsrc,
-                    fx.Int32(-1),
-                    (j < fill).select((row * fill + j) * 4, fx.Int32(0x7FFFFFF0)),
-                )
         in_base = row * (cols * esize) + sub * 16
         values = []
         for c in range_constexpr(steps):
@@ -173,12 +162,11 @@ def compile_row_quant_fp8(cols, in_dtype, fill=0):
         p_in: fx.Pointer,
         p_out: fx.Pointer,
         p_scale: fx.Pointer,
-        p_aux: fx.Pointer,
         rows: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        row_quant_fp8(p_in, p_out, p_scale, p_aux, rows).launch(
+        row_quant_fp8(p_in, p_out, p_scale, rows).launch(
             grid=((rows + rows_per_block - 1) // rows_per_block, 1, 1),
             block=(256, 1, 1),
             stream=stream,

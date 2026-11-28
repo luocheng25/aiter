@@ -39,7 +39,7 @@ at every 64-K step), stages its ``R * 16`` channel factors in LDS and
 streams ``R`` 16-row blocks of the hidden dimension, writing BF16 rows by sorted position (padding
 rows are not written), or, with ``ATOMIC`` (what ``moe_a8w4`` dispatches), adding each route into its token's output
 row with BF16x2 atomics. ``compile_stream_prep`` (sorting, input quantization and the zeroed output in one launch)
-replaces Opus sorting and the input quantization (streaming, and prefill up to a route limit); ``compile_route_sum``
+is the sorting front end of the streaming and the prefill tiers; ``compile_route_sum``
 (sum of a token's routes) replaces the base's ``sorted_sum`` behind the prefill Down.
 
 Raw operations: these kernels address global memory through raw buffer descriptors built from 64-bit addresses
@@ -60,6 +60,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import common_a8w4 as a8w4
+from .decode_a8w4 import _fast_div_ok, _fp8_word_q, _quant_fast
 
 # Byte offset past every buffer used here: loads return 0, stores are dropped.
 _DROP = 0x7FFFFF00
@@ -1064,19 +1065,26 @@ def compile_route_sum(topk, cols):
     return launch
 
 
-# Routes placed by each sorting workgroup of ``compile_stream_prep`` (one per thread) and routes histogrammed per
-# round trip (four 16-byte loads of ids per thread).
-_PREP_RANGE = 256
+# Routes of one piece of a sorting workgroup's range (one per thread), routes histogrammed per round trip (four
+# 16-byte loads of ids per thread), and the most sorting workgroups of one ``compile_stream_prep`` launch: every
+# sorting workgroup histograms all routes, so beyond _PREP_SORT_WGS pieces the workgroups take several pieces each
+# instead of growing in number (the sorting work then grows with the routes, not with their square).
+_PREP_PIECE = 256
 _PREP_ROUND = 4096
+_PREP_SORT_WGS = 64
 
 
 def stream_prep_sizes(M, TOPK, E, BM):
-    """``(sorting workgroups, sorted-row capacity, block capacity)`` of ``compile_stream_prep`` for M tokens: an
-    expert with c routes takes ceil(c / BM) <= (c + BM - 1) / BM blocks, over at most min(E, routes) experts.
+    """``(sorting workgroups, sorted-row capacity, block capacity)`` of ``compile_stream_prep`` for M tokens: one
+    workgroup per piece of ``_PREP_PIECE`` routes up to ``_PREP_SORT_WGS`` workgroups, beyond that as few workgroups
+    of equally many pieces (each workgroup's range follows from the count at launch); an expert with c routes takes
+    ceil(c / BM) <= (c + BM - 1) / BM blocks, over at most min(E, routes) experts.
     """
     routes = M * TOPK
     blocks = (routes + min(E, routes) * (BM - 1)) // BM
-    return -(-routes // _PREP_RANGE), blocks * BM, blocks
+    pieces = -(-routes // _PREP_PIECE)
+    span = max(1, -(-pieces // _PREP_SORT_WGS))
+    return -(-pieces // span), blocks * BM, blocks
 
 
 def _lds_word(address):
@@ -1104,7 +1112,7 @@ def _lds_inc(address):
     )
 
 
-def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
+def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, SHARED=False):
     """Build the streaming path's prep launcher: the moe_sorting of ``BM``-row blocks and the FP8 input rows (with
     ``ZERO`` also a zeroed output) in one launch.
 
@@ -1116,19 +1124,21 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
     Sorting (workgroups ``[0, n)``), in aiter moe_sorting's format: sorted_ids ``token | slot << 24`` grouped by
     expert in ascending order, each expert padded to whole blocks with rows of token M and weight 0;
     sorted_expert_ids per block; num_valid ``[padded rows, M]``; loc_ids the sorted row of each route (-1 for an
-    expert id outside ``[0, E)``). Every sorting workgroup histograms all routes in LDS, and separately those
-    before its own ``_PREP_RANGE`` routes, so it knows every expert's offset and its own base without talking to
-    the others; it places its routes with LDS atomics (the order within an expert is not deterministic) and
-    writes the padding rows and block experts of experts ``e % n == workgroup``. Every route of a token is kept,
-    repeated expert ids included. Quantization (the other workgroups), the arithmetic of ``quant_a8w4``: with
-    ``QW == 4`` one row per workgroup, the four waves splitting its 512-column chunks and exchanging the amax
-    through LDS (``_fp8_bytes``); with ``QW == 1`` one row per wave (IEEE division per element; fewer workgroups
-    for many rows). With ``ZERO`` the waves also zero their rows of out. With ``SHARED`` the last of the TOPK columns
-    is a fused shared expert's (``moe_a8w4._SharedFold``): it is never sorted, whatever its id, and its loc_ids is -1.
+    expert id outside ``[0, E)``). The routes split into pieces of ``_PREP_PIECE`` and workgroup w takes pieces
+    ``[w * span, (w + 1) * span)``, span = ceil(pieces / n). Every sorting workgroup histograms all routes in LDS
+    (``_PREP_ROUND`` per round, the next round's ids in flight), and separately those before its own range, so it
+    knows every expert's offset and its own base without talking to the others; it places its routes with LDS atomics,
+    one piece per round with the next piece's ids and weights in flight (the order within an expert is not
+    deterministic), and writes the padding rows (16 bytes per store from a 4-row boundary on) and block experts of
+    experts ``e % n == workgroup``. Every route of a token is kept, repeated expert ids included. Quantization (the
+    other workgroups): one row per wave, the bytes of ``quant_a8w4`` (``scale = amax / 240``, IEEE quotient, RNE,
+    ``-0`` -> ``+0``) through one reciprocal per row and one FMA correction per value (``decode_a8w4._quant_fast``,
+    exact for BF16 rows within ``_fast_div_ok``), other rows (NaN, Inf, a tiny abs-max) dividing per value. With
+    ``ZERO`` the waves also zero their rows of out. With ``SHARED`` the last of the TOPK columns is a fused shared
+    expert's (``moe_a8w4._SharedFold``): it is never sorted, whatever its id, and its loc_ids is -1.
     """
     assert H % 512 == 0, f"H={H} must be a multiple of 512"
     assert BM & (BM - 1) == 0, f"BM={BM} must be a power of two"
-    assert QW in (1, 4)
     chunks = H // 512
     LOG_BM = BM.bit_length() - 1
     EPT = -(-E // 256)  # consecutive experts per thread in the scan
@@ -1140,18 +1150,36 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
     ZERO_ROUNDS = -(-2 * (ES + 64) // 256)
     LDS_WORDS = max(WTOT + 4, 256 * ZERO_ROUNDS)
 
-    def histogram(lds, base, tid, lane, R, start, ids_rsrc):
-        first = [base + (tid + 256 * u) * 4 for u in range(_PREP_ROUND // 1024)]
-        words = [_load(ids_rsrc, i * 4, 0, 4) for i in first]
-        for i0, w4 in zip(first, words):
+    def round_ids(base, tid, ids_rsrc):
+        """The ids of routes base + 4 (tid + 256 u) + v of one histogram round (past R: zeros)."""
+        return [
+            w
+            for u in range(_PREP_ROUND // 1024)
+            for w in _load(ids_rsrc, (base + (tid + 256 * u) * 4) * 4, 0, 4)
+        ]
+
+    def count(lds, base, tid, lane, R, start, words, before):
+        """Count one round's routes in CNT and, with ``before``, those before ``start`` in BEF."""
+        for u in range(_PREP_ROUND // 1024):
             for v in range(4):
-                i = i0 + v
-                e = fx.Int32(w4[v])
+                i = base + (tid + 256 * u) * 4 + v
+                e = fx.Int32(words[4 * u + v])
                 ok = (i < R) & (e >= 0) & (e < E)
                 if const_expr(SHARED):
                     ok = ok & (i % TOPK != TOPK - 1)
                 _lds_inc(lds + ok.select(CNT + e, CNT + ES + lane) * 4)
-                _lds_inc(lds + (ok & (i < start)).select(BEF + e, BEF + ES + lane) * 4)
+                if before:
+                    _lds_inc(
+                        lds + (ok & (i < start)).select(BEF + e, BEF + ES + lane) * 4
+                    )
+
+    def histogram(lds, base, tid, lane, R, start, words):
+        """One round: rounds from ``start`` on hold no route before it and skip BEF (a wave-uniform branch)."""
+        _if(
+            base < start,
+            lambda: count(lds, base, tid, lane, R, start, words, True),
+            lambda: count(lds, base, tid, lane, R, start, words, False),
+        )
 
     def scan(lds, tid, lane, wave):
         """Per expert of this thread: (routes, padded rows, first sorted row); and all padded rows."""
@@ -1179,8 +1207,8 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
             _lds_put(lds + (CUR + e) * 4, offsets[k] + _lds_word(lds + (BEF + e) * 4))
         return counts, padded, offsets, totals[0] + totals[1] + totals[2] + totals[3]
 
-    def scatter(lds, tid, lane, R, start, ids, weights, sid_rsrc, sw_rsrc, loc_rsrc):
-        i = start + tid
+    def scatter(lds, lane, R, i, ids, weights, sid_rsrc, sw_rsrc, loc_rsrc):
+        """Route ``i`` (expert id ``ids``, weight bits ``weights``): its sorted row, id and weight, and its loc_ids."""
         e = fx.Int32(ids)
         ok = (i < R) & (e >= 0) & (e < E)
         if const_expr(SHARED):
@@ -1189,69 +1217,65 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
         token = i // TOPK
         row = ok.select(pos * 4, fx.Int32(_DROP))
         _store(sid_rsrc, [fx.Uint32(token | ((i - token * TOPK) << 24))], row)
-        _store(sw_rsrc, [weights], row)
+        _store(sw_rsrc, [fx.Uint32(weights)], row)
         _store(
             loc_rsrc,
             [fx.Uint32(ok.select(pos, fx.Int32(-1)))],
             (i < R).select(i * 4, fx.Int32(_DROP)),
         )
 
-    def quant(lds, q, lane, wave, M, p_x, p_xq, p_xs, p_out):
-        """Workgroup ``q`` of the quantization: row q split over the four waves (``QW == 4``, amax through LDS),
-        or rows 4q .. 4q+3, one per wave."""
+    def quant(q, lane, wave, M, p_x, p_xq, p_xs, p_out):
+        """Rows 4q .. 4q+3 of the quantization, one per wave (lane l holds the 16-byte pieces l + 64 c of its row)."""
+        row = q * 4 + wave
+        live = row < M
         in_rsrc = _rsrc(_address(p_x), M * (H * 2))
-        if QW == 4:
-            row, first = q, (wave == 0) & (lane == 0)
-            mine = [
-                (wave + 4 * j, wave + 4 * j < chunks) for j in range(-(-chunks // 4))
-            ]
-        else:
-            row = q * 4 + wave
-            first = (row < M) & (lane == 0)
-            mine = [(c, row < M) for c in range(chunks)]
         values = []
-        for c, ok in mine:
+        for c in range(chunks):
             for word in _load(
                 in_rsrc,
-                ok.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)),
+                live.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)),
                 0,
                 4,
             ):
                 values.append((word << 16).bitcast(fx.Float32))
                 values.append((word & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
-        peak = _lanes_max(_abs_bits_max(values), (32, 16, 8, 4, 2, 1))
-        if QW == 4:
-            _lds_put(lds + wave * 4, peak)
-            gpu.barrier()
-            peaks = [fx.Uint32(_lds_word(lds + w * 4)) for w in range(4)]
-            peak = _umax(_umax(peaks[0], peaks[1]), _umax(peaks[2], peaks[3]))
-        scale = _row_scale(peak.bitcast(fx.Float32))
-        q8 = (
-            _fp8_bytes(values, scale)
-            if QW == 4
-            else [_fp8_byte(v / scale) for v in values]
+        amax = _lanes_max(_abs_bits_max(values), (32, 16, 8, 4, 2, 1)).bitcast(
+            fx.Float32
+        )
+        scale = _row_scale(amax)
+        inv = fx.Float32(1.0) / scale
+        quads = [values[k : k + 4] for k in range(0, len(values), 4)]
+        fast = [
+            _fp8_word_q(*[_quant_fast(v, scale, inv, 1) for v in quad])
+            for quad in quads
+        ]
+        # rocdl.ballot: no typed wave vote (see _fp8_bytes); the abs-max, so the test, is the same on every lane.
+        slow = fx.Int64(rocdl.ballot(T.i64, _raw(_fast_div_ok(amax)))) == fx.Int64(0)
+        words = _uniform_if(
+            slow,
+            lambda: [
+                _pack_bytes([_fp8_byte(v / scale) for v in quad]) for quad in quads
+            ],
+            fast,
         )
         out_rsrc = _rsrc(_address(p_xq), M * H)
         zero_rsrc = _rsrc(_address(p_out), M * (H * 2))
-        for j, (c, ok) in enumerate(mine):
-            words = [
-                _pack_bytes(q8[j * 8 + h * 4 : j * 8 + h * 4 + 4]) for h in range(2)
-            ]
+        for c in range(chunks):
             _store(
                 out_rsrc,
-                words,
-                ok.select(row * H + (c * 64 + lane) * 8, fx.Int32(_DROP)),
+                words[2 * c : 2 * c + 2],
+                live.select(row * H + (c * 64 + lane) * 8, fx.Int32(_DROP)),
             )
             if ZERO:
                 _store(
                     zero_rsrc,
                     [fx.Uint32(0)] * 4,
-                    ok.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)),
+                    live.select(row * (H * 2) + (c * 64 + lane) * 16, fx.Int32(_DROP)),
                 )
         _store(
             _rsrc(_address(p_xs), M * 4),
             [scale.bitcast(fx.Uint32)],
-            first.select(row * 4, fx.Int32(_DROP)),
+            (live & (lane == 0)).select(row * 4, fx.Int32(_DROP)),
         )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
@@ -1278,34 +1302,41 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
         lds = _lds_base(LDS_WORDS * 4)
         if wg < n_sort:
             R = M * TOPK
-            start = wg * _PREP_RANGE
+            span = ((R + (_PREP_PIECE - 1)) // _PREP_PIECE + n_sort - 1) // n_sort
+            start = wg * span * _PREP_PIECE
             ids_rsrc = _rsrc(_address(p_ids), (R * 4 + 15) & -16)
             w_rsrc = _rsrc(_address(p_w), (R * 4 + 15) & -16)
             sid_rsrc = _rsrc(_address(p_sid), rows * 4)
             sw_rsrc = _rsrc(_address(p_sw), rows * 4)
             se_rsrc = _rsrc(_address(p_se), (rows >> LOG_BM) * 4)
-            own_ids = _load(ids_rsrc, (start + tid) * 4, 0, 1)[0]
-            own_weights = _load(w_rsrc, (start + tid) * 4, 0, 1)[0]
+            loc_rsrc = _rsrc(_address(p_loc), R * 4)
+            # The first piece's ids and weights, in flight during the histogram.
+            first = [
+                _load(ids_rsrc, (start + tid) * 4, 0, 1)[0],
+                _load(w_rsrc, (start + tid) * 4, 0, 1)[0],
+            ]
             for j in range_constexpr(ZERO_ROUNDS):
                 _lds_put(lds + (tid + 256 * j) * 4, 0)
             gpu.barrier()
-            for base in range(fx.Int32(0), R, fx.Int32(_PREP_ROUND)):
-                histogram(lds, base, tid, lane, R, start, ids_rsrc)
+            # One round's ids in flight while the previous round counts.
+            for base, ids in range(
+                fx.Int32(0), R, fx.Int32(_PREP_ROUND), init=round_ids(0, tid, ids_rsrc)
+            ):
+                ahead = round_ids(fx.Int32(base) + _PREP_ROUND, tid, ids_rsrc)
+                histogram(lds, fx.Int32(base), tid, lane, R, start, list(ids))
+                counted = yield ahead  # noqa: F841
             gpu.barrier()
             counts, padded, offsets, total = scan(lds, tid, lane, wave)
             gpu.barrier()
-            scatter(
-                lds,
-                tid,
-                lane,
-                R,
-                start,
-                own_ids,
-                own_weights,
-                sid_rsrc,
-                sw_rsrc,
-                _rsrc(_address(p_loc), R * 4),
-            )
+            for u, own in range(fx.Int32(0), span, fx.Int32(1), init=first):
+                i = start + fx.Int32(u) * _PREP_PIECE + tid
+                ahead = (i + _PREP_PIECE) * 4
+                following = [
+                    _load(ids_rsrc, ahead, 0, 1)[0],
+                    _load(w_rsrc, ahead, 0, 1)[0],
+                ]
+                scatter(lds, lane, R, i, own[0], own[1], sid_rsrc, sw_rsrc, loc_rsrc)
+                placed = yield following  # noqa: F841
             for k in range_constexpr(EPT):
                 expert = tid * EPT + k
                 owned = (expert < E) & (expert - (expert // n_sort) * n_sort == wg)
@@ -1313,18 +1344,25 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
                 b1 = b0 + owned.select(padded[k] >> LOG_BM, fx.Int32(0))
                 for b in range(b0, b1):
                     _store(se_rsrc, [fx.Uint32(expert)], b * 4)
+                # Padding rows one by one up to a 4-row boundary, then 4 per 16-byte store (p1: a multiple
+                # of BM >= 16).
                 p0 = offsets[k] + counts[k]
                 p1 = owned.select(offsets[k] + padded[k], p0)
-                for p in range(p0, p1):
+                p4 = (p0 + 3) & -4
+                p4 = (p4 < p1).select(p4, p1)
+                for p in range(p0, p4):
                     _store(sid_rsrc, [fx.Uint32(M)], p * 4)
                     _store(sw_rsrc, [fx.Uint32(0)], p * 4)
+                for p in range(p4, p1, fx.Int32(4)):
+                    _store(sid_rsrc, [fx.Uint32(M)] * 4, p * 4)
+                    _store(sw_rsrc, [fx.Uint32(0)] * 4, p * 4)
             _store(
                 _rsrc(_address(p_nv), 8),
                 [fx.Uint32(total), fx.Uint32(M)],
                 ((wg == 0) & (tid == 0)).select(fx.Int32(0), fx.Int32(_DROP)),
             )
         else:
-            quant(lds, wg - n_sort, lane, wave, M, p_x, p_xq, p_xs, p_out)
+            quant(wg - n_sort, lane, wave, M, p_x, p_xq, p_xs, p_out)
 
     @flyc.jit
     def launch(
@@ -1361,7 +1399,7 @@ def compile_stream_prep(*, H, TOPK, E, BM, ZERO=False, QW=4, SHARED=False):
             n_sort,
             rows,
         ).launch(
-            grid=(n_sort + (M if QW == 4 else (M + 3) // 4), 1, 1),
+            grid=(n_sort + (M + 3) // 4, 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )

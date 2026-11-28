@@ -18,14 +18,13 @@ blocks of 64 quantizes the intermediate; at most ``STREAM_BM32_ROWS`` from padde
 weight-streaming kernels of ``gfx9_fp8/stream_a8w4.py``: one prep launch sorts the routes into small blocks,
 quantizes the input and zeroes the output, the Gate/Up writes SiLU(gate) * up (with larger blocks quantized to FP8 in
 the same kernel), and the Down adds each route into the output with BF16x2 atomics. The rest run the prefill kernels:
-the sorting (the streaming prep up to ``PREFILL_PREP_MAX_ROUTES`` routes from hidden 2560 on, else Opus
-``moe_sorting`` and a per-row FP8 quantization of the input that sets ``loc_ids`` to -1), the A8W4 Gate/Up kernel
-(SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the
+the streaming path's prep (sorting into blocks of ``block_m`` rows, the FP8 input and ``loc_ids``), the A8W4 Gate/Up
+kernel (SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the
 intermediate, the A8W4 Down kernel (routing weight applied; it writes the routes by sorted row and records each
 route's sorted row in ``loc_ids``) and ``a8w4_route_sum``, which adds every token's routes. The
 calls issue no host synchronization. A routing id of -1 masks its route (ATOM's padding rows): no tier reads its
 weights or adds it (the decode kernels load through zero-byte views and leave it out of the deduplication plan, the
-sortings drop it).
+prep does not sort it).
 
 ``aiter.fused_moe`` is the other entry: ``prepare_moe_a8w4_ptpc_weight`` tags the ``w1`` / ``w2`` it returns with the
 attribute ``WEIGHT_TAG`` (as ``shuffle_weight`` sets ``is_shuffled``), and ``fused_moe(hidden_states, weight.w1,
@@ -199,13 +198,6 @@ STREAM_DOWN_W_AUX = 0
 # few blocks (M ~2048) otherwise leave the last round of workgroups mostly idle (MiMo M2048 Down -10%).
 # Padded I below 256 (short Down steps) gains nothing from it and stays unsplit.
 DOWN_MIN_WGS = 1000
-# The prefill kernels take the streaming path's prep (one launch: sorting, input quantization, loc_ids) instead of
-# Opus moe_sorting and the row kernel while M * topk stays at or below this, for hidden 2560 and above with
-# H % 512 == 0 (measured at 2560 and 4096; smaller hidden sizes keep Opus). Each sorting workgroup histograms every
-# route, so the prep grows with the square of the routes: measured in one process, M2048 MiMo TP8 (16384 routes)
-# 0.988x, Qwen TP2 (22528) 0.979x, MiMo TP4 1.00x the time; MiMo TP8 M4096 / 8192 / 16384 1.01x / 1.03x / 1.06x,
-# Qwen TP2 M8192 1.02x.
-PREFILL_PREP_MAX_ROUTES = 24576
 # DeepSeek-V4.1-Flash TP4 (hidden 5120, E384, topk 6, I576, swiglu_limit 10), measured in one process against the rules
 # above; they apply from hidden 5120 on:
 # - the streaming kernels run up to STREAM_MAX_ROWS_H5120 mean rows per expert once M * topk reaches
@@ -216,12 +208,9 @@ PREFILL_PREP_MAX_ROUTES = 24576
 #   0.97 / 1.10x; fewer routes keep STREAM_MAX_ROWS_WIDE (the MTP layer, E128 topk 3, up to M1365; TP4's padded I
 #   576 stops at STREAM_BM32_ROWS: at 24 / 27 / 30 / 32 rows 0.96 / 1.00 / 1.02 / 1.02x at TP4, 0.94 / 0.93 / 1.07 /
 #   1.06x at TP8);
-# - the prefill kernels take the streaming prep up to PREFILL_PREP_MAX_ROUTES_H5120 routes (Opus and the row kernel vs
-#   the prep at 7680 / 12288 / 24576 routes, M1280 / 2048 / 4096: 1.003x / 0.998x / 0.988x the time);
 # - the streaming Down's weight loads are non-temporal (M48-1536 2-4% faster).
 STREAM_MAX_ROWS_H5120 = 24
 STREAM_H5120_MIN_ROUTES = 4096
-PREFILL_PREP_MAX_ROUTES_H5120 = 12288
 STREAM_DOWN_W_AUX_H5120 = 2
 # Activation bytes per lane and load of the light-wave streaming Gate/Up from hidden 5120 on (16: one load every 4 /
 # 2 steps with blocks of 16 / 32 instead of 4 / 8 bytes every step).
@@ -328,7 +317,7 @@ class KernelLaunch(NamedTuple):
     kernel's interface).
 
     - ``name``: the step's name in ``last_path`` for a step of one kernel; ``<step>/<part>`` for each kernel of a step
-      that launches several (aiter's Opus ``moe_sorting`` in phases, a shared GEMM in row chunks: ``<step>/chunk<i>``)
+      that launches several (a shared GEMM in row chunks: ``<step>/chunk<i>``)
       and for kernels of steps ``last_path`` does not name (``routing_copy/*``: routing tensors made contiguous int32 /
       float32).
     - ``stream``: ``"main"``, the stream current at the call, or ``"side"``, the device's side stream of the folded
@@ -345,7 +334,7 @@ class KernelLaunch(NamedTuple):
       FP8 and xs f32, mid f32, mq FP8 and ms f32, routes BF16, out BF16; an output the kernel also reads first counts
       as a read and a write, an atomic add into it as one write), the routing tensors' columns it reads (int32 ids,
       f32 weights), the sorting metadata at its minimum (4 bytes per route of sorted ids and of sorted weights, 8 of
-      num_valid; no padding rows), loc_ids, the dedup plan, Opus' workspace.
+      num_valid; no padding rows), loc_ids, the dedup plan.
     - ``flops``: useful FLOPs, 2 * rows * N * K of each GEMM: rows = M * topk routes (masked ids included: the host
       does not read the ids) or M for the shared expert, N and K at the padded I (the shared expert's padded I, its
       Down's K padding to 128 not counted), MXFP4 counted as the FP8 MFMA it is decoded for, sorting-block and MFMA
@@ -446,13 +435,6 @@ def _cost(cost):
     ``_recording`` first, right after the launch: outside the recording nothing is computed.
     """
     last_launches[-1] = KernelLaunch(*last_launches[-1][:2], *cost)
-
-
-def _record_copy(device, name, src, dst):
-    """Record ``routing_copy/<name>`` when ``dst`` (``src``'s columns made contiguous) is a copy, not ``src``'s
-    memory: one read and one write of its bytes."""
-    if dst.data_ptr() != src.data_ptr():
-        _record(device, f"routing_copy/{name}", _Cost(fixed=2 * dst.nbytes))
 
 
 def _routing_input(t, dtype, name):
@@ -993,9 +975,9 @@ def _down_kernel(
 
 
 @functools.cache
-def _row_quant_kernel(cols, dtype, fill, device):
+def _row_quant_kernel(cols, dtype, device):
     """Row quantization launcher (``compile_row_quant_fp8``). ``device`` only keys the cache."""
-    return compile_row_quant_fp8(cols, dtype, fill)
+    return compile_row_quant_fp8(cols, dtype)
 
 
 def _prefill_down(tokens, topk, experts, hidden, inter, block_m, device, loc_topk=None):
@@ -1728,13 +1710,11 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants
 
 
 @functools.cache
-def _stream_prep_kernel(
-    hidden, topk, experts, block_m, zero, qw, device, *, shared=False
-):
+def _stream_prep_kernel(hidden, topk, experts, block_m, zero, device, *, shared=False):
     """Streaming prep launcher (``compile_stream_prep``). ``device`` only keys the cache; ``shared``: the last of the
     ``topk`` columns is a folded shared expert's, never sorted."""
     return stream_a8w4.compile_stream_prep(
-        H=hidden, TOPK=topk, E=experts, BM=block_m, ZERO=zero, QW=qw, SHARED=shared
+        H=hidden, TOPK=topk, E=experts, BM=block_m, ZERO=zero, SHARED=shared
     )
 
 
@@ -1768,9 +1748,6 @@ def _stream_prep(
     loc_ids = torch.empty((M, topk), dtype=torch.int32, device=device)
     xq = torch.empty((M, H), dtype=torch.float8_e4m3fnuz, device=device)
     xs = torch.empty((M,), dtype=torch.float32, device=device)
-    # Four waves per input row while the row's 512-column chunks split evenly or rows are few (measured: H 4096
-    # M512 13.2 vs 14.5 us; H 2560 M1024 one wave per row 15.4 vs 17.7 us).
-    qw = 4 if H % 2048 == 0 or M <= 256 else 1
     _launch(
         "a8w4_stream_prep",
         _stream_prep_kernel(
@@ -1779,7 +1756,6 @@ def _stream_prep(
             experts,
             block_m,
             zero,
-            qw,
             device.index,
             **({"shared": True} if shared else {}),
         ),
@@ -1910,18 +1886,14 @@ def _stream_block_m(tokens, topk, experts, hidden=0):
     return 32 if rows <= STREAM_BM32_ROWS else 64
 
 
-def _quantize(x, rows, cols, dtype, fill=None):
-    """Per-row FP8 quantization of ``x`` [rows, cols]; the same kernel sets int32 ``fill`` [rows, k] to -1."""
+def _quantize(x, rows, cols, dtype):
+    """Per-row FP8 quantization of ``x`` [rows, cols] (``compile_row_quant_fp8``)."""
     q = torch.empty((rows, cols), dtype=torch.float8_e4m3fnuz, device=x.device)
     scale = torch.empty((rows,), dtype=torch.float32, device=x.device)
-    kernel = _row_quant_kernel(
-        cols, dtype, 0 if fill is None else fill.shape[1], x.device.index
-    )
-    _launch(
-        "a8w4_row_quant_fp8", kernel, x, q, scale, scale if fill is None else fill, rows
-    )
+    kernel = _row_quant_kernel(cols, dtype, x.device.index)
+    _launch("a8w4_row_quant_fp8", kernel, x, q, scale, rows)
     if _recording:
-        _cost(_Cost(fixed=_nbytes(x, q, scale, fill)))
+        _cost(_Cost(fixed=_nbytes(x, q, scale)))
     return q, scale
 
 
@@ -2176,8 +2148,8 @@ def flydsl_moe_a8w4_ptpc(
     ``weight`` comes from ``prepare_moe_a8w4_ptpc_weight``; ``topk_weight`` [M, topk] (float32) is applied
     in Down; ``topk_ids`` [M, topk] (int32) in ``[0, E)`` (a fused shared expert is an ordinary
     expert id) or -1, a masked route (ATOM's padding rows): it reads no weights and adds nothing whatever its weight,
-    so a token whose ids are all -1 gets 0. Ids are distinct within a token apart from -1 (with a repeated id the
-    Opus-sorted prefill keeps one route, the other paths every route); other ids are invalid. Only ``DEBUG_CHECKS``
+    so a token whose ids are all -1 gets 0. Ids are distinct within a token apart from -1 (every tier runs each slot
+    of a repeated id as a route of its own and adds them all); other ids are invalid. Only ``DEBUG_CHECKS``
     (``AITER_MOE_A8W4_DEBUG=1``, a host synchronization) reads the ids to check both rules (``ValueError``). int64
     ids, other floating weights and non-contiguous routing tensors are converted first.
     The input and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
@@ -2441,19 +2413,19 @@ def _record_shared_gemm(device, name, rows, shared, fixed, flops):
 class _SharedFold:
     """The shared expert of a call that folds it into the routed experts' last reduction (``_moe_shared_fold``).
 
-    Its chain: the Gate/Up GEMM (``_shared_gemm``) on the routed path's FP8 input and per-row scale (the stream prep's,
-    the row kernel's of prefill and of the decode tier, the plan kernel's of the deduplicated decode Gate/Up), then
-    ``shared_a8w4.compile_shared_mid`` (SiLU(gate) * up with the SwiGLU limit, per-row FP8 for Down with the shared
-    expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM
-    (``_shared_down``: ``shared_a8w4.compile_shared_down`` or the preshuffle GEMM) into ``out``:
-    M rows of the prefill tier's routes buffer that ``a8w4_route_sum`` adds as the last column of loc_ids, or the
-    output itself, onto which the slot-pair decode Down or the streaming Down's BF16x2 atomics add the routes. The
-    GEMM stores 16 bytes per thread: an ``out`` off a 16-byte boundary gets the GEMM's output from an aligned buffer
-    through a copy (``shared_fold_copy``, one more kernel on the chain's stream). A token whose shared expert is dropped
-    (ATOM's rule, ``shared_a8w4``) gets +0 there. With a side stream (``side``) the side stream waits for the current
-    stream where the routed path calls ``start`` (after the kernel that quantizes the input), its kernels are issued
-    by ``fork``, which the routed path calls right after its next launch (``_moe_shared_fold``), and joined by
-    ``join`` (before the kernel that reads ``out``); without one the chain runs on the current stream at ``start``.
+    Its chain: the Gate/Up GEMM (``_shared_gemm``) on the routed path's FP8 input and per-row scale (the prep's of the
+    streaming and prefill tiers, the row kernel's of the decode tier, the plan kernel's of the deduplicated decode
+    Gate/Up), then ``shared_a8w4.compile_shared_mid`` (SiLU(gate) * up with the SwiGLU limit, per-row FP8 for Down
+    with the shared expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM
+    (``_shared_down``: ``shared_a8w4.compile_shared_down`` or the preshuffle GEMM) into ``out``: M rows of the prefill
+    tier's routes buffer that ``a8w4_route_sum`` adds as the last column of loc_ids, or the output itself, onto which
+    the slot-pair decode Down or the streaming Down's BF16x2 atomics add the routes. The GEMM stores 16 bytes per
+    thread: an ``out`` off a 16-byte boundary gets the GEMM's output from an aligned buffer through a copy
+    (``shared_fold_copy``, one more kernel on the chain's stream). A token whose shared expert is dropped (ATOM's rule,
+    ``shared_a8w4``) gets +0 there. With a side stream (``side``) the side stream waits for the current stream where
+    the routed path calls ``start`` (after the kernel that quantizes the input), its kernels are issued by ``fork``,
+    which the routed path calls right after its next launch (``_moe_shared_fold``), and joined by ``join`` (before the
+    kernel that reads ``out``); without one the chain runs on the current stream at ``start``.
     """
 
     def __init__(self, hidden_states, weight, topk_weight, topk_ids, limit, side):
@@ -2731,10 +2703,7 @@ def _check_routing(topk_ids, experts, shared):
         )
     ids = routed.sort(dim=1).values
     if bool(((ids[:, 1:] == ids[:, :-1]) & (ids[:, 1:] >= 0)).any()):
-        raise ValueError(
-            "a token's routed expert ids must be distinct (-1 aside): with a repeated id the Opus-sorted prefill "
-            "keeps one route, the other paths every route"
-        )
+        raise ValueError("a token's routed expert ids must be distinct (-1 aside)")
 
 
 def _moe_routed(
@@ -2754,8 +2723,6 @@ def _moe_routed(
     ``_routed_tier``'s) and its kernels. With a folded shared expert (``shared``, ``_SharedFold``) the routing tensors
     keep its column, the last: the routed experts take the others, and each tier starts the shared expert's chain on
     its FP8 input and joins it before its last reduction."""
-    from aiter.fused_moe import moe_sorting
-
     M, H = hidden_states.shape
     cols = topk_ids.shape[1]
     topk = cols - (shared is not None)
@@ -2781,39 +2748,18 @@ def _moe_routed(
     block_n = 128 if block_n is None else block_n
     tile_k = (128 if M > 2048 else 256) if tile_k is None else tile_k
 
-    prep_routes = (
-        PREFILL_PREP_MAX_ROUTES_H5120 if H >= 5120 else PREFILL_PREP_MAX_ROUTES
-    )
-    if H >= 2560 and H % 512 == 0 and M * topk <= prep_routes:
-        sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
-            _stream_prep(
-                hidden_states,
-                topk_weight,
-                topk_ids,
-                E,
-                block_m,
-                output,
-                zero=False,
-                routed=topk,
-            )
+    sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
+        _stream_prep(
+            hidden_states,
+            topk_weight,
+            topk_ids,
+            E,
+            block_m,
+            output,
+            zero=False,
+            routed=topk,
         )
-    else:
-        sort_weight, sort_ids = topk_weight, topk_ids
-        if shared is not None:
-            sort_weight = topk_weight[:, :topk].contiguous()
-            sort_ids = topk_ids[:, :topk].contiguous()
-        sorted_ids, sorted_weights, sorted_experts, num_valid = moe_sorting(
-            sort_ids, sort_weight, E, H, hidden_states.dtype, block_m, accumulate=False
-        )[:4]
-        last_path.append("moe_sorting_opus")
-        if _recording:
-            _record_copy(device, "sort_weight", topk_weight, sort_weight)
-            _record_copy(device, "sort_ids", topk_ids, sort_ids)
-            _record_opus_sorting(device, M, topk, E)
-        # The sort's inverse output (output_aux) costs more than Down storing it: the input quantization
-        # sets loc to -1 (a repeated expert id of a token keeps one route), Down stores each route's sorted row.
-        loc_ids = torch.empty((M, cols), dtype=torch.int32, device=device)
-        xq, xs = _quantize(hidden_states, M, H, "bf16", fill=loc_ids)
+    )
     grid = sorted_experts.numel()
     routing = (sorted_ids, sorted_weights, sorted_experts, num_valid)
     rows = grid * block_m
@@ -2912,34 +2858,9 @@ def _moe_routed(
     return output
 
 
-def _record_opus_sorting(device, tokens, topk, experts):
-    """``last_launches`` entries of aiter's Opus ``moe_sorting`` on ``tokens`` x ``topk`` routes (its default
-    dispatch, which ``_moe_routed`` takes): without a workspace one kernel (``moe_sorting_opus``), else the multi-phase
-    sort, from 2048 tokens on the workspace clear, P0, P1 and P23, below it P0 and P23 (``moe_sorting_opus/<phase>``).
-    Each phase reads or writes the workspace once (``moe_sorting_opus_get_workspace_size`` bytes); P0 reads the ids,
-    the last kernel the ids and weights and writes the sorted ids, weights, blocks' experts and num_valid.
-    """
-    import aiter
-
-    routes = tokens * topk
-    sort = _Cost(4, 0, 16 * routes + 8)
-    ws = aiter.moe_sorting_opus_get_workspace_size(
-        tokens, experts, topk, 0, device.index
-    )
-    if ws == 0:
-        _record(device, "moe_sorting_opus", sort)
-        return
-    if tokens >= 2048:
-        _record(device, "moe_sorting_opus/clear_ws", _Cost(fixed=ws))
-    _record(device, "moe_sorting_opus/p0", _Cost(fixed=4 * routes + ws))
-    if tokens >= 2048:
-        _record(device, "moe_sorting_opus/p1", _Cost(fixed=ws))
-    _record(device, "moe_sorting_opus/p23", sort._replace(fixed=sort.fixed + ws))
-
-
 # fused_moe parameters that _fused_moe_route reads; every other one must keep its fused_moe default, except these
 # hints that do not change the result: moe_sorting_dispatch_policy only schedules aiter's own moe_sorting (this op
-# sorts with its own prep kernel or moe_sorting's default), splitk only moves the order of the K sums (fused_moe_
+# sorts with its own prep kernel), splitk only moves the order of the K sums (fused_moe_
 # lets a provider ignore it), herd_routed_scaling_factor is unused while herd_topk is 0 (which is required).
 _ROUTE_ARGS = frozenset(
     (
