@@ -99,15 +99,14 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #     → down_prefill（写有效路由的 loc_ids）→ sorted_sum → out；H5120 且 M·TOPK ≥ 16384 时两个 GEMM 按 XCD 分块
 #     （XCD_CHUNK）；I > 512 且估计 WG > 80 时 down_prefill 的激活分两段（TWO_PASS）
 #   入口：会建 down_prefill（prefill 档，或流式 BM64 且 H ≥ 4096）且 BM·I > 64 KiB（BM64 即 I > 1024）时，任何 kernel 启动前报错
-#   带 shared expert（expert E 在路由最后一列，见 moe_a8w4.py 的 _moe_shared）：M ≤ 4、routed 列走核内量化的逐路由 decode
-#     且 TOPK ≤ 16（含 shared 列）时 gateup_decode_mixed → down_decode_mixed（shared 作末路，不另 launch、不相加；能折叠时
-#     还要 M·routed topk·I ≤ DECODE_SHARED_MIXED_MAX_WORK，主干 TP4 的 M4 因此折叠）；
-#     其余 M 在 decode 槽对 Down、流式、prefill M > 1024 处折叠（shared 折叠一节；shared 写 out 的档还要 out 16 B 对齐）：上面各档的
-#     kernel 以 TOPK+1 列的路由编译、跳过末列；x 量化之后 preshuffle GEMM(gate / up) → shared_mid → preshuffle GEMM(Down)
-#     写 out 或 routes 末尾 M 行（M ≤ 1024 在 side stream 上、routed Gate/Up 之后发出），最后一次规约前 join；
-#     再其余（单槽 / 去重 Down、prefill M ≤ 1024、out 未对齐）按 ATOM split：per_token_quant_hip(x) → gemm_a8w8_bpreshuffle
-#     (gate / up) → silu_and_mul(L) → per_token_quant_hip(mid) → gemm_a8w8_bpreshuffle(Down)；M ≤ 1024 且 out 与 x 不重叠时
-#     在 side stream 上与 routed 并发（路由权重另一条 side stream），join 后 out.addcmul_(shared, bf16(权重))；否则当前流上先跑
+#   带 shared expert（expert E 在路由最后一列，见 moe_a8w4.py 的 _moe_shared）只有两种走法：
+#     混合：M ≤ 10、M·routed topk·I ≤ DECODE_SHARED_MIXED_MAX_WORK（10368）、routed 列在 decode 档且 TOPK ≤ 16（含 shared 列）时
+#       gateup_decode_mixed → down_decode_mixed（shared 作末路，不另 launch、不相加；整层 DS TP4 到 M3、TP8 到 M5、MTP TP4 到 M6、
+#       MTP TP8 到 M10）；
+#     折叠：其余全部（shared 折叠一节）。routed 档照常（decode 档一律用槽对 Down，槽对 Down 不可用时改流式档），各档 kernel 以
+#       TOPK+1 列的路由编译、跳过末列；x 量化之后 preshuffle GEMM(gate / up；M > 65536 按 65536 行分块) → shared_mid →
+#       preshuffle GEMM(Down) 写 out（未 16 B 对齐时写临时缓冲再拷进 out）或 routes 末尾 M 行（M ≤ 1024 在 side stream 上、
+#       routed Gate/Up 之后发出），最后一次规约前 join
 ```
 
 ## 逐 kernel 的 roofline 口径（[moe_a8w4.py](../../../moe_a8w4.py) 的 `KernelLaunch`）
@@ -115,9 +114,8 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 （`moe_a8w4.last_launches`，与 `last_path` 并列；每次调用都清空它，只有开关内的调用写入）：名字、stream、最少字节的三项与有用
 运算量；不读 GPU 数据、不同步（graph 捕获时照样登记）。关闭时发射点只多一次 `if _recording` 判断，不求字节与运算量（eager
 调用的 host 时间不变）；打开时每个 kernel 多约 4–9 µs host 时间。kernel 改名 / 合并时随代码改登记与本节，bench 不用改。
-外部 kernel 也逐个登记：Opus 排序的各相、底座 sorted_sum、preshuffle GEMM、split 链（含 Down 输入补零的 fill + copy）、
-`_shared_gate` 的小 kernel、`addcmul_`、路由张量的转换拷贝（`routing_copy/*`）；fork / join / mixed 标记与 `DEBUG_CHECKS`
-的 host 检查不登记。
+外部 kernel 也逐个登记：Opus 排序的各相、底座 sorted_sum、preshuffle GEMM（按行分块时每块一条，`<名>/chunk<i>`）、未对齐输出的
+拷贝（`shared_fold_copy`）、路由张量的转换拷贝（`routing_copy/*`）；fork / join / mixed 标记与 `DEBUG_CHECKS` 的 host 检查不登记。
 
 **字节** = 唯一 routed expert 数 × 每 expert 字节 + shared 字节 + 固定字节（唯一 expert 数由调用方在 host 上从路由列数出）。
 按 kernel 接口的必需流量，每个不同字节算一次，不扣 cache 命中：权重、delta、通道因子按存储格式（含 I 补零）；激活、中间量、
@@ -143,8 +141,8 @@ S1 / S2 = shared_w1 / shared_w2 及其行 scale，B = 4 B（块的 expert 号）
 - Opus 排序（无 workspace 时 1 个 kernel；有时 P0 + P23，≥ 2048 token 再加清零与 P1）：末个 B；0；单 kernel 16R + 8，分相时
   每相 + workspace 一次，P0 + ids 4R，末相 + 16R + 8；0。
 - shared 折叠（GEMM、shared_mid、GEMM）：0；S1 / 0 / S2；xq + xs + gate_up、gate_up + mq + ms + 12M（+ loc 4M）、mq + ms + out；
-  2·M·2I_s·H / 0 / 2·M·H·I_s。split 链同样逐步算（补零：fill M·K_w、copy 2M·I_s）。
-- 小 kernel（routing_copy、shared_gate、addcmul_）：0；0；读 + 写（addcmul_ 读 out、shared、gate，写 out）；0。
+  2·M·2I_s·H / 0 / 2·M·H·I_s。M > 65536 时 GEMM 每块一条：S1 / S2 只记在第一块（一次调用每个字节只计一次），固定字节与运算量按块的行数分。
+- 小 kernel（routing_copy、shared_fold_copy）：0；0；读 + 写；0。
 
 bench 计时的调用都不登记：计时之后在开关内再调一次 a8w4 取登记（`_recorded_launches`；kernel 只取决于形状、选项与模块常量，
 与计时的调用相同）。`_kernel_us` 把它与 run_perftest 那一遍的 profiler 事件对齐：每个 stream 的事件按 profile 的顺序
@@ -784,10 +782,12 @@ q clamp ±240 → cvt_pk_fp8（RNE；两次转换写同一 dword）→ -0 改 +0
   mid 22/33、x 8/11 ≤ 10%；整层例在 fork 之后为 2.3–2.8 µs，routed 例紧跟预量化或去重 Gate/Up 时 3.9–5.2 µs（未采 PMC，机理未证实）。
 
 ## 混合 Gate/Up decode：shared FP8 作末路（[decode_a8w4.py](decode_a8w4.py#L1359)）
-带 shared 的调用在 M ≤ `DECODE_SHARED_MIXED_MAX_M`（4）、routed 列走核内量化的逐路由 decode、TOPK ≤ 16 时用；能折叠时（M ≥ 4 的
-槽对 Down）只到 M·routed topk·I ≤ `DECODE_SHARED_MIXED_MAX_WORK`（10240：主干 TP4 M4 = 13824 改走折叠，graph 下 0.94× 混合；
-TP8 与 MTP 的 M4 仍混合，是折叠的 0.55–0.82×）
-（[`_mixed_decode`](../../../moe_a8w4.py#L2288)，档位只按 routed 列判断）：shared（topk_ids 的末列，id = E）和 routed 列在同一个 launch
+带 shared 的调用在 M ≤ `DECODE_SHARED_MIXED_MAX_M`（10）且 M·routed topk·I ≤ `DECODE_SHARED_MIXED_MAX_WORK`（10368）、routed 列在
+decode 档、TOPK ≤ 16 时用，其余一律折叠（下文 shared 折叠一节）。按工作量而不按 M 划界：混合 kernel 每 token 的 wave 随 routed 列数
+与 I 增长，折叠的 shared 链在侧流上与 routed 并行；整层 graph 同进程实测（混合 / 折叠）10368 及以下混合快（MTP TP8 M5–10
+0.61–0.94×、MTP TP4 M5 / 6 0.85 / 0.90–0.96×、主干 TP8 M5 0.92×），主干 TP8 M6（11520）与 MTP TP4 M7（12096）持平，主干 TP4 M4
+（13824）起折叠快（混合 1.05–1.22×）；所以整层 DS TP4 到 M3、TP8 到 M5、MTP TP4 到 M6、MTP TP8 到 M10 走混合
+（[`_mixed_decode`](../../../moe_a8w4.py#L2577)，档位只按 routed 列判断）：shared（topk_ids 的末列，id = E）和 routed 列在同一个 launch
 里算 Gate/Up，接着混合 Down（下一节）在同一个 launch 里把每列加进 out，没有 side stream、没有最后相加。
 shared 权重直接用 prepare 存的 `shuffle_weight(16,16)`：K%64 = 0 时它就是 `[N/16][K/64][4][16 行][16 B]`（routed 块的两倍字节、
 K 自然序），lane 16g+n 一条 16 B 加载拿到行 n 的 K 组 g，字节直接作 MFMA 的 B（不读 delta、不查 LUT），每行 scale 代替通道因子。
@@ -966,8 +966,8 @@ wave 内量化本列 mid 行
 4. 屏蔽列与不生效的 shared 不读权重（记录数 0），贡献由 select 置零（它们的 mid 行与路由权重可以是任意值）；
    部分和按固定顺序 tree_sum，同输入的输出逐位确定。
 
-**资源**：LDS = TOPK·(I + 128 + 96) B（DS TP4 5600 B、MTP TP8 2176 B）；VGPR MTP TP8 62（8 B 单块读法时 44）。主干 TP4 的 M4 改走折叠（见混合 Gate/Up 一节的
-DECODE_SHARED_MIXED_MAX_WORK）；M8 起 H5120 的 routed Gate/Up 去重，不走混合。
+**资源**：LDS = TOPK·(I + 128 + 96) B（DS TP4 5600 B、MTP TP8 2176 B）；VGPR MTP TP8 62（8 B 单块读法时 44）。范围见混合 Gate/Up 一节
+（M ≤ 10 且 M·routed topk·I ≤ 10368；grid (H/32, M) 与 LDS 都与 M 无关，M5–10 用同一份编译结果）。
 
 **roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：消融（用冻结的输入重测）、sweep、ATT）
 - memory bound；1.12–1.84 TB/s（28–46% 线）。
@@ -1107,8 +1107,8 @@ x 片 → LDS [组员, H+16]；barrier
   → f32 写 mid[组员路由, 16j + t%16]（条数以外的线程不写）
 ```
 关键代码：[组首判断](decode_dedup_a8w4.py#L608)、[x 行与权重](decode_dedup_a8w4.py#L384)、[主循环](decode_dedup_a8w4.py#L453)、
-[收尾](decode_dedup_a8w4.py#L469)、[pin](decode_dedup_a8w4.py#L85)、[host 分派](../../../moe_a8w4.py#L1015)、
-[H5120 路径](../../../moe_a8w4.py#L1111)。
+[收尾](decode_dedup_a8w4.py#L469)、[pin](decode_dedup_a8w4.py#L85)、[host 分派](../../../moe_a8w4.py#L1395)、
+[H5120 路径](../../../moe_a8w4.py#L1280)。
 
 **命名与不变量**：count / members / expert 组首条目与本路由的 expert；G = GROUP；XS = H+16 LDS 行距；KB_PART 本 wave 的 64-K 块数；
 em = t//16、cr = t%16 收尾线程的组员与通道行 2m'+h。
@@ -1317,7 +1317,7 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并
 ```
 关键代码：[前导](stream_a8w4.py#L417)、[按 S 特化](stream_a8w4.py#L879)、[共享激活](stream_a8w4.py#L711)、[ACT_STEPS 取址](stream_a8w4.py#L672)、
 [分组发与写](stream_a8w4.py#L763)、[预取](stream_a8w4.py#L762)、[主循环](stream_a8w4.py#L777)、[SiLU 与截断](stream_a8w4.py#L523)、
-[尾部量化](stream_a8w4.py#L564)、[夹逼与回退](stream_a8w4.py#L265)、[分派的 tile](../../../moe_a8w4.py#L1400)。
+[尾部量化](stream_a8w4.py#L564)、[夹逼与回退](stream_a8w4.py#L265)、[分派的 tile](../../../moe_a8w4.py#L1625)。
 
 **命名与不变量**：S 有效子块数；P 预取步数；SYNC / RING = 2·SYNC 激活环的步数与槽数；LOADER 每 lane 每步读的激活字节，
 LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
@@ -1522,7 +1522,7 @@ def a8w4_route_sum(loc_ids, routes, out, M):
 | `a8w4_route_sum` | ⌈M·H/512 / 4⌉ × 256 线程 | wave 管一个 token 的 512 列；lane 16 B |
 
 QW 由 host 选：H%2048 = 0 或 M ≤ 256 时 4（列块均分或行少），否则 1（行多时 CTA 少）。排序块 BM 也由 host 选
-（[_stream_block_m](../../../moe_a8w4.py#L1593)：每 expert 平均 ≤ 12 行一律 16，与路由数和 H 无关）。
+（[_stream_block_m](../../../moe_a8w4.py#L1830)：每 expert 平均 ≤ 12 行一律 16，与路由数和 H 无关）。
 
 **流水线**
 ```text
@@ -1566,27 +1566,33 @@ route_sum：lane < topk 读 loc_ids[token] → readlane 逐槽广播 → topk �
 - 可达上限：① = T0 + 字节/4 TB/s（小 M 就是 T0）；② 只能由原子 Down 去掉，而 I ≥ 512 时原子更慢，保留。
 
 ## shared expert 折叠（[shared_a8w4.py](shared_a8w4.py)，入口 `moe_a8w4._SharedFold`）
-带 FP8 shared expert（DeepSeek-V4.1，路由末列 = E）的调用，在 routed 路径允许处（`_shared_fold_tier`）不再单独相加：shared
+带 FP8 shared expert（DeepSeek-V4.1，路由末列 = E）的调用，不走混合 decode 的（上面两节）一律折叠，不再单独相加：shared
 的两次稠密 GEMM（aiter 的 FlyDSL preshuffle FP8 GEMM，`_shared_gemm` 按 M 选 tile；gfx942 上比 CK 默认配置快）吃 routed
 路径已量化的 x，中间一步是本文件的 `a8w4_shared_mid`，结果（已乘 shared 的路由权重）写到 routed 路径最后一次规约会加它的地方。
-档位只按 routed 列判断；routed kernel 只看前 topk 列（prep 以 SHARED 编译；decode 的 kernel 以 ID_COLS = topk+1 编译，按 `common_a8w4.id_index` 跳过末列，不再拷贝 routed 列）。
+档位只按 routed 列判断（`_fold_tier`）；routed kernel 只看前 topk 列（prep 以 SHARED 编译；decode 的 kernel 以 ID_COLS = topk+1 编译，按 `common_a8w4.id_index` 跳过末列，不再拷贝 routed 列）。
 
 | routed 档 | x 的量化来自 | shared Down 写到 | 规约 |
 |---|---|---|---|
-| decode 槽对 Down（np / pp / wide-dd） | row_quant_decode（np / pp；Gate/Up 随之一律预量化）或计划 kernel（wide-dd） | out 本身 | 槽对 Down 的 SHARED 变体读回、相加后舍入一次 |
+| decode（任意 M 都用槽对 Down；np / pp / wide-dd） | row_quant_decode（np / pp；Gate/Up 随之一律预量化，不走去重 Down）或计划 kernel（wide-dd） | out 本身 | 槽对 Down 的 SHARED 变体读回、相加后舍入一次 |
 | 流式，I_pad ≥ 512 | prep | routes 末尾预留的 M 行，loc[:, topk] = 行号 | route_sum 以 topk+1 列求和 |
 | 流式，原子 Down（I_pad < 512） | prep | out 本身（prep 不再清零） | routed 的 bf16x2 原子加在其上（本就不确定） |
-| prefill，M > 1024 | prep 或 `_quantize(fill)` | routes 末尾预留的 M 行 | sorted_sum 以 topk+1 列求和（底座 kernel 不改） |
+| prefill（任意 M，含带 tile 参数的小 M） | prep 或 `_quantize(fill)` | routes 末尾预留的 M 行 | sorted_sum 以 topk+1 列求和（底座 kernel 不改） |
 
-`_moe_shared` 先判混合 decode（M ≤ `DECODE_SHARED_MIXED_MAX_M` = 4，上面两节），再判折叠，所以折叠的 decode 档从 M5 起；
-混合不收的单槽 Down（M ≤ 3）、去重 Down（H ≥ 4096 且 I_pad 为 128 的倍数）、prefill M ≤ 1024、shared 要写 out 而 out 未按 16 B
-对齐（decode、原子流式）、M > `SHARED_FOLD_MAX_M` = 65536（下述 GEMM 行上限）仍走 ATOM 的 split。
+- decode 档的槽对 Down 用不了（w2 加一个 expert 超 4 GiB，或形状超出槽对 Down 的 LDS / lane 上限，`_decode_fold`）时，routed 改走
+  流式档折叠（`_fold_tier` 的回落；流式 kernel 任意 M 可用）。只涉及非目标形状。回落的调用一律用流式 Down
+  （`_fused_moe_stream(prefill_down=False)`，入口检查同样按它算）：排序块 64、H ≥ 4096、I_pad ≥ 512 时流式档本来按 `STREAM_PREFILL_DOWN`
+  换 prefill Down，而 prefill Down 只容 I_pad ≤ 1024，回落的调用是 decode 档的输入，不能因此报错（如 E2 topk2 H4096 I1088 M30）；
+  不带 shared、或本来就在流式档的调用照旧（该档 I_pad > 1024 入口报错）。
+- shared 的 Down GEMM 每线程写 16 B：out 未按 16 B 对齐时（decode、原子流式）GEMM 写对齐的临时缓冲，再一次拷贝进 out
+  （`shared_fold_copy`，同一条流上），代价只落在未对齐这种少见情况。
+- preshuffle GEMM 最多 65536 行（`gemm_kernels.PRESHUFFLE_M_MAX`：kernel 以 65536 行的 layout 看 A 和 C，超出即报错），所以
+  M > 65536 时 `_shared_gemm` 按 65536 行分块（A、scale、C 的行视图，每块一次 GEMM，tile 按块的行数选）。整层 graph 同进程实测
+  （M65537–131072，4 形状）为 ATOM split 的 0.82–0.94×（M98304：主干 TP4 0.93×、MTP TP8 0.82×）。
 
 shared 的两次 GEMM 要求 tile_m·tile_k ≥ 每线程 16 B（四波 256 线程、两波（tile_n 32）128 线程；`_shared_gemm` 断言）：preshuffle
 GEMM 的 A 按“每线程一个 16 B 片”拷进 LDS，tile 更小时拷贝覆盖的行超出 tile_m、写进另一 LDS stage，别的 wave 还在读时就是竞争
 （四波 tile_m 16·tile_k 128：与别的 kernel 共享 CU 时偶发 8 行×16 列块错）。所以 M ≤ 48 的 Down（K = I_pad 640 / 384，tile_k 只能
-128）用两波 (16, 32, 128)，速度与 (16, 64, 128) 相同。preshuffle GEMM 最多 65536 行（`gemm_kernels.PRESHUFFLE_M_MAX`：kernel 以
-65536 行的 layout 看 A 和 C，超出即报错），所以 `_shared_fold_tier` 在 M > 65536 时退回 split（CK 的 `gemm_a8w8_bpreshuffle` 无此上限）。
+128）用两波 (16, 32, 128)，速度与 (16, 64, 128) 相同。
 
 **Gluon 风格**
 ```python
@@ -1605,9 +1611,9 @@ def a8w4_shared_mid(gate_up, topk_ids, topk_weight, mq, ms, loc, base):   # gate
 ```
 
 **次序（每档同一模式）**：x 量化的 kernel 之后记一个事件（`start`），侧流等它，但侧流的 GEMM → shared_mid → GEMM 在 routed
-的下一个 kernel（Gate/Up）发出之后才发出（`fork`，`SHARED_FOLD_FORK_AFTER`：graph 重放时 fork 不再把 Gate/Up 推后，decode
-M8–32 为 0.89–0.99 倍）；读 shared 结果的 kernel 之前 join。输出就地（out = x）时只有 np 档的 Gate/Up 在 fork 之后还读 x（仅
-`SHARED_FOLD_DECODE_SIDE_QUANT` = 1 时，Gate/Up 不预量化）：shared 的 Down GEMM 先 hold，Gate/Up 发出后再等一次主流（`release`）。prefill 的 shared_mid 在 `_quantize(fill)` 之后写 loc 末列，gemm2 只写 routed 列。
+的下一个 kernel（Gate/Up）发出之后才发出（`fork`：graph 重放时 fork 不再把 Gate/Up 推后，decode M8–32 为先发出时的 0.89–0.99 倍）；
+读 shared 结果的 kernel 之前 join。shared 链只读 routed 路径量化好的 x，输出就地（out = x）时 x 也在 shared 写 out 之前读完（decode
+档的 Gate/Up 一律预量化；让侧流自己量化 x 慢 2–6%）。prefill 的 shared_mid 在 `_quantize(fill)` 之后写 loc 末列，gemm2 只写 routed 列。
 侧流用到 `SHARED_FOLD_DUAL_STREAM_MAX_M`（1024），更多 token 在当前流上串行。graph 重放时每条跨流边（fork、join 各一条）
 在 routed 关键路径上约 5–6 µs，侧流链本身藏在 routed Gate/Up 后面（只让它慢约 2 µs）：对串行，decode M8–32 快 2–10%、流式持平
 到快 3%；与 bench 的 split 参考（也是一 fork 一 join、不做最后相加）在流式档持平。fork 挪到调用开头（侧流自己量化 x）没有收益。
@@ -1637,19 +1643,20 @@ M8–32 为 0.89–0.99 倍）；读 shared 结果的 kernel 之前 join。输�
 - 可达上限：① = 冷读包络（M32768 TP4 23.5、TP8 14.1 µs，实测是它的 6.5× / 5.8×）；② 并进 Gate/Up GEMM 的收尾（要跨 tile 的行 amax）。
 - 核对：串行档模型对官方的超出只在 5–9 µs 的例（±13–17%，约 1 µs）。
 
-## split 链（aiter / CK 外部 kernel）
-shared 不能折叠时（M > 65536、shared 要写 out 而 out 未 16 B 对齐、单槽 / 去重 Down、prefill M ≤ 1024）按 ATOM 的 split 链计算（调用顺序见
-文首「先读」）：per_token_quant_hip(x) → CK gemm_a8w8_bpreshuffle(gate / up) → silu_and_mul → per_token_quant_hip(mid) → Down 输入补零
-（fill + copy）→ CK GEMM(Down) → out.addcmul_(shared, 权重)，路由权重另经 `_shared_gate` 的 6 个小 kernel。bench 里只有两个 M98304 例走它。
+## ATOM 的 split 链（只作 bench 的 a8w4_split 对照）
+算子里没有 split：shared 只走混合 decode 或折叠（上一节）。bench 的 a8w4_split 对照按 ATOM 的 split 臂计时（测试文件自带实现，
+不计最后相加）：per_token_quant_hip(x) → CK gemm_a8w8_bpreshuffle(gate / up) → silu_and_mul → per_token_quant_hip(mid)
+→ Down 输入补零（fill + copy）→ CK GEMM(Down)。冻结基线的算子在 M > 65536 时还走这条链（再加 out.addcmul_ 与 6 个路由权重小 kernel），
+下面是那两例的分解，作为分块折叠的对照。
 
-**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数；诊断：整层 graph 消融、分块折叠对照）
+**roofline 与分解**（官方 = 冻结基线（M0）bench 中位数，基线算子的 split；诊断：整层 graph 消融、分块折叠对照）
 - 两例 shared 链合计 9676 µs（ds_layer_tp4 M98304）/ 7430 µs（mtp_layer_tp8 M98304），shared 增量 9114 / 6954 µs = 墙钟的 20% / 41%；
   墙钟 = 主流 25 个 kernel 之和（≤ 0.2%）。
 - CK 在这些形状没有调优表（用默认 kernel）：Gate/Up 63–67% 线、Down 29–44%（K 补零到 128 的倍数）；addcmul_ 1.8 TB/s（45–46%）、
   x 量化 2.4 TB/s（60–61%）、silu_and_mul 1.3 TB/s（32–33%）、mid 量化 0.56–0.86 TB/s（14–22%）；补零 fill + copy 共 78–131 µs，
   6 个 gate 小 kernel 共 34 µs（每个 5–8 µs，T0 级）。
-- 可达上限：逐 kernel 的 ① 之和 ≈ 5200 / 3400 µs；② 按 65536 行分块调用折叠的 preshuffle GEMM（kernel 不改，已测）：shared 增量
-  6007 / 3924 µs，墙钟 −6.7% / −17.8%（对融合 FP8 0.96× / 0.94×），对 FP32 参考的 rel L2 1.21e-2 / 1.07e-2（split 1.40e-2 / 1.21e-2）。
+- 现行的分块折叠（按 65536 行分块调用 preshuffle GEMM，kernel 不改）：shared 增量 6007 / 3924 µs，墙钟 −6.7% / −17.8%
+  （对融合 FP8 0.96× / 0.94×），对 FP32 参考的 rel L2 1.21e-2 / 1.07e-2（split 1.40e-2 / 1.21e-2）。
 
 ## 链路与空隙
 整层墙钟（CUDA graph 重放）= 主流 kernel 之和 + 侧流的 fork/join（FJ）+ shared 链的露出与竞争（X）；按档的模型对 95 个整层例的官方墙钟
@@ -1663,6 +1670,9 @@ shared 不能折叠时（M > 65536、shared 要写 out 而 out 未 16 B 对齐�
 | 侧流 · 流式（M11–1024） | routed 链（graph）+ shared 增量 | 38 | −4.0…+6.0% | 3.4–61.3 µs |
 | 串行（M1025–65536，流式末段与 prefill） | 主流 Σ（含 shared 的 GEMM、mid、GEMM） | 27 | −5.1…+0.7%（中位 +0.3%） | 47.8–1855.8 µs |
 | split（M98304） | 主流 Σ（25 个 kernel） | 2 | ≤ 0.2% | 9114 / 6954 µs |
+
+表与下文按冻结基线的分派分档，未按现分派重测。现分派下混合 decode 按工作量到 DS TP4 M3、TP8 M5、MTP TP4 M6、MTP TP8 M10
+（表中「侧流 · 折叠 decode」的 MTP TP8 M5–10、MTP TP4 M5–6、DS TP8 M5 现走混合），M98304 两例现为串行的分块折叠。
 
 - 超 10% 的 3 例：混合档 mtp_layer_tp4 M4 −10.5%（混合 kernel 在 graph 连续重放里比 eager 慢 5–16%，同进程实测）；侧流 · 流式档若按 eager
   主流 Σ + FJ + X 算，ds_layer_tp4 M64 −11.8%、ds_layer_tp8 M256 −12.2%——routed 链的 graph 墙钟是 eager 主流 Σ 的 0.99–1.13 倍（M16–512 多为
