@@ -560,10 +560,9 @@ def _stream_path(block_m, fused):
     return [gateup, f"a8w4_down_stream_bm{block_m}"]
 
 
-# The steps that sum routes a Down kernel wrote into the output: A8W4's a8w4_route_sum and the base's sorted_sum (the
-# prefill tier's today). Behind the streaming Down the cases accept either that sum or the Down's own BF16x2 atomics,
-# behind the prefill Down either sum (later milestones move shapes between them; the output is graded either way).
-_ROUTE_SUMS = ("a8w4_route_sum", "sorted_sum")
+# The step that sums the routes the prefill Down wrote into the output (a8w4_route_sum, behind the prefill Down only:
+# the streaming Down adds every route into the output with BF16x2 atomics, the decode Downs write it themselves).
+_ROUTE_SUMS = ("a8w4_route_sum",)
 
 
 # The Gate/Up and Down kernels of the per-route decode path's three dispatches (as pyhip M17's tests name them): x and
@@ -621,15 +620,15 @@ def _assert_kernels(tier=None):
 def _assert_h5120(tokens, path):
     """H 5120 (DeepSeek): the kernels of ``path`` while ``tokens`` is within the H 5120 decode limit
     ``DECODE_WIDE_MAX_M``, past it the streaming kernels: the prep and sorting blocks of 16 (up to 12 rows per expert,
-    M <= 48 at E 24), the routes summed by route_sum (I 576 >= 512 today) or by the Down's atomics (_ROUTE_SUMS). The
-    cases follow the constant (10 by default; the cases about the decode kernels pin pyhip M17's 32) instead of
-    assuming its value.
+    M <= 48 at E 24), the Down adding the routes atomically at I 576 too (no a8w4_route_sum). The cases follow the
+    constant (10 by default; the cases about the decode kernels pin pyhip M17's 32) instead of assuming its value.
     """
     if tokens <= moe_a8w4.DECODE_WIDE_MAX_M:
         assert path is not None, tokens
         _assert_path(path)
     else:
         _assert_path(["a8w4_stream_prep"] + _stream_path(16, False))
+        assert "a8w4_route_sum" not in moe_a8w4.last_path, moe_a8w4.last_path
 
 
 def _a8w4_prepare(w):
@@ -1809,6 +1808,10 @@ def test_decode_topk_variants(topk, tokens, path):
     half); the benchmark's MiMo cases (topk 8) take the expert-deduplicated decode from M 2 on (M 1 the single-slot
     Down), never the slot-pair Down; no case of either has topk > 16.
     """
+    if topk > 16 and not hasattr(moe_a8w4.decode_a8w4, "compile_a8w4_down_decode"):
+        # M6 folds the single-slot Down into the mixed Down (topk <= 16): topk 17 takes the slot-pair Down. Its review
+        # deletes this branch.
+        path = "np"
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = make_inputs(
         tokens, HIDDEN, EXPERTS, topk, seed=94 + topk
@@ -2076,9 +2079,9 @@ def test_decode_wide_hidden(monkeypatch, tokens, case):
 def test_h5120_decode_limit(tokens):
     """Both sides of the H 5120 decode limit at its default (``DECODE_WIDE_MAX_M``, 10 tokens, read through
     ``_decode_max_m``): DeepSeek TP4 (E 24) M 10 still decodes, Gate/Up deduplicated by expert (from
-    DECODE_WIDE_DEDUP_MIN_M on), M 11 streams (the prep, blocks of 16, route_sum: _assert_h5120). The limit applies to
-    the DECODE_WIDE_HIDDEN sizes only: other hidden sizes keep DECODE_MAX_M, so the Qwen (H 2560) and MiMo (H 4096)
-    shapes still take the decode tier at M 11 (end to end up to M 32 in test_decode_dispatch_boundaries).
+    DECODE_WIDE_DEDUP_MIN_M on), M 11 streams (the prep, blocks of 16, the atomic Down: _assert_h5120). The limit
+    applies to the DECODE_WIDE_HIDDEN sizes only: other hidden sizes keep DECODE_MAX_M, so the Qwen (H 2560) and MiMo
+    (H 4096) shapes still take the decode tier at M 11 (end to end up to M 32 in test_decode_dispatch_boundaries).
 
     The other H 5120 decode cases pin the limit to pyhip M17's 32 (they test the kernels, not where the default lies);
     the benchmark runs ds_tp4 at M 8 and 16 and the layers at M 10 / 11 without asserting kernels; the basic tests
@@ -2173,6 +2176,9 @@ def test_stream_dispatch_boundary(tokens, path):
         (4096, 256, 62, _stream_path(32, False)),
         (4096, 256, 120, _stream_path(64, False)),
         (4096, 256, 121, _prefill_path(128)),
+        (4096, 512, 70, _stream_path(32, False)),
+        (4096, 512, 71, _prefill_path(128)),
+        (5120, 320, 71, _stream_path(64, False)),
     ],
     ids=[
         "h2560_i192_m140",
@@ -2180,17 +2186,24 @@ def test_stream_dispatch_boundary(tokens, path):
         "h4096_i256_m62_bm32",
         "h4096_i256_m120",
         "h4096_i256_m121",
+        "h4096_i512_m70_bm32",
+        "h4096_i512_m71",
+        "h5120_i320_m71_bm64",
     ],
 )
 def test_stream_rows_limits(hidden, inter, tokens, path):
     """The streaming limit by shape, both sides each: 48 rows per expert from H 4096 on (STREAM_MAX_ROWS_WIDE) and 56
     at H 2560 when the Gate/Up of blocks of 64 quantizes the intermediate (I_pad 192, STREAM_MAX_ROWS_FUSED_QUANT);
     with E 5 and topk 2, M 140 / 141 give 56 / 56.4 rows and M 120 / 121 48 / 48.4. H 4096 with I 256 streams with
-    the atomic Down, which reads the activations from LDS at blocks of 32 (M 62, K % 256 == 0).
+    the atomic Down, which reads the activations from LDS at blocks of 32 (M 62, K % 256 == 0). From padded I 512 on
+    streaming stops at STREAM_BM32_ROWS (28) rows, the last of blocks of 32: M 70 (28 rows) streams, M 71 (28.4) takes
+    prefill; below I 512 the H 5120 shapes with fewer than STREAM_H5120_MIN_ROUTES routes still stream past 28 rows in
+    blocks of 64 (I 320, M 71). Every streaming Down adds the routes atomically (no a8w4_route_sum), the prefill Down
+    writes them for a8w4_route_sum.
 
-    The basic tests and the benchmark are not on these two boundaries (the 22-row one is
-    test_stream_dispatch_boundary); the benchmark's MiMo TP8 M512 / 1024 run both atomic Downs without asserting
-    kernels. E 5 and topk 2 keep this fast.
+    The basic tests and the benchmark are not on these boundaries (the 22-row one is test_stream_dispatch_boundary);
+    the benchmark's MiMo TP8 M512 / 1024 run both atomic Downs and its MiMo TP4 M1024 / MTP TP8 M1365 layer cases the
+    two sides of the 28-row rule, without asserting kernels. E 5 and topk 2 keep this fast.
     """
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = make_inputs(
@@ -2198,6 +2211,8 @@ def test_stream_rows_limits(hidden, inter, tokens, path):
     )
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     _assert_path(path)
+    sums = "a8w4_route_sum" in moe_a8w4.last_path
+    assert sums == (_path_tier(moe_a8w4.last_path) == "prefill"), moe_a8w4.last_path
     assert_close(out, ref)
 
 
@@ -2397,13 +2412,11 @@ def _spy(monkeypatch, name, record):
 @pytest.mark.parametrize(
     "min_wgs, nsplit", [(5, 1), (8, 2), (1000, 4)], ids=["split1", "split2", "split4"]
 )
-def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
+def test_prefill_down_split(monkeypatch, min_wgs, nsplit):
     """The prefill Down splits the hidden dimension over 1, 2 or 4 workgroups per sorted block by the estimated blocks
     times the split against ``DOWN_MIN_WGS`` (E 5, M 100, topk 2: 5 blocks; DOWN_MIN_WGS 5 / 8 / default 1000); each
-    part writes its columns of the routes and only part 0 the loc_ids. H 4096, I 512, 40 rows per expert: today
-    sorting blocks of 64 without the atomic Down, where the prefill Down writes the routes behind the streaming
-    Gate/Up (STREAM_PREFILL_DOWN); a dispatch that stops streaming I >= 512 earlier runs the prefill tier, with the same
-    Down. Either way a sum (_ROUTE_SUMS) adds the routes.
+    part writes its columns of the routes and only part 0 the loc_ids. H 4096, I 512, 40 rows per expert: past the 28
+    rows where I >= 512 stops streaming, the prefill tier sorted by the prep; a8w4_route_sum adds the routes.
 
     The basic tests and the benchmark run whichever split their shape gets and assert neither the split nor its
     result per split (the basic MiMo TP4 M 1600 is prefill with split 4; the benchmark streams into the prefill Down
@@ -2418,10 +2431,108 @@ def test_stream_prefill_down_split(monkeypatch, min_wgs, nsplit):
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     assert [args[5] for args in built] == [nsplit], built
     path = moe_a8w4.last_path
-    _assert_path(["a8w4_stream_prep", "a8w4_down_prefill_bm64"])
-    assert _path_tier(path) in ("stream", "prefill"), path
+    _assert_path(["a8w4_stream_prep"] + _prefill_path(128))
     assert any(name in _ROUTE_SUMS for name in path), path
     assert_close(out, ref)
+
+
+def _route_sum(loc_ids, routes):
+    """One ``a8w4_route_sum`` launch (the prefill tier's sum, ``_stream_sum_kernel``) of ``routes`` [rows, H] by
+    ``loc_ids`` [M, columns] into a NaN-filled BF16 [M, H]."""
+    out = torch.full(
+        (loc_ids.shape[0], routes.shape[1]), float("nan"), dtype=torch.bfloat16
+    )
+    kernel = moe_a8w4._stream_sum_kernel(
+        loc_ids.shape[1], routes.shape[1], routes.device.index
+    )
+    moe_a8w4._launch(
+        "a8w4_route_sum",
+        kernel,
+        loc_ids,
+        routes,
+        out,
+        loc_ids.shape[0],
+        routes.shape[0],
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+def _route_sum_reference(loc_ids, routes):
+    """a8w4_route_sum's arithmetic in torch: per token its routes' BF16 rows summed in f32 in slot order, the first slot
+    starting the sum, a slot whose loc is negative or ``routes.shape[0]`` and more adding +0; rounded to BF16 (nearest
+    even)."""
+    rows, total = routes.shape[0], None
+    for k in range(loc_ids.shape[1]):
+        loc = loc_ids[:, k].long()
+        valid = ((loc >= 0) & (loc < rows)).unsqueeze(1)
+        values = torch.where(valid, routes[loc.clamp(0, rows - 1)].float(), 0.0)
+        total = values if total is None else total + values
+    return total.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("hidden", [2560, 4096, 5120], ids=["h2560", "h4096", "h5120"])
+def test_route_sum_bitexact(hidden):
+    """``a8w4_route_sum`` (the prefill tier's sum of the routes, replacing the base's sorted_sum) gives the bits of its
+    arithmetic in torch (_route_sum_reference): f32 in slot order, round to nearest even. A wave sums 2 KB of an output
+    row while the row's 1 KB pieces are even in number (H 4096 / 5120: 8 / 10, all 2 * topk loads of a lane in flight)
+    and 1 KB while odd (H 2560: 5); 37 tokens leave the last workgroup's waves partly past the tokens. loc_ids of 7
+    columns (the layers' 6 routed and the folded shared expert) with -1, rows past the routes (``rows``, ``rows`` + 3,
+    2**31 - 1: no route, nothing read), a token without any route, the first slot missing and a row taken twice.
+
+    End to end route_sum only runs behind the prefill Down, where the basic tests, the benchmark and the prefill cases
+    grade it within the tolerance and never pass a loc at or past the routes' rows.
+    """
+    tokens, columns, rows = 37, 7, 300
+    gen = torch.Generator(device="cuda").manual_seed(990 + hidden)
+    routes = (torch.randn((rows, hidden), generator=gen) * 4).to(torch.bfloat16)
+    loc_ids = torch.randint(
+        0, rows, (tokens, columns), generator=gen, dtype=torch.int32
+    )
+    loc_ids[(torch.rand((tokens, columns), generator=gen) < 0.2)] = -1
+    loc_ids[1] = -1
+    loc_ids[2, 0] = -1
+    loc_ids[3, :3] = torch.tensor([rows, rows + 3, 2**31 - 1], dtype=torch.int32)
+    loc_ids[4, 1] = loc_ids[4, 0] = rows - 1
+    out = _route_sum(loc_ids, routes)
+    assert torch.equal(_bits(out), _bits(_route_sum_reference(loc_ids, routes)))
+    assert bool((out[1] == 0).all())
+
+
+@pytest.mark.parametrize("hidden", [2560, 5120], ids=["h2560", "h5120"])
+def test_route_sum_routes_past_4gib(hidden):
+    """``a8w4_route_sum`` reads every route's row through a descriptor whose base is the row's own 64-bit address, so
+    routes past 4 GiB (the prefill tier's at ds_layer M98304: 7 GB) are summed right: a routes buffer just over
+    4 GiB (only the rows the case reads written) with rows below, across (the row holding byte 2**32) and past the
+    4 GiB boundary, the last row, -1 and the row count, against _route_sum_reference; the 1 KB (H 2560) and the 2 KB
+    (H 5120) wave.
+
+    The benchmark reaches routes past 4 GiB only at its M98304 layer cases, graded within the tolerance; the basic
+    tests and the other cases stay far below.
+    """
+    row_bytes = 2 * hidden
+    across = (1 << 32) // row_bytes
+    rows = across + 8
+    assert across * row_bytes < 1 << 32 < (across + 1) * row_bytes
+    routes = torch.empty((rows, hidden), dtype=torch.bfloat16)
+    picks = torch.tensor([0, 1, across - 1, across, across + 1, rows - 1])
+    gen = torch.Generator(device="cuda").manual_seed(995 + hidden)
+    routes[picks.cuda()] = torch.randn((picks.numel(), hidden), generator=gen).to(
+        torch.bfloat16
+    )
+    loc_ids = torch.tensor(
+        [
+            [across, 0, across + 1, rows - 1],
+            [across - 1, -1, across, 1],
+            [rows, across + 1, rows - 1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    out = _route_sum(loc_ids, routes)
+    want = _route_sum_reference(loc_ids, routes)
+    del routes
+    torch.cuda.empty_cache()
+    assert torch.equal(_bits(out), _bits(want))
 
 
 @pytest.mark.parametrize(
@@ -2826,16 +2937,15 @@ def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
 
 
 # case -> (M, tile options, set thresholds, kernels in order, the prefill kernels' (Gate/Up XCD_CHUNK, Down
-# TWO_PASS, Down XCD_CHUNK) or None for no prefill kernel); DeepSeek H5120, E24, topk 6, I576, each threshold set to
-# exactly one side of its boundary (M=96: 576 routes, exactly the default STREAM_MAX_ROWS_H5120 = 24 rows per expert;
-# M=97: 582 routes, 24.25 rows; M=3: 18 routes and 18 x 4 = 72 estimated Down workgroups; M=4: 24 routes and 96). The
-# streaming cases follow the H 5120 row limit (M = limit * E / topk; blocks of 32 from 13 to 28 rows per expert); their
-# routes are summed by route_sum or by the Down's atomics (_ROUTE_SUMS).
+# TWO_PASS, Down XCD_CHUNK) or None for no prefill kernel; a TWO_PASS of None: the dispatch's, both forced compared);
+# DeepSeek H5120, E24, topk 6, I576, each threshold set to exactly one side of its boundary (M=96: 576 routes, exactly
+# the default STREAM_MAX_ROWS_H5120 = 24 rows per expert; M=97: 582 routes, 24.25 rows; M=3: 18 routes and 18 x 4 = 72
+# estimated Down workgroups; M=4: 24 routes and 96). The streaming cases follow the H 5120 row limit (M = limit * E /
+# topk; blocks of 32 from 13 to 28 rows per expert), their Down adding the routes atomically.
 _H5120_ROWS_M = moe_a8w4.STREAM_MAX_ROWS_H5120 * DS_EXPERTS // DS_TOPK
 _H5120_PREFILL_LIMITS = {
     "PREFILL_PREP_MAX_ROUTES_H5120": 18,
     "XCD_MIN_ROUTES_H5120": 24,
-    "DOWN_TWO_PASS_MIN_WGS": 72,
 }
 _H5120_STREAM_BM32 = ["a8w4_stream_prep"] + _stream_path(32, False)
 _H5120_LIMIT_CASES = {
@@ -2860,12 +2970,12 @@ _H5120_LIMIT_CASES = {
         _H5120_STREAM_BM32,
         None,
     ),
-    "prep_one_pass": (
+    "prep_one_and_two_pass": (
         3,
         {"block_m": 64, "tile_k": 128},
         _H5120_PREFILL_LIMITS,
         ["a8w4_stream_prep"] + _prefill_path(128),
-        (0, False, 0),
+        (0, None, 0),
     ),
     "opus_xcd_two_pass": (
         4,
@@ -2885,14 +2995,15 @@ def test_h5120_dispatch_limits(monkeypatch, case):
     ``STREAM_MAX_ROWS_H5120`` rows per expert (24 by default: M 96 with exactly 24 rows still streams, M 97 with
     24.25 takes prefill, and with the threshold one route above M 97 still streams, the limit 48 again); prefill
     sorts with the streaming prep up to ``PREFILL_PREP_MAX_ROUTES_H5120`` routes and
-    with Opus past it, Gate/Up and Down chunk their grids by XCD from ``XCD_MIN_ROUTES_H5120`` routes on, and Down
-    stages its activation tile in two passes when the estimated workgroups (blocks x hidden split) exceed
-    ``DOWN_TWO_PASS_MIN_WGS`` (M 3: 72, equal to it, still one pass; M 4: 96).
+    with Opus past it, and Gate/Up and Down chunk their grids by XCD from ``XCD_MIN_ROUTES_H5120`` routes on. Down
+    stages its activation tile in two passes with many estimated workgroups (M 4: 96; M 97: 96): the prep-sorted M 3
+    (72) takes the Down's pass count as the dispatch decides, and the same call with one pass and with two passes
+    forced gives the same bits (prep sort, routes and a8w4_route_sum unchanged).
 
-    The real thresholds (4096, 12288 and 16384 routes) need M >= 683 on E 24, where both sides are prefill, and the
-    80 workgroups fall between M 3 and M 4, so they are moved onto the M 3-97 boundaries to keep this fast; the
-    benchmark's ds_tp4 runs E 384 at powers of two and 48 without asserting kernels or build parameters (M 1024: 16
-    rows, M 2048: 32); the basic tests are not on these boundaries.
+    The real thresholds (4096, 12288 and 16384 routes) need M >= 683 on E 24, where both sides are prefill, so they
+    are moved onto the M 3-97 boundaries to keep this fast; the benchmark's ds_tp4 runs E 384 at powers of two and 48
+    without asserting kernels or build parameters (M 1024: 16 rows, M 2048: 32); the basic tests are not on these
+    boundaries.
     """
     tokens, options, limits, path, built = _H5120_LIMIT_CASES[case]
     for name, value in limits.items():
@@ -2909,8 +3020,23 @@ def test_h5120_dispatch_limits(monkeypatch, case):
     if built is None:
         assert not gateup and not down, (gateup, down)
     else:
-        assert (gateup[-1][8], down[-1][6], down[-1][7]) == built, (gateup, down)
+        got = (gateup[-1][8], down[-1][6], down[-1][7])
+        assert all(b is None or g == b for g, b in zip(got, built)), (gateup, down)
     assert_close(out, ref)
+    if built is not None and built[1] is None:
+        build, outs = moe_a8w4._down_kernel, []
+        for two_pass in (False, True):
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    moe_a8w4,
+                    "_down_kernel",
+                    lambda *a, two=two_pass, **k: build(*a[:6], two, *a[7:], **k),
+                )
+                outs.append(_a8w4_run(w, prepared, x, topk_weight, topk_ids, **options))
+            _assert_path(path)
+            assert down[-1][6] is two_pass, down
+            assert_close(*outs[-1])
+        assert torch.equal(_bits(outs[0][0]), _bits(outs[1][0]))
 
 
 def test_gateup_few_waves_grid(monkeypatch):
@@ -2971,7 +3097,7 @@ def test_gateup_few_waves_grid(monkeypatch):
         (512, 1088, 4, {}, _DECODE_PATHS["nn"], None, None),
         (512, 1024, 300, {"block_m": 64}, _prefill_path(256), None, None),
         (512, 1024, 48, {}, _stream_path(32, False), True, None),
-        (512, 1024, 300, {}, _stream_path(64, False), False, 120),
+        (512, 1024, 300, {}, _prefill_path(128), False, 120),
     ],
     ids=[
         "h4096_decode",
@@ -2994,9 +3120,9 @@ def test_shape_fallbacks(
     M 300 (block_m=64 selects the prefill kernels, which pyhip M17 runs with the K tile 128 by default) fills Down's
     activation tile with exactly 64 KiB of LDS in one pass, the hidden dimension split in 4. The streaming Down lets
     4 waves share the block's activation rows only when they fit in the 64 KiB of LDS (``shared``): I 1024 fits with
-    blocks of 32 (M 48) but not of 64 (M 300 with STREAM_MAX_ROWS raised to 120 rows per expert, as the default
-    dispatch never streams blocks of 64 at H 512), where a wrongly shared tile fails when the kernel is built; a
-    dispatch that stops streaming I >= 512 earlier whatever STREAM_MAX_ROWS says runs that M as prefill (graded).
+    blocks of 32 (M 48) but not of 64, which the dispatch never streams at I >= 512: M 300 with STREAM_MAX_ROWS
+    raised to 120 rows per expert still takes prefill past STREAM_BM32_ROWS (graded; the tile estimate of blocks of
+    64 at I 1024 against the kernel's layout is test_stream_down_lds_budget's).
 
     The basic tests and the benchmark only use the target shapes (H 2560 / 4096 / 5120, I_pad 192-576; H 4096 only
     with I_pad % 128 == 0), out of reach of these limits; E 5 and topk 2 keep this fast.
@@ -3006,8 +3132,7 @@ def test_shape_fallbacks(
     w, prepared = _small_weights(hidden, inter)
     x, topk_weight, topk_ids = make_inputs(tokens, hidden, 5, 2, seed=tokens)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
-    if max_rows is None or _path_tier(moe_a8w4.last_path) != "prefill":
-        _assert_path(path)
+    _assert_path(path)
     assert_close(out, ref)
     if shared is not None:
         block_m = moe_a8w4._stream_block_m(tokens, 2, 5)
@@ -3024,10 +3149,14 @@ def test_decode_down_needs_hidden_multiple_of_32():
     Every H of the basic tests, the benchmark and the other cases is a multiple of 512.
     """
     decode = moe_a8w4.decode_a8w4
+    # M6 builds the routed Down as the mixed Down without SHARED; its review deletes the first form.
+    single = getattr(decode, "compile_a8w4_down_decode", None) or functools.partial(
+        decode.compile_a8w4_down_decode_mixed, SHARED=False
+    )
     for hidden in (DS_HIDDEN + 16, MIMO_HIDDEN + 48):
         assert not decode.gateup_decode_fits(hidden)
         with pytest.raises(AssertionError, match="unsupported Down decode shape"):
-            decode.compile_a8w4_down_decode(N=hidden, K=DS_INTER, TOPK=DS_TOPK)
+            single(N=hidden, K=DS_INTER, TOPK=DS_TOPK)
         with pytest.raises(AssertionError, match="unsupported mixed Down decode"):
             decode.compile_a8w4_down_decode_mixed(
                 N=hidden, K=DS_INTER, KP=640, TOPK=DS_TOPK + 1, E=8
@@ -3291,7 +3420,8 @@ def test_compile_cache_keys(monkeypatch):
     its inputs' device and the current constants. The Gate/Up limited to GATEUP_FEW_WAVES workgroups per CU
     (``wgs_per_cu``, ``_gateup_grid``) has a launcher of its own too. Building a launcher does not trace it, so the
     other device need not exist. The call passes block_m=64 to run the prefill launchers (pyhip M17 decodes M 16 by
-    default).
+    default), a8w4_route_sum's (``_stream_sum_kernel``, keyed by the device too: test_stream_compile_cache_keys)
+    included.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
     passes as well; the benchmark builds the limited Gate/Up only for its M >= 16384 DeepSeek cases, never the
@@ -3327,7 +3457,13 @@ def test_compile_cache_keys(monkeypatch):
                 is not first
             )
     calls = {
-        name: [] for name in ("_gateup_kernel", "_down_kernel", "_row_quant_kernel")
+        name: []
+        for name in (
+            "_gateup_kernel",
+            "_down_kernel",
+            "_row_quant_kernel",
+            "_stream_sum_kernel",
+        )
     }
     for name, record in calls.items():
         _spy(monkeypatch, name, record)
@@ -3339,23 +3475,38 @@ def test_compile_cache_keys(monkeypatch):
         (device, constants)
     ] * 2
     assert [args[-1] for args in calls["_row_quant_kernel"]] == [device] * 2
+    assert calls["_stream_sum_kernel"] == [(2, 512, device)]
+
+
+def _routed_decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, device):
+    """``moe_a8w4._decode_kernels`` (the routed experts' per-route decode Gate/Up and Down launchers) as the dispatch
+    builds them: with the Down's wave count (``_decode_waves``) while the builder takes one. M6 drops the wave count
+    from the builder; its review deletes the old branch."""
+    args = (N1, H, I, topk, gateup_pq, down_pq, limit)
+    if hasattr(moe_a8w4, "_decode_waves"):
+        args += (moe_a8w4._decode_waves(topk, down_pq),)
+    return moe_a8w4._decode_kernels(*args, device)
 
 
 def test_decode_compile_cache_keys(monkeypatch):
-    """The decode launcher caches are keyed by the device (``_decode_kernels``, ``_row_quant_decode``) and, for Down,
-    by its wave count, which a call derives from DECODE_DOWN_PQ_WAVES (``_decode_waves``; the decode kernels read no
-    other tunable module constant): another device or wave count gets its own launcher, and a call passes its inputs'
-    device and the current wave count (topk 4: 2 waves by default, 1 with DECODE_DOWN_PQ_WAVES = 1, same result).
-    Building a launcher does not trace it, so the other device need not exist.
+    """The decode launcher caches are keyed by the device (``_decode_kernels``, ``_row_quant_decode``) and, while the
+    slot-pair Down takes a wave count from DECODE_DOWN_PQ_WAVES (``_decode_waves``; the decode kernels read no other
+    tunable module constant), by that count: another device or wave count gets its own launcher, and a call passes its
+    inputs' device and the current wave count (topk 4: 2 waves by default, 1 with DECODE_DOWN_PQ_WAVES = 1, same
+    result). Building a launcher does not trace it, so the other device need not exist. M6 drops the wave count (the
+    kernel's rule); its review deletes that branch.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
     passes as well; test_compile_cache_keys covers the prefill launchers.
     """
     decode = (128, 512, 64, 4, False, True, 0.0)
-    first = moe_a8w4._decode_kernels(*decode, 2, 0)
-    assert moe_a8w4._decode_kernels(*decode, 2, 0) is first
-    assert moe_a8w4._decode_kernels(*decode, 2, 1) is not first
-    assert moe_a8w4._decode_kernels(*decode, 1, 0) is not first
+    pq_waves = getattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", None)
+    extra = (2,) if pq_waves else ()
+    first = moe_a8w4._decode_kernels(*decode, *extra, 0)
+    assert moe_a8w4._decode_kernels(*decode, *extra, 0) is first
+    assert moe_a8w4._decode_kernels(*decode, *extra, 1) is not first
+    if pq_waves:
+        assert moe_a8w4._decode_kernels(*decode, 1, 0) is not first
     assert moe_a8w4._row_quant_decode(64, False, 1) is not moe_a8w4._row_quant_decode(
         64, False, 0
     )
@@ -3364,24 +3515,29 @@ def test_decode_compile_cache_keys(monkeypatch):
     _spy(monkeypatch, "_row_quant_decode", quant)
     w, prepared = _small_weights(512, 64)
     x, topk_weight, topk_ids = make_inputs(4, 512, 5, 4, seed=67, shared=False)
-    for waves in (moe_a8w4.DECODE_DOWN_PQ_WAVES, 1):
-        monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
+    runs = (pq_waves, 1) if pq_waves else (None,)
+    for waves in runs:
+        if waves is not None:
+            monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
         assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
         _assert_path(_DECODE_PATHS["np"])
     device = x.device.index
-    assert [args[-2:] for args in built] == [(2, device), (1, device)], built
-    assert [args[-1] for args in quant] == [device] * 2
+    if pq_waves:
+        assert [args[-2:] for args in built] == [(2, device), (1, device)], built
+    else:
+        assert [args[-1] for args in built] == [device], built
+    assert [args[-1] for args in quant] == [device] * len(runs)
 
 
 def test_decode_dedup_compile_cache_keys(monkeypatch):
     """The launcher caches of the expert-deduplicated decode are keyed by the device (``_gateup_plan_kernel``,
     ``_row_quant_plan``, ``_gateup_dd_kernel``, ``_down_dd_kernel`` and the H 5120 slot-pair ``_down_pq_kernel``),
-    the plan Gate/Up also by its token limit, which a call takes from DECODE_MAX_M, and the slot-pair Down by its wave
-    count, which a call derives from DECODE_DOWN_PQ_WAVES (as ``_decode_kernels``); their other build parameters are
-    arguments already. Another device, limit or wave count gets its own launcher, and a call passes its inputs'
-    device and the current constants (MiMo M 5 and M 12: the two- and the four-kernel form; DeepSeek M 8 with 3 and
-    1 Down waves, same result, while H 5120 decodes M 8). Building a launcher does not trace it, so the other device
-    need not exist.
+    the plan Gate/Up also by its token limit, which a call takes from DECODE_MAX_M, and, while it takes one, the
+    slot-pair Down by its wave count, which a call derives from DECODE_DOWN_PQ_WAVES (as ``_decode_kernels``; M6 drops
+    it, its review deletes that branch); their other build parameters are arguments already. Another device, limit or
+    wave count gets its own launcher, and a call passes its inputs' device and the current constants (MiMo M 5 and
+    M 12: the two- and the four-kernel form; DeepSeek M 8 with 3 and 1 Down waves, same result, while H 5120 decodes
+    M 8). Building a launcher does not trace it, so the other device need not exist.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
     passes as well; test_decode_compile_cache_keys covers the per-route decode launchers.
@@ -3391,18 +3547,20 @@ def test_decode_dedup_compile_cache_keys(monkeypatch):
     assert moe_a8w4._gateup_plan_kernel(*plan, 32, 0) is first
     assert moe_a8w4._gateup_plan_kernel(*plan, 32, 1) is not first
     assert moe_a8w4._gateup_plan_kernel(*plan, 16, 0) is not first
+    pq_waves = hasattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES")
     for name, args in (
         ("_row_quant_plan", (4096, 8, 2, 32, True)),
         ("_gateup_dd_kernel", (512, 4096, 8, 2, 8, 0.0)),
         ("_down_dd_kernel", (4096, 256, 8, 2, 2, True)),
-        ("_down_pq_kernel", (5120, 576, 6, 3)),
+        ("_down_pq_kernel", (5120, 576, 6) + ((3,) if pq_waves else ())),
     ):
         build = getattr(moe_a8w4, name)
         assert build(*args, 0) is build(*args, 0), name
         assert build(*args, 1) is not build(*args, 0), name
-    assert moe_a8w4._down_pq_kernel(5120, 576, 6, 1, 0) is not moe_a8w4._down_pq_kernel(
-        5120, 576, 6, 3, 0
-    )
+    if pq_waves:
+        assert moe_a8w4._down_pq_kernel(
+            5120, 576, 6, 1, 0
+        ) is not moe_a8w4._down_pq_kernel(5120, 576, 6, 3, 0)
     names = (
         "_gateup_plan_kernel",
         "_row_quant_plan",
@@ -3434,13 +3592,17 @@ def test_decode_dedup_compile_cache_keys(monkeypatch):
     x, topk_weight, topk_ids = make_inputs(
         8, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=228, shared=False
     )
-    for waves in (moe_a8w4.DECODE_DOWN_PQ_WAVES, 1):
-        monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
+    for waves in (moe_a8w4.DECODE_DOWN_PQ_WAVES, 1) if pq_waves else (None,):
+        if waves is not None:
+            monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
         assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
         _assert_h5120(8, _DEDUP_PATHS["wide"])
     if 8 <= moe_a8w4.DECODE_WIDE_MAX_M:
-        built = [args[-2:] for args in calls["_down_pq_kernel"]]
-        assert built == [(3, device), (1, device)], built
+        if pq_waves:
+            built = [args[-2:] for args in calls["_down_pq_kernel"]]
+            assert built == [(3, device), (1, device)], built
+        else:
+            assert [args[-1] for args in calls["_down_pq_kernel"]] == [device]
 
 
 def test_stream_compile_cache_keys(monkeypatch):
@@ -3449,8 +3611,8 @@ def test_stream_compile_cache_keys(monkeypatch):
     while building (``_stream_gateup_constants()``: STREAM_GATEUP_ACT_BYTES_H5120 / PREFETCH / SYNC / W_AUX;
     ``_stream_down_constants()``: STREAM_DOWN_PREFETCH / PREFETCH_SMALL / W_AUX / W_AUX_H5120 / LDS_ACTS and
     common_a8w4.LDS_BYTES, which decides the shared tile): another device or constant gets its own launcher, and a call
-    passes its inputs' device and the current constants (H 512, I 1024, M 48: the prep, the light-wave Gate/Up, the
-    shared Down and route_sum where the Down writes the routes, none where it adds them atomically). Building a
+    passes its inputs' device and the current constants (H 512, I 1024, M 48: the prep, the light-wave Gate/Up and
+    the shared atomic Down; no route_sum, which only the prefill tier runs, test_compile_cache_keys). Building a
     launcher does not trace it, so the other device need not exist.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
@@ -3509,27 +3671,26 @@ def test_stream_compile_cache_keys(monkeypatch):
     x, topk_weight, topk_ids = make_inputs(48, 512, 5, 2, seed=48)
     assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
     _assert_path(["a8w4_stream_prep"] + _stream_path(32, False))
-    sums = int("a8w4_route_sum" in moe_a8w4.last_path)
+    assert "a8w4_route_sum" not in moe_a8w4.last_path, moe_a8w4.last_path
     device = x.device.index
     assert [args[-2:] for args in calls["_stream_gateup_kernel"]] == [(device, g0)]
     assert [args[-2:] for args in calls["_stream_down_kernel"]] == [(device, d0)]
-    assert [
-        args[-1] for args in calls["_stream_prep_kernel"] + calls["_stream_sum_kernel"]
-    ] == [device] * (1 + sums)
+    assert [args[-1] for args in calls["_stream_prep_kernel"]] == [device]
+    assert calls["_stream_sum_kernel"] == []
 
 
 # -- 2.7 routing and output variants: repeated expert ids, in-place output, input dtypes, M = 0 -------
 
 
 @pytest.mark.parametrize(
-    "case", ["dedup_m5", "dedup_m24", "wide_m24", "stream_atomic", "stream_route_sum"]
+    "case", ["dedup_m5", "dedup_m24", "wide_m24", "stream_atomic", "stream_i1024"]
 )
 def test_duplicate_ids_keep_every_route(monkeypatch, case):
     """Several slots of a token select the same expert on the expert-deduplicated decode (two and four kernels: the
     routes of one token may land in one group; H 5120 deduplicates Gate/Up only, and the two slots of one slot pair
     of the Down may be one expert) and on the streaming path (the prep gives every route its own sorted row; Qwen
-    M 64 with I 320 adds them atomically, H 512 with I 1024 sums them in route_sum today, _ROUTE_SUMS): every slot is
-    computed once and the slots are summed, as the reference does.
+    M 64 with I 320 and H 512 with I 1024, padded I >= 512, both add them atomically): every slot is computed once
+    and the slots are summed, as the reference does.
 
     The generated routes never repeat an expert within a token, so the basic tests and the benchmark never get here;
     test_decode_duplicate_and_int64_ids covers the per-route decode, test_prefill_prep_routes_limit the prefill
@@ -3578,6 +3739,7 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
         _assert_h5120(tokens, _DEDUP_PATHS[path])
     elif isinstance(path, list):
         _assert_path(path)
+        assert "a8w4_route_sum" not in moe_a8w4.last_path, moe_a8w4.last_path
     else:
         _assert_path(_DEDUP_PATHS[path])
     assert_close(out, ref)
@@ -3585,7 +3747,7 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
 
 def test_prefill_duplicate_ids_keep_last_route():
     """Two slots of a token select the same expert: the Opus sort keeps only the later slot, the earlier slot's loc
-    keeps the -1 of the input quantization and sorted_sum skips it (no uninitialized row read, nothing added
+    keeps the -1 of the input quantization and a8w4_route_sum skips it (no uninitialized row read, nothing added
     twice); the result equals the reference with the earlier slot's routing weight set to 0. block_m=64 selects
     the prefill kernels (by default M 200 takes the K tile 128, as in pyhip M17); H 512 keeps the Opus sort (from
     H 2560 on the streaming prep sorts and keeps every slot, test_prefill_prep_routes_limit).
@@ -3613,7 +3775,7 @@ def test_inplace_output(case):
     slot-pair Down writes the output last (pinned within the H 5120 decode limit, past it the streaming kernels,
     _assert_h5120); the streaming prep (Qwen M 64) zeroes each piece of an output row in the lane that has read
     that piece of x, before the atomic Down adds into it; on the prefill path (block_m=64) the front end reads x
-    first and sorted_sum writes last.
+    first and a8w4_route_sum writes last.
 
     The basic tests and the benchmark pass separate output buffers.
     """
@@ -3902,7 +4064,7 @@ def _path_atomic(path):
 # (shape, tokens, tier): one case per tier and output form, at token counts that select it with the cut E (asserted):
 # the per-route decode (TP4 M 8, with the I 160 -> 192 padding that the tag must carry), the deduplicated decode with
 # its atomic Down (MiMo TP8 M 8) and with H 5120's slot-pair Down (DeepSeek M 8), streaming with the atomic Down
-# (TP2 M 48) and with a8w4_route_sum (DeepSeek M 64), prefill (TP2 M 300).
+# (TP2 M 48 and DeepSeek M 64, I 576), prefill with a8w4_route_sum (TP2 M 300).
 _FUSED_CASES = [
     ("tp4", 8, "decode"),
     ("mimo_tp8", 8, "dedup"),
@@ -4972,7 +5134,7 @@ def test_fused_moe_shared_expert_id():
             {},
             ["a8w4_stream_prep", "a8w4_down_prefill_bm64"],
             (9, 600),
-            id="stream_prefill_down_mimo_m1200",
+            id="prefill_prep_mimo_m1200",
         ),
         pytest.param(
             (DS_EXPERTS, DS_HIDDEN, DS_INTER, 400),
@@ -5021,11 +5183,11 @@ def test_masked_routes(monkeypatch, weights, tokens, topk, fused, options, path,
     rows whole, on poisoned weights with NaN weights on the masked routes; graded, the rows without a live route
     bitwise 0, the kernels asserted. The per-route decode Gate/Up and Down (nn) and the pre-quantized Gate/Up (pp) with
     the slot-pair Down; the dedup plan and its forms (H 5120 wide, the MiMo two- and four-kernel ones; groups of 2 and
-    3); streaming with the streaming Down (DeepSeek I 576: the routes summed by route_sum today, or by its atomics) and
-    with the prefill Down (MiMo TP4 M 1200, 37.5 rows per expert: behind the streaming Gate/Up with blocks of 64 today,
-    behind the prefill Gate/Up where streaming stops earlier at I >= 512; it writes loc_ids only for sorted routes);
-    prefill sorted by the prep and by Opus (moe_sorting, which skips ids outside [0, E); the input quantization sets
-    loc_ids to -1, which the final sum skips). Behind the prefill Down a sum (_ROUTE_SUMS) is asserted. The ``_all``
+    3); streaming (DeepSeek I 576, blocks of 32: its Down adds only the sorted routes atomically, no a8w4_route_sum);
+    prefill sorted by the prep (DeepSeek M 200 with block_m; MiMo TP4 M 1200, I 512 at 37.5 rows per expert, past the
+    28 rows where I >= 512 stops streaming: its Down writes loc_ids only for sorted routes) and by Opus (moe_sorting,
+    which skips ids outside [0, E); the input quantization sets loc_ids to -1, which a8w4_route_sum skips). Behind the
+    prefill Down a8w4_route_sum is asserted (_ROUTE_SUMS), behind the streaming Down its absence. The ``_all``
     cases mask every route: the dedup plan has no leader, the sortings no row (num_valid 0), and the output is all
     zero. The H 5120 decode limit is pinned to pyhip M17's 32 tokens, so that the wide case (M 24) masks the H 5120
     dedup decode whatever the default limit (the other H 5120 cases run M 3 or more than 32 tokens).
@@ -5041,10 +5203,9 @@ def test_masked_routes(monkeypatch, weights, tokens, topk, fused, options, path,
     topk_weight, topk_ids = mask_routes(topk_weight, topk_ids, seed=seed + 4, full=full)
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids, **options)
     _assert_path(path)
-    if any(name.startswith("a8w4_down_prefill") for name in moe_a8w4.last_path):
-        assert any(
-            name in _ROUTE_SUMS for name in moe_a8w4.last_path
-        ), moe_a8w4.last_path
+    path = moe_a8w4.last_path
+    prefill = any(name.startswith("a8w4_down_prefill") for name in path)
+    assert any(name in _ROUTE_SUMS for name in path) == prefill, path
     assert_close(out, ref)
     dead = (topk_ids < 0).all(dim=1).nonzero().flatten().tolist()
     assert set(range(tokens) if full == "all" else full) <= set(dead)
@@ -5060,9 +5221,9 @@ def test_layer_masked_routes_tiers(shape, tokens, tier):
     """Masked routes in layer calls beyond the basic test's decode: TP8 streaming (I 320: the routed experts' atomic
     Down adds only the sorted routes into the output) and TP4 prefill, with the shared expert however the op runs it
     (_assert_layer_path; today folded: at M 64 its Down writes the output the atomic Down adds onto, at M 2048 it is
-    sorted_sum's last column). A random 30% of the routed ids, rows 1 and 5 whole and row 2's first id masked: ATOM's
-    rule drops the shared expert of every row whose first id is -1, so rows 1 and 5 are bitwise 0. Poisoned weights,
-    graded against reference_layer.
+    a8w4_route_sum's last column). A random 30% of the routed ids, rows 1 and 5 whole and row 2's first id masked:
+    ATOM's rule drops the shared expert of every row whose first id is -1, so rows 1 and 5 are bitwise 0. Poisoned
+    weights, graded against reference_layer.
 
     The basic test masks the per-route decode only; the benchmark never masks.
     """
@@ -5176,9 +5337,8 @@ def test_masked_gateup_reads_no_weights(case):
     _, masked = mask_routes(topk_weight, topk_ids, seed=851, full=(1,))
     I, device = view.inter_padded, x.device.index
     if case == "ds_m3":
-        waves = moe_a8w4._decode_waves(topk, False)
-        kernel = moe_a8w4._decode_kernels(
-            2 * I, hidden, I, topk, False, False, limit, waves, device
+        kernel = _routed_decode_kernels(
+            2 * I, hidden, I, topk, False, False, limit, device
         )[0]
     else:
         kernel = moe_a8w4._gateup_plan_kernel(
@@ -5221,10 +5381,10 @@ def test_masked_gateup_reads_no_weights(case):
 def test_entry_checks(monkeypatch):
     """Errors raised before any kernel runs (ValueError; last_path empty, the output untouched):
     - padded I above what the prefill Down stages in LDS (block_m * I_pad <= 64 KiB): I 1088 at H 512 for the prefill
-      tier (M 300, many rows per expert) and with block_m 64 (M 40), at H 4096 for streaming blocks of 64 (M 100, 40
-      rows per expert), which take the prefill Down, and with a shared expert (H 5120, block_m 64: no shared-expert
-      kernel either); block_m 128 with I 576 (DeepSeek). Streaming with the streaming Down (H 512, M 48, blocks of 32)
-      still runs I 1088 (graded; decode in test_shape_fallbacks).
+      tier (M 300, many rows per expert) and with block_m 64 (M 40), at H 4096 past the 28 rows per expert where
+      I >= 512 stops streaming (M 100, 40 rows: prefill), and with a shared expert (H 5120, block_m 64: no
+      shared-expert kernel either); block_m 128 with I 576 (DeepSeek). Streaming (H 512, M 48, blocks of 32) still
+      runs I 1088 (graded; decode in test_shape_fallbacks).
     - with DEBUG_CHECKS (AITER_MOE_A8W4_DEBUG=1, a host synchronization): a token's routed id repeated, an id of E or
       -2; -1, repeated or not, passes. Without it a repeated id runs (test_duplicate_ids_keep_every_route).
     The 32-bit offset limit M * topk * I_pad * 4 < 2**31 is checked by test_rejects_bad_inputs and, with a shared
@@ -5294,14 +5454,18 @@ def test_entry_checks(monkeypatch):
 
 
 def _assert_mixed():
-    """The last call ran the shared expert inside the mixed decode kernels: its A8W4 Gate/Up and Down are the mixed
-    ones ("_mixed" in their names, as moe_a8w4.last_path's "shared_mixed" marker) and no other step ran the shared
-    expert (no folded GEMM). Kernel names are matched by that fragment only, so that later milestones may add variants
-    of the mixed kernels."""
+    """The last call ran the shared expert inside the two decode kernels: its A8W4 kernels are one decode Gate/Up and
+    one decode Down (a8w4_gateup_decode / a8w4_down_decode, "_mixed" appended while the mixed kernels are a family of
+    their own; M6 names them as the routed ones, its review drops the suffix), moe_a8w4.last_path holds the
+    "shared_mixed" marker, and no other step ran the shared expert (no folded GEMM, no side stream).
+    """
     path = moe_a8w4.last_path
     kernels = [name for name in path if name.startswith(("a8w4_gateup", "a8w4_down"))]
-    assert len(kernels) == 2 and all("_mixed" in name for name in kernels), path
-    assert any(name.startswith("shared") for name in path), path
+    assert [name.removesuffix("_mixed") for name in kernels] == [
+        "a8w4_gateup_decode",
+        "a8w4_down_decode",
+    ], path
+    assert "shared_mixed" in path, path
     assert all("_mixed" in name for name in path if name.startswith("shared")), path
 
 
@@ -5461,13 +5625,10 @@ def test_mixed_decode_quant_bitexact():
     mixed_gateup, mixed_down = moe_a8w4._decode_mixed_kernels(
         2 * I, H, I, prepared.shared_w2.shape[1], topk + 1, experts, limit, device
     )
-    waves = moe_a8w4._decode_waves(topk, False)
-    gateup, down = moe_a8w4._decode_kernels(
-        2 * I, H, I, topk, False, False, limit, waves, device
+    gateup, down = _routed_decode_kernels(
+        2 * I, H, I, topk, False, False, limit, device
     )
-    gateup_pq = moe_a8w4._decode_kernels(
-        2 * I, H, I, topk, True, False, limit, waves, device
-    )[0]
+    gateup_pq = _routed_decode_kernels(2 * I, H, I, topk, True, False, limit, device)[0]
     _, topk_weight, topk_ids = make_layer_inputs(1, H, experts, topk, seed=799)
     routed_weight, routed_ids = (
         topk_weight[:, :topk].contiguous(),
@@ -5698,38 +5859,34 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, tokens, mixed):
 # (moe_a8w4._SharedFold on the routed tier of moe_a8w4._fold_tier): two FP8 GEMMs (aiter's FlyDSL preshuffle GEMM, in
 # chunks of at most 65536 rows) on the routed path's quantized input with shared_a8w4's mid kernel between them write
 # the output (the decode tier's slot-pair Down, at any M, then adds the routes in f32, the streaming atomic Down in
-# BF16; an output off a 16-byte boundary gets the GEMM's output through a copy) or M more rows of the routes buffer
-# that the final sum adds as one more column; on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M tokens today. Where
-# the slot-pair Down cannot run (w2 past 4 GiB, or a shape past its limits) the decode tier's calls stream instead,
-# with the streaming Down. The basic layer tests (streaming M 64, prefill M 2048, the wide decode M 8) and the
+# BF16; an output off a 16-byte boundary gets the GEMM's output through a copy) or M more rows of the prefill tier's
+# routes buffer that a8w4_route_sum adds as one more column; on a side stream beside the decode and streaming tiers,
+# on the current stream behind the prefill tier. Where the slot-pair Down cannot run (w2 past 4 GiB, or a shape past
+# its limits) the decode tier's calls stream instead. The basic layer tests (streaming M 64, prefill M 2048, the wide
+# decode M 8) and the
 # benchmark's layer cases (every folded tier of the layers; unmasked routing, the last column E with weight 1) grade
 # it without asserting how the shared expert runs. Here: every folded tier with masks and with rows whose last column
 # is a routed expert instead of E, in place and under graph replay; the GEMM tiles' LDS race; an output that is not
 # 16-byte aligned; the fallback to streaming; small M with a tile option and both sides of the GEMMs' row limit; the
-# compile-cache keys. The cases pin only what holds as later milestones merge the streaming and prefill Downs and sums:
-# the routed tier (two where a shape may move from streaming to prefill), no mixed kernels, the copy exactly where the
-# shared Down GEMM writes an unaligned output, the streaming Down of the fallback; bits are compared where no Down adds
-# atomically (_path_atomic), else graded.
+# compile-cache keys. The cases pin the routed tier, the side stream by tier, a8w4_route_sum exactly behind the prefill
+# Down, no mixed kernels, the copy exactly where the shared Down GEMM writes an unaligned output, the streaming Down of
+# the fallback; bits are compared where no Down adds atomically (_path_atomic), else graded.
 
 # case: (shape, tokens, options, routed tier as _path_tier names it, or the tiers it may take). Shape: a LAYER_SHAPES
 # name, or "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus
-# below H 2560). The tiers reached today: the pre-quantized per-route Gate/Up with the slot-pair Down (main TP4 M 6),
-# the wide decode (deduplicated Gate/Up, M 16), streaming with route_sum behind the streaming Down (I 576, blocks of
-# 16) and behind the prefill Down (MTP TP4 M 1280: blocks of 64 and 30 rows per expert, prefill where streaming stops
-# earlier), streaming with the atomic Down (I 320), prefill sorted by the prep (MTP TP8 M 1366: 4098 routes, the
-# layer's first prefill M by default, below M 2048) and by Opus, prefill with a tile option at M 40 (Opus in one
-# kernel; the fold on the side stream today).
+# below H 2560). The tiers: the pre-quantized per-route Gate/Up with the slot-pair Down (main TP4 M 6), the wide decode
+# (deduplicated Gate/Up, M 16), streaming with the atomic Down at I 576 (blocks of 16) and at I 320 (blocks of 16, and
+# MTP TP8 M 1365: 32 rows per expert in blocks of 64, below 4096 routes, past 1024 tokens still on the side stream),
+# prefill sorted by the prep (MTP TP4 M 1280: 30 rows per expert, past the 28 where I >= 512 stops streaming; MTP TP8
+# M 1366: 4098 routes, 24 rows from 4096 routes on) and by Opus, prefill with a tile option at M 40 (Opus in one
+# kernel).
 _FOLD_CASES = {
     "decode_pq_ds_tp4_m6": ("ds_layer_tp4", 6, {}, "decode"),
     "wide_dd_mtp_tp8_m16": ("mtp_layer_tp8", 16, {}, "dedup"),
-    "stream_sum_mtp_tp4_m128": ("mtp_layer_tp4", 128, {}, "stream"),
-    "stream_prefill_down_mtp_tp4_m1280": (
-        "mtp_layer_tp4",
-        1280,
-        {},
-        ("stream", "prefill"),
-    ),
+    "stream_i576_mtp_tp4_m128": ("mtp_layer_tp4", 128, {}, "stream"),
+    "prefill_prep_mtp_tp4_m1280": ("mtp_layer_tp4", 1280, {}, "prefill"),
     "stream_atomic_mtp_tp8_m64": ("mtp_layer_tp8", 64, {}, "stream"),
+    "stream_bm64_mtp_tp8_m1365": ("mtp_layer_tp8", 1365, {}, "stream"),
     "prefill_prep_mtp_tp8_m1366": ("mtp_layer_tp8", 1366, {}, "prefill"),
     "prefill_opus_small_m2048": ("small", 2048, {"block_m": 64}, "prefill"),
     "prefill_tile_small_m40": ("small", 40, {"block_m": 64}, "prefill"),
@@ -5773,22 +5930,28 @@ def _fold_routing(tokens, hidden, experts, topk, seed):
 
 def _assert_folded(tier):
     """The last call ran the routed experts on ``tier`` (_path_tier; a tuple: one of those tiers) and the shared
-    expert outside the mixed decode kernels and without a final add: what ran it, the fold today, wrote where the
-    routed experts' last reduction adds it."""
+    expert outside the mixed decode kernels and without a final add: what ran it, the fold, wrote where the routed
+    experts' last reduction adds it (a8w4_route_sum exactly behind the prefill Down), on a side stream (shared_fork /
+    shared_join) beside the decode and streaming tiers and on the current stream behind the prefill tier.
+    """
     path = moe_a8w4.last_path
     tiers = (tier,) if isinstance(tier, str) else tier
     assert _path_tier(path) in tiers, (tier, path)
     _assert_shared()
     assert "shared_add" not in path, path
     assert not any("_mixed" in name for name in path), path
+    prefill = _path_tier(path) == "prefill"
+    assert ("shared_fork" in path) == ("shared_join" in path) == (not prefill), path
+    assert any(name in _ROUTE_SUMS for name in path) == prefill, path
 
 
 @pytest.mark.parametrize("case", list(_FOLD_CASES))
 def test_layer_fold_tiers(monkeypatch, case):
     """Every folded tier (_FOLD_CASES) on poisoned routed weights with _fold_routing's masks and dropped shared
     experts: graded against reference_layer, the rows without a live routed id bitwise 0 (row 1: the shared expert's
-    +0 plus nothing), no final add (_assert_folded; the case of MTP TP4 M 1280 also asserts the prefill Down, the Opus
-    case Opus). The same call with output = hidden_states gives the bits of the separate output (the chain writes the
+    +0 plus nothing), no final add and the side stream by tier (_assert_folded; MTP TP8 M 1365 also asserts the blocks
+    of 64, the Opus case Opus). The same call with output = hidden_states gives the bits of the separate output (the
+    chain writes the
     output, or the routes buffer, only after the kernel that quantizes the input), and a CUDA graph of the call replays
     other inputs with the masks moved with the bits of an eager call on them; where a Down adds the routes atomically
     (_path_atomic), whose order changes from run to run, both are graded instead. The H 5120 decode limit is pinned to
@@ -5829,8 +5992,8 @@ def test_layer_fold_tiers(monkeypatch, case):
     assert call(x, topk_weight, topk_ids, out) is out
     _assert_folded(tier)
     exact = not _path_atomic(moe_a8w4.last_path)
-    if case.startswith("stream_prefill_down"):
-        assert any(n.startswith("a8w4_down_prefill") for n in moe_a8w4.last_path)
+    if case.startswith("stream_bm64"):
+        assert "a8w4_down_stream_bm64" in moe_a8w4.last_path, moe_a8w4.last_path
     if case.startswith("prefill_opus"):
         assert "moe_sorting_opus" in moe_a8w4.last_path, moe_a8w4.last_path
     assert_close(out, ref(x, topk_weight, topk_ids))
@@ -5940,14 +6103,14 @@ def test_layer_fold_gemm_race(monkeypatch):
 
 @pytest.mark.parametrize(
     "case",
-    ["decode_pq_ds_tp4_m6", "stream_atomic_mtp_tp8_m64", "stream_sum_mtp_tp4_m128"],
+    ["decode_pq_ds_tp4_m6", "stream_atomic_mtp_tp8_m64", "stream_i576_mtp_tp4_m128"],
 )
 def test_layer_fold_unaligned_output(case):
     """An output 8 bytes past a 16-byte boundary (a view into a larger buffer) folds the shared expert as an aligned
     one does: where its Down GEMM, which stores 16 bytes per thread, writes the output (the slot-pair decode Down and
     the streaming atomic Down then add the routes onto it), the GEMM writes an aligned buffer that one more kernel
-    copies into the output (shared_fold_copy); where it writes rows of the routes buffer for a final sum (_ROUTE_SUMS),
-    nothing is copied. Graded against reference_layer; the buffer before the view stays untouched.
+    copies into the output (shared_fold_copy); where it writes rows of the prefill routes buffer for a8w4_route_sum
+    (_ROUTE_SUMS), nothing is copied. Graded against reference_layer; the buffer before the view stays untouched.
 
     The basic tests and the benchmark pass outputs from torch.empty, always aligned.
     """
@@ -6008,9 +6171,9 @@ def test_layer_fold_max_m(over):
 @pytest.mark.parametrize("over", [0, 1], ids=["m1024", "m1025"])
 def test_layer_fold_prefill_tile(over):
     """With a tile option (block_m 64: the prefill kernels at any M) the prefill tier folds the shared expert at any M
-    (shared_fold_*, no final add) on the small shape (E 8, H 512, I 64, routed topk 2): M 1024, the last M of the side
-    stream today (SHARED_FOLD_DUAL_STREAM_MAX_M), and M 1025, the first on the current stream; both graded against
-    reference_layer. test_layer_fold_tiers runs M 40 with a tile option in place and under graph replay.
+    (shared_fold_*, no final add) on the small shape (E 8, H 512, I 64, routed topk 2), on the current stream at any M
+    (no shared_fork / shared_join, _assert_folded): M 1024 and M 1025, both graded against reference_layer.
+    test_layer_fold_tiers runs M 40 with a tile option in place and under graph replay.
 
     The default dispatch of the layer shapes first reaches prefill above M 1024 (MTP M 1366, DeepSeek M 1537), so the
     benchmark (M 1024-1536 stream, M 2048 prefill) and the basic tests (prefill M 2048) never run the prefill tier at
@@ -6040,7 +6203,7 @@ def _fold_fallback_weights(experts, hidden, inter, seed):
 # I 1088: a row's 68 16-byte pieces exceed the slot-pair Down's lanes at topk 2; blocks of 16), "w2_4gib" (the small
 # shape, E 8, H 512, I 64, with w2 one byte past what the slot-pair Down's 32-bit offsets reach, through a stride-0
 # view, as test_decode_down_fallback_w2_4gib), "h4096_i1088" (E 2, H 4096, I 1088: 30 rows per expert sort in blocks
-# of 64, where a routed-only call that streams writes its routes with the prefill Down, which holds at most I 1024).
+# of 64, which the routed-only dispatch never streams at I >= 512; the prefill Down holds at most I 1024).
 _FOLD_FALLBACK_CASES = {
     "i1088_m16": ("i1088", 16, "a8w4_down_stream_bm16"),
     "w2_4gib_m16": ("w2_4gib", 16, "a8w4_down_stream_bm16"),
@@ -6139,16 +6302,18 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
         (576, 640, 7, 384, 0.0, False, 0),
     ):
         assert moe_a8w4._shared_mid_kernel(*args) is not first, args
+    # The slot-pair Down's wave count while the builders take one (M6 drops it; its review deletes this).
+    waves = (3,) if hasattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES") else ()
     variants = (
         (
             "_decode_kernels",
-            (1152, 5120, 576, 6, True, True, 10.0, 3, 0),
+            (1152, 5120, 576, 6, True, True, 10.0, *waves, 0),
             "shared",
             True,
         ),
         ("_gateup_dd_kernel", (1152, 5120, 6, 2, 4, 10.0, 0), "shared", True),
         ("_row_quant_plan", (5120, 6, 2, 32, False, 0), "shared", True),
-        ("_down_pq_kernel", (5120, 576, 6, 3, 0), "shared", True),
+        ("_down_pq_kernel", (5120, 576, 6, *waves, 0), "shared", True),
         ("_stream_prep_kernel", (5120, 7, 128, 16, False, 4, 0), "shared", True),
         (
             "_down_kernel",
@@ -6210,26 +6375,25 @@ _LAUNCH_CASES = {
     # The shared expert inside the two mixed decode kernels.
     "mixed": ("layer:mtp_layer_tp8", 1, {}, {}, None),
     # Folded shared expert on the side stream: pre-quantized per-route decode, wide deduplicated decode (main TP4,
-    # which keeps the fold at these M while the mixed decode widens by shape), streaming with the atomic Down and with
-    # route_sum, and streaming whose Gate/Up quantizes the intermediate itself (blocks of 32 below H 4096: 15 rows per
-    # expert).
+    # which keeps the fold at these M while the mixed decode widens by shape), streaming with the atomic Down at I 320
+    # and at I 576, and streaming whose Gate/Up quantizes the intermediate itself (blocks of 32 below H 4096: 15 rows
+    # per expert).
     "fold_decode_pq": ("layer:ds_layer_tp4", 6, {}, {}, None),
     "fold_decode_wide": ("layer:ds_layer_tp4", 8, {}, {}, None),
     "fold_stream_atomic": ("layer:mtp_layer_tp8", 64, {}, {}, None),
-    "fold_stream_route_sum": ("layer:mtp_layer_tp4", 128, {}, {}, "converted"),
+    "fold_stream_i576": ("layer:mtp_layer_tp4", 128, {}, {}, "converted"),
     "fold_stream_fused_quant": ("small", 60, {}, {}, None),
     # Folded into an unaligned output: the shared Down GEMM writes an aligned buffer, one more kernel copies it.
     "fold_decode_unaligned": ("layer:ds_layer_tp4", 6, {}, {}, "unaligned"),
-    # Folded, serial: streaming blocks of 64 into the prefill Down (30 rows per expert; prefill where streaming stops
-    # earlier), prefill sorted by the prep, prefill sorted by Opus (four phases from 2048 tokens; the routed columns
-    # copied out for it), and past the GEMM's 65536 rows each shared GEMM in two chunks (one launch each, the weight's
-    # bytes counted on the first).
-    "fold_stream_prefill_down": ("layer:mtp_layer_tp4", 1280, {}, {}, None),
+    # Folded, serial (the prefill tier): sorted by the prep (I 576 past 28 rows per expert, and I 320 from 4096
+    # routes), sorted by Opus (four phases from 2048 tokens; the routed columns copied out for it), and past the
+    # GEMM's 65536 rows each shared GEMM in two chunks (one launch each, the weight's bytes counted on the first).
+    "fold_prefill_prep_i576": ("layer:mtp_layer_tp4", 1280, {}, {}, None),
     "fold_prefill_prep": ("layer:mtp_layer_tp8", 1366, {}, {}, None),
     "fold_prefill_opus": ("small", 2048, {"block_m": 64}, {}, None),
     "fold_prefill_chunks": ("small", 65537, {}, {}, None),
-    # Folded, prefill with a tile option at few tokens (the fold on the side stream today) with Opus in two phases
-    # (below 2048 tokens) and in one kernel (few tokens).
+    # Folded, serial: prefill with a tile option at few tokens with Opus in two phases (below 2048 tokens) and in one
+    # kernel (few tokens).
     "tile_prefill_opus_phases": ("small", 1024, {"block_m": 64}, {}, None),
     "tile_prefill_opus_oneshot": ("small", 40, {"block_m": 64}, {}, None),
 }

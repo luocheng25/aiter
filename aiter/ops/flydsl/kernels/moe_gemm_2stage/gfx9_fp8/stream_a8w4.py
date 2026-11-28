@@ -36,9 +36,10 @@ I) it quantizes those rows to FP8 itself, exchanging the row maxima through LDS.
 its rows' FP8 activations (all of K = I) in VGPRs (with ``LDS_ACTS`` it reads them from the shared LDS rows
 at every 64-K step), stages its ``R * 16`` channel factors in LDS and
 streams ``R`` 16-row blocks of the hidden dimension, writing BF16 rows by sorted position (padding
-rows are not written), or, with ``ATOMIC``, adding each route into its token's output row with BF16x2 atomics.
-``compile_stream_prep`` (sorting, input quantization and the zeroed output in one launch) and ``compile_route_sum``
-(sum of a token's routes) replace the prefill path's Opus sorting, input quantization and ``sorted_sum``.
+rows are not written), or, with ``ATOMIC`` (what ``moe_a8w4`` dispatches), adding each route into its token's output
+row with BF16x2 atomics. ``compile_stream_prep`` (sorting, input quantization and the zeroed output in one launch)
+replaces Opus sorting and the input quantization (streaming, and prefill up to a route limit); ``compile_route_sum``
+(sum of a token's routes) replaces the base's ``sorted_sum`` behind the prefill Down.
 
 Raw operations: these kernels address global memory through raw buffer descriptors built from 64-bit addresses
 (``_rsrc`` / ``_load`` / ``_store``: per-lane byte offsets, ``_DROP`` past every buffer instead of a branch), run
@@ -950,24 +951,30 @@ def compile_a8w4_gateup_stream(
 def compile_route_sum(topk, cols):
     """Launcher ``(loc_ids, routes, out, tokens, rows, stream)``: BF16 ``out[t] = sum_k routes[loc_ids[t, k]]``.
 
-    ``loc_ids`` int32 [tokens, topk] (negative: no route), ``routes`` BF16 [rows, cols]. Same arithmetic as
-    ``sorted_sum``: f32 sum in slot order (missing routes add +0), round to nearest even. One wave per
-    1 KB of an output row, so all ``topk`` 16-byte loads of a lane are in flight together
-    (``cols % 512 == 0``).
+    ``loc_ids`` int32 [tokens, topk] (negative or ``rows`` and more: no route), ``routes`` BF16 [rows, cols] of any
+    size: each route's row is read through a descriptor of its own whose base is a 64-bit address (the row index is
+    wave-uniform), so routes past 4 GiB (the prefill tier's at M98304, 7 GB) need no 32-bit byte offset. Same
+    arithmetic as ``sorted_sum``: f32 sum in slot order (missing routes add +0), round to nearest even. One wave
+    per 2 KB of an output row (1 KB when ``cols / 512`` is odd), so all ``2 * topk`` 16-byte loads of a lane are in
+    flight together (``cols % 512 == 0``): measured against 1 KB per wave (DeepSeek H5120 with 4 / 6 / 7 columns,
+    MiMo H4096 with 8; M2048-32768), 0.91-0.93x / 0.97x / 0.96-1.01x / 0.98x the time, below sorted_sum's.
     """
     assert cols % 512 == 0, f"cols={cols} must be a multiple of 512"
     chunks = cols // 512
+    per_wave = 2 if chunks % 2 == 0 else 1
+    groups = chunks // per_wave
+    row_bytes = cols * 2
 
     def body(p_loc, p_routes, p_out, tokens, rows):
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid & 63
         item = _uniform(fx.Int32(gpu.block_id("x")) * 4 + (tid >> 6))
-        token = item // chunks
+        token = item // groups
         live = token < tokens
-        column = (item - token * chunks) * 1024 + lane * 16
+        column = (item - token * groups) * (per_wave * 1024) + lane * 16
         loc_rsrc = _rsrc(_address(p_loc), tokens * (topk * 4))
-        routes_rsrc = _rsrc(_address(p_routes), rows * (cols * 2))
-        out_rsrc = _rsrc(_address(p_out), tokens * (cols * 2))
+        routes_base = _address(p_routes)
+        out_rsrc = _rsrc(_address(p_out), tokens * row_bytes)
         mine = fx.Int32(
             _load(
                 loc_rsrc,
@@ -978,7 +985,7 @@ def compile_route_sum(topk, cols):
                 1,
             )[0]
         )
-        words = []
+        words = [[] for _ in range(per_wave)]
         for k in range(topk):
             # Raw readlane (no typed readlane in FlyDSL 0.5.3, see _block_head): route k's sorted row, uniform.
             loc = fx.Int32(
@@ -986,25 +993,29 @@ def compile_route_sum(topk, cols):
                     fx.Int32.ir_type, mine.ir_value(), fx.Int32(k).ir_value()
                 )
             )
-            words.append(
-                _load(
-                    routes_rsrc,
-                    (live & (loc >= 0)).select(
-                        loc * (cols * 2) + column, fx.Int32(_DROP)
-                    ),
-                    0,
-                    4,
-                )
+            # The row's own descriptor (scalar: the base is uniform); a missing route reads nothing (_DROP).
+            valid = live & (loc >= 0) & (loc < rows)
+            row_rsrc = _rsrc(
+                routes_base + fx.Int64(valid.select(loc, fx.Int32(0))) * row_bytes,
+                row_bytes,
             )
-        total = []
-        for k, row in enumerate(words):
-            values = []
-            for word in row:
-                values.append((word << 16).bitcast(fx.Float32))
-                values.append((word & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
-            total = values if k == 0 else [a + b for a, b in zip(total, values)]
-        out = [_bf16_pair(total[2 * i], total[2 * i + 1]) for i in range(4)]
-        _store(out_rsrc, out, live.select(token * (cols * 2) + column, fx.Int32(_DROP)))
+            for j in range(per_wave):
+                offset = valid.select(column + j * 1024, fx.Int32(_DROP))
+                words[j].append(_load(row_rsrc, offset, 0, 4))
+        for j in range(per_wave):
+            total = []
+            for k, row in enumerate(words[j]):
+                values = []
+                for word in row:
+                    values.append((word << 16).bitcast(fx.Float32))
+                    values.append((word & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
+                total = values if k == 0 else [a + b for a, b in zip(total, values)]
+            out = [_bf16_pair(total[2 * i], total[2 * i + 1]) for i in range(4)]
+            _store(
+                out_rsrc,
+                out,
+                live.select(token * row_bytes + column + j * 1024, fx.Int32(_DROP)),
+            )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def a8w4_route_sum(
@@ -1027,7 +1038,7 @@ def compile_route_sum(topk, cols):
     ):
         CompilationContext.get_current()
         a8w4_route_sum(p_loc, p_routes, p_out, tokens, rows).launch(
-            grid=((tokens * chunks + 3) // 4, 1, 1), block=(256, 1, 1), stream=stream
+            grid=((tokens * groups + 3) // 4, 1, 1), block=(256, 1, 1), stream=stream
         )
 
     return launch

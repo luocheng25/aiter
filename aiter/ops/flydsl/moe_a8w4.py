@@ -14,15 +14,15 @@ routes instead (``gfx9_fp8/decode_dedup_a8w4.py``; the Down then adds the routes
 atomics), and runs up to ``DECODE_DEDUP_MAX_M`` tokens while at most 1.5 routes fall on an expert. Larger token
 counts with at most ``STREAM_MAX_ROWS`` rows per expert (M * topk / E; ``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096,
 ``STREAM_MAX_ROWS_H5120`` for hidden >= 5120 with many routes, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of
-blocks of 64 quantizes the intermediate) use the weight-streaming kernels of ``gfx9_fp8/stream_a8w4.py``: one prep
-launch sorts the routes into small blocks, quantizes the input and (for the atomic Down) zeroes the output, the
-Gate/Up writes SiLU(gate) * up (with larger blocks quantized to FP8 in the same kernel), and the Down either adds
-each route into the output with BF16x2 atomics or writes the routes for ``a8w4_route_sum`` (blocks of 64 without
-the atomic Down take the prefill Down from hidden 4096 on). The rest run the prefill kernels: the sorting (the
-streaming prep up to ``PREFILL_PREP_MAX_ROUTES`` routes from hidden 2560 on, else Opus ``moe_sorting`` and a
-per-row FP8 quantization of the input that sets ``loc_ids`` to -1), the A8W4 Gate/Up kernel (SiLU(gate) * up ->
-f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the intermediate, the A8W4 Down
-kernel (routing weight applied; it also records each route's sorted row in ``loc_ids``) and ``sorted_sum``. The
+blocks of 64 quantizes the intermediate; at most ``STREAM_BM32_ROWS`` from padded I 512 on) use the
+weight-streaming kernels of ``gfx9_fp8/stream_a8w4.py``: one prep launch sorts the routes into small blocks,
+quantizes the input and zeroes the output, the Gate/Up writes SiLU(gate) * up (with larger blocks quantized to FP8 in
+the same kernel), and the Down adds each route into the output with BF16x2 atomics. The rest run the prefill kernels:
+the sorting (the streaming prep up to ``PREFILL_PREP_MAX_ROUTES`` routes from hidden 2560 on, else Opus
+``moe_sorting`` and a per-row FP8 quantization of the input that sets ``loc_ids`` to -1), the A8W4 Gate/Up kernel
+(SiLU(gate) * up -> f32, optionally with the DeepSeek-V4.1 SwiGLU limit), per-row FP8 quantization of the
+intermediate, the A8W4 Down kernel (routing weight applied; it writes the routes by sorted row and records each
+route's sorted row in ``loc_ids``) and ``a8w4_route_sum``, which adds every token's routes. The
 calls issue no host synchronization. A routing id of -1 masks its route (ATOM's padding rows): no tier reads its
 weights or adds it (the decode kernels load through zero-byte views and leave it out of the deduplication plan, the
 sortings drop it).
@@ -44,9 +44,10 @@ of two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8 weight
 ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other columns (the tier decided on them
 alone; ``_fold_tier``) and the shared expert is folded into their last reduction (``_SharedFold``): two FlyDSL FP8 GEMMs
 (aiter's preshuffle GEMM in chunks of at most its 65536 rows, ``_shared_gemm``) on the routed path's FP8 input with
-``gfx9_fp8/shared_a8w4.py`` between them, on a side stream up to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens, write its
-weighted output where ``a8w4_route_sum`` / ``sorted_sum`` add it as one more route, or into the output that the
-routed Down then adds onto (the decode tier's slot-pair Down, the streaming tier's atomic Down).
+``gfx9_fp8/shared_a8w4.py`` between them, on a side stream when the routed experts take the decode or the streaming
+tier (on the current stream behind the prefill tier), write its weighted output where ``a8w4_route_sum`` adds it as
+one more route (prefill), or into the output that the routed Down then adds onto (the decode tier's slot-pair Down,
+the streaming tier's atomic Down).
 """
 
 import contextlib
@@ -73,7 +74,6 @@ from .kernels.moe_gemm_2stage.gfx9_fp8 import (
 )
 from .kernels.moe_gemm_2stage.gfx9_fp8.common import _TORCH_TO_FX
 from .kernels.moe_gemm_2stage.gfx9_fp8.gemm1_a8w4 import compile_a8w4_gemm1
-from .kernels.moe_gemm_2stage.gfx9_fp8.moe_reduce import sorted_sum
 from .kernels.moe_gemm_2stage.gfx9_fp8.quant_a8w4 import compile_row_quant_fp8
 from .kernels.tensor_shim import (
     _run_compiled,
@@ -158,17 +158,20 @@ DECODE_DEDUP_MAX_M = 64
 # between 22.0 and 24.7 rows per expert for TP2 and TP4 alike (E513, topk 11: M = 1024 / 1152); with blocks of 64
 # Qwen TP2 (I=320) streams 27% slower at 33 and 44 rows.
 STREAM_MAX_ROWS = 22
-# The same with hidden >= 4096, with the atomic streaming Down (MiMo TP8) and without (MiMo TP4): measured in one
-# process against the prefill kernels, 48 rows (M1536) 0.94x / 1.00x the time, 64 rows (M2048) 1.04x / 1.03x.
+# The same with hidden >= 4096 (MiMo TP8; padded I >= 512 stops at STREAM_BM32_ROWS): measured in one process against
+# the prefill kernels, 48 rows (M1536) 0.94x the time, 64 rows (M2048) 1.04x.
 STREAM_MAX_ROWS_WIDE = 48
 # The same for hidden 2560 to 4095 (measured at 2560) when the Gate/Up of blocks of 64 quantizes the intermediate
 # itself (``_stream_fused_quant``, Qwen TP4 I=192): 33 / 44 / 55 rows (M1536 / 2048 / 2560) 0.96x / 0.92x / 0.98x.
 STREAM_MAX_ROWS_FUSED_QUANT = 56
-# Most mean rows per expert sorted in blocks of 32 (more: blocks of 64).
+# Most mean rows per expert sorted in blocks of 32 (more: blocks of 64), and the most the streaming kernels take from
+# padded I 512 on (``_stream_max_rows``): the streaming Down always adds atomically, and with blocks of 64 that costs
+# registers from K 512 on (MiMo TP4 M1024: 1.27x the time of the prefill Down and route_sum), so there the prefill
+# kernels follow blocks of 32. Measured against streaming blocks of 64 into the prefill Down (same-GPU ABBA): MiMo TP4
+# M1024 1.01x the summed kernel time, the MTP TP4 layer (CUDA graph) M1365 0.98x. Below padded I 512 blocks of 64
+# stream with the atomic Down (MiMo TP8, Qwen TP4, the MTP TP8 layer up to M1365: the prefill kernels instead 1.06x /
+# 1.10x / 1.05x the time).
 STREAM_BM32_ROWS = 28
-# Whether the streaming Down adds its routes into the output with BF16x2 atomics (``_stream_atomic``): 1 while padded
-# I < 512, 0 never, 2 always (diagnostics).
-STREAM_ATOMIC = 1
 # 16-row weight blocks the streaming Down keeps in flight (it loads them in pairs: half as many block pairs) with
 # sorting blocks of 64 rows, and with smaller sorting blocks (STREAM_DOWN_PREFETCH_SMALL: one pair ahead, fewer VGPRs;
 # measured against 4 in one process: Qwen TP2 M48 0.81x, MiMo TP8 M512 0.91x, DeepSeek TP4 M64-256 0.98x the Down's
@@ -191,10 +194,6 @@ STREAM_GATEUP_PREFETCH = 5
 # the Gate/Up 10-24% faster (MiMo TP8 M64 / M512 / M1024 122 / 148 / 191 -> 93 / 126 / 163 us), the Down no faster.
 STREAM_GATEUP_W_AUX = 2
 STREAM_DOWN_W_AUX = 0
-# Sorting blocks of 64 rows without the atomic Down, hidden >= 4096: the prefill Down (gemm2_a8w4) writes the routes
-# instead of the streaming Down (MiMo TP4 M1024: Down 303 -> 289 us; with the atomic Down it is slower, MiMo TP8
-# 166 -> 187 + 29).
-STREAM_PREFILL_DOWN = 1
 # The prefill Down splits the hidden dimension over 2 or 4 workgroups per sorted block while the
 # estimated blocks (E * ceil(M * topk / E / block_m), uniform routing) times the split stay below this:
 # few blocks (M ~2048) otherwise leave the last round of workgroups mostly idle (MiMo M2048 Down -10%).
@@ -214,8 +213,9 @@ PREFILL_PREP_MAX_ROUTES = 24576
 #   experts alone by summed kernel times at 17 / 20 / 24 / 26 / 28 / 32 rows, M1088 / 1280 / 1536 / 1664 / 1792 /
 #   2048, 0.92 / 0.94 / 0.97 / 0.99 / 1.04 / 1.03x the time; the main TP4 / TP8 layers (CUDA graph, the shared expert
 #   folded on both paths) at 17 / 24 / 26 / 28 / 30 rows 0.92 / 0.97 / 1.00 / 1.04 / 1.04x and 0.87 / 0.92 / 0.94 /
-#   0.97 / 1.10x; fewer routes keep STREAM_MAX_ROWS_WIDE (the MTP layer, E128 topk 3, up to M1365: at 24 / 27 / 30 /
-#   32 rows 0.96 / 1.00 / 1.02 / 1.02x at TP4, 0.94 / 0.93 / 1.07 / 1.06x at TP8);
+#   0.97 / 1.10x; fewer routes keep STREAM_MAX_ROWS_WIDE (the MTP layer, E128 topk 3, up to M1365; TP4's padded I
+#   576 stops at STREAM_BM32_ROWS: at 24 / 27 / 30 / 32 rows 0.96 / 1.00 / 1.02 / 1.02x at TP4, 0.94 / 0.93 / 1.07 /
+#   1.06x at TP8);
 # - the prefill kernels take the streaming prep up to PREFILL_PREP_MAX_ROUTES_H5120 routes (Opus and the row kernel vs
 #   the prep at 7680 / 12288 / 24576 routes, M1280 / 2048 / 4096: 1.003x / 0.998x / 0.988x the time);
 # - the streaming Down's weight loads are non-temporal (M48-1536 2-4% faster).
@@ -250,16 +250,6 @@ GATEUP_FEW_WAVES_MIN_ROUTES = 98304
 # The prefill Down stages a large activation tile in two passes (gemm2_a8w4 TWO_PASS) only for grids of more
 # workgroups (estimated blocks times the split) than one per CU.
 DOWN_TWO_PASS_MIN_WGS = 80
-# Token counts up to this run the chain of a folded shared expert (``_SharedFold``) on a side stream of the device,
-# beside the routed kernels (ATOM's dual-stream threshold, ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD = 1024); more tokens run
-# it on the current stream. Under graph replay the side stream's kernels run beside the routed ones only where these
-# leave the CUs room, and a fork / join costs about 8 us: measured in one process at the DeepSeek-V4.1 layers (PTL on)
-# against the chain on the current stream, M4-1024 0.97-1.03x the time, prefill M2048 / 4096 1.00-1.02x. The side
-# stream's kernels are issued right after the routed path's next kernel (the Gate/Up), with the same dependencies (they
-# wait for the kernel that quantizes the input only), so that the routed Gate/Up does not start behind the fork under
-# graph replay (measured in one process at the layers, PTL on, against issuing them first: decode M4-32 0.89-0.98x the
-# time, streaming M64 / 256 0.97-1.00x).
-SHARED_FOLD_DUAL_STREAM_MAX_M = 1024
 # Token counts up to this, while M * routed topk * padded I stays within DECODE_SHARED_MIXED_MAX_WORK, run the shared
 # expert as one more route of the per-route decode kernels (``decode_a8w4``'s mixed Gate/Up and Down: its FP8 weights
 # feed the MFMA directly; two launches, no side stream, no final add) when the routed experts take the decode tier
@@ -1720,7 +1710,7 @@ def _stream_prep(
     routed=None,
 ):
     """Sorting and input quantization of the streaming path in one launch (``compile_stream_prep``); with
-    ``zero`` the same launch zeroes ``output`` for the atomic Down. ``topk_ids`` / ``topk_weight`` are the
+    ``zero`` the same launch zeroes ``output`` for the streaming Down's atomics. ``topk_ids`` / ``topk_weight`` are the
     contiguous int32 / float32 routing of the entry point; with ``routed`` = topk - 1 the last column is a folded
     shared expert's (``_SharedFold``): the prep never sorts it (its loc_ids -1) and sizes the sorted rows and blocks
     for the routed columns."""
@@ -1786,7 +1776,8 @@ def _stream_prep(
 
 @functools.cache
 def _stream_sum_kernel(topk, cols, device):
-    """``a8w4_route_sum`` launcher (``compile_route_sum``). ``device`` only keys the cache."""
+    """``a8w4_route_sum`` launcher (``compile_route_sum``; the prefill tier's sum of the routes). ``device`` only keys
+    the cache."""
     return stream_a8w4.compile_route_sum(topk, cols)
 
 
@@ -1821,8 +1812,9 @@ def _stream_down_constants():
 
 @functools.cache
 def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants):
-    """Streaming Down launcher. ``device`` (a compiled handle runs on one GPU) and ``constants``
-    (``_stream_down_constants()``) only key the cache."""
+    """Streaming Down launcher (``atomic``: add the routes into the output, what the streaming tier runs; else write
+    them by sorted row). ``device`` (a compiled handle runs on one GPU) and ``constants`` (``_stream_down_constants()``)
+    only key the cache."""
     # The atomic Down of blocks of 64 at K = 256 keeps the rows' offsets and factors in LDS: with the activations read
     # from LDS that lifts it from 2 to 3 waves per SIMD (178 -> 134 VGPRs; MiMo TP8 M1024 0.90x the Down's time, lab);
     # K <= 192 already reaches 3 and from K = 320 LDS bounds 2 workgroups, where the extra LDS reads only cost 1-2%.
@@ -1845,35 +1837,22 @@ def _stream_down_kernel(N, K, topk, block_m, experts, atomic, device, constants)
     )
 
 
-def _stream_atomic(hidden, inter, block_m):
-    """Whether the streaming Down adds its routes into the output with BF16 atomics (no routes buffer and
-    route_sum): measured faster up to I = 320 (Qwen TP2 M512 355 -> 336 us, MiMo TP8 M512 272 -> 263 us), slower
-    at I = 512 (MiMo TP4 M128 / M512 +4 us: the atomic epilogue's extra registers on top of K = 512 activations).
-    ``STREAM_ATOMIC``: 0 never, 2 always (diagnostics)."""
-    return STREAM_ATOMIC == 2 or (STREAM_ATOMIC == 1 and inter < 512)
-
-
-def _stream_prefill_down(hidden, inter, block_m):
-    """Whether the streaming path writes its routes with the prefill Down (gemm2_a8w4) instead of the streaming Down
-    (see ``STREAM_PREFILL_DOWN``)."""
-    return (
-        bool(STREAM_PREFILL_DOWN)
-        and block_m == 64
-        and hidden >= 4096
-        and not _stream_atomic(hidden, inter, block_m)
-    )
-
-
 def _stream_max_rows(hidden, inter, routes=0):
-    """Most mean rows per expert (M * topk / E) for the streaming kernels (``routes`` = M * topk)."""
+    """Most mean rows per expert (M * topk / E) for the streaming kernels (``routes`` = M * topk): at most
+    STREAM_BM32_ROWS from padded I 512 on, where the atomic streaming Down of blocks of 64 is
+    slow."""
     if hidden >= 5120 and hidden % 512 == 0 and routes >= STREAM_H5120_MIN_ROUTES:
-        return STREAM_MAX_ROWS_H5120
-    if hidden >= 4096 and hidden % 512 == 0:
-        return STREAM_MAX_ROWS_WIDE
+        rows = STREAM_MAX_ROWS_H5120
+    elif hidden >= 4096 and hidden % 512 == 0:
+        rows = STREAM_MAX_ROWS_WIDE
     # Measured at hidden 2560 only; smaller hidden sizes keep STREAM_MAX_ROWS.
-    if hidden >= 2560 and _stream_fused_quant(inter, 64, hidden):
-        return STREAM_MAX_ROWS_FUSED_QUANT
-    return STREAM_MAX_ROWS
+    elif hidden >= 2560 and _stream_fused_quant(inter, 64, hidden):
+        rows = STREAM_MAX_ROWS_FUSED_QUANT
+    else:
+        rows = STREAM_MAX_ROWS
+    if inter >= 512:
+        return min(rows, STREAM_BM32_ROWS)
+    return rows
 
 
 def _stream_block_m(tokens, topk, experts, hidden=0):
@@ -1936,25 +1915,16 @@ def _fused_moe_stream(
     output,
     limit,
     shared=None,
-    prefill_down=True,
 ):
     """Streaming path (``stream_a8w4``): the prep sorts the routes into blocks of ``_stream_block_m`` rows,
-    quantizes the input and, for the atomic Down, zeroes ``output``; the streaming Gate/Up writes SiLU(gate) * up
-    (quantized to FP8 in its epilogue when ``_stream_fused_quant``, else by the row kernel); the Down either adds
-    every route into ``output`` with BF16x2 atomics (``_stream_atomic``) or writes the routes by sorted row for
-    ``a8w4_route_sum`` (blocks of 64 from hidden 4096 on: the prefill Down, ``STREAM_PREFILL_DOWN``, unless
-    ``prefill_down`` is False).
+    quantizes the input and zeroes ``output``; the streaming Gate/Up writes SiLU(gate) * up (quantized to FP8 in its
+    epilogue when ``_stream_fused_quant``, else by the row kernel); the Down adds every route into ``output`` with
+    BF16x2 atomics (any padded I: no routes buffer and no sum, so no prefill kernel and no entry check either).
 
     With a folded shared expert (``shared``, ``_SharedFold``) the routing tensors keep its column (the last; the prep
-    reads them as they are and drops it), its chain starts on the prep's FP8 input and writes either M more rows of
-    the routes buffer, which route_sum adds as one more column of loc_ids, or (atomic Down) the whole output, which the
-    prep then leaves alone and the Down adds the routes onto.
-
-    ``prefill_down`` False keeps the streaming Down there too. It exists for the fold that streams only because the
-    decode tier's slot-pair Down cannot take the call (``_fold_tier``'s fallback): such a call has the decode tier's
-    few tokens and any padded I the decode kernels take, while the prefill Down holds at most 64 KiB / 64 = 1024
-    padded I in LDS and the streaming Down any, so the fallback must not refuse a call the decode tier would run.
-    Elsewhere the streaming tier keeps the prefill Down and its entry check (``_check_prefill_down``).
+    reads them as they are and drops it), its chain starts on the prep's FP8 input and writes the whole output, which
+    the prep then leaves alone and the Down adds the routes onto. The streaming tier also takes the fold that a decode
+    tier cannot (``_fold_tier``: the decode tier's few tokens and any padded I the decode kernels take).
     """
     M, H = hidden_states.shape
     cols = topk_ids.shape[1]
@@ -1962,28 +1932,19 @@ def _fused_moe_stream(
     E, I = weight.experts, weight.inter_padded
     block_m = _stream_block_m(M, topk, E, H)
     device = hidden_states.device
-    atomic = _stream_atomic(H, I, block_m)
-    sorted_ids, sorted_weights, sorted_experts, num_valid, loc_ids, xq, xs = (
-        _stream_prep(
-            hidden_states,
-            topk_weight,
-            topk_ids,
-            E,
-            block_m,
-            output,
-            atomic and shared is None,
-            routed=topk,
-        )
+    sorted_ids, sorted_weights, sorted_experts, num_valid, _, xq, xs = _stream_prep(
+        hidden_states,
+        topk_weight,
+        topk_ids,
+        E,
+        block_m,
+        output,
+        shared is None,
+        routed=topk,
     )
     task_num = sorted_experts.numel()
-    rows = task_num * block_m
-    routes = None
     if shared is not None:
-        if atomic:
-            shared.start(xq, xs, output)
-        else:
-            routes = torch.empty((rows + M, H), dtype=torch.bfloat16, device=device)
-            shared.start(xq, xs, routes[rows:], loc_ids, rows)
+        shared.start(xq, xs, output)
     gateup = _stream_gateup_kernel(
         2 * I, H, topk, block_m, E, limit, device.index, _stream_gateup_constants()
     )
@@ -2055,105 +2016,32 @@ def _fused_moe_stream(
         M,
         task_num,
     )
-    if atomic:
-        # The prep zeroed output (or the shared expert wrote it): Down adds every route into its token's row with
-        # BF16 atomics.
-        if shared is not None:
-            shared.join()
-        _launch(
-            f"a8w4_down_stream_bm{block_m}",
-            _stream_down_kernel(
-                H, I, topk, block_m, E, True, device.index, _stream_down_constants()
-            ),
-            mq,
-            weight.w2,
-            weight.w2_delta,
-            output,
-            *down_args,
-        )
-        if _recording:
-            # The routes' sorted ids and weights (8 bytes each) and num_valid; the atomic adds are one write of the
-            # output.
-            _cost(
-                _down_cost(
-                    weight,
-                    M * topk,
-                    _nbytes(mq, ms, output) + 8 * M * topk + 8,
-                    blocks=True,
-                )
-            )
-        return output
-    if routes is None:
-        routes = torch.empty((rows, H), dtype=torch.bfloat16, device=device)
-    if prefill_down and _stream_prefill_down(H, I, block_m):
-        # The prefill Down also stores each route's sorted row into loc_ids, the same values the prep wrote.
-        _launch(
-            f"a8w4_down_prefill_bm{block_m}",
-            _prefill_down(
-                M,
-                topk,
-                E,
-                H,
-                I,
-                block_m,
-                device.index,
-                loc_topk=None if shared is None else cols,
-            ),
-            mq,
-            weight.w2,
-            weight.w2_delta,
-            routes,
-            *down_args[:-2],
-            loc_ids,
-            M,
-            task_num,
-        )
-        if _recording:
-            # The routes' sorted ids and weights and num_valid; the routes' BF16 rows written (not the padding rows)
-            # and their loc_ids.
-            _cost(
-                _down_cost(
-                    weight,
-                    M * topk,
-                    _nbytes(mq, ms) + 12 * M * topk + 8 + 2 * M * topk * H,
-                    blocks=True,
-                )
-            )
-    else:
-        _launch(
-            f"a8w4_down_stream_bm{block_m}",
-            _stream_down_kernel(
-                H, I, topk, block_m, E, False, device.index, _stream_down_constants()
-            ),
-            mq,
-            weight.w2,
-            weight.w2_delta,
-            routes,
-            *down_args,
-        )
-        if _recording:
-            _cost(
-                _down_cost(
-                    weight,
-                    M * topk,
-                    _nbytes(mq, ms) + 8 * M * topk + 8 + 2 * M * topk * H,
-                    blocks=True,
-                )
-            )
+    # The prep zeroed output (or the shared expert wrote it): Down adds every route into its token's row with BF16
+    # atomics.
     if shared is not None:
         shared.join()
     _launch(
-        "a8w4_route_sum",
-        _stream_sum_kernel(cols, H, device.index),
-        loc_ids,
-        routes,
+        f"a8w4_down_stream_bm{block_m}",
+        _stream_down_kernel(
+            H, I, topk, block_m, E, True, device.index, _stream_down_constants()
+        ),
+        mq,
+        weight.w2,
+        weight.w2_delta,
         output,
-        M,
-        routes.shape[0],
+        *down_args,
     )
     if _recording:
-        # loc_ids and the rows it points to (the routes and the folded shared expert's), the output.
-        _cost(_Cost(fixed=_nbytes(loc_ids, output) + 2 * M * cols * H))
+        # The routes' sorted ids and weights (8 bytes each) and num_valid; the atomic adds are one write of the
+        # output.
+        _cost(
+            _down_cost(
+                weight,
+                M * topk,
+                _nbytes(mq, ms, output) + 8 * M * topk + 8,
+                blocks=True,
+            )
+        )
     return output
 
 
@@ -2255,9 +2143,9 @@ def flydsl_moe_a8w4_ptpc(
     ids, other floating weights and non-contiguous routing tensors are converted first.
     The input and the f32 intermediate SiLU(gate) * up are quantized per row to FP8
     E4M3FNUZ with ``scale = amax / 240`` and ``q = RNE(x / scale)``. SiLU only, no expert mask /
-    bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``; a call that takes the prefill Down (the
-    prefill tier, or streaming blocks of 64 from hidden 4096 on) needs ``block_m * I_padded <= 64 KiB`` (I_padded <=
-    1024 by default). Both raise ``ValueError`` before any kernel runs. ``output`` may be a caller's contiguous
+    bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``; a call on the prefill tier needs
+    ``block_m * I_padded <= 64 KiB`` (I_padded <= 1024 by default; the decode and streaming tiers take any). Both raise
+    ``ValueError`` before any kernel runs. ``output`` may be a caller's contiguous
     BF16 [M, H] tensor, ``hidden_states`` itself included. Issues no host synchronization; compile a shape
     outside a CUDA graph capture before capturing it. Raises ``RuntimeError`` off gfx942.
 
@@ -2267,7 +2155,8 @@ def flydsl_moe_a8w4_ptpc(
     ``DECODE_DEDUP_MAX_M`` tokens while at most 1.5 routes fall on an expert), larger M with at most
     ``STREAM_MAX_ROWS`` rows per expert (``STREAM_MAX_ROWS_WIDE`` for hidden >= 4096, ``STREAM_MAX_ROWS_H5120`` for
     hidden >= 5120 with many routes, ``STREAM_MAX_ROWS_FUSED_QUANT`` when the Gate/Up of blocks of 64 quantizes the
-    intermediate) the streaming kernels and the rest the prefill kernels (TILE_K 128 when chosen for having more
+    intermediate; at most ``STREAM_BM32_ROWS`` from padded I 512 on) the streaming kernels and the
+    rest the prefill kernels (TILE_K 128 when chosen for having more
     rows per expert, else 256). ``block_m`` / ``block_n`` / ``tile_k`` select the prefill kernels' tiles: ``block_m``
     (default 64) is the sorting block and M tile of both kernels (``block_m * I_padded % 4096 == 0``, e.g. 64 or
     128); ``block_n`` (default 128) / ``tile_k`` are the Gate/Up N tile (128 or 256, dividing 2 * padded I into
@@ -2294,9 +2183,9 @@ def flydsl_moe_a8w4_ptpc(
     (``_SharedFold``; the routed tier ``_fold_tier``: their own, with the decode tier's slot-pair Down at any M, or
     streaming where that Down cannot run): two FP8 GEMMs on the routed path's quantized input (in chunks of at most
     65536 rows) with SiLU(gate) * up, the limit, a per-row FP8 quantization and the routing weight between them, on a
-    side stream up to ``SHARED_FOLD_DUAL_STREAM_MAX_M`` tokens, their BF16 output summed with the routes in f32 and
-    rounded to BF16 once (onto which the streaming tier's atomic Down adds the routes in BF16; an ``output`` off a
-    16-byte boundary gets the GEMM's output through one more copy).
+    side stream beside the decode and streaming tiers (behind the prefill tier on the current stream), their BF16
+    output summed with the routes in f32 and rounded to BF16 once (onto which the streaming tier's atomic Down adds the
+    routes in BF16; an ``output`` off a 16-byte boundary gets the GEMM's output through one more copy).
     The streams can be captured in a CUDA graph (compile outside the capture first, as above). Tile options apply to
     the routed experts.
 
@@ -2435,13 +2324,13 @@ class _SharedFold:
     the row kernel's of prefill and of the decode tier, the plan kernel's of the deduplicated decode Gate/Up), then
     ``shared_a8w4.compile_shared_mid`` (SiLU(gate) * up with the SwiGLU limit, per-row FP8 for Down with the shared
     expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM into ``out``:
-    M rows of the routes buffer that ``a8w4_route_sum`` / ``sorted_sum`` add as the last column of loc_ids, or the
+    M rows of the prefill tier's routes buffer that ``a8w4_route_sum`` adds as the last column of loc_ids, or the
     output itself, onto which the slot-pair decode Down or the streaming Down's BF16x2 atomics add the routes. The
     GEMM stores 16 bytes per thread: an ``out`` off a 16-byte boundary gets the GEMM's output from an aligned buffer
     through a copy (``shared_fold_copy``, one more kernel on the chain's stream). A token whose shared expert is dropped
     (ATOM's rule, ``shared_a8w4``) gets +0 there. With a side stream (``side``) the side stream waits for the current
     stream where the routed path calls ``start`` (after the kernel that quantizes the input), its kernels are issued
-    by ``fork``, which the routed path calls right after its next launch (SHARED_FOLD_DUAL_STREAM_MAX_M), and joined by
+    by ``fork``, which the routed path calls right after its next launch (``_moe_shared_fold``), and joined by
     ``join`` (before the kernel that reads ``out``); without one the chain runs on the current stream at ``start``.
     """
 
@@ -2572,52 +2461,43 @@ def _decode_fold(weight, topk):
 
 
 def _fold_tier(M, weight, topk, tiles):
-    """``(tier, fallback)``: the routed tier of a call that folds its shared expert (``_SharedFold``; ``topk`` routed
-    columns, M > 0) and whether it is a fallback. The tier is the routed experts' own (``_routed_tier``: the routed
-    columns decide), except streaming in place of a decode tier that cannot fold (``_decode_fold``: weights or a shape
-    past the slot-pair Down's limits), the fallback, whose streaming Down takes any padded I (the streaming kernels
-    take any M; ``_fused_moe_stream``'s ``prefill_down``). Every tier folds at any M: the decode tier's slot-pair Down
-    and the streaming atomic Down add the routes onto the shared expert's output, ``a8w4_route_sum`` / ``sorted_sum``
-    add its M rows of the routes buffer as one more column.
+    """The routed tier of a call that folds its shared expert (``_SharedFold``; ``topk`` routed columns, M > 0): the
+    routed experts' own (``_routed_tier``: the routed columns decide), except streaming in place of a decode tier that
+    cannot fold (``_decode_fold``: weights or a shape past the slot-pair Down's limits; the streaming kernels take any M
+    and padded I). Every tier folds at any M: the decode tier's slot-pair Down and the streaming atomic Down add the
+    routes onto the shared expert's output, ``a8w4_route_sum`` adds its M rows of the prefill tier's routes buffer as
+    one more column.
     """
     H, I = weight.hidden, weight.inter_padded
     tier = _routed_tier(M, H, I, topk, weight.experts, *tiles)
     if tier == "decode" and not _decode_fold(weight, topk):
-        return "stream", True
-    return tier, False
+        return "stream"
+    return tier
 
 
 def _moe_shared_fold(
     hidden_states, weight, topk_weight, topk_ids, output, limit, tiles
 ):
     """``flydsl_moe_a8w4_ptpc`` with a shared expert folded into the routed experts' last reduction (``_SharedFold``):
-    the routed experts on ``_fold_tier`` with the full routing tensors (its fallback streams with the streaming Down
-    only) and the chain on a side stream up to SHARED_FOLD_DUAL_STREAM_MAX_M tokens (an output in place included: the
-    chain writes the output only after the routed kernels that read x), else on the current stream.
+    the routed experts on ``_fold_tier`` with the full routing tensors, the chain on a side stream beside the decode
+    and streaming tiers (an output in place included: the chain writes the output only after the routed kernels that
+    read x) and on the current stream behind the prefill tier.
     """
+    # Under graph replay the side stream's kernels run beside the routed ones only where these leave the CUs room, and a
+    # fork / join costs about 8 us: measured in one process at the DeepSeek-V4.1 layers (PTL on) against the chain on
+    # the current stream, decode and streaming M4-1024 0.97-1.03x the time, streaming M1025-1536 0.96-1.01x, prefill
+    # M2048 / 4096 1.00-1.02x. The side stream's kernels are issued right after the routed path's next kernel (the
+    # Gate/Up), with the same dependencies (they wait for the kernel that quantizes the input only), so that the routed
+    # Gate/Up does not start behind the fork under graph replay (measured in one process at the layers, PTL on, against
+    # issuing them first: decode M4-32 0.89-0.98x the time, streaming M64 / 256 0.97-1.00x).
     M = hidden_states.shape[0]
     if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
         topk_ids = _routing_input(topk_ids, torch.int32, "topk_ids")
     if topk_weight.dtype != torch.float32 or not topk_weight.is_contiguous():
         topk_weight = _routing_input(topk_weight, torch.float32, "topk_weight")
-    side = (
-        _side_stream(hidden_states.device)
-        if M <= SHARED_FOLD_DUAL_STREAM_MAX_M
-        else None
-    )
+    tier = _fold_tier(M, weight, topk_ids.shape[1] - 1, tiles)
+    side = _side_stream(hidden_states.device) if tier != "prefill" else None
     fold = _SharedFold(hidden_states, weight, topk_weight, topk_ids, limit, side)
-    tier, fallback = _fold_tier(M, weight, topk_ids.shape[1] - 1, tiles)
-    if fallback:
-        return _fused_moe_stream(
-            hidden_states,
-            weight,
-            topk_weight,
-            topk_ids,
-            output,
-            limit,
-            fold,
-            prefill_down=False,
-        )
     return _moe_routed(
         hidden_states, weight, topk_weight, topk_ids, output, limit, *tiles, fold, tier
     )
@@ -2679,42 +2559,24 @@ def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
     return "prefill"
 
 
-def _prefill_down_block_m(M, H, I, topk, E, tier, block_m, prefill_down=True):
-    """Sorting block of the prefill Down (gemm2_a8w4) the routed experts of a call build on ``tier`` (the prefill tier,
-    or the streaming tier's blocks of 64, ``_stream_prefill_down``, unless ``prefill_down`` is False: as in
-    ``_fused_moe_stream``), 0 if none."""
-    if tier == "decode":
-        return 0
-    if tier == "stream":
-        stream_bm = _stream_block_m(M, topk, E, H)
-        return (
-            stream_bm if prefill_down and _stream_prefill_down(H, I, stream_bm) else 0
-        )
-    return 64 if block_m is None else block_m
-
-
 def _check_prefill_down(M, weight, topk, block_m, block_n, tile_k):
     """ValueError before any launch when the call's prefill Down cannot hold its block_m x padded-I FP8 activation
-    tile in LDS (``gemm2_a8w4``: block_m * I_padded <= 64 KiB, so I_padded <= 1024 with the default block_m 64); the
-    decode and streaming Downs take any padded I their dispatch accepts. A call with a shared expert that streams as
-    ``_fold_tier``'s fallback builds no prefill Down (``_fused_moe_stream``'s ``prefill_down`` False): it is checked
-    with ``prefill_down`` False here too."""
+    tile in LDS (``gemm2_a8w4``: block_m * I_padded <= 64 KiB, so I_padded <= 1024 with the default block_m 64); only
+    the prefill tier builds a prefill Down, the decode and streaming Downs take any padded I their dispatch
+    accepts."""
     I = weight.inter_padded
-    # Every prefill Down of the call fits (the streaming tier's takes blocks of 64): no tier needed.
-    if I * (64 if block_m is None else block_m) <= layout.LDS_BYTES:
+    bm = 64 if block_m is None else block_m
+    # The call's prefill Down, if any, fits: no tier needed.
+    if bm * I <= layout.LDS_BYTES:
         return
     tiles = (block_m, block_n, tile_k)
-    fallback = False
     if not weight.has_shared:
         tier = _routed_tier(M, weight.hidden, I, topk, weight.experts, *tiles)
     elif _mixed_decode(M, weight, topk, tiles):
         return
     else:
-        tier, fallback = _fold_tier(M, weight, topk, tiles)
-    bm = _prefill_down_block_m(
-        M, weight.hidden, I, topk, weight.experts, tier, block_m, not fallback
-    )
-    if bm and bm * I > layout.LDS_BYTES:
+        tier = _fold_tier(M, weight, topk, tiles)
+    if tier == "prefill":
         raise ValueError(
             f"padded I {I} is too large for the prefill Down this call takes (M={M}, block_m {bm}): it stages a "
             f"block_m x I_padded FP8 tile in {layout.LDS_BYTES} bytes of LDS, so I_padded <= "
@@ -2903,15 +2765,18 @@ def _moe_routed(
         )
     if shared is not None:
         shared.join()
-    sorted_sum(cols, H)(loc_ids, routes, output, M)
-    last_path.append("sorted_sum")
+    _launch(
+        "a8w4_route_sum",
+        _stream_sum_kernel(cols, H, device.index),
+        loc_ids,
+        routes,
+        output,
+        M,
+        routes.shape[0],
+    )
     if _recording:
         # loc_ids and the rows it points to (the routes and the folded shared expert's), the output.
-        _record(
-            device,
-            "sorted_sum",
-            _Cost(fixed=_nbytes(loc_ids, output) + 2 * M * cols * H),
-        )
+        _cost(_Cost(fixed=_nbytes(loc_ids, output) + 2 * M * cols * H))
     return output
 
 
