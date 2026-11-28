@@ -783,7 +783,9 @@ def _layer_check(
 # shared expert's run checked independent of how the op runs it (_assert_layer_path: today the mixed decode kernels
 # while M * routed topk * I_pad stays within DECODE_SHARED_MIXED_MAX_WORK (main TP4 up to M 3, TP8 up to M 5), else the
 # fold into the routed experts' last reduction; later milestones may change that). One case per routed tier of the
-# main layer TP4 (decode M 1, streaming M 64, prefill M 2048), the TP8 I 288 -> 320 padding (decode M 4) and the MTP
+# main layer TP4 (decode M 1, streaming M 64, prefill M 2048), the TP8 I 288 -> 320 padding (decode M 4, and streaming
+# M 1024: the folded shared expert's own Down kernel and its mid kernel with 8 lanes per row, today's way from
+# SHARED_DOWN_MIN_M_SHORT_K / SHARED_MID_WAVE_ROW_MAX_M rows at I 320) and the MTP
 # layer (E 128, topk 3, the official 32x32-block format folded by prepare; the H 5120 decode deduplicating Gate/Up,
 # M 8), and fused_moe on the E385 / topk-7 call (M 8, with shared_expert_id=E).
 # =================================================================================================
@@ -981,6 +983,7 @@ _LAYER_CASES = [
     ("ds_layer_tp4", 64, "stream", "row"),
     ("ds_layer_tp4", 2048, "prefill", "row"),
     ("ds_layer_tp8", 4, "decode", "row"),
+    ("ds_layer_tp8", 1024, "stream", "row"),
     ("mtp_layer_tp4", 8, "dedup", "block"),
 ]
 
@@ -2723,20 +2726,35 @@ def test_prefill_prep_routes_limit(monkeypatch, tokens, first, duplicate):
     assert_close(out, ref)
 
 
-@pytest.mark.parametrize(
-    "tokens, block_m, steps", [(40, 16, 4), (64, 32, 2)], ids=["m40_bm16", "m64_bm32"]
-)
-def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
-    """The streaming Gate/Up of H 5120 (light waves: one gate and one up block each, 4 waves sharing the activations
-    through an LDS ring) loads 16 bytes per lane covering ACT_STEPS 64-K steps (4 / 2 with blocks of 16 / 32, issued
-    two groups ahead and written to LDS at the end of the previous group): the dispatch's tile for K 5120 has 4 / 2
-    steps, and mid equals bit for bit that of the kernel with ACT_STEPS 1 (4 / 8 bytes per lane and step, a barrier
-    every 2 steps) on the same sort and input. E 24 with M 40 / 64 are the M that the dispatch sorts in blocks of
-    16 / 32; with blocks of 32 both one and two live sub-blocks occur (asserted below).
+# case: (H, I, E, topk, M, sorting block, ACT_STEPS and waves of the dispatch's tile). DeepSeek TP4 (E 24, I 576)
+# M 40 / 64 sort in blocks of 16 / 32. Blocks of 64 (K % 128 == 0): H 5120 at the TP8 I 320 (E 24, topk 6, 4 waves:
+# 32 bytes per lane and group, two 16-byte loads; skewed routing, so that the blocks hold 1-4 live sub-blocks) and
+# H 4096 with I 256 (E 5, topk 2, 8 waves: one 16-byte load per lane and group).
+_ACT_STEPS_CASES = {
+    "m40_bm16": (DS_HIDDEN, DS_INTER, DS_EXPERTS, DS_TOPK, 40, 16, 4, 4),
+    "m64_bm32": (DS_HIDDEN, DS_INTER, DS_EXPERTS, DS_TOPK, 64, 32, 2, 4),
+    "i320_m240_bm64": (DS_HIDDEN, 320, DS_EXPERTS, DS_TOPK, 240, 64, 2, 4),
+    "h4096_m120_bm64": (4096, 256, 5, 2, 120, 64, 2, 8),
+}
 
-    The basic DeepSeek M 64 and the benchmark's ds_tp4 M48-1024 run this kernel but only grade end-to-end errors,
-    which do not show a few differing elements.
+
+@pytest.mark.parametrize("case", list(_ACT_STEPS_CASES))
+def test_stream_act_steps_bitexact(monkeypatch, case):
+    """The streaming Gate/Up's light waves (one gate and one up block each, sharing the activations through an LDS
+    ring) load the block's activations ACT_STEPS 64-K steps at a time (issued two groups ahead, written to LDS at the
+    end of the previous group): the dispatch's tile has 4 / 2 steps at H 5120 with blocks of 16 / 32 (16 bytes per
+    lane), and 2 with blocks of 64 at any H with K % 128 == 0 (a row's 128 bytes of a group are whole cache lines;
+    32 bytes per lane with 4 waves, two 16-byte loads), where it also computes the LUT with VALU instead of reading
+    the LDS table (LUT_LDS False). mid equals bit for bit that of the kernel with ACT_STEPS 1 (4 / 8 / 16 bytes per
+    lane and step, a barrier every 2 steps) on the same sort and input, and with blocks of 64 also that of the tile
+    with ACT_STEPS 1 and the LDS table. _ACT_STEPS_CASES lists the shapes; the H 5120 blocks of 32 / 64 hold every
+    count of live sub-blocks (asserted below).
+
+    The basic DeepSeek M 64 and the benchmark's ds_tp4 M48-1024 (blocks of 16 / 32), mtp_layer_tp8 M1195-1365 and
+    mimo M1024 (blocks of 64) run these tiles but only grade end-to-end errors, which do not show a few differing
+    elements; no dispatch runs a tile with the other ACT_STEPS or LUT.
     """
+    hidden, inter, experts, topk, tokens, block_m, steps, waves = _ACT_STEPS_CASES[case]
     compile_stream, seen = stream_a8w4.compile_a8w4_gateup_stream, {}
 
     def spy(**options):
@@ -2744,32 +2762,48 @@ def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
         return compile_stream(**options)
 
     monkeypatch.setattr(stream_a8w4, "compile_a8w4_gateup_stream", spy)
-    _, prepared = _ds_weights()
+    if inter == DS_INTER:
+        _, prepared = _ds_weights()
+    elif hidden == DS_HIDDEN:
+        _, prepared = _weights(experts, hidden, inter, 401)
+    else:
+        _, prepared = _small_weights(hidden, inter)
     E, inter = prepared.experts, prepared.inter_padded
-    assert moe_a8w4._stream_block_m(tokens, DS_TOPK, E, DS_HIDDEN) == block_m
+    assert E == experts
+    assert moe_a8w4._stream_block_m(tokens, topk, E, hidden) == block_m
     device, constants = torch.cuda.current_device(), moe_a8w4._stream_gateup_constants()
-    args = (2 * inter, DS_HIDDEN, DS_TOPK, block_m, E, 0.0, device, constants)
+    args = (2 * inter, hidden, topk, block_m, E, 0.0, device, constants)
     # Builds the dispatch's launcher uncached, only to read its tile (nothing is launched with it).
     moe_a8w4._stream_gateup_kernel.__wrapped__(*args)
-    assert (seen["ACT_STEPS"], seen["W"], seen["G"]) == (steps, 4, 1), seen
+    assert (seen["ACT_STEPS"], seen["W"], seen["G"]) == (steps, waves, 1), seen
     assert not seen.get("QUANT"), seen
-    kernels = [
-        moe_a8w4._stream_gateup_kernel(*args),
-        compile_stream(**{**seen, "ACT_STEPS": 1}),
+    assert seen.get("LUT_LDS", True) == (block_m != 64), seen
+    variants = [{**seen, "ACT_STEPS": 1}]
+    if block_m == 64:
+        variants.append({**seen, "ACT_STEPS": 1, "LUT_LDS": True})
+    kernels = [moe_a8w4._stream_gateup_kernel(*args)] + [
+        compile_stream(**options) for options in variants
     ]
     x, topk_weight, topk_ids = make_inputs(
-        tokens, DS_HIDDEN, E, DS_TOPK, seed=450 + tokens, shared=False
+        tokens, hidden, E, topk, seed=450 + tokens, shared=False
     )
-    tail = torch.bincount(topk_ids.flatten().long(), minlength=E) % block_m
-    assert block_m == 16 or (
-        bool(((tail > 0) & (tail <= 16)).any()) and bool((tail > 16).any())
-    ), tail
+    if block_m == 64 and hidden == DS_HIDDEN:
+        # Skewed routing (expert e drawn with weight 0.1 + e / 12): the experts' tails cover 1-4 sub-blocks.
+        gen = torch.Generator(device="cuda").manual_seed(455)
+        probs = torch.linspace(0.1, 2.0, E, device="cuda").expand(tokens, E)
+        topk_ids = torch.multinomial(probs, topk, generator=gen).to(torch.int32)
+    counts = torch.bincount(topk_ids.flatten().long(), minlength=E)
+    tail = counts % block_m
+    if hidden == DS_HIDDEN and block_m > 16:
+        live = {(int(t) + 15) // 16 for t in tail.tolist() if t}
+        assert live == set(range(1, block_m // 16 + 1)), counts
+        assert block_m == 32 or bool((counts >= block_m).any()), counts
     sorted_ids, _, sorted_experts, num_valid, _, xq, xs = moe_a8w4._stream_prep(
         x, topk_weight, topk_ids, E, block_m, torch.empty_like(x), zero=False
     )
     mids = []
     for kernel in kernels:
-        mids.append(torch.full((tokens, DS_TOPK, inter), float("nan")))
+        mids.append(torch.full((tokens, topk, inter), float("nan")))
         moe_a8w4._launch(
             "gateup",
             kernel,
@@ -2787,7 +2821,8 @@ def test_stream_act_steps_bitexact(monkeypatch, tokens, block_m, steps):
             sorted_experts.numel(),
         )
     assert not bool(mids[0].isnan().any())
-    assert torch.equal(mids[0].view(torch.int32), mids[1].view(torch.int32))
+    for mid in mids[1:]:
+        assert torch.equal(mids[0].view(torch.int32), mid.view(torch.int32))
 
 
 def _spy_build(monkeypatch, name):
@@ -6183,9 +6218,11 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, tokens, mixed):
 # it without asserting how the shared expert runs. Here: every folded tier with masks and with rows whose last column
 # is a routed expert instead of E, in place and under graph replay; the GEMM tiles' LDS race; an output that is not
 # 16-byte aligned; the fallback to streaming; small M with a tile option and both sides of the GEMMs' row limit; the
-# compile-cache keys. The cases pin the routed tier, the side stream by tier, a8w4_route_sum exactly behind the prefill
-# Down, no mixed kernels, the copy exactly where the shared Down GEMM writes an unaligned output, the streaming Down of
-# the fallback; bits are compared where no Down adds atomically (_path_atomic), else graded.
+# compile-cache keys; shared_a8w4's own Down kernel against the preshuffle GEMM and its mid kernel's lanes per row
+# against one row per wave, bit for bit. The cases pin the routed tier, the side stream by tier, a8w4_route_sum
+# exactly behind the prefill Down, no mixed kernels, the copy exactly where the shared Down GEMM writes an unaligned
+# output, the streaming Down of the fallback; bits are compared where no Down adds atomically (_path_atomic), else
+# graded.
 
 # case: (shape, tokens, options, routed tier as _path_tier names it, or the tiers it may take). Shape: a LAYER_SHAPES
 # name, or "small" (_fold_small_weights: E 8, H 512, I 64, routed topk 2; prefill with a tile option sorts with Opus
@@ -6418,7 +6455,12 @@ def test_layer_fold_gemm_race(monkeypatch):
 
 @pytest.mark.parametrize(
     "case",
-    ["decode_pq_ds_tp4_m6", "stream_atomic_mtp_tp8_m64", "stream_i576_mtp_tp4_m128"],
+    [
+        "decode_pq_ds_tp4_m6",
+        "stream_atomic_mtp_tp8_m64",
+        "stream_i576_mtp_tp4_m128",
+        "stream_bm64_mtp_tp8_m1365",
+    ],
 )
 def test_layer_fold_unaligned_output(case):
     """An output 8 bytes past a 16-byte boundary (a view into a larger buffer) folds the shared expert as an aligned
@@ -6426,6 +6468,8 @@ def test_layer_fold_unaligned_output(case):
     the streaming atomic Down then add the routes onto it), the GEMM writes an aligned buffer that one more kernel
     copies into the output (shared_fold_copy); where it writes rows of the prefill routes buffer for a8w4_route_sum
     (_ROUTE_SUMS), nothing is copied. Graded against reference_layer; the buffer before the view stays untouched.
+    The Down is the preshuffle GEMM at M 6-128 and shared_a8w4's own Down kernel at MTP TP8 M 1365 (I 320, from
+    SHARED_DOWN_MIN_M_SHORT_K rows on), which needs a 16-byte aligned output too.
 
     The basic tests and the benchmark pass outputs from torch.empty, always aligned.
     """
@@ -6676,6 +6720,158 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
         (False, device),
         (True, device),
     ], built
+
+
+@pytest.mark.parametrize("inter", [320, 576], ids=["i320", "i576"])
+def test_shared_mid_lanes_bitexact(inter):
+    """shared_fold_mid with several rows per wave (what moe_a8w4 runs past SHARED_MID_WAVE_ROW_MAX_M rows: 8 / 16 lanes
+    per row, shared_a8w4.mid_row_lanes; the row maximum by DPP, the quotients through the reciprocal with two
+    corrections, the whole wave on the IEEE division where a row's abs-max is outside decode_a8w4._fast_div_ok)
+    writes the FP8 bytes, scales and loc_ids column of one row per wave (LANES 64: the per-value IEEE division, what
+    runs for fewer rows). At the layers' padded shared I 320 / 576 (KP 384 / 640: 40 / 72 pieces of 8 values, so 16
+    lanes leave some lanes without a last piece) with LANES 8, 16 and the default, without and with the SwiGLU limit,
+    on 1003 rows (a partial last workgroup): N(0, 10) rows, a zero row, a row whose abs-max is below 2^-60 and (without
+    the limit) one at 2^127, each in a wave of its own, and rows whose shared expert is dropped (first id -1, or the
+    last id not E: q 0, scale +0, loc -1); the pad columns [I, KP) are 0, a live row's loc base + t.
+
+    The basic tests and the benchmark run the default lanes at a few M and grade end to end, where a flipped FP8 byte
+    stays within the tolerance, and their rows never reach the IEEE fallback.
+    """
+    kp, cols, experts, rows, base = inter + 64, 4, 128, 1003, 77
+    tiny, huge, zero, dropped = 9, 42, 20, (3, 50)
+    device = torch.cuda.current_device()
+    gen = torch.Generator(device="cuda").manual_seed(985 + inter)
+    gate_up = torch.randn((rows, 2 * inter), generator=gen, device="cuda") * 10.0
+    gate_up[zero] = 0.0
+    gate_up[tiny] *= 2.0**-40
+    gate_up[huge, :inter] = 2.0**64
+    gate_up[huge, inter:] = (gate_up[huge, inter:] / 40.0).clamp(-1.0, 1.0) * 2.0**63
+    gate_up[huge, inter] = 2.0**63
+    gate_up = gate_up.to(torch.bfloat16)
+    ids = torch.randint(
+        0, experts, (rows, cols), generator=gen, device="cuda", dtype=torch.int32
+    )
+    ids[:, -1] = experts
+    ids[dropped[0], 0] = -1
+    ids[dropped[1], -1] = 5
+    topk_weight = torch.rand((rows, cols), generator=gen, device="cuda") + 0.5
+    for limit in (0.0, LAYER_SWIGLU_LIMIT):
+        results = {}
+        for lanes in (64, 8, 16, 0):
+            q = torch.full((rows, kp), 0x7F, dtype=torch.uint8)
+            scale = torch.full((rows, 1), float("nan"))
+            loc = torch.full((rows, cols), -7, dtype=torch.int32)
+            kernel = moe_a8w4._shared_mid_kernel(
+                inter, kp, cols, experts, limit, True, device, lanes=lanes
+            )
+            moe_a8w4._launch(
+                "shared_fold_mid",
+                kernel,
+                gate_up,
+                ids,
+                topk_weight,
+                q.view(torch.float8_e4m3fnuz),
+                scale,
+                loc,
+                rows,
+                base,
+            )
+            torch.cuda.synchronize()
+            results[lanes] = (q, scale.view(torch.int32), loc)
+        for lanes in (8, 16, 0):
+            for got, want in zip(results[lanes], results[64]):
+                assert torch.equal(got, want), (limit, lanes)
+        q, scale, loc = results[64]
+        assert bool((q[:, inter:] == 0).all())
+        assert bool((q[list(dropped)] == 0).all())
+        assert bool((scale[list(dropped)] == 0).all())
+        assert bool((q[tiny, :inter] != 0).any())
+        assert loc[:, -1].tolist() == [
+            -1 if t in dropped else base + t for t in range(rows)
+        ]
+        assert bool((loc[:, :-1] == -7).all())
+
+
+# case: (shared I (prepare pads TP8's 288 to 320), H, M (a number, or a moe_a8w4 constant and an offset), whether every
+# PAIRS / OUT_AUX of the kernel is forced instead of _shared_down_config's, launches of shared_a8w4's Down kernel). The
+# dispatch on both sides of its thresholds (I 320: SHARED_DOWN_MIN_M_SHORT_K rows, I 576: SHARED_DOWN_MIN_M) and past
+# the preshuffle GEMM's 65536 rows (H 512, I 64: chunks of 65536 and SHARED_DOWN_MIN_M_SHORT_K rows, both on the
+# kernel); the forced tiles PAIRS 4 / 10 / 20 (with the non-temporal stores on 4 and 20) at M 1000, a tail of 40 rows.
+_SHARED_DOWN_CASES = {
+    "i320_below": (288, LAYER_HIDDEN, ("SHARED_DOWN_MIN_M_SHORT_K", -1), False, 0),
+    "i320_at": (288, LAYER_HIDDEN, ("SHARED_DOWN_MIN_M_SHORT_K", 0), False, 1),
+    "i576_below": (576, LAYER_HIDDEN, ("SHARED_DOWN_MIN_M", -1), False, 0),
+    "i576_at": (576, LAYER_HIDDEN, ("SHARED_DOWN_MIN_M", 0), False, 1),
+    "small_chunks": (64, 512, ("SHARED_DOWN_MIN_M_SHORT_K", 65536), False, 2),
+    "i320_tiles": (288, LAYER_HIDDEN, 1000, True, 3),
+    "i576_tiles": (576, LAYER_HIDDEN, 1000, True, 3),
+}
+
+
+@pytest.mark.parametrize("case", list(_SHARED_DOWN_CASES))
+def test_shared_down_bitexact(monkeypatch, case):
+    """The folded shared expert's Down (moe_a8w4._shared_down: shared_a8w4's own kernel where _shared_down_config
+    picks it, else aiter's preshuffle GEMM) writes the preshuffle GEMM's output bit for bit (_SHARED_DOWN_CASES: both
+    sides of the thresholds, every tile, row chunks), reading only the useful K (the columns past the padded shared I
+    are 0, as shared_fold_mid writes them) and never writing rows past M (64 NaN rows after the output stay NaN); rows
+    of a dropped shared expert (q 0, scale 0) give +0. The kernel's launches are counted; shapes it is not built for
+    (K past 576 or not a multiple of 64, N not a multiple of 512) take the preshuffle GEMM.
+
+    The basic tests and the benchmark run the dispatch's tile at a few M and grade end to end, where a few differing
+    elements stay within the tolerance; neither writes next to the output nor runs the other tiles.
+    """
+    from aiter.ops.flydsl import gemm_kernels
+
+    inter, hidden, tokens, tiles, launches = _SHARED_DOWN_CASES[case]
+    if isinstance(tokens, tuple):
+        tokens = getattr(moe_a8w4, tokens[0]) + tokens[1]
+    if hidden == 512:
+        prepared = _fold_small_weights()[2]
+    else:
+        prepared = _fold_fallback_weights(2, hidden, inter, 980)[2]
+    wq, ws = prepared.shared_w2, prepared.shared_w2_scale
+    k = prepared.shared_w1.shape[0] // 2
+    N, kp = wq.shape
+    assert N == hidden and k == -(-inter // 64) * 64, (wq.shape, k)
+    big = gemm_kernels.PRESHUFFLE_M_MAX
+    assert moe_a8w4._shared_down_config(big, N, k) is not None
+    for shape in ((big, N, 640), (big, N, k + 32), (big, N - 256, k)):
+        assert moe_a8w4._shared_down_config(*shape) is None, shape
+    gen = torch.Generator(device="cuda").manual_seed(990 + inter)
+    v = torch.randn((tokens, kp), generator=gen, device="cuda") * 60.0
+    v[:, k:] = 0.0
+    dropped = list(range(1, tokens, 97))
+    v[dropped] = 0.0
+    mq = v.clamp(-240.0, 240.0).to(torch.float8_e4m3fnuz)
+    ms = torch.rand((tokens, 1), generator=gen, device="cuda") * 1e-3 + 1e-4
+    ms[dropped] = 0.0
+    want = torch.empty((tokens, N), dtype=torch.bfloat16)
+    moe_a8w4._shared_gemm(mq, wq, ms, ws, want)
+    torch.cuda.synchronize()
+    assert _zero_rows(want, dropped)
+    built = []
+    original = moe_a8w4._shared_down_kernel
+
+    def spy(*args):
+        built.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(moe_a8w4, "_shared_down_kernel", spy)
+    configs = [(4, 2), (10, 0), (20, 2)] if tiles else [None]
+    chunks = [min(big, tokens - r) for r in range(0, tokens, big)]
+    for config in configs:
+        if config is not None:
+            monkeypatch.setattr(
+                moe_a8w4, "_shared_down_config", lambda m, n, kk, c=config: c
+            )
+        buf = torch.full((tokens + 64, N), float("nan"), dtype=torch.bfloat16)
+        assert moe_a8w4._shared_down(mq, wq, ms, ws, buf[:tokens], k) == chunks
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(buf[:tokens]), _bits(want)), config
+        assert bool(buf[tokens:].isnan().all()), config
+    assert len(built) == launches, built
+    if tiles:
+        assert [args[3:5] for args in built] == configs, built
 
 
 # -- 2.14 launch records: the bytes and FLOPs of each kernel behind the benchmark's roofline lines -------------------

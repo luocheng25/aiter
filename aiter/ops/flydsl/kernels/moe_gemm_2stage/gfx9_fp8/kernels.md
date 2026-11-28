@@ -106,8 +106,9 @@ Gluon 没有的操作写成伪操作。指令级的细节（sched_group 排布�
 #       MTP TP8 到 M10）；
 #     折叠：其余全部（shared 折叠一节）。routed 档照常（decode 档一律用槽对 Down，槽对 Down 不可用时改流式档），各档 kernel 以
 #       TOPK+1 列的路由编译、跳过末列；x 量化之后 preshuffle GEMM(gate / up；M > 65536 按 65536 行分块) → shared_mid →
-#       preshuffle GEMM(Down) 写 out（未 16 B 对齐时写临时缓冲再拷进 out）或 prefill 的 routes 末尾 M 行（decode 与流式档在
-#       side stream 上、routed Gate/Up 之后发出；prefill 档在当前流上串行），最后一次规约前 join
+#       shared Down（每块 M ≥ 769（I ≤ 384）/ 8192 行用本目录的 a8w4_shared_down，否则 preshuffle GEMM）写 out（未 16 B
+#       对齐时写临时缓冲再拷进 out）或 prefill 的 routes 末尾 M 行（decode 与流式档在 side stream 上、routed Gate/Up 之后
+#       发出；prefill 档在当前流上串行），最后一次规约前 join
 ```
 
 ## 逐 kernel 的 roofline 口径（[moe_a8w4.py](../../../moe_a8w4.py) 的 `KernelLaunch`）
@@ -1240,8 +1241,10 @@ mid[token, slot, :]，或在尾部量化成 fp8 mq[route, :] 与 ms[route]。
 #       轻 wave SYNC = 2，尾部量化 1）分给各 wave。预取距离 P 个 64-K 步，由分派给：
 #       尾部量化 S = 1 为 4、否则 3（子块多时少预取，省 VGPR）；其余为 5。
 #       共享时步 k+SYNC 的激活在步 k 写进 LDS（覆盖步 k−SYNC 用过的槽），每 SYNC 步一次 barrier
-#       ACT_STEPS = A > 1（K ≥ 5120 的轻 wave；排序块 16 / 32 时 A = 4 / 2）：SYNC = A，每 lane 一次 16 B 加载取一行 A 个
-#       64-K 步里的一片（A = 1 时每步每 lane 4 / 8 B）；激活按 A 步一组提前 2 组发，组 g 末尾写组 g+1（覆盖组 g−1 的槽）再 barrier
+#       ACT_STEPS = A > 1（K ≥ 5120 的轻 wave 排序块 16 / 32 时 A = 4 / 2；排序块 64 时 A = 2，含尾部量化 tile）：SYNC = A，
+#       每 lane 每组取一行 A 个 64-K 步里的 A·BM/W B（一条 4 / 8 / 16 B，超过 16 B 时多条 16 B，第 q 条取组内第 q·W + w 个 KiB），
+#       A ≥ 2 时一行一组的字节是整条 128 B cache line（单步只有半条）；激活按组提前 2 组发，组 g 末尾写组 g+1（覆盖组 g−1 的槽）
+#       再 barrier。排序块 64 的 LUT 用 VALU 算（LUT_LDS False），4 wave 的 WG LDS 正好 16 KiB
 @gluon.jit
 def a8w4_gateup_stream(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert_ids, num_valid, mid, mq, ms):
     c, e = gl.program_id(0), gl.program_id(1)        # c：W·G 个 16 通道 gate 块及同号 up 块；e：排序块
@@ -1293,14 +1296,15 @@ def a8w4_gateup_stream(xq, xs, w1, w1_delta, w1_scale, sorted_ids, sorted_expert
 ```
 
 **任务划分**（G、W 由分派选：尾部量化时 G = I/64、W = 4，一个 WG 管全部 I；其余 G1，排序块 ≥ 32 且 I%128 = 0 时 W8、否则 W4，
-激活都经 LDS 共享；H ≥ 4096 时不尾部量化，轻 wave 加 row_quant_fp8 更快；K ≥ 5120 时 ACT_STEPS = max(16·W/BM, 1)）
+激活都经 LDS 共享；H ≥ 4096 时不尾部量化，轻 wave 加 row_quant_fp8 更快；K ≥ 5120 时 ACT_STEPS = max(16·W/BM, 1)；
+排序块 64（K%128 = 0，轻 wave 与 G ≤ 4 的尾部量化 tile）ACT_STEPS = 2、LUT 用 VALU）
 | 层级 | 形状 / 数量 | 负责的数据 |
 |---|---|---|
 | grid | (I/(16·G·W), 排序块数) | x：W·G 个 gate 16 行块与同号 up 块；y：1 个排序块 |
 | CTA（64·W 线程） | W 个 wave | 本块 expert 的 2·G·W 个 16 行权重块 × 全部 H |
 | wave | G 个 gate 块 + 同号 G 个 up 块 | 本块的 S 个有效 16 行子块（S = 1 … BM/16） |
 | lane | l = 16b + i | i < 8：gate 块第 2(i&7)、+1 行，i ≥ 8：同号 up 块的这两行，K 16b…16b+15（每 64-K 16 B）；子块第 i 个排序行的同段激活 16 B |
-| K 步 | 64-K 块 | 每个块对：两行各 1 次 LUT（LDS 表）、2 个 dword 解码（64 位移位），每子块 4 条 MFMA 16x16x32 |
+| K 步 | 64-K 块 | 每个块对：两行各 1 次 LUT（LDS 表；排序块 64 为 4 条 VALU）、2 个 dword 解码（64 位移位），每子块 4 条 MFMA 16x16x32 |
 
 MFMA 的 A 是权重（链 p 的行 R 是 gate（R < 8）或 up 块的通道 2(R&7)+p），B 是 16 个排序行；输出 lane 16q+t 持有排序行 t
 的 gate（q < 2）或 up 块 8 个通道 8(q&1) … +7，收尾 lane l 与 l^32 换一半后各持通道 8(q&1)+4(q>>1) … +3 的 gate 与 up。
@@ -1312,16 +1316,18 @@ M·topk ≤ E 时 grid 的 y 维取 M·topk；排序块里有效行在前，所�
 序言（一轮访存）：num_valid、本块 expert、本 lane 各子块的 sorted id → token / slot
   S = 首行有效的子块数（越过 num_valid 为 0）；进入第 S 份特化体，S = 0 直接退出
 发 kb = 0 … P−1：激活（共享时每 lane 读 max(4, BM/W) B，否则每子块 16 B）→ G 个块对各 16 B → 每 4 步 delta 1 条 8 B
-各 wave 把 LUT 表（delta 0…11 各 8 B）写进 LDS（lane 写一项，内容相同，无需 barrier）
+各 wave 把 LUT 表（delta 0…11 各 8 B）写进 LDS（lane 写一项，内容相同，无需 barrier；LUT_LDS False 时不写、无此表）
 共享：激活(0 … SYNC−1) → LDS 槽 0 … SYNC−1；lgkmcnt(0) + barrier
 主循环 kb = 0 … H/64 − 1：
   发 kb+P 的激活与权重（先激活后权重，等激活时不必等后发的权重）
   共享：激活(kb+SYNC) → LDS 槽 (kb+SYNC)%(2·SYNC)；从槽 kb%(2·SYNC) 读本 lane 的 16 B 作 B（行内 16 B 片按 (行号>>1)&3 异或错开）
   不共享：B = 寄存器里的激活(kb)
-  for G 个块对 × 2 行：取 delta 第 kb%4 字节（1 条 VALU）→ ds_read_b64 取 LUT → 64 位移位 + 2 个 dword 解成 2 个 fp8 i64
+  for G 个块对 × 2 行：取 delta 第 kb%4 字节（1 条 VALU）→ ds_read_b64 取 LUT（LUT_LDS False：fp8_lut 4 条 VALU）
+    → 64 位移位 + 2 个 dword 解成 2 个 fp8 i64
     → 每子块 MFMA ×2（链 p）
   共享：每 SYNC 步一次 lgkmcnt(0) + barrier（读完的槽此后才会被覆盖）；sched_barrier
-ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并写组 0；组首步发组 g+2，组末步算完后写组 g+1 再 barrier
+ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B；排序块 64、4 wave 时两条）并写组 0；组首步发组 g+2，
+  组末步算完后写组 g+1 再 barrier
 收尾
   lane l 与 l^32 交换一半累加值（4 条 ds_bpermute / 块对 / 子块）
   acc × 通道因子（gate、up 各自）× xs[token] → [截断] → g · rcp(1 + exp2(−g·log2e)) · u
@@ -1338,12 +1344,14 @@ ACT_STEPS = A > 1：序言只发组 0、1 的激活（每 lane 一条 16 B）并
 LOADERS 读激活的 wave 数（其余 wave 写草稿槽）；A = ACT_STEPS。
 1. SYNC ≤ min(PREFETCH)（构建时断言）：步 k 写进环的步 k+SYNC 激活此时已在途。
 2. 环槽 (k+SYNC)%RING 在步 k 写、步 k+SYNC 读；每 SYNC 步一次 barrier，保证写前该槽已被所有 wave 读完、读前已写完。
-3. ACT_STEPS > 1 只用于共享激活的轻 wave（不尾部量化），且 H/64 是 A 的倍数；此时 SYNC = A。
+3. ACT_STEPS > 1 只对共享激活起作用（不共享的 tile 忽略它，逐步自取），且 H/64 是 A 的倍数；此时 SYNC = A，
+   每 lane 每组 A·BM/W B（4 / 8 / 16，或 32 / 64 = 2 / 4 条 16 B）。
 4. 尾部量化与 quant_row 逐位一致：近舍入边界或 scale 非有限正规数时整 wave 回退 IEEE 除法。
 
-**资源**：LDS = 128 B LUT 表 + 共享时 2·SYNC·BM·64 B 激活环（SYNC1：BM16 2 KiB、BM64 8 KiB，轻 wave 的 SYNC2 翻倍，ACT_STEPS 时
-SYNC = A，BM16 / 32 都是 8 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时 BM·W·4 B amax；累加器 8·G·S 个 VGPR，
-分派只在它 ≤ 96 时让一个 WG 管全部 I 并尾部量化（TP2 BM32 为 80，BM64 为 160 故不量化）。
+**资源**：LDS = 128 B LUT 表（LUT_LDS False 时没有）+ 共享时 2·SYNC·BM·64 B 激活环（SYNC1：BM16 2 KiB、BM64 8 KiB，轻 wave 的
+SYNC2 翻倍，ACT_STEPS 时 SYNC = A，BM16 / 32 都是 8 KiB、BM64 16 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分派用不到）+ 量化时
+BM·W·4 B amax；BM64 4 wave 带 LUT 表是 16.1 KiB ⇒ 每 CU 3 个 WG，去表后 16 KiB 整 ⇒ 4 个（VGPR 120 也允许 4 wave/SIMD）；
+累加器 8·G·S 个 VGPR，分派只在它 ≤ 96 时让一个 WG 管全部 I 并尾部量化（TP2 BM32 为 80，BM64 为 160 故不量化）。
 
 **roofline 与分解**（官方 = 冻结基线（M0）bench 中位数，分区 76 例；诊断：消融（单项 Δ）、ATT、合成访存）
 - memory bound（BM64 的 AI 109–116 贴着 compute 线）。族中位：BM16 73% 线（单例 2.26–3.37 TB/s）、BM32 58–62%、BM64 44–49%
@@ -1354,6 +1362,11 @@ SYNC = A，BM16 / 32 都是 8 KiB；BM/W < 4 时另加 64·4 B 草稿槽，分�
   - DS TP4 M1024 BM32（474.6 µs）：2.5 + 306.1 + 解码 52.6 + 激活环 69.7 + 收尾 22.3 + 余量 33.5 = 486.7（+2.6%）；
   - mtp_layer_tp4 M1280 BM64（231.2 µs）：2.5 + 104.3 + 解码 22.8 + 激活环 87.0 + 收尾 6.2 + 余量 7.5 = 230.3（−0.4%）。
   FP4 解码占 12–22%；激活 LDS 环在 BM32 / 64 占 14–41%（H5120 的 act4 几乎为 0，H ≤ 4096 的 act1 每步装载、每 2 步 barrier，4–19 µs）。
+  注意：去激活环与骨架两个消融的 B 用常数，各子块的 MFMA 输入相同被编译器合并（BM64 静态 v_mfma 3200 → 1280），所以 BM32 / 64
+  的激活环 Δ 含被删的 MFMA、偏大；只去全局激活装载（B 仍从 LDS 读）的可信 Δ：mtp_layer_tp8 M1365 BM64 −17%，ATT 上 VMEM 发射停顿
+  从 41% 降到 2%——半条 cache line 的激活请求（每步每行 64 B）堵住了 VMEM 队列。现行排序块 64 两步一组整线装载 + VALU LUT（4 WG/CU）：
+  BM64 Gate/Up 是单步半线装载版的 0.84–0.96×（mtp_layer_tp8 M1365 135 → 113 µs、2.08 TB/s、237 TF；mtp_layer_tp4 M1280 / M1365 0.86× / 0.85×；
+  MiMo TP8 / TP4 M1024 0.92× / 0.94×，bench INFO）。
 - ATT：BM16 每 wave 序言 11.7–17.8 µs，是在饱和的访存队列里排队（去掉空 WG 不提速，不是独立的固定开销）；尾段空闲占 CU 跨度 1–18%
   （小 M 最大）；占用 BM16 7 wave/SIMD（LDS 8320 B）、BM32 5–6、BM64 3–4；停顿以 VMEM 发射为主（BM16 51–65%），VALU 平均只忙约 60%。
 - 可达上限：① = max(骨架中位, T0 + 运算/450 TF)，①/实测 BM16 0.68–0.81、BM32 0.60–0.64、BM64 与尾部量化版 0.46–0.53；
@@ -1601,8 +1614,10 @@ route_sum：lane < topk 读 loc_ids[token] → readlane 逐槽广播 → 每槽�
 
 ## shared expert 折叠（[shared_a8w4.py](shared_a8w4.py)，入口 `moe_a8w4._SharedFold`）
 带 FP8 shared expert（DeepSeek-V4.1，路由末列 = E）的调用，不走混合 decode 的（上面两节）一律折叠，不再单独相加：shared
-的两次稠密 GEMM（aiter 的 FlyDSL preshuffle FP8 GEMM，`_shared_gemm` 按 M 选 tile；gfx942 上比 CK 默认配置快）吃 routed
-路径已量化的 x，中间一步是本文件的 `a8w4_shared_mid`，结果（已乘 shared 的路由权重）写到 routed 路径最后一次规约会加它的地方。
+的两次稠密 GEMM 吃 routed 路径已量化的 x——Gate/Up 用 aiter 的 FlyDSL preshuffle FP8 GEMM（`_shared_gemm` 按 M 选 tile；gfx942
+上比 CK 默认配置快），Down 在每块 M ≥ `SHARED_DOWN_MIN_M_SHORT_K`（769，I_pad ≤ 384）/ `SHARED_DOWN_MIN_M`（8192）行时用本文件
+的 `a8w4_shared_down`（下面“shared Down”小节），更少的行仍用 preshuffle GEMM（`_shared_down`）——中间一步是本文件的
+`a8w4_shared_mid`，结果（已乘 shared 的路由权重）写到 routed 路径最后一次规约会加它的地方。两种 Down 的结果逐位相同。
 档位只按 routed 列判断（`_fold_tier`）；routed kernel 只看前 topk 列（prep 以 SHARED 编译；decode 的 kernel 以 ID_COLS = topk+1 编译，按 `common_a8w4.id_index` 跳过末列，不再拷贝 routed 列）。
 
 | routed 档 | x 的量化来自 | shared Down 写到 | 规约 |
@@ -1617,7 +1632,7 @@ route_sum：lane < topk 读 loc_ids[token] → readlane 逐槽广播 → 每槽�
 - shared 的 Down GEMM 每线程写 16 B：out 未按 16 B 对齐时（decode、原子流式）GEMM 写对齐的临时缓冲，再一次拷贝进 out
   （`shared_fold_copy`，同一条流上），代价只落在未对齐这种少见情况。
 - preshuffle GEMM 最多 65536 行（`gemm_kernels.PRESHUFFLE_M_MAX`：kernel 以 65536 行的 layout 看 A 和 C，超出即报错），所以
-  M > 65536 时 `_shared_gemm` 按 65536 行分块（A、scale、C 的行视图，每块一次 GEMM，tile 按块的行数选）。整层 graph 同进程实测
+  M > 65536 时 `_shared_gemm` / `_shared_down` 按 65536 行分块（A、scale、C 的行视图，每块一次 GEMM，kernel 与 tile 按块的行数选）。整层 graph 同进程实测
   （M65537–131072，4 形状）为 ATOM split 的 0.82–0.94×（M98304：主干 TP4 0.93×、MTP TP8 0.82×）。
 
 shared 的两次 GEMM 要求 tile_m·tile_k ≥ 每线程 16 B（四波 256 线程、两波（tile_n 32）128 线程；`_shared_gemm` 断言）：preshuffle
@@ -1627,15 +1642,18 @@ GEMM 的 A 按“每线程一个 16 B 片”拷进 LDS，tile 更小时拷贝覆
 
 **Gluon 风格**
 ```python
-# shared_mid：grid = ⌈M/4⌉，256 线程，一 wave 一行；lane l 读 gate / up 的第 l + 64m 个 16 B 片（8 个 bf16）
+# shared_mid：256 线程，每行 G 个相邻 lane（G = mid_row_lanes：M ≤ 512 为 64（一 wave 一行），否则 I ≤ 320 为 8、其余 16），
+#             grid = ⌈M / (1024/G)⌉；行内第 r 个 lane 读 gate / up 的第 r、r+G… 个 16 B 片（8 个 bf16，每次行内连续读 G·16 B）
 @gluon.jit
 def a8w4_shared_mid(gate_up, topk_ids, topk_weight, mq, ms, loc, base):   # gate_up bf16 [M, 2I]，mq fp8 [M, KP]
-    t = 4 * gl.program_id(0) + wave_id()
+    t = (1024 // G) * gl.program_id(0) + thread_id() // G
     live = topk_ids[t, 0] >= 0 and topk_ids[t, TOPK] == E              # ATOM 的规则（首列屏蔽连 shared 一起丢）
     w = topk_weight[t, TOPK] if live else 0
     g, u = swiglu 截断(gate_up[t, :I].to(f32), gate_up[t, I:].to(f32))
     h = silu(g) * u if live else 0                                       # 丢弃的行整行为 0：Down GEMM 得 +0
-    q, s = quant_row(h)
+    s = row_scale(行内 G 个 lane 的 DPP max(|h|))                         # amax / 240，全 0 行为 1
+    q = fp8(h / s)  # G = 64：逐值 IEEE 除法；G = 8 / 16：倒数 + 两次 Markstein 修正（正确舍入，同一字节），行 amax 超出
+                    # _fast_div_ok 时整 wave 回落 IEEE 除法（ballot 后 wave 一致分支）
     mq[t, :I] = q; mq[t, I:KP] = 0                                       # KP = Down 权重补零后的 K（640 / 384）
     ms[t] = s * w                                                        # 路由权重并进行 scale
     if LOC: loc[t, TOPK] = base + t if live else -1                       # 预留 routes 行
@@ -1654,10 +1672,57 @@ def a8w4_shared_mid(gate_up, topk_ids, topk_weight, mq, ms, loc, base):   # gate
 **不变量**：丢弃 shared 的行 mq 全 0、ms = 0 → Down 输出 +0，整行屏蔽仍逐位 +0；route_sum 对 shared 行的 f32
 求和顺序在 routed 之后、只舍入一次；除原子 Down 外结果逐位确定（graph 重放 = eager）。
 
+### shared Down（[shared_a8w4.py](shared_a8w4.py) 的 `compile_shared_down`，分派 `moe_a8w4._shared_down`）
+out[M, H] = bf16((mq[:, :I] · w2[:, :I]ᵀ) × ms × w2_scale)，与 preshuffle GEMM 逐位相同（每个累加链同样按 64-K 块、块内两次 MMA
+的次序累加，收尾同为 (acc × ms) × w2_scale 再 RNE；权重 K 尾的补零只加 +0）。权重仍是 `shuffle_weight(16, 16)` 布局、K 补到 128
+（与 preshuffle GEMM、混合 decode 共用），kernel 只读真实的 I_pad 列（I576 / 320，不是 640 / 384）。
+
+```python
+# grid = (H / NG, ⌈M / BM⌉)，256 线程（4 wave）；BM = 64（4 个 16 行子块），NG = 128·PAIRS 列（PAIRS 由 M 定：4 / 10 / 20）
+@gluon.jit
+def a8w4_shared_down(mq, ms, w2, w2_scale, out, M):
+    L_a, L_ws = mq[rows, :I], w2_scale[本 WG 的 NG 列]       # 序言：每 WG 各读一次进 LDS（256 lane 均分 16 B 片），barrier
+    a = L_a → VGPR 常驻（lane 16q+j 持子块第 j 行每个 64-K 块的第 q 个 16 B，权重布局的 K 次序）
+    for u in range(PAIRS):              # 每 wave 一对 16 行权重块 = 32 列；对 u+1 的权重在对 u 的 MFMA 期间逐 64-K 块发出
+        for kb in range(I // 64):        # 两条链 t：MFMA 行 R ↔ 本对的第 8(R>>2) + 4t + (R&3) 列（权重作 A、16 行激活作 B）
+            acc[t][s] += mfma(w2[对 u, 链 t 的 16 列, kb], a[s, kb])      # × 2 个 MMA × 4 个子块 × 2 条链
+        收尾(对 u-1) 插在对 u 的 MFMA 流里：(acc × ms[行]) × L_ws[列] → RNE bf16 → lane 16q+j 存第 j 行的 8 个连续列（16 B）
+```
+
+| 层级 | 形状 / 数量 | 负责的数据 |
+|---|---|---|
+| grid | (H / NG, ⌈M / 64⌉) | 64 行 × NG 列 |
+| CTA（256 线程） | 4 个 wave | 64 行激活与 NG 个通道因子经 LDS 各读一次；wave w 负责第 w 组 PAIRS 对 |
+| wave | PAIRS 对 × 32 列 | 每对 2 条 MFMA 链 × 4 个子块，累加器 32 个 f32 / lane |
+| lane | l = 16q + j | 子块第 j 行；写本对第 8q…8q+7 列（16 B） |
+
+- 资源（ISA，PAIRS 20）：VGPR TP8（I320）222（每 SIMD 2 wave），TP4（I576）324 + AGPR 68（每 SIMD 1 wave），无溢出；LDS 64·(I+16) + 4·NG B
+  （I320、NG 2560：31744 B，每 CU 2 个 WG；I576：48128 B，每 CU 1 个，与 VGPR 限制一致）。
+- 输出越界：描述符从本块首行起、长度到 M 为止，M 以外的行读 0、写被硬件范围检查丢掉（不分支）。
+- PAIRS：I ≤ 384 时 M ≤ 4096 为 4、≤ 16384 为 10、以上 20；I576 时 M ≤ 1536 为 4、≤ 4096 为 20、≤ 16384 为 10、以上 20（隔离扫描）。
+- `SHARED_DOWN_NT_MIN_M`（2048）行起写回带非临时位（整层持平到快 0.8%；M1024 一快一慢 ±2%，不带）。
+- ATT（MTP TP8 M8192，层内，激活改经 LDS 之前）：VMEM 发射停顿 47%、waitcnt 16%、VALU 16%、MFMA 17%，每 wave 344 条 VMEM（权重 200、写 80、
+  因子 40、激活 20）——激活与因子改经 LDS 后隔离再快 7–10%（I576 M4096 89 → 80 µs）。
+- 未采用（隔离同进程实测）：权重按原布局整行合并读（与置换读同速）、每 lane 8 B 写（慢 17–36%）、BM 32 / 48 / 96 / 128（慢或同速）、
+  收尾按 MFMA 穿插的调度提示（TP4 慢 6%）、预取 2 对（同速）。
+- 门槛（`SHARED_DOWN_MIN_M_SHORT_K` 769 / `SHARED_DOWN_MIN_M` 8192）按独占卡整层 graph A/B 定（preshuffle / 本 kernel）：I320 MTP
+  M1024 / 2048 / 8192 / 32768 0.999 / 1.029 / 1.022 / 1.041×、主干 M1024 / 1536 / 4096 1.011 / 1.019 / 1.012×；I576 主干 M1536 / 2048 /
+  4096 / 8192 / 16384 0.998 / 1.009 / 1.000 / 1.006 / 1.008×，MTP M1152 / 2048 / 32768 0.980 / 0.993 / 1.025×；I576 M4096 本 kernel 层内
+  eager 92 → 103 µs（PAIRS 20 只有 128 个 WG），所以 I576 从 8192 行起。K > 576 不用（激活整段常驻 VGPR / LDS）。
+
+**roofline 与分解：shared Down（本 kernel）**（bench INFO，eager 层内；箭头左边是 preshuffle GEMM 的同口径；① = T0 + 有用运算/450 TF）
+- I320（TP8）：M1024 23.9 → 17.8 µs，M2048 40.8 → 29.2，M4096 71.4 → 53.0，M16384 268 → 183，M32768 559 → 366 µs（294 TF，65% 线；
+  ① 241：2.32× → 1.52×），M98304 两块 1210 / 565 → 777 / 379。I576（TP4）：M16384 338 → 308，M32768 718 → 601 µs（321 TF，71%；
+  ① 432：1.66× → 1.39×），M98304 两块 1499 / 717 → 1208 / 576；M < 8192 仍是 preshuffle GEMM。
+- 隔离（无竞争）M32768：I320 305 µs（352 TF）、I576 530 µs（365 TF）。还没到线的部分：VMEM 发射（每 wave 每对 10 / 18 条权重读 + 4 条写），
+  层内又比隔离慢 15–20%（preshuffle GEMM 只慢 2–12%；本 kernel 的 MFMA 占用更高，层内整卡功耗态压得更多，未直接读时钟）。
+- 再进一步要减权重读：每 wave 更多 token 行（S = 8）需要激活按需从 LDS 读（VGPR 放不下 I576 的 8 个子块），未做。
+
 **roofline 与分解：preshuffle GEMM**（aiter 外部 kernel；官方 = 冻结基线（M0）bench 中位数；诊断：隔离链、K / tile 扫描、收尾消融、ATT）
 - Gate/Up（N = 2·I_pad，K 5120）。M ≤ 128（16x64x512 / 32x64x512）访存延迟受限：M ≤ 16 只有 18（TP4）/ 10（TP8）个 WG，主循环每 512-K 步
   0.564 µs = 1.05 TB/s，ATT 停顿 waitcnt 73%、MFMA 3%；隔离 7.7–10.5 µs，① = 冷读包络 3.1–5.8 µs。M ≥ 1024（64x128x256）MFMA 受限：
-  主循环 443 TF（98% 线），固定段 9.2 µs（8%），M1152–1536 尾波 1 → 2（162 个 WG > 160 槽，+12 µs）；串行档官方 56–99% 线（M16384–32768 6 例 ≥ 95%）；
+  主循环 443 TF（98% 线），固定段 9.2 µs（8%），M1152–1536 尾波 1 → 2（162 个 WG > 160 槽，+12 µs；现 M1025–1152 换 48x192x256（N1152）/
+  48x128x256（N640，到 M1408），整层 graph A/B M1152 0.98×、MTP TP8 M1365 0.99×，其余 M 持平未换）；串行档官方 56–99% 线（M16384–32768 6 例 ≥ 95%）；
   ① = T0 + 运算/450 TF（M4096 109.8、M32768 861 µs），隔离 = ① 的 1.01–1.09×（M ≥ 2048）、1.11–1.58×（M1024–1536）。
 - Down（N 5120，K = I_pad 补到 128 的倍数）。M ≤ 128（16x32x128 / 32x64x128）：每 WG 只有 5 / 3 个 K 步，ATT waitcnt 83%，主循环 0.83 TB/s；
   隔离 4.2–7.6 µs，① 3.0–4.1。M ≥ 256（64x128x128）：主循环 426–449 TF（95–100%），但收尾不与主循环重叠：K 扫描截距 27.3 µs（M4096）/
@@ -1669,12 +1734,13 @@ def a8w4_shared_mid(gate_up, topk_ids, topk_weight, mq, ms, loc, base):   # gate
 - 核对：串行档按 M 的线性模型 70/81 ≤ 10%（超出的 11 个都在 M1152–2048：层内慢态、TP8 Gate/Up 尾波、5–9 µs 的 shared_fold_mid）；
   侧流 M4–16 的隔离值对官方 68/72；代表例 7/8（mtp_layer_tp4 M1152 Gate/Up 的官方比同进程层内高 15%，未定位）。
 
-**roofline 与分解：shared_fold_mid**（官方 = 冻结基线（M0）bench 中位数；诊断：ISA、ATT、隔离扫描）
-- VALU 发射受限：一 wave 一行，每行 472 条 VALU + 49 条超越函数 ≈ 2480 发射周期；I576 的第二组 16 B 只有 8/64 个 lane 有效（其余算重复值）；
-  ATT VALU 80%。T = 2.24 + 4.585 µs/千行（TP4；TP8 2.42 + 2.447，R² ≥ 0.9997）。
-- 官方：M ≤ 128 为 2.4–3.9 µs（≈ T0），M32768 TP4 156.0、TP8 86.2 µs；串行档 9–16% 线。
-- 可达上限：① = 冷读包络（M32768 TP4 23.5、TP8 14.1 µs，实测是它的 6.5× / 5.8×）；② 并进 Gate/Up GEMM 的收尾（要跨 tile 的行 amax）。
-- 核对：串行档模型对官方的超出只在 5–9 µs 的例（±13–17%，约 1 µs）。
+**roofline 与分解：shared_fold_mid**（一 wave 一行版的官方 = 冻结基线（M0）bench 中位数；诊断：ISA、ATT、隔离扫描）
+- 一 wave 一行（逐值 IEEE 除法；M ≤ 512 仍用）VALU 发射受限：每行 472 条 VALU + 49 条超越函数 ≈ 2480 发射周期；I576 的第二组 16 B 只有
+  8/64 个 lane 有效；ATT VALU 80%。官方 M32768 TP4 156.0、TP8 86.2 µs，是冷读包络 ①（23.5 / 14.1 µs）的 6.5× / 5.8×。
+- 现行（M > 512：每行 8 / 16 lane，倒数 + 两次修正）：每行约 260 条 VALU、18 条超越（静态），重复片只剩 I576 的 8/80。
+  层内（bench INFO）M32768 TP4 154 → 67 µs（1.45 TB/s，① 的 2.9×）、TP8 87.7 → 36.6 µs（1.51 TB/s，2.6×）；M4096 23.4 / 14.0 →
+  13.7 / 8.5 µs；M ≤ 512 仍一 wave 一行（侧流，≈ T0）。剩下的主要是每值约 20 条 VALU + 2 条超越（SiLU 的 exp / rcp）。
+- 可达上限：① = 冷读包络；② 并进 Gate/Up GEMM 的收尾（要跨 tile 的行 amax）。
 
 ## ATOM 的 split 链（只作 bench 的 a8w4_split 对照）
 算子里没有 split：shared 只走混合 decode 或折叠（上一节）。bench 的 a8w4_split 对照按 ATOM 的 split 臂计时（测试文件自带实现，

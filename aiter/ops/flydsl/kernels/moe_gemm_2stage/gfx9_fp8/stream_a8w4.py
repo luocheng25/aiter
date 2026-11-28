@@ -25,7 +25,8 @@ are Gate/Up's gate block and the up block of the same channels (lanes l and l ^ 
 so each lane holds gate and up of 4 channels for the epilogue) and Down's blocks 2u and 2u + 1 of the wave (lanes hold
 8 consecutive channels for a 16-byte BF16 store, or with ``ATOMIC`` a channel pair per row). The decode reads the LUT
 pair of each row and step from a table that every wave writes into LDS (``_lut_table``: one VALU and an 8-byte LDS
-read instead of four VALU) and shifts the nibbles of a row's two dwords with 64-bit shifts (``_decode_row``); the
+read instead of four VALU; the Gate/Up with ``LUT_LDS`` False computes it) and shifts the nibbles of a row's two
+dwords with 64-bit shifts (``_decode_row``); the
 bytes are those of ``common_a8w4.fp8_lut`` / ``fp4x8_to_fp8``, and every channel's MFMAs run in the same order as
 with one block per 8-byte load, so the results are unchanged bit for bit.
 
@@ -474,6 +475,7 @@ def compile_a8w4_gateup_stream(
     W_AUX=0,
     SWIGLU_LIMIT=0.0,
     ACT_STEPS=1,
+    LUT_LDS=True,
 ):
     """Build the streaming A8W4 Gate/Up launcher.
 
@@ -486,10 +488,15 @@ def compile_a8w4_gateup_stream(
     exchanged through LDS): out FP8 [M * TOPK, I], out_scale f32 [M * TOPK]. With ``SHARE`` and ``W > 1``
     the waves of a workgroup load the block's activations once into LDS (ring of ``2 * SYNC`` 64-K steps,
     step k + SYNC written during step k, one barrier every ``SYNC`` steps) instead of each wave reading all
-    of them. ``ACT_STEPS`` > 1 (with ``SHARE``): each lane loads 16 (or 8) bytes covering ``ACT_STEPS`` 64-K steps
-    of one row, one load per lane every ``ACT_STEPS`` steps instead of every step (fewer vector memory
-    instructions); ``SYNC`` becomes ``ACT_STEPS``, the loads run two groups ahead and a group is written at the
-    end of the group before it. ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
+    of them. ``ACT_STEPS`` > 1 (only with ``SHARE``; an unshared tile ignores it): the block's rows are loaded
+    ``ACT_STEPS`` 64-K steps at a time, ``ACT_STEPS * BLOCK_M * 64 / (64 * W)`` bytes per lane and group within one
+    row's ``ACT_STEPS * 64`` bytes (one load of 4 / 8 / 16 bytes, or several 16-byte loads, load q of wave w
+    covering KiB ``q * W + w`` of the group), so that from 2 steps on a row's bytes of a group are whole 128-byte
+    cache lines (one 64-K step is half a line); ``SYNC`` becomes ``ACT_STEPS``, the loads run two groups ahead and
+    a group is written at the end of the group before it. ``LUT_LDS`` False computes each row's LUT pair with VALU
+    (``common_a8w4.fp8_lut``) instead of reading the 128-byte LDS table, which keeps blocks of 64 with 4 waves and a
+    ring of four 4-KiB slots at 16 KiB of LDS (4 workgroups per CU instead of 3). ``SWIGLU_LIMIT`` > 0 clamps gate
+    and up before SiLU (``common_a8w4.swiglu_clamp``).
     """
     I = N // 2
     if QUANT:
@@ -504,10 +511,9 @@ def compile_a8w4_gateup_stream(
     # LOADER bytes per 64-K step; with more waves the rest write a scratch slot that nobody reads.
     SHARE = SHARE and W > 1
     SLOT = BLOCK_M * 64
+    # ACT_STEPS groups the loads that fill the shared ring; an unshared tile loads its rows step by step.
+    ACT_STEPS = ACT_STEPS if SHARE else 1
     if ACT_STEPS > 1:
-        assert (
-            SHARE and not QUANT
-        ), "ACT_STEPS > 1 needs the light-wave tile with shared activations"
         assert (
             ACT_STEPS & (ACT_STEPS - 1) == 0 and KB % ACT_STEPS == 0
         ), f"K={K} with ACT_STEPS={ACT_STEPS}"
@@ -520,10 +526,8 @@ def compile_a8w4_gateup_stream(
     else:
         LOADER = max(4, SLOT // (64 * W))
         LOADERS = SLOT // (64 * LOADER)
-    assert not SHARE or LOADER in (
-        4,
-        8,
-        16,
+    assert not SHARE or LOADER in (4, 8, 16) or (
+        ACT_STEPS > 1 and LOADER in (32, 64)
     ), f"BLOCK_M={BLOCK_M} with W={W} waves: {LOADER} bytes per lane"
     assert SYNC <= min(
         PREFETCH
@@ -684,34 +688,43 @@ def compile_a8w4_gateup_stream(
             # The same ring, filled ACT_STEPS steps at a time: of the block's rows of ACT_STEPS * 64 bytes, lane L
             # loads bytes L * LOADER .. + LOADER - 1 (all in one row and one 64-K step) and writes them to that step.
             span_log2 = (ACT_STEPS * 64).bit_length() - 1
-            idx = (wave * 64 + lane) * LOADER
-            ld_sub = idx >> (span_log2 + 4)
-            ld_row = (idx >> span_log2) & 15
-            off = idx & ((1 << span_log2) - 1)
-            within = off & 63
-            token = block.token[0]
-            for s in range(1, S):
-                token = (ld_sub == s).select(block.token[s], token)
-            # Raw ds_bpermute (byte address = 4 * source lane): fx.gpu.shuffle_idx scales the lane and range-checks
-            # it on every call. Each loader lane fetches the token of the row it loads.
-            token = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(ld_row * 4), _raw(token)))
-            ld_voff = (ld_sub < S).select(token * K + off, fx.Int32(_DROP))
-            ld_lds = (
-                act_lds
-                + (off >> 6) * SLOT
-                + ld_sub * 1024
-                + ld_row * 64
-                + (((within >> 4) ^ ((ld_row >> 1) & 3)) << 4)
-                + (within & 15)
-            )
+            # Above 16 bytes per lane, LOADER / 16 loads of 16 bytes: load q of wave w covers KiB q * W + w of
+            # the group's [sub-block][row][ACT_STEPS * 64 B] bytes (wave-contiguous, like the single load).
+            chunk = min(LOADER, 16)
+            parts = []
+            for q in range(max(LOADER // 16, 1)):
+                idx = ((q * W + wave) * 64 + lane) * chunk
+                ld_sub = idx >> (span_log2 + 4)
+                ld_row = (idx >> span_log2) & 15
+                off = idx & ((1 << span_log2) - 1)
+                within = off & 63
+                token = block.token[0]
+                for s in range(1, S):
+                    token = (ld_sub == s).select(block.token[s], token)
+                # Raw ds_bpermute (byte address = 4 * source lane): fx.gpu.shuffle_idx scales the lane and
+                # range-checks it on every call. Each loader lane fetches the token of the row it loads.
+                token = fx.Int32(
+                    rocdl.ds_bpermute(T.i32, _raw(ld_row * 4), _raw(token))
+                )
+                ld_voff = (ld_sub < S).select(token * K + off, fx.Int32(_DROP))
+                ld_lds = (
+                    act_lds
+                    + (off >> 6) * SLOT
+                    + ld_sub * 1024
+                    + ld_row * 64
+                    + (((within >> 4) ^ ((ld_row >> 1) & 3)) << 4)
+                    + (within & 15)
+                )
+                parts.append((ld_voff, ld_lds))
             row = lane & 15
             rd_lds = act_lds + row * 64 + (((lane >> 4) ^ ((row >> 1) & 3)) << 4)
 
             def load_a(kb):
-                return _load(x_rsrc, ld_voff, kb * 64, LOADER // 4)
+                return [_load(x_rsrc, v, kb * 64, chunk // 4) for v, _ in parts]
 
-            def write_a(kb, words):
-                _lds_store(ld_lds + (kb % RING) * SLOT, words)
+            def write_a(kb, loads):
+                for (_, address), words in zip(parts, loads):
+                    _lds_store(address + (kb % RING) * SLOT, words)
 
             def read_a(kb):
                 xs = [
@@ -808,7 +821,12 @@ def compile_a8w4_gateup_stream(
             for j in range(len(rbs)):
                 # Chain p takes row p of every lane's pair (dwords 2p, 2p + 1 of its load).
                 for p in range(2):
-                    lut = _lut_at(lut_lds, deltas[j][p], kb % 4)
+                    if LUT_LDS:
+                        lut = _lut_at(lut_lds, deltas[j][p], kb % 4)
+                    else:
+                        lut = a8w4.fp8_lut(
+                            deltas[j][p], fx.Uint32((kb % 4) * 0x01010101)
+                        )
                     ops = _decode_row(w[j][2 * p : 2 * p + 2], lut)
                     for s in range(S):
                         for c in range(2):
@@ -877,13 +895,15 @@ def compile_a8w4_gateup_stream(
         wave = _uniform(tid >> 6)
         group = fx.Int32(gpu.block_id("x"))
         blk = fx.Int32(gpu.block_id("y"))
-        lds = _lds_base(
-            _LUT_LDS + ACT_LDS + (BLOCK_M * W * 4 if QUANT else 0)
-        )
+        lut_bytes = _LUT_LDS if LUT_LDS else 0
+        lds_bytes = lut_bytes + ACT_LDS + (BLOCK_M * W * 4 if QUANT else 0)
+        # No LDS at all for an unshared tile with the LUT by VALU.
+        lds = _lds_base(lds_bytes) if lds_bytes else None
         lut_lds = lds
-        _lut_table(lut_lds, lane)
-        act_lds = lds + _LUT_LDS if SHARE else None
-        amax_lds = lds + _LUT_LDS + ACT_LDS if QUANT else None
+        if const_expr(LUT_LDS):
+            _lut_table(lut_lds, lane)
+        act_lds = lds + lut_bytes if SHARE else None
+        amax_lds = lds + lut_bytes + ACT_LDS if QUANT else None
         live, block = _block_head(
             blk, BLOCK_M, M, lane, p_sorted_ids, p_sorted_experts, p_num_valid, rows
         )

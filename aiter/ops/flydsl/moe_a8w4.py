@@ -43,8 +43,9 @@ holds E. Up to ``DECODE_SHARED_MIXED_MAX_M`` tokens, while tokens times routed t
 of two decode launches (``decode_a8w4``'s mixed Gate/Up and Down: its FP8 weights feed the MFMA directly,
 ``_fused_moe_decode_mixed``). Otherwise the routed experts run as above on the other columns (the tier decided on them
 alone; ``_fold_tier``) and the shared expert is folded into their last reduction (``_SharedFold``): two FlyDSL FP8 GEMMs
-(aiter's preshuffle GEMM in chunks of at most its 65536 rows, ``_shared_gemm``) on the routed path's FP8 input with
-``gfx9_fp8/shared_a8w4.py`` between them, on a side stream when the routed experts take the decode or the streaming
+in chunks of at most 65536 rows (aiter's preshuffle GEMM, ``_shared_gemm``; the Down from SHARED_DOWN_MIN_M_SHORT_K /
+SHARED_DOWN_MIN_M rows on ``gfx9_fp8/shared_a8w4.py``'s own, ``_shared_down``) on the routed path's FP8 input with
+``shared_a8w4``'s mid kernel between them, on a side stream when the routed experts take the decode or the streaming
 tier (on the current stream behind the prefill tier), write its weighted output where ``a8w4_route_sum`` adds it as
 one more route (prefill), or into the output that the routed Down then adds onto (the decode tier's slot-pair Down,
 the streaming tier's atomic Down).
@@ -261,6 +262,28 @@ DECODE_SHARED_MIXED_MAX_M = 10
 # 0.61-0.94x, MTP TP4 M5 / 6 0.85-0.86x / 0.90-0.96x, main TP8 M5 0.92-0.93x the time), main TP8 M6 (11520) and MTP
 # TP4 M7 (12096) take about the same time (0.99-1.04x), main TP4 M4 (13824) and more fold faster (mixed 1.05-1.22x).
 DECODE_SHARED_MIXED_MAX_WORK = 10368
+# The shared expert's Down GEMM (N = hidden, K = padded shared I, short) runs shared_a8w4.compile_shared_down from
+# these token counts on (``_shared_down_config``): SHARED_DOWN_MIN_M_SHORT_K rows where K <= 384, SHARED_DOWN_MIN_M
+# above; fewer rows take aiter's preshuffle GEMM (``_shared_gemm``). The kernel stores 16 bytes per lane interleaved
+# with the next columns' MFMAs and reads only the useful K, where the preshuffle GEMM writes 2 bytes per lane after
+# its main loop and runs K padded to 128. Measured alone (eager, cold operands, PTL on), us, preshuffle GEMM -> this
+# kernel: K 320 M1024 19.6 -> 13.2, M2048 34.7 -> 23.0, M4096 62.9 -> 43.8, M16384 245 -> 156, M32768 499 -> 305;
+# K 576 M1024 24.6 -> 23.5, M2048 44.4 -> 41.6, M4096 80.3 -> 80.0, M8192 160 -> 148, M16384 325 -> 272, M32768 695
+# -> 530. Whole layer under CUDA graph replay (one process, PTL on, exclusive GPU), preshuffle / this kernel: K 320
+# MTP M1024 / 1152 / 2048 / 8192 / 32768 0.999 / 0.997 / 1.029 / 1.022 / 1.041x, main M1024 / 1536 / 4096 1.011 /
+# 1.019 / 1.012x; K 576 main M1536 / 2048 / 4096 / 8192 / 16384 0.998 / 1.009 / 1.000 / 1.006 / 1.008x, MTP M1152 /
+# 2048 / 32768 0.980 / 0.993 / 1.025x; the kernel alone in the layers (bench INFO, eager) at K 576: M4096 92 -> 103 us,
+# M8192 177 -> 175, so K 576 takes it from 8192 rows on.
+SHARED_DOWN_MIN_M_SHORT_K = 769
+SHARED_DOWN_MIN_M = 8192
+# Rows from which its stores carry the non-temporal bit (whole layer, without / with it: K 320 MTP M2048 / 8192 /
+# 32768 1.002 / 0.996 / 1.008x, main M1536 / 4096 1.008 / 1.001x; at M1024 MTP 0.981x, main 1.016x).
+SHARED_DOWN_NT_MIN_M = 2048
+# Token counts up to which shared_fold_mid runs one row per wave (per-value IEEE division, as before M10); more rows
+# share a wave, 8 / 16 lanes per row (``shared_a8w4.mid_row_lanes``; quotients through the reciprocal, the same
+# bytes). Measured alone (eager, cold, PTL on), us, one row per wave / 16 lanes per row at I 576: M256 3.6 / 4.8,
+# M1000 6.6 / 5.0, M32768 134.5 (before) / 57; 8 lanes at I 320: M256 3.0 / 4.8, M1000 4.6 / 4.5, M32768 74.9 / 31.
+SHARED_MID_WAVE_ROW_MAX_M = 512
 # Checks that read routing tensors on the host (a synchronization, so off by default; AITER_MOE_A8W4_DEBUG=1): routed
 # ids in [0, E) or -1 (masked), no id repeated within a token apart from -1 and, with a shared expert, its id E in the
 # last column of every row (``_check_routing``).
@@ -1668,9 +1691,17 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants
     # in the epilogue; with up to 4 + 4 row blocks per wave the activations are a large share of the traffic, so
     # the waves share them in LDS. Otherwise many light waves (one gate and one up block each, four per
     # workgroup, eight with larger blocks) sharing the block's activations in LDS.
+    # Blocks of 64: the shared activations two 64-K steps at a time (a row's 128 bytes, whole cache lines, instead
+    # of half a line per step: the half-line requests jam the vector memory queue in front of the weight loads) and
+    # the LUT by VALU, which keeps 4 waves' workgroups at 16 KiB of LDS (4 per CU instead of 3); lab, kernel alone:
+    # MTP TP8 M1365 0.88x, MTP TP4 M1280 / M1365 0.90x, MiMo TP8 / TP4 M1024 0.95x / 0.97x, Qwen TP4 M2048 (fused
+    # quantization) 0.94x the time.
+    wide = block_m == 64 and K % 128 == 0
     if _stream_fused_quant(N // 2, block_m, K):
         G = N // 2 // 64
         tile = dict(G=G, PREFETCH=(4, 3), QUANT=True, SHARE=G <= 4)  # noqa: C408
+        if wide and G <= 4:
+            tile.update(ACT_STEPS=2, LUT_LDS=False)
     else:
         W = 8 if block_m > 16 and (N // 2) % 128 == 0 else 4
         # From hidden 5120 on each lane loads 16 bytes of the shared activations per load, covering several 64-K
@@ -1681,7 +1712,8 @@ def _stream_gateup_kernel(N, K, topk, block_m, experts, limit, device, constants
             W=W,
             PREFETCH=(STREAM_GATEUP_PREFETCH, STREAM_GATEUP_PREFETCH),
             SYNC=STREAM_GATEUP_SYNC,
-            ACT_STEPS=steps,
+            ACT_STEPS=max(steps, 2) if wide else steps,
+            LUT_LDS=not wide,
         )
     return stream_a8w4.compile_a8w4_gateup_stream(
         N=N,
@@ -2263,10 +2295,11 @@ _SIDE_STREAMS = {}
 
 
 @functools.cache
-def _shared_mid_kernel(inter, kp, cols, experts, limit, loc, device):
-    """``shared_a8w4.compile_shared_mid`` launcher. ``device`` only keys the cache."""
+def _shared_mid_kernel(inter, kp, cols, experts, limit, loc, device, lanes=0):
+    """``shared_a8w4.compile_shared_mid`` launcher (``lanes`` per row, see SHARED_MID_WAVE_ROW_MAX_M; 0: the kernel's
+    default for many rows). ``device`` only keys the cache."""
     return shared_a8w4.compile_shared_mid(
-        I=inter, KP=kp, COLS=cols, E=experts, SWIGLU_LIMIT=limit, LOC=loc
+        I=inter, KP=kp, COLS=cols, E=experts, SWIGLU_LIMIT=limit, LOC=loc, LANES=lanes
     )
 
 
@@ -2286,6 +2319,12 @@ def _shared_gemm_tiles(M, N, K):
             return 16, 64, 512
         if M <= 256:
             return 32, 64, 512
+        if 1024 < M <= 1152 or (1152 < M <= 1408 and N % 192):
+            # Just past one wave of 64 x 128 tiles (N1152 M1152: 162 tiles on 160 slots): smaller or wider tiles.
+            # Whole layer under CUDA graph replay (one process, PTL on) against 64 x 128 x 256: N1152 M1152 0.984x
+            # (48 x 192 x 256; M1280 / 1365 / 1536 with 64 x 192 x 256 1.000 / 1.001 / 0.999x, kept), N640 M1152 /
+            # 1365 / 1536 0.980 / 0.992 / 1.001x (48 x 128 x 256).
+            return (48, 192, 256) if N % 192 == 0 else (48, 128, 256)
         return (64, 128, 512) if M <= 512 else (64, 128, 256)
     if M <= 48:
         # Two waves (tile_n 32): a 16 x 128 FP8 A tile is 2 KiB, one 16-byte load per thread of 128 (see _shared_gemm).
@@ -2322,6 +2361,69 @@ def _shared_gemm(xq, wq, x_scale, w_scale, out):
     return [M]
 
 
+def _shared_down_config(M, N, K):
+    """``(PAIRS, OUT_AUX)`` of ``shared_a8w4.compile_shared_down`` for the shared Down GEMM of M rows (one chunk
+    of ``_shared_down``), N = hidden columns and useful K (the padded shared I), or None where the preshuffle GEMM
+    (``_shared_gemm``) runs: below SHARED_DOWN_MIN_M_SHORT_K / SHARED_DOWN_MIN_M rows, or a shape the kernel is not
+    built for (K % 64 or K > 576: its rows of a stay in VGPRs and LDS; N % 512). PAIRS (pairs of 16-row weight
+    blocks per wave, 128 * PAIRS columns per workgroup) by M:
+    measured alone (eager, cold, PTL on) at the DeepSeek-V4.1 shapes, a workgroup's fixed cost (its activations, the
+    first weights) wants many pairs, the grid wants enough workgroups for 80 CUs."""
+    if K % 64 or K > 576 or N % 512:
+        return None
+    short = K <= 384
+    if M < (SHARED_DOWN_MIN_M_SHORT_K if short else SHARED_DOWN_MIN_M):
+        return None
+    if M <= (4096 if short else 1536):
+        pairs = 4
+    elif M <= 16384 and (short or M > 4096):
+        pairs = 10
+    else:
+        pairs = 20
+    if N % (128 * pairs):
+        pairs = 4
+    return pairs, 2 if M >= SHARED_DOWN_NT_MIN_M else 0
+
+
+@functools.cache
+def _shared_down_kernel(n, k, kp, pairs, aux, device):
+    """``shared_a8w4.compile_shared_down`` launcher. ``device`` only keys the cache."""
+    return shared_a8w4.compile_shared_down(N=n, K=k, KP=kp, PAIRS=pairs, OUT_AUX=aux)
+
+
+def _shared_down(mq, wq, m_scale, w_scale, out, inter):
+    """The shared expert's Down GEMM ``out`` = BF16 (mq[:, :inter] @ wq[:, :inter].T) * m_scale * w_scale.T (operands
+    of ``_shared_gemm``; ``inter`` = the padded shared I, the columns of mq that ``shared_a8w4.compile_shared_mid``
+    fills; the rest up to the weight's K is zero) on the current stream, in chunks of at most
+    ``gemm_kernels.PRESHUFFLE_M_MAX`` rows as ``_shared_gemm``; each chunk runs ``shared_a8w4.compile_shared_down``
+    where ``_shared_down_config`` picks it, else the preshuffle GEMM. Returns the rows of each launch. Both give the
+    same values bit for bit (the same MFMA order and epilogue rounding; the zero K tail adds +0)."""
+    from .gemm_kernels import PRESHUFFLE_M_MAX
+
+    M, KP = mq.shape
+    N = wq.shape[0]
+    if M > PRESHUFFLE_M_MAX:
+        rows = []
+        for r in range(0, M, PRESHUFFLE_M_MAX):
+            chunk = slice(r, min(r + PRESHUFFLE_M_MAX, M))
+            rows += _shared_down(mq[chunk], wq, m_scale[chunk], w_scale, out[chunk], inter)
+        return rows
+    config = _shared_down_config(M, N, inter)
+    if config is None:
+        return _shared_gemm(mq, wq, m_scale, w_scale, out)
+    _run_compiled(
+        _shared_down_kernel(N, inter, KP, *config, mq.device.index),
+        _arg(mq),
+        _arg(m_scale),
+        _arg(wq),
+        _arg(w_scale),
+        _arg(out),
+        M,
+        current_stream_arg(mq.device),
+    )
+    return [M]
+
+
 def _record_shared_gemm(device, name, rows, shared, fixed, flops):
     """``last_launches`` entries of a shared GEMM of ``sum(rows)`` rows launched per chunk as ``_shared_gemm`` returned
     ``rows`` (``name``, or ``<name>/chunk<i>`` for several): the first chunk counts the weight (``shared`` bytes; a
@@ -2342,7 +2444,8 @@ class _SharedFold:
     Its chain: the Gate/Up GEMM (``_shared_gemm``) on the routed path's FP8 input and per-row scale (the stream prep's,
     the row kernel's of prefill and of the decode tier, the plan kernel's of the deduplicated decode Gate/Up), then
     ``shared_a8w4.compile_shared_mid`` (SiLU(gate) * up with the SwiGLU limit, per-row FP8 for Down with the shared
-    expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM into ``out``:
+    expert's routing weight folded into the row scale, optionally its loc_ids column) and the Down GEMM
+    (``_shared_down``: ``shared_a8w4.compile_shared_down`` or the preshuffle GEMM) into ``out``:
     M rows of the prefill tier's routes buffer that ``a8w4_route_sum`` adds as the last column of loc_ids, or the
     output itself, onto which the slot-pair decode Down or the streaming Down's BF16x2 atomics add the routes. The
     GEMM stores 16 bytes per thread: an ``out`` off a 16-byte boundary gets the GEMM's output from an aligned buffer
@@ -2393,6 +2496,11 @@ class _SharedFold:
                 self.limit,
                 loc is not None,
                 device.index,
+                lanes=(
+                    64
+                    if M <= SHARED_MID_WAVE_ROW_MAX_M
+                    else shared_a8w4.mid_row_lanes(w.inter_padded)
+                ),
             ),
             gate_up,
             self.topk_ids,
@@ -2417,7 +2525,9 @@ class _SharedFold:
     def _down(self, mq, ms, out):
         w = self.weight
         dst = out if out.data_ptr() % 16 == 0 else torch.empty_like(out)
-        rows = _shared_gemm(mq, w.shared_w2, ms, w.shared_w2_scale, dst)
+        rows = _shared_down(
+            mq, w.shared_w2, ms, w.shared_w2_scale, dst, w.shared_w1.shape[0] // 2
+        )
         last_path.append("shared_fold_gemm_down")
         if _recording:
             # Useful K: the shared expert's padded I, not the weight's K padded to 128.
