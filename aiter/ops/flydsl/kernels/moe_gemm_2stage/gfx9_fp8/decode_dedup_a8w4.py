@@ -15,13 +15,13 @@ row's token: wave ``t`` loads all ``M * TOPK`` expert ids and, for each route ``
 it among the routes of the same expert (route order) with ballots. ``plan[r] = [count, r, r1, ...]``:
 the route of rank ``GROUP * g`` leads a group of ``count`` routes (itself and the next ``count - 1``
 routes of the expert), every other route gets ``count = 0``; a masked route (id -1) leads and joins no group, so no
-kernel here computes it. (``decode_a8w4.compile_a8w4_gateup_decode`` with ``PLAN`` writes the same plan from its
+kernel here computes it. (``decode_a8w4.compile_a8w4_gateup_decode_mixed`` with ``PLAN`` writes the same plan from its
 per-route workgroups.)
 
-``compile_a8w4_gateup_decode_dd`` keeps the grid of ``decode_a8w4.compile_a8w4_gateup_decode`` (``(I / 16,
-M * TOPK)``, workgroup ``(j, route)``) and its block-pair weight loads; a workgroup reads its plan entry
-and exits unless it leads. A leader stages the group's FP8 token rows in LDS, reads the expert's
-16-channel block once and runs the MFMAs with route ``m`` of the group in A rows ``m`` and ``8 + m``
+``compile_a8w4_gateup_decode_dd`` keeps the grid of the per-route Gate/Up (``(I / 16, M * TOPK)``, workgroup
+``(j, route)``) and its block-pair weight loads; a workgroup reads its plan entry and exits unless it leads. A leader
+stages the group's FP8 token rows in LDS, reads the expert's 16-channel block once and runs the MFMAs with route ``m``
+of the group in A rows ``m`` and ``8 + m``
 (see "Block pairs" in ``decode_a8w4``), so a fused shared expert chosen by every token is read
 ``ceil(M / GROUP)`` times instead of ``M`` times. Outputs are ``SiLU(gate) * up`` as float32 per route. With
 4 waves (two halves of K, as in the per-route kernel) they are bit-identical to the per-route kernel (with the
@@ -515,7 +515,7 @@ def compile_a8w4_gateup_decode_dd(
 ):
     """Launcher ``(x, x_scale, topk_ids, plan, w, w_delta, w_scale, out, M, stream)``.
 
-    Arguments and output of ``decode_a8w4.compile_a8w4_gateup_decode(PREQUANT=True)`` plus ``plan`` from
+    Arguments and output of the per-route Gate/Up with ``PREQUANT`` (``decode_a8w4``) plus ``plan`` from
     ``compile_a8w4_row_quant_plan`` (same ``GROUP``): x FP8 [M, K] with x_scale f32 [M]; topk_ids int32
     [M, TOPK] ([M, ID_COLS] with ``ID_COLS`` > TOPK, as ``compile_a8w4_row_quant_plan``); out f32 [M, TOPK, I].
     ``WAVES`` (4 or 8) waves split gate / up and ``WAVES / 2`` parts of K

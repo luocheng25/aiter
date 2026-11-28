@@ -41,6 +41,7 @@ import contextlib
 import copy
 import functools
 import gc
+import inspect
 import itertools
 import json
 import math
@@ -770,8 +771,9 @@ def _layer_check(
 # streaming ("_stream_") for Qwen M 64 (sorting blocks of 32, the Gate/Up quantizing the intermediate), MiMo TP8
 # M 300 (blocks of 16) and DeepSeek M 64 (blocks of 32), prefill (sorted by the streaming prep) for Qwen M 1031,
 # TP4 M 257 and MiMo TP4 M 1600, the expert-deduplicated decode for MiMo TP8 M 5 (two kernels) and TP4 M 24 (four
-# kernels), and for DeepSeek M 8 the decode that deduplicates Gate/Up only while H 5120 decodes M 8, else the
-# streaming kernels (_assert_h5120 follows the H 5120 decode limit DECODE_WIDE_MAX_M).
+# kernels; M7 decodes M 5 per route and streams M 24), and for DeepSeek M 8 the decode that deduplicates Gate/Up only
+# while H 5120 decodes M 8, else the streaming kernels (_assert_h5120 follows the H 5120 decode limit
+# DECODE_WIDE_MAX_M).
 # The aiter.fused_moe entry (test_fused_moe_entry): fused_moe on the tagged w1 / w2 of a prepared weight with
 # activation=Silu, quant_type=per_1x32 and quant_type_a=per_Token runs flydsl_moe_a8w4_ptpc (one Qwen decode case).
 # DeepSeek-V4.1-Flash layers with the shared expert (test_layer, test_fused_moe_shared_entry; LAYER_SHAPES with their
@@ -899,6 +901,10 @@ def test_tp4_padded():
     ids=["tp8_m5", "tp8_m300", "tp4_m24", "tp4_m1600"],
 )
 def test_mimo(inter, tokens, tier):
+    if _M7 and isinstance(tier, list):
+        # M7 decodes MiMo per route up to M 7 (the Down that quantizes its rows) and streams M 24 (blocks of 16).
+        # M7's review deletes the M6 branch.
+        tier = _m7_mimo_path(tokens)
     _a8w4_check(
         inter,
         tokens,
@@ -1090,6 +1096,59 @@ def test_layer_masked_routes():
 # =================================================================================================
 
 
+# The prefill front end and internal signatures that M8 changes (notes/M8-test-impact.md), read before any spy wraps
+# them: M6 sorts with Opus past PREFILL_PREP_MAX_ROUTES(_H5120) and below hidden 2560, M8 always with the prep; M6's
+# _stream_prep_kernel takes the quantization layout ``qw`` and _quantize / _row_quant_kernel the loc fill, M8 neither.
+_OPUS_PREFILL = hasattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES")
+_PREP_QW = "qw" in inspect.signature(moe_a8w4._stream_prep_kernel).parameters
+_RQ_FILL = "fill" in inspect.signature(moe_a8w4._quantize).parameters
+_PREFILL_SORT_H512 = "moe_sorting_opus" if _OPUS_PREFILL else "a8w4_stream_prep"
+
+
+def _prep_kernel(hidden, topk, experts, block_m, zero, device, qw=4, **kw):
+    """moe_a8w4._stream_prep_kernel under its M6 (with ``qw``) and M8 (without) signatures."""
+    extra = (qw,) if _PREP_QW else ()
+    return moe_a8w4._stream_prep_kernel(
+        hidden, topk, experts, block_m, zero, *extra, device, **kw
+    )
+
+
+# The decode dispatch that M7 changes (notes/M7-test-impact.md): M7 renames DECODE_GATEUP_PREQUANT_MIN_WGS to
+# DECODE_MAX_WGS and makes it the decode limit below hidden 4096 (M * topk * I_pad / 16 < 2560 Gate/Up workgroups,
+# no token limit: Qwen TP2 / TP4 decode up to M 11 / 19 and stream beyond), lowers DECODE_MAX_M to 7 for the other
+# hidden sizes from 4096 on (DECODE_WIDE_HIDDEN aside), and removes the MiMo expert-deduplicated decode (its plan
+# Gate/Up, dedup Down and their constants; MiMo decodes per route with the Down that quantizes its rows). The H 5120
+# deduplicated Gate/Up stays, with groups of 2 and 4 waves fixed; the per-route Gate/Up launchers lose the plan and
+# output pointers. Each test keeps M6's expectation and adds M7's under ``if _M7``; M7's review deletes the M6
+# branches.
+_M7 = hasattr(moe_a8w4, "DECODE_MAX_WGS")
+
+
+def _m7_stream(block_m=16):
+    """M7's streaming kernels where M6 decodes (the prep sorting in blocks of ``block_m``, the intermediate quantized by
+    the row kernel). M7's review deletes the M6 branches that use it."""
+    return ["a8w4_stream_prep"] + _stream_path(block_m, False)
+
+
+def _m7_mimo_path(tokens, block_m=16):
+    """M7's kernels for a MiMo-shape call (H 4096, topk 8, no shared expert) that M6 deduplicates: per route with the
+    Down that quantizes its rows up to DECODE_MAX_M = 7 tokens, past it streaming in blocks of ``block_m`` (16 at
+    E 256, 32 for the E 12 cases at M 24). M7's review deletes the M6 branches that use it.
+    """
+    return (
+        _DECODE_PATHS["nn"] if tokens <= moe_a8w4.DECODE_MAX_M else _m7_stream(block_m)
+    )
+
+
+def _row_quant_plan_kernel(cols, topk, group, max_m, zero, device, out):
+    """moe_a8w4._row_quant_plan's launcher and its arguments between the plan and the row count: M6's builder takes
+    the group size and whether to zero ``out`` and its launcher the output, M7's (groups of 2, no zeroing) neither.
+    M7's review deletes the M6 branch."""
+    if _M7:
+        return moe_a8w4._row_quant_plan(cols, topk, max_m, device), ()
+    return moe_a8w4._row_quant_plan(cols, topk, group, max_m, zero, device), (out,)
+
+
 def _small_weights(hidden, inter):
     """E=5 weights of the small-shape cases (cached per H and I)."""
     return _weights(5, hidden, inter, hidden + inter)
@@ -1258,6 +1317,7 @@ def test_row_quant_bitexact(dtype, cols):
     assert float(scale[7]) < 2.0**-64 <= float(scale[6])
 
 
+@pytest.mark.skipif(not _RQ_FILL, reason="M8: the input quantization sets no loc_ids")
 @pytest.mark.parametrize(
     "dtype, cols, fill",
     [("bf16", 2560, 11), ("f32", 512, 40)],
@@ -1369,9 +1429,18 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero, masked):
     With masked routes (id -1, a random 30% and rows 2 and 7 whole) a masked route gets the entry [0, route] and the
     groups list valid routes only: its ballots also match the -1 that pads the plan past the routes, so it must
     lead no group. End to end a masked leader would show only through the result of its group (test_masked_routes
-    runs the dedup paths on poisoned weights); this pins every entry.
+    runs the dedup paths on poisoned weights); this pins every entry. M7 plans groups of 2 and drops the zeroing (and
+    the H 4096 case with it): its launcher takes no output.
     """
+    if _M7 and zero:
+        # M7 has no zeroing plan kernel, so its review drops the h4096_zero_out case. M7's review deletes this branch.
+        pytest.skip(
+            "M7 removes the plan kernel's output zeroing (the H 4096 dedup decode)"
+        )
     guard, group = 3, 3
+    if _M7:
+        # M7's plan holds groups of 2. M7's review deletes the M6 branch.
+        group = 2
     gen = torch.Generator(device="cuda").manual_seed(87)
     x = torch.randn((rows, cols), generator=gen) * 3
     x[1].zero_()
@@ -1390,15 +1459,19 @@ def test_decode_plan_quant_bitexact(cols, topk, rows, max_m, zero, masked):
     scale = torch.full((rows + guard,), -1.0)
     plan = torch.full((rows * topk, 4), -1, dtype=torch.int32)
     out = torch.full((rows + guard, cols), float("nan"), dtype=torch.bfloat16)
+    # M7's launcher takes no output, which stays NaN (_row_quant_plan_kernel).
+    kernel, out_args = _row_quant_plan_kernel(
+        cols, topk, group, max_m, zero, x.device.index, out
+    )
     moe_a8w4._launch(
         "a8w4_row_quant_plan_decode",
-        moe_a8w4._row_quant_plan(cols, topk, group, max_m, zero, x.device.index),
+        kernel,
         x,
         q.view(torch.float8_e4m3fnuz),
         scale,
         topk_ids,
         plan,
-        out,
+        *out_args,
         rows,
     )
     assert bool((q[rows:] == 0x5A).all()) and bool((scale[rows:] == -1.0).all())
@@ -1505,15 +1578,24 @@ def test_fast_row_quant_bitexact(kernel):
     scale = torch.full((n,), -1.0)
     if kernel == "plan_bf16":
         _, _, topk_ids = make_inputs(n, 512, 40, DS_TOPK, seed=785, shared=False)
+        plan_kernel, out_args = _row_quant_plan_kernel(
+            cols,
+            DS_TOPK,
+            3,
+            32,
+            False,
+            x.device.index,
+            torch.empty((n, cols), dtype=torch.bfloat16),
+        )
         moe_a8w4._launch(
             "a8w4_row_quant_plan_decode",
-            moe_a8w4._row_quant_plan(cols, DS_TOPK, 3, 32, False, x.device.index),
+            plan_kernel,
             x,
             q.view(torch.float8_e4m3fnuz),
             scale,
             topk_ids,
             torch.full((n * DS_TOPK, 4), -1, dtype=torch.int32),
-            torch.empty((n, cols), dtype=torch.bfloat16),
+            *out_args,
             n,
         )
     else:
@@ -1596,9 +1678,7 @@ def test_stream_row_quant_bitexact(cols, qw):
     out = torch.full((rows + guard, cols), float("nan"), dtype=torch.bfloat16)
     moe_a8w4._launch(
         "a8w4_stream_prep",
-        moe_a8w4._stream_prep_kernel(
-            cols, TOPK, experts, block_m, True, qw, x.device.index
-        ),
+        _prep_kernel(cols, TOPK, experts, block_m, True, x.device.index, qw=qw),
         topk_ids,
         topk_weight,
         x,
@@ -1779,7 +1859,8 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
 
     The basic tests decode Qwen M = 3 and MiMo M = 5, on none of these boundaries; the benchmark runs powers of two
     and 48 (no 11 / 12, 19 / 20 or 33) and asserts no kernels: M = 4 and 32 run the benchmark's paths and stay as
-    one side of their boundaries.
+    one side of their boundaries. M7 makes DECODE_MAX_WGS (as DECODE_GATEUP_PREQUANT_MIN_WGS is renamed there) the
+    decode limit: TP2 M 12 / 32 and TP4 M 20 stream there.
     """
     w, prepared = _decode_weights(inter)
     x, topk_weight, topk_ids = make_inputs(
@@ -1788,6 +1869,9 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
     if path == "stream":
         _assert_path(["a8w4_stream_prep"] + _stream_path(16, False))
+    elif _M7 and path == "pp":
+        # M7 streams from DECODE_MAX_WGS Gate/Up workgroups on. M7's review deletes the M6 branch.
+        _assert_path(_m7_stream())
     else:
         _assert_path(_DECODE_PATHS[path])
     assert_close(out, ref)
@@ -1795,29 +1879,33 @@ def test_decode_dispatch_boundaries(inter, tokens, path):
 
 @pytest.mark.parametrize(
     "topk, tokens, path",
-    [(8, 16, "pp"), (17, 2, "nn")],
-    ids=["topk8_m16", "topk17_m2"],
+    [(8, 16, "pp"), (17, 2, "np"), (1, 2, "nn"), (16, 3, "nn")],
+    ids=["topk8_m16", "topk17_m2", "topk1_m2", "topk16_m3"],
 )
 def test_decode_topk_variants(topk, tokens, path):
     """topk other than 11: with topk = 8 (even) the slot-pair Down's 3 waves take two rounds and both slots of the
     second round's last two waves are invalid, and M = 16 gives exactly 2560 Gate/Up workgroups (>=: x pre-quantized);
-    with topk = 17 (above 16) the Down quantizing in the kernel runs 4 waves taking the slots in turn, 3 slots of its
-    last round invalid.
+    topk = 17 is past the 16 columns of the Down that quantizes its rows (one wave per column), so the slot-pair Down
+    takes it below DECODE_PREQUANT_MIN_M too (M 2: 9 slot pairs in 3 rounds of 3 waves, the last pair's upper slot
+    invalid); the Down that quantizes its rows at both ends of its column count: topk 1 (one wave, nothing to add
+    across waves; one random expert per token) and topk 16 (16 waves, 1024 threads).
 
     The Qwen cases of the basic tests and the benchmark have topk = 11 (only the last slot pair lacks its upper
-    half); the benchmark's MiMo cases (topk 8) take the expert-deduplicated decode from M 2 on (M 1 the single-slot
-    Down), never the slot-pair Down; no case of either has topk > 16.
+    half), the others 6 or 8; the benchmark's MiMo cases (topk 8) take the expert-deduplicated decode from M 2 on
+    (M 1 the Down that quantizes its rows), never the slot-pair Down; no case of either has topk 1 or topk > 11
+    (test_mixed_decode_shapes runs that Down with the shared expert at 2 and 16 columns). M7 streams topk 8 M 16
+    (2560 Gate/Up workgroups reach its decode limit DECODE_MAX_WGS).
     """
-    if topk > 16 and not hasattr(moe_a8w4.decode_a8w4, "compile_a8w4_down_decode"):
-        # M6 folds the single-slot Down into the mixed Down (topk <= 16): topk 17 takes the slot-pair Down. Its review
-        # deletes this branch.
-        path = "np"
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = make_inputs(
-        tokens, HIDDEN, EXPERTS, topk, seed=94 + topk
+        tokens, HIDDEN, EXPERTS, topk, seed=94 + topk, shared=topk > 1
     )
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    _assert_path(_DECODE_PATHS[path])
+    if _M7 and path == "pp":
+        # M7 streams from DECODE_MAX_WGS Gate/Up workgroups on. M7's review deletes the M6 branch.
+        _assert_path(_m7_stream())
+    else:
+        _assert_path(_DECODE_PATHS[path])
     assert_close(out, ref)
 
 
@@ -1853,8 +1941,9 @@ def test_decode_duplicate_and_int64_ids():
 def test_decode_down_fallback_w2_4gib(over, down):
     """Down takes the slot-pair kernel on pre-quantized rows only while w2 plus one expert's bytes fit in 4 GiB (it
     addresses all experts' weights with 32-bit byte offsets, its range check ending one expert below 2**32, where a
-    masked route's offsets fall); larger w2 takes the single-slot kernel quantizing in the kernel (M = 16). Both sides
-    of that boundary: w2 of 2**32 bytes minus one expert's (``fits``) and one byte more (``over``, still below 4 GiB).
+    masked route's offsets fall); larger w2 takes the Down that quantizes its rows (M = 8, past
+    DECODE_PREQUANT_MIN_M). Both sides of that boundary: w2 of 2**32 bytes minus one expert's (``fits``) and one byte
+    more (``over``, still below 4 GiB).
 
     Real 4 GiB weights are too large: a stride-0 view makes w2 report that many bytes with the same data pointer (the
     kernels read by pointer and expert offset, the routes only real experts); the basic tests, the benchmark and the
@@ -1865,9 +1954,47 @@ def test_decode_down_fallback_w2_4gib(over, down):
     w, prepared = _decode_weights(320)
     size = (1 << 32) - prepared.w2[0].numel() * prepared.w2.element_size() + over
     big = dataclasses.replace(prepared, w2=prepared.w2.view(-1)[:1].expand(size))
-    x, topk_weight, topk_ids = make_inputs(16, HIDDEN, EXPERTS, TOPK, seed=99)
+    # M 8 (1760 Gate/Up workgroups) stays on the decode tier under M7's workgroup limit too (M 16 streams there).
+    x, topk_weight, topk_ids = make_inputs(8, HIDDEN, EXPERTS, TOPK, seed=99)
     out, ref = _a8w4_run(w, big, x, topk_weight, topk_ids)
-    _assert_path(["a8w4_gateup_decode_pq", down])
+    _assert_path(["a8w4_gateup_decode", down])
+    assert_close(out, ref)
+
+
+# case: (E, H, I, topk, M, w2 over 4 GiB): token counts of the decode tier whose shape neither decode Down holds.
+_DECODE_UNFIT_CASES = {
+    "topk32_i1792_m2": (40, 512, 1792, 32, 2, False),
+    "topk8_i8000_m1": (10, 512, 8000, 8, 1, False),
+    "topk17_w2_over_4gib_m2": (EXPERTS, HIDDEN, 320, 17, 2, True),
+}
+
+
+@pytest.mark.parametrize("case", list(_DECODE_UNFIT_CASES))
+def test_decode_down_unfit_streams(case):
+    """A call on the decode tier's token counts whose shape neither decode Down holds streams instead (no error,
+    graded against the reference): topk 32 with I 1792 (past the 16 columns of the Down that quantizes its rows, and
+    the slot-pair Down's staged rows past the 64 KiB of LDS) and topk 8 with I 8000 (the 8 rows with their partial sums
+    and LUT copies just past 64 KiB, the slot-pair rows far past it), H 512; topk 17 (only the slot-pair Down holds it)
+    with w2 one byte past the slot-pair Down's 32-bit offsets (the stride-0 view of test_decode_down_fallback_w2_4gib),
+    Qwen E 33. The streaming kernels take any M and padded I.
+
+    The basic tests, the benchmark and the other decode cases have topk <= 11 or I <= 576 and w2 far below 4 GiB,
+    where some decode Down holds the shape; test_decode_topk_variants runs topk 17 on the slot-pair Down.
+    """
+    import dataclasses
+
+    experts, hidden, inter, topk, tokens, over = _DECODE_UNFIT_CASES[case]
+    w, prepared = _weights(experts, hidden, inter, 900 + topk)
+    if over:
+        size = (1 << 32) - prepared.w2[0].numel() * prepared.w2.element_size() + 1
+        prepared = dataclasses.replace(
+            prepared, w2=prepared.w2.view(-1)[:1].expand(size)
+        )
+    x, topk_weight, topk_ids = make_inputs(
+        tokens, hidden, experts, topk, seed=901, shared=False
+    )
+    out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+    assert _path_tier(moe_a8w4.last_path) == "stream", moe_a8w4.last_path
     assert_close(out, ref)
 
 
@@ -1934,6 +2061,9 @@ def test_decode_dedup_dispatch(monkeypatch, inter, tokens, path, group, waves):
     one token in different groups adding atomically all occur; MiMo's E 256 gives groups of one route at small M. The
     benchmark's MiMo cases run powers of two and 48 and assert no kernels; the basic MiMo decode cases run M 5 / 24.
     """
+    if _M7:
+        # M7 removes this test's subject; its review deletes the test. M7's review deletes this branch.
+        pytest.skip("M7 removes the MiMo expert-deduplicated decode")
     seen = _spy_dedup(monkeypatch)
     w, prepared = _mimo_small_weights(inter)
     x, topk_weight, topk_ids = make_inputs(
@@ -1960,6 +2090,11 @@ def test_decode_dedup_plan_prequant():
     That needs topk >= 14 at H >= 4096: the target shapes (MiMo topk 8) never get there, so neither the basic tests,
     the benchmark nor the other dedup cases run this kernel variant.
     """
+    if _M7:
+        # M7 removes this test's subject; its review deletes the test. M7's review deletes this branch.
+        pytest.skip(
+            "M7 removes the plan Gate/Up (the H 4096 expert-deduplicated decode)"
+        )
     w, prepared = _weights(20, MIMO_HIDDEN, 256, 225)
     x, topk_weight, topk_ids = make_inputs(
         10, MIMO_HIDDEN, 20, 16, seed=226, shared=False
@@ -1983,16 +2118,17 @@ def test_decode_dedup_stream_boundary(tokens):
     route_sum).
 
     The boundary depends on E, so only the full E 256 reaches it; the benchmark runs M 48 and 64 and asserts no
-    kernels.
+    kernels. M7 has no dedup extension (MiMo decodes up to DECODE_MAX_M = 7 tokens there): both M stream.
     """
     w, prepared = _weights(MIMO_EXPERTS, MIMO_HIDDEN, 256, 230)
     x, topk_weight, topk_ids = make_inputs(
         tokens, MIMO_HIDDEN, MIMO_EXPERTS, MIMO_TOPK, seed=230 + tokens, shared=False
     )
     out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
-    if tokens == 48:
+    if tokens == 48 and not _M7:
         _assert_path(_DEDUP_PATHS["dd4"])
     else:
+        # M 49; M7 streams M 48 too. M7's review deletes the M6 branch.
         _assert_path(["a8w4_stream_prep"] + _stream_path(16, False))
         assert "a8w4_route_sum" not in moe_a8w4.last_path, moe_a8w4.last_path
     assert_close(out, ref)
@@ -2023,7 +2159,7 @@ def test_decode_wide_hidden(monkeypatch, tokens, case):
     that threshold raised to 33, M 12 gives 12 * 6 * 36 = 2592 >= 2560 Gate/Up workgroups and Gate/Up reads
     pre-quantized x: the FP8 row of K 5120 enters LDS in two rounds of 16-byte pieces (the second only 64 threads);
     with w2 >= 4 GiB (stride-0 view, as test_decode_down_fallback_w2_4gib) M 8 is not deduplicated and Down takes
-    the single-slot kernel quantizing in the kernel; the H 5120 decode ends at DECODE_WIDE_MAX_M = 32: M 32 still
+    the Down that quantizes its rows; the H 5120 decode ends at DECODE_WIDE_MAX_M = 32: M 32 still
     deduplicates Gate/Up (groups of 3), M 33 streams. With E 256, M 33 gives 0.77 routes per expert (the dedup
     decode's <= 1.5 holds) and still streams, and with fewer than 4E/3 routes it still sorts in blocks of 16 (H 5120
     sorts with the prep, any route count).
@@ -2085,15 +2221,28 @@ def test_h5120_decode_limit(tokens):
 
     The other H 5120 decode cases pin the limit to pyhip M17's 32 (they test the kernels, not where the default lies);
     the benchmark runs ds_tp4 at M 8 and 16 and the layers at M 10 / 11 without asserting kernels; the basic tests
-    decode H 5120 at M 8 only.
+    decode H 5120 at M 8 only. M7 has no ``_decode_max_m``: the Qwen shape decodes by its Gate/Up grid (still at
+    M 11) and the MiMo shape only up to DECODE_MAX_M = 7 tokens.
     """
     limit = moe_a8w4.DECODE_WIDE_MAX_M
-    assert moe_a8w4.DECODE_WIDE_DEDUP_MIN_M <= limit < moe_a8w4.DECODE_MAX_M
-    assert moe_a8w4._decode_max_m(DS_HIDDEN) == limit
-    for hidden in (512, HIDDEN, MIMO_HIDDEN):
-        assert moe_a8w4._decode_max_m(hidden) == moe_a8w4.DECODE_MAX_M, hidden
-    for shape in ((HIDDEN, 320, TOPK, EXPERTS), (MIMO_HIDDEN, 512, MIMO_TOPK, 256)):
-        assert moe_a8w4._routed_tier(tokens, *shape, None, None, None) == "decode"
+    if _M7:
+        # M7 bounds each hidden size's decode tier on its own (_decode_range): Qwen TP2 below DECODE_MAX_WGS Gate/Up
+        # workgroups (M 11: 2420), MiMo up to M 7, so it streams at M 10 / 11. M7's review deletes the M6 branch.
+        assert moe_a8w4.DECODE_WIDE_DEDUP_MIN_M <= limit
+        qwen = (HIDDEN, 320, TOPK, EXPERTS, None, None, None)
+        mimo = (MIMO_HIDDEN, 512, MIMO_TOPK, 256, None, None, None)
+        assert moe_a8w4._routed_tier(tokens, *qwen) == "decode"
+        assert moe_a8w4._routed_tier(tokens, *mimo) == "stream"
+    else:
+        assert moe_a8w4.DECODE_WIDE_DEDUP_MIN_M <= limit < moe_a8w4.DECODE_MAX_M
+        assert moe_a8w4._decode_max_m(DS_HIDDEN) == limit
+        for hidden in (512, HIDDEN, MIMO_HIDDEN):
+            assert moe_a8w4._decode_max_m(hidden) == moe_a8w4.DECODE_MAX_M, hidden
+        for shape in (
+            (HIDDEN, 320, TOPK, EXPERTS),
+            (MIMO_HIDDEN, 512, MIMO_TOPK, 256),
+        ):
+            assert moe_a8w4._routed_tier(tokens, *shape, None, None, None) == "decode"
     w, prepared = _ds_weights()
     x, topk_weight, topk_ids = make_inputs(
         tokens, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=460 + tokens, shared=False
@@ -2328,9 +2477,7 @@ def test_prefill_xcd_two_pass_bitexact(kernel, nsplit, two_pass, xcd, wgs):
         num_valid,
     ), sorted_experts.numel()
     assert task_num % 4 != 0, task_num
-    xq, xs = moe_a8w4._quantize(
-        x, M, H, "bf16", fill=torch.empty((M, topk), dtype=torch.int32)
-    )
+    xq, xs = moe_a8w4._quantize(x, M, H, "bf16")
     device, constants = x.device.index, moe_a8w4._trace_constants()
 
     def gateup(chunk, wgs=0):
@@ -2552,9 +2699,17 @@ def test_prefill_prep_routes_limit(monkeypatch, tokens, first, duplicate):
     that sums every slot (the Opus front end keeps the later slot only, test_prefill_duplicate_ids_keep_last_route).
 
     The prefill cases of the basic tests and the benchmark are not on this boundary, assert no sorting kernel and
-    never repeat an expert within a token; the real limit 24576 needs M 12288 at topk 2.
+    never repeat an expert within a token; the real limit 24576 needs M 12288 at topk 2. M7 decodes this shape up to
+    M 319 (its decode limit DECODE_MAX_WGS), so these cases set that limit to 0 there.
     """
-    monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", 400)
+    if _OPUS_PREFILL:
+        monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", 400)
+    else:
+        first = "a8w4_stream_prep"
+    if _M7:
+        # M7 decodes this shape up to M 319: a decode limit of 0 keeps it on prefill. M7's review deletes the M6
+        # branch.
+        monkeypatch.setattr(moe_a8w4, "DECODE_MAX_WGS", 0)
     w, prepared = _small_weights(2560, 64)
     x, topk_weight, topk_ids = make_inputs(
         tokens, 2560, 5, 2, seed=330 + tokens, shared=False
@@ -2944,7 +3099,7 @@ def test_stream_gateup_tiles_bitexact(monkeypatch, tokens, block_m):
 # topk; blocks of 32 from 13 to 28 rows per expert), their Down adding the routes atomically.
 _H5120_ROWS_M = moe_a8w4.STREAM_MAX_ROWS_H5120 * DS_EXPERTS // DS_TOPK
 _H5120_PREFILL_LIMITS = {
-    "PREFILL_PREP_MAX_ROUTES_H5120": 18,
+    **({"PREFILL_PREP_MAX_ROUTES_H5120": 18} if _OPUS_PREFILL else {}),
     "XCD_MIN_ROUTES_H5120": 24,
 }
 _H5120_STREAM_BM32 = ["a8w4_stream_prep"] + _stream_path(32, False)
@@ -2981,7 +3136,8 @@ _H5120_LIMIT_CASES = {
         4,
         {"block_m": 64, "tile_k": 128},
         _H5120_PREFILL_LIMITS,
-        ["moe_sorting_opus"] + _prefill_path(128),
+        ["moe_sorting_opus" if _OPUS_PREFILL else "a8w4_stream_prep"]
+        + _prefill_path(128),
         (moe_a8w4.GATEUP_XCD_CHUNK_H5120, True, moe_a8w4.DOWN_XCD_CHUNK_H5120),
     ),
 }
@@ -3091,8 +3247,10 @@ def test_gateup_few_waves_grid(monkeypatch):
 @pytest.mark.parametrize(
     "hidden, inter, tokens, options, path, shared, max_rows",
     [
-        (4096, 64, 8, {}, _DECODE_PATHS["np"], None, None),
-        (4608, 64, 8, {}, _prefill_path(256), None, None),
+        # M 7 (was 8, the same M6 kernels) stays within M7's decode limit from H 4096 on too (DECODE_MAX_M = 7),
+        # where M7's H 4096 takes the Down that quantizes its rows. M7's review deletes the M6 branch.
+        (4096, 64, 7, {}, _DECODE_PATHS["nn" if _M7 else "np"], None, None),
+        (4608, 64, 7, {}, _prefill_path(256), None, None),
         (512, 1024, 4, {}, _DECODE_PATHS["np"], None, None),
         (512, 1088, 4, {}, _DECODE_PATHS["nn"], None, None),
         (512, 1024, 300, {"block_m": 64}, _prefill_path(256), None, None),
@@ -3113,10 +3271,10 @@ def test_shape_fallbacks(
     monkeypatch, hidden, inter, tokens, options, path, shared, max_rows
 ):
     """Shapes outside the target set still run and are right, on the path the kernels' limits and the measured
-    ranges give: the decode kernels take hidden <= 4096 (H 4096 with I 64, I_pad % 128 != 0: the per-route decode)
-    and the measured H 5120 only, so hidden 4608 = 9 x 512 (an odd count of 512-column Gate/Up steps; the target
-    shapes have 5, 8 and 10) falls back to prefill; the slot-pair Down needs a row's I_pad / 16 16-byte pieces in its
-    64 * WAVES lanes (topk 2: one wave), so I 1088 takes the single-slot Down where I 1024 still pairs; I 1024 at
+    ranges give: the decode kernels take hidden <= 4096 (H 4096 with I 64, I_pad % 128 != 0: the per-route decode,
+    M 7) and the measured H 5120 only, so hidden 4608 = 9 x 512 (an odd count of 512-column Gate/Up steps; the target
+    shapes have 5, 8 and 10) falls back to prefill (M 7: within the decode tier's token counts); the slot-pair Down needs a row's I_pad / 16 16-byte pieces in its
+    64 * WAVES lanes (topk 2: one wave), so I 1088 takes the Down that quantizes its rows where I 1024 still pairs; I 1024 at
     M 300 (block_m=64 selects the prefill kernels, which pyhip M17 runs with the K tile 128 by default) fills Down's
     activation tile with exactly 64 KiB of LDS in one pass, the hidden dimension split in 4. The streaming Down lets
     4 waves share the block's activation rows only when they fit in the 64 KiB of LDS (``shared``): I 1024 fits with
@@ -3141,7 +3299,7 @@ def test_shape_fallbacks(
 
 
 def test_decode_down_needs_hidden_multiple_of_32():
-    """The single-slot and the mixed Down decode own 32 output channels per workgroup (decode_a8w4's row-block pairs:
+    """The Down decode that quantizes its rows, routed-only and mixed, owns 32 output channels per workgroup (row-block pairs:
     one 16-byte load per lane covers two 16-row blocks) and refuse a hidden size H % 32 != 0 when built
     (AssertionError, before compiling); the decode tier never asks for one, as it needs gateup_decode_fits
     (H % 512 == 0).
@@ -3149,10 +3307,7 @@ def test_decode_down_needs_hidden_multiple_of_32():
     Every H of the basic tests, the benchmark and the other cases is a multiple of 512.
     """
     decode = moe_a8w4.decode_a8w4
-    # M6 builds the routed Down as the mixed Down without SHARED; its review deletes the first form.
-    single = getattr(decode, "compile_a8w4_down_decode", None) or functools.partial(
-        decode.compile_a8w4_down_decode_mixed, SHARED=False
-    )
+    single = functools.partial(decode.compile_a8w4_down_decode_mixed, SHARED=False)
     for hidden in (DS_HIDDEN + 16, MIMO_HIDDEN + 48):
         assert not decode.gateup_decode_fits(hidden)
         with pytest.raises(AssertionError, match="unsupported Down decode shape"):
@@ -3189,6 +3344,8 @@ def test_graph_replay(monkeypatch, options, limit, path):
     The basic tests and the benchmark call eagerly and never capture a graph.
     """
     if limit is not None:
+        if not _OPUS_PREFILL:
+            pytest.skip("M8: prefill always sorts with the prep ([prefill] covers it)")
         monkeypatch.setattr(moe_a8w4, "PREFILL_PREP_MAX_ROUTES", limit)
     w, prepared = _weights(33, HIDDEN, 320, 51)
     x, topk_weight, topk_ids = make_inputs(64, HIDDEN, 33, TOPK, seed=52)
@@ -3222,7 +3379,8 @@ def test_decode_graph_replay(tokens, path):
     newly written inputs (xq / mid / mq allocated in the call belong to the graph's pool). The shape is compiled by an
     eager call outside the capture first.
 
-    The basic tests and the benchmark call eagerly; test_graph_replay captures the streaming and prefill paths.
+    The basic tests and the benchmark call eagerly; test_graph_replay captures the streaming and prefill paths. M7
+    streams M 16 (DECODE_MAX_WGS).
     """
     w, prepared = _decode_weights(320)
     x, topk_weight, topk_ids = make_inputs(
@@ -3234,7 +3392,11 @@ def test_decode_graph_replay(tokens, path):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids, output=out)
-    _assert_path(_DECODE_PATHS[path])
+    if _M7 and path == "pp":
+        # M7 streams from DECODE_MAX_WGS Gate/Up workgroups on. M7's review deletes the M6 branch.
+        _assert_path(_m7_stream())
+    else:
+        _assert_path(_DECODE_PATHS[path])
     x2, topk_weight2, topk_ids2 = make_inputs(
         tokens, HIDDEN, EXPERTS, TOPK, seed=98 + tokens
     )
@@ -3262,7 +3424,8 @@ def test_decode_dedup_graph_replay(tokens, path):
     call belong to the graph's pool). The shape is compiled by an eager call outside the capture first.
 
     The basic tests and the benchmark call eagerly; test_decode_graph_replay captures the per-route decode only. The
-    H 5120 case pins its kernels within the H 5120 decode limit (_assert_h5120).
+    H 5120 case pins its kernels within the H 5120 decode limit (_assert_h5120). M7 has no MiMo dedup decode: the
+    MiMo cases capture its per-route decode (M 5) and streaming (M 24) there.
     """
     if path == "wide":
         (w, prepared), hidden, experts, topk = (
@@ -3289,6 +3452,10 @@ def test_decode_dedup_graph_replay(tokens, path):
         flydsl_moe_a8w4_ptpc(x, prepared, topk_weight, topk_ids, output=out)
     if path == "wide":
         _assert_h5120(tokens, _DEDUP_PATHS[path])
+    elif _M7:
+        # M7 decodes MiMo M 5 per route and streams M 24 (E 12: 16 rows per expert, blocks of 32). M7's review
+        # deletes the M6 branch.
+        _assert_path(_m7_mimo_path(tokens, 32))
     else:
         _assert_path(_DEDUP_PATHS[path])
     x2, topk_weight2, topk_ids2 = make_inputs(
@@ -3442,9 +3609,8 @@ def test_compile_cache_keys(monkeypatch):
     assert moe_a8w4._down_kernel(*down, 1, constants) is not moe_a8w4._down_kernel(
         *down, 0, constants
     )
-    assert moe_a8w4._row_quant_kernel(
-        512, "bf16", 2, 1
-    ) is not moe_a8w4._row_quant_kernel(512, "bf16", 2, 0)
+    rq = (512, "bf16", 2) if _RQ_FILL else (512, "bf16")
+    assert moe_a8w4._row_quant_kernel(*rq, 1) is not moe_a8w4._row_quant_kernel(*rq, 0)
     for module, name, value in (
         (common_a8w4, "XCDS", 8),
         (gemm2_a8w4, "A_TWO_PASS_MIN_K", 256),
@@ -3474,39 +3640,30 @@ def test_compile_cache_keys(monkeypatch):
     assert [args[-2:] for args in calls["_gateup_kernel"] + calls["_down_kernel"]] == [
         (device, constants)
     ] * 2
-    assert [args[-1] for args in calls["_row_quant_kernel"]] == [device] * 2
+    # x by the row kernel behind Opus (M6), by the prep (M8); mid by the row kernel.
+    rq_calls = 1 + ("moe_sorting_opus" in moe_a8w4.last_path)
+    assert [args[-1] for args in calls["_row_quant_kernel"]] == [device] * rq_calls
     assert calls["_stream_sum_kernel"] == [(2, 512, device)]
 
 
 def _routed_decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, device):
     """``moe_a8w4._decode_kernels`` (the routed experts' per-route decode Gate/Up and Down launchers) as the dispatch
-    builds them: with the Down's wave count (``_decode_waves``) while the builder takes one. M6 drops the wave count
-    from the builder; its review deletes the old branch."""
-    args = (N1, H, I, topk, gateup_pq, down_pq, limit)
-    if hasattr(moe_a8w4, "_decode_waves"):
-        args += (moe_a8w4._decode_waves(topk, down_pq),)
-    return moe_a8w4._decode_kernels(*args, device)
+    builds them."""
+    return moe_a8w4._decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, device)
 
 
 def test_decode_compile_cache_keys(monkeypatch):
-    """The decode launcher caches are keyed by the device (``_decode_kernels``, ``_row_quant_decode``) and, while the
-    slot-pair Down takes a wave count from DECODE_DOWN_PQ_WAVES (``_decode_waves``; the decode kernels read no other
-    tunable module constant), by that count: another device or wave count gets its own launcher, and a call passes its
-    inputs' device and the current wave count (topk 4: 2 waves by default, 1 with DECODE_DOWN_PQ_WAVES = 1, same
-    result). Building a launcher does not trace it, so the other device need not exist. M6 drops the wave count (the
-    kernel's rule); its review deletes that branch.
+    """The decode launcher caches are keyed by the device (``_decode_kernels``, ``_row_quant_decode``; the decode
+    kernels read no tunable module constant): another device gets its own launcher, and a call passes its inputs'
+    device. Building a launcher does not trace it, so the other device need not exist.
 
-    The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
-    passes as well; test_compile_cache_keys covers the prefill launchers.
+    The basic tests and the benchmark run one GPU, where a cache keyed by shape alone passes as well;
+    test_compile_cache_keys covers the prefill launchers.
     """
     decode = (128, 512, 64, 4, False, True, 0.0)
-    pq_waves = getattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", None)
-    extra = (2,) if pq_waves else ()
-    first = moe_a8w4._decode_kernels(*decode, *extra, 0)
-    assert moe_a8w4._decode_kernels(*decode, *extra, 0) is first
-    assert moe_a8w4._decode_kernels(*decode, *extra, 1) is not first
-    if pq_waves:
-        assert moe_a8w4._decode_kernels(*decode, 1, 0) is not first
+    first = moe_a8w4._decode_kernels(*decode, 0)
+    assert moe_a8w4._decode_kernels(*decode, 0) is first
+    assert moe_a8w4._decode_kernels(*decode, 1) is not first
     assert moe_a8w4._row_quant_decode(64, False, 1) is not moe_a8w4._row_quant_decode(
         64, False, 0
     )
@@ -3515,52 +3672,72 @@ def test_decode_compile_cache_keys(monkeypatch):
     _spy(monkeypatch, "_row_quant_decode", quant)
     w, prepared = _small_weights(512, 64)
     x, topk_weight, topk_ids = make_inputs(4, 512, 5, 4, seed=67, shared=False)
-    runs = (pq_waves, 1) if pq_waves else (None,)
-    for waves in runs:
-        if waves is not None:
-            monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
-        assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
-        _assert_path(_DECODE_PATHS["np"])
+    assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
+    _assert_path(_DECODE_PATHS["np"])
     device = x.device.index
-    if pq_waves:
-        assert [args[-2:] for args in built] == [(2, device), (1, device)], built
-    else:
-        assert [args[-1] for args in built] == [device], built
-    assert [args[-1] for args in quant] == [device] * len(runs)
+    assert [args[-1] for args in built] == [device], built
+    assert [args[-1] for args in quant] == [device]
 
 
 def test_decode_dedup_compile_cache_keys(monkeypatch):
     """The launcher caches of the expert-deduplicated decode are keyed by the device (``_gateup_plan_kernel``,
     ``_row_quant_plan``, ``_gateup_dd_kernel``, ``_down_dd_kernel`` and the H 5120 slot-pair ``_down_pq_kernel``),
-    the plan Gate/Up also by its token limit, which a call takes from DECODE_MAX_M, and, while it takes one, the
-    slot-pair Down by its wave count, which a call derives from DECODE_DOWN_PQ_WAVES (as ``_decode_kernels``; M6 drops
-    it, its review deletes that branch); their other build parameters are arguments already. Another device, limit or
-    wave count gets its own launcher, and a call passes its inputs' device and the current constants (MiMo M 5 and
-    M 12: the two- and the four-kernel form; DeepSeek M 8 with 3 and 1 Down waves, same result, while H 5120 decodes
-    M 8). Building a launcher does not trace it, so the other device need not exist.
+    the plan Gate/Up also by its token limit, which a call takes from DECODE_MAX_M; their other build parameters are
+    arguments already. Another device or limit gets its own launcher, and a call passes its inputs' device and the
+    current limit (MiMo M 5 and M 12: the two- and the four-kernel form; DeepSeek M 8 while H 5120 decodes M 8).
+    Building a launcher does not trace it, so the other device need not exist.
 
     The basic tests and the benchmark run one GPU with the default constants, where a cache keyed by shape alone
-    passes as well; test_decode_compile_cache_keys covers the per-route decode launchers.
+    passes as well; test_decode_compile_cache_keys covers the per-route decode launchers. M7 keeps only the H 5120
+    launchers (``_row_quant_plan`` keyed by its token limit, which a call takes from DECODE_WIDE_MAX_M,
+    ``_gateup_dd_kernel`` with groups of 2 and 4 waves fixed, ``_down_pq_kernel``) and the DeepSeek call.
     """
+    if _M7:
+        # M7 removes the plan Gate/Up, the dedup Down and the H 4096 dedup decode. M7's review deletes the M6 branch.
+        for name, args in (
+            ("_row_quant_plan", (5120, 6, 32)),
+            ("_gateup_dd_kernel", (1152, 5120, 6, 0.0)),
+            ("_down_pq_kernel", (5120, 576, 6)),
+        ):
+            build = getattr(moe_a8w4, name)
+            assert build(*args, 0) is build(*args, 0), name
+            assert build(*args, 1) is not build(*args, 0), name
+        build = moe_a8w4._row_quant_plan
+        assert build(5120, 6, 16, 0) is not build(5120, 6, 32, 0)
+        names = ("_row_quant_plan", "_gateup_dd_kernel", "_down_pq_kernel")
+        calls = {name: [] for name in names}
+        for name, record in calls.items():
+            _spy(monkeypatch, name, record)
+        w, prepared = _ds_weights()
+        x, topk_weight, topk_ids = make_inputs(
+            8, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=228, shared=False
+        )
+        assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
+        _assert_h5120(8, _DEDUP_PATHS["wide"])
+        device = x.device.index
+        if 8 <= moe_a8w4.DECODE_WIDE_MAX_M:
+            assert [args[-2:] for args in calls["_row_quant_plan"]] == [
+                (moe_a8w4.DECODE_WIDE_MAX_M, device)
+            ]
+            assert [
+                args[-1]
+                for args in calls["_gateup_dd_kernel"] + calls["_down_pq_kernel"]
+            ] == [device] * 2
+        return
     plan = (512, 4096, 8, False, 2, 0.0)
     first = moe_a8w4._gateup_plan_kernel(*plan, 32, 0)
     assert moe_a8w4._gateup_plan_kernel(*plan, 32, 0) is first
     assert moe_a8w4._gateup_plan_kernel(*plan, 32, 1) is not first
     assert moe_a8w4._gateup_plan_kernel(*plan, 16, 0) is not first
-    pq_waves = hasattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES")
     for name, args in (
         ("_row_quant_plan", (4096, 8, 2, 32, True)),
         ("_gateup_dd_kernel", (512, 4096, 8, 2, 8, 0.0)),
         ("_down_dd_kernel", (4096, 256, 8, 2, 2, True)),
-        ("_down_pq_kernel", (5120, 576, 6) + ((3,) if pq_waves else ())),
+        ("_down_pq_kernel", (5120, 576, 6)),
     ):
         build = getattr(moe_a8w4, name)
         assert build(*args, 0) is build(*args, 0), name
         assert build(*args, 1) is not build(*args, 0), name
-    if pq_waves:
-        assert moe_a8w4._down_pq_kernel(
-            5120, 576, 6, 1, 0
-        ) is not moe_a8w4._down_pq_kernel(5120, 576, 6, 3, 0)
     names = (
         "_gateup_plan_kernel",
         "_row_quant_plan",
@@ -3592,17 +3769,10 @@ def test_decode_dedup_compile_cache_keys(monkeypatch):
     x, topk_weight, topk_ids = make_inputs(
         8, DS_HIDDEN, DS_EXPERTS, DS_TOPK, seed=228, shared=False
     )
-    for waves in (moe_a8w4.DECODE_DOWN_PQ_WAVES, 1) if pq_waves else (None,):
-        if waves is not None:
-            monkeypatch.setattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES", waves)
-        assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
-        _assert_h5120(8, _DEDUP_PATHS["wide"])
+    assert_close(*_a8w4_run(w, prepared, x, topk_weight, topk_ids))
+    _assert_h5120(8, _DEDUP_PATHS["wide"])
     if 8 <= moe_a8w4.DECODE_WIDE_MAX_M:
-        if pq_waves:
-            built = [args[-2:] for args in calls["_down_pq_kernel"]]
-            assert built == [(3, device), (1, device)], built
-        else:
-            assert [args[-1] for args in calls["_down_pq_kernel"]] == [device]
+        assert [args[-1] for args in calls["_down_pq_kernel"]] == [device]
 
 
 def test_stream_compile_cache_keys(monkeypatch):
@@ -3628,9 +3798,9 @@ def test_stream_compile_cache_keys(monkeypatch):
     assert moe_a8w4._stream_down_kernel(
         *down, 1, d0
     ) is not moe_a8w4._stream_down_kernel(*down, 0, d0)
-    assert moe_a8w4._stream_prep_kernel(
-        2560, 11, 33, 32, True, 4, 1
-    ) is not moe_a8w4._stream_prep_kernel(2560, 11, 33, 32, True, 4, 0)
+    assert _prep_kernel(2560, 11, 33, 32, True, 1) is not _prep_kernel(
+        2560, 11, 33, 32, True, 0
+    )
     assert moe_a8w4._stream_sum_kernel(11, 2560, 1) is not moe_a8w4._stream_sum_kernel(
         11, 2560, 0
     )
@@ -3696,7 +3866,8 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
     test_decode_duplicate_and_int64_ids covers the per-route decode, test_prefill_prep_routes_limit the prefill
     sorted by the prep (every slot summed too), test_prefill_duplicate_ids_keep_last_route the Opus-sorted prefill.
     The H 5120 case pins the H 5120 decode limit to pyhip M17's 32 tokens (so that M 24 stays on the dedup decode
-    whatever the default limit), its kernels within it and the streaming kernels past it (_assert_h5120).
+    whatever the default limit), its kernels within it and the streaming kernels past it (_assert_h5120). M7 has no
+    MiMo dedup decode: the MiMo cases run its per-route decode (M 5) and streaming (M 24) there.
     """
     shared = False
     if case.startswith("dedup"):
@@ -3740,6 +3911,9 @@ def test_duplicate_ids_keep_every_route(monkeypatch, case):
     elif isinstance(path, list):
         _assert_path(path)
         assert "a8w4_route_sum" not in moe_a8w4.last_path, moe_a8w4.last_path
+    elif _M7:
+        # M7 decodes MiMo M 5 per route and streams M 24 (E 12: blocks of 32). M7's review deletes the M6 branch.
+        _assert_path(_m7_mimo_path(tokens, 32))
     else:
         _assert_path(_DEDUP_PATHS[path])
     assert_close(out, ref)
@@ -3759,9 +3933,10 @@ def test_prefill_duplicate_ids_keep_last_route():
     x, topk_weight, topk_ids = make_inputs(200, 512, 5, 2, seed=320, shared=False)
     topk_ids[::2, 1] = topk_ids[::2, 0]
     out, _ = _a8w4_run(w, prepared, x, topk_weight, topk_ids, block_m=64)
-    _assert_path(["moe_sorting_opus"] + _prefill_path(256))
+    _assert_path([_PREFILL_SORT_H512] + _prefill_path(256))
     kept = topk_weight.clone()
-    kept[::2, 0] = 0
+    if _OPUS_PREFILL:
+        kept[::2, 0] = 0
     ref = reference(x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], kept, topk_ids)
     assert_close(out, ref)
 
@@ -3775,7 +3950,8 @@ def test_inplace_output(case):
     slot-pair Down writes the output last (pinned within the H 5120 decode limit, past it the streaming kernels,
     _assert_h5120); the streaming prep (Qwen M 64) zeroes each piece of an output row in the lane that has read
     that piece of x, before the atomic Down adds into it; on the prefill path (block_m=64) the front end reads x
-    first and a8w4_route_sum writes last.
+    first and a8w4_route_sum writes last. M7 decodes MiMo M 5 per route (its Down writes the output after Gate/Up
+    has read x).
 
     The basic tests and the benchmark pass separate output buffers.
     """
@@ -3813,7 +3989,10 @@ def test_inplace_output(case):
     )
     assert result is x
     _assert_kernels()
-    if case == "dedup":
+    if case == "dedup" and _M7:
+        # M7 has no MiMo dedup decode. M7's review deletes the M6 branch.
+        _assert_path(_DECODE_PATHS["nn"])
+    elif case == "dedup":
         _assert_path(_DEDUP_PATHS["dd4"])
     elif case == "wide":
         _assert_h5120(x.shape[0], _DEDUP_PATHS["wide"])
@@ -3824,15 +4003,128 @@ def test_inplace_output(case):
     assert_close(x, ref)
 
 
-def test_routing_input_dtypes():
+def _odd_output(rows, cols):
+    """A BF16 [rows, cols] view 2 bytes past a 4-byte boundary (at an odd element) of a NaN-filled buffer, with
+    _ODD_PAD sentinel elements before and after it: ``(buffer, view)``."""
+    buf = torch.full((rows * cols + 2 * _ODD_PAD,), float("nan"), dtype=torch.bfloat16)
+    view = buf[_ODD_PAD : _ODD_PAD + rows * cols].view(rows, cols)
+    assert view.data_ptr() % 4 == 2, view.data_ptr()
+    return buf, view
+
+
+def _copies_odd_outputs():
+    """Whether the op computes a call with an output off a 4-byte boundary into an aligned buffer and copies it
+    (``output_copy``, since M6): on a tree without it the BF16x2 atomics would write past such an output, so the
+    cases that pass one are skipped there instead of run."""
+    return "output_copy" in inspect.getsource(moe_a8w4)
+
+
+_ODD_PAD = 9
+# case: (shape, M, options) of test_unaligned_output, one per way the op writes its output. Routed: "h512" (E 5, H 512,
+# I 64, topk 2) per-route decode with the Down that quantizes its rows (M 1) and the slot-pair Down (M 8), prefill with
+# a tile option (M 40); "qwen" (E 33, H 2560, I 320, topk 11) streaming with the atomic Down (M 64), prefill sorted by
+# the prep (M 300); "mimo" (E 12, H 4096, I 256, topk 8) the deduplicated decode in two (M 5) and four (M 24) kernels.
+# With the shared expert (_fold_weights): "small" the mixed decode (M 1), the fold on the decode tier (M 16) and on
+# prefill with a tile option (M 2048); the MTP TP8 layer the fold on the streaming tier (M 64).
+_UNALIGNED_CASES = {
+    "h512_m1": ("h512", 1, {}),
+    "h512_m8": ("h512", 8, {}),
+    "h512_tile_m40": ("h512", 40, {"block_m": 64}),
+    "qwen_m64": ("qwen", 64, {}),
+    "qwen_m300": ("qwen", 300, {}),
+    "mimo_m5": ("mimo", 5, {}),
+    "mimo_m24": ("mimo", 24, {}),
+    "layer_small_m1": ("small", 1, {}),
+    "layer_small_m16": ("small", 16, {}),
+    "layer_small_tile_m2048": ("small", 2048, {"block_m": 64}),
+    "layer_mtp_tp8_m64": ("mtp_layer_tp8", 64, {}),
+}
+
+
+@pytest.mark.parametrize("case", list(_UNALIGNED_CASES))
+def test_unaligned_output(case):
+    """An output 2 bytes past a 4-byte boundary (a view at an odd BF16 element of a larger buffer, NaN sentinels on
+    both sides), separate and as ``hidden_states`` itself (``output=hidden_states``), on every way the op writes its
+    output (_UNALIGNED_CASES): the BF16x2 atomics of the streaming and the deduplicated decode Down add element pairs
+    at 4-byte boundaries, so such a call computes into an aligned buffer and copies it into the output (one more step,
+    ``output_copy``, the last; an aligned output takes none). The sentinels stay NaN, the output is graded against the
+    reference and, where no Down adds atomically (_path_atomic), has the bits of the call into an aligned output.
+
+    The basic tests and the benchmark pass outputs from torch.empty; test_inplace_output passes aligned inputs and
+    test_layer_fold_unaligned_output an output 8 bytes past a 16-byte boundary (4-byte aligned).
+    """
+    if not _copies_odd_outputs():
+        pytest.skip("this op writes such an output directly (before M6)")
+    shape, tokens, options = _UNALIGNED_CASES[case]
+    if shape in ("h512", "qwen", "mimo"):
+        (w, prepared), hidden, experts, topk = {
+            "h512": (_small_weights(512, 64), 512, 5, 2),
+            "qwen": (_decode_weights(320), HIDDEN, EXPERTS, TOPK),
+            "mimo": (_mimo_small_weights(256), MIMO_HIDDEN, 12, MIMO_TOPK),
+        }[shape]
+        x, topk_weight, topk_ids = make_inputs(
+            tokens, hidden, experts, topk, seed=510 + tokens, shared=False
+        )
+        limit = 0.0
+        ref = reference(
+            x, w["w1"], w["w1_scale"], w["w2"], w["w2_scale"], topk_weight, topk_ids
+        )
+    else:
+        w, shared, prepared, topk, hidden = _fold_weights(shape)
+        x, topk_weight, topk_ids = make_layer_inputs(
+            tokens,
+            hidden,
+            prepared.experts,
+            topk,
+            seed=520 + tokens,
+            shared_weight=None,
+        )
+        limit = LAYER_SWIGLU_LIMIT
+        ref = reference_layer(x, w, shared, topk_weight, topk_ids, swiglu_limit=limit)
+
+    def call(inp, out):
+        got = flydsl_moe_a8w4_ptpc(
+            inp,
+            prepared,
+            topk_weight,
+            topk_ids,
+            output=out,
+            swiglu_limit=limit,
+            **options,
+        )
+        assert got is out
+        return list(moe_a8w4.last_path)
+
+    want = torch.full_like(x, float("nan"))
+    path = call(x, want)
+    assert "output_copy" not in path, path
+    for inplace in (False, True):
+        buf, out = _odd_output(*x.shape)
+        if inplace:
+            out.copy_(x)
+        got = call(out if inplace else x, out)
+        assert got[-1] == "output_copy" and got.count("output_copy") == 1, got
+        assert bool(buf[:_ODD_PAD].isnan().all()), (inplace, buf[:_ODD_PAD])
+        assert bool(buf[_ODD_PAD + x.numel() :].isnan().all()), inplace
+        assert_close(out, ref)
+        if not _path_atomic(got):
+            assert torch.equal(_bits(out), _bits(want)), inplace
+
+
+def test_routing_input_dtypes(monkeypatch):
     """int64 and non-contiguous ``topk_ids`` and a non-contiguous BF16 ``topk_weight`` (as a router may produce
     them) are converted to the contiguous int32 / float32 the sort and the kernels read; without the output
     argument the op allocates the output. The entry converts once for every path; M 40 (H 512, E 5) streams, so the
-    streaming prep sorts the converted routing.
+    streaming prep sorts the converted routing (M7, which decodes this shape up to M 319, with its decode limit
+    DECODE_MAX_WGS set to 0).
 
     The basic tests and the benchmark pass the contiguous int32 / float32 routing of ``make_inputs`` and an output
     buffer; test_decode_duplicate_and_int64_ids converts on the decode path.
     """
+    if _M7:
+        # M7 decodes this shape up to M 319: a decode limit of 0 keeps it on the streaming tier. M7's review deletes
+        # the M6 branch.
+        monkeypatch.setattr(moe_a8w4, "DECODE_MAX_WGS", 0)
     w, prepared = _small_weights(512, 64)
     x, topk_weight, topk_ids = make_inputs(40, 512, 5, 2, seed=66, shared=False)
     ids = torch.zeros((40, 4), dtype=torch.int64)[:, ::2]
@@ -3889,12 +4181,18 @@ def test_swiglu_limit_tile_k128():
 
 # case -> (shape, M, tile options, the kernels in order); qwen = H 2560, E 33, topk 11, I 320; mimo = H 4096, E 12,
 # topk 8, I 256; ds = DeepSeek H 5120, E 24, topk 6, I 576. Behind the streaming Down the routes are summed by
-# route_sum or by the Down's atomics (_ROUTE_SUMS).
+# route_sum or by the Down's atomics (_ROUTE_SUMS). M7 streams Qwen M 12 (DECODE_MAX_WGS) and MiMo M 24, and decodes
+# MiMo M 5 per route; M7's review deletes the M6 branches.
 _SWIGLU_CASES = {
     "decode_nn": ("qwen", 3, {}, _DECODE_PATHS["nn"]),
-    "decode_pq": ("qwen", 12, {}, _DECODE_PATHS["pp"]),
-    "decode_plan": ("mimo", 5, {}, _DEDUP_PATHS["dd2"]),
-    "decode_dd": ("mimo", 24, {}, _DEDUP_PATHS["dd4"]),
+    "decode_pq": ("qwen", 12, {}, _m7_stream() if _M7 else _DECODE_PATHS["pp"]),
+    "decode_plan": ("mimo", 5, {}, _m7_mimo_path(5) if _M7 else _DEDUP_PATHS["dd2"]),
+    "decode_dd": (
+        "mimo",
+        24,
+        {},
+        _m7_mimo_path(24, 32) if _M7 else _DEDUP_PATHS["dd4"],
+    ),
     "stream_fused_quant": (
         "qwen",
         64,
@@ -3923,7 +4221,8 @@ def test_swiglu_limit_kernels(case):
     Down, which the streaming tier keeps where it stops earlier at I >= 512), the prefill Gate/Up with the K tile 256
     (block_m=64), and the H 5120 decode quantizing in the kernel (M = 3: 10 bf16 pairs per thread over K = 5120);
     inputs scaled by 10 so that more than 10% of the gate and of the up values exceed the limit, graded against the
-    reference with the limit.
+    reference with the limit. M7 runs the Qwen M 12 and MiMo M 24 cases on its streaming kernels and MiMo M 5 per
+    route (_SWIGLU_CASES).
 
     The benchmark's DeepSeek cases have N(0, 1) inputs that almost never exceed 10 (they measure the cost of the
     limit without checking it), the Qwen / MiMo cases pass no limit. The basic DeepSeek cases clamp in the streaming
@@ -4064,7 +4363,7 @@ def _path_atomic(path):
 # (shape, tokens, tier): one case per tier and output form, at token counts that select it with the cut E (asserted):
 # the per-route decode (TP4 M 8, with the I 160 -> 192 padding that the tag must carry), the deduplicated decode with
 # its atomic Down (MiMo TP8 M 8) and with H 5120's slot-pair Down (DeepSeek M 8), streaming with the atomic Down
-# (TP2 M 48 and DeepSeek M 64, I 576), prefill with a8w4_route_sum (TP2 M 300).
+# (TP2 M 48 and DeepSeek M 64, I 576), prefill with a8w4_route_sum (TP2 M 300). M7 streams MiMo TP8 M 8.
 _FUSED_CASES = [
     ("tp4", 8, "decode"),
     ("mimo_tp8", 8, "dedup"),
@@ -4090,6 +4389,9 @@ def test_fused_moe_matches_api(shape, tokens, tier):
     """
     if shape == "ds" and tokens > moe_a8w4.DECODE_WIDE_MAX_M:
         tier = "stream"  # past the H 5120 decode limit, as in _assert_h5120
+    if shape == "mimo_tp8" and _M7:
+        # M7 decodes MiMo up to M 7 only. M7's review deletes the M6 branch.
+        tier = "stream"
     w, prepared, x, topk_weight, topk_ids, limit = _fused_inputs(
         shape, tokens, seed=600 + tokens
     )
@@ -5062,7 +5364,8 @@ def test_fused_moe_shared_expert_id():
             TOPK,
             True,
             {},
-            _DECODE_PATHS["pp"],
+            # M7 streams Qwen M 16 (DECODE_MAX_WGS). M7's review deletes the M6 branch.
+            _m7_stream() if _M7 else _DECODE_PATHS["pp"],
             (3, 11),
             id="pp_qwen_m16",
         ),
@@ -5082,7 +5385,8 @@ def test_fused_moe_shared_expert_id():
             MIMO_TOPK,
             False,
             {},
-            _DEDUP_PATHS["dd2"],
+            # M7 decodes MiMo M 5 per route. M7's review deletes the M6 branch.
+            _m7_mimo_path(5) if _M7 else _DEDUP_PATHS["dd2"],
             (2,),
             id="dd2_mimo_m5",
         ),
@@ -5092,7 +5396,8 @@ def test_fused_moe_shared_expert_id():
             MIMO_TOPK,
             False,
             {},
-            _DEDUP_PATHS["dd4"],
+            # M7 streams MiMo M 24 (E 12: blocks of 32). M7's review deletes the M6 branch.
+            _m7_mimo_path(24, 32) if _M7 else _DEDUP_PATHS["dd4"],
             (5, 6),
             id="dd4_mimo_m24",
         ),
@@ -5102,7 +5407,8 @@ def test_fused_moe_shared_expert_id():
             MIMO_TOPK,
             False,
             {},
-            _DEDUP_PATHS["dd4"],
+            # M7 streams MiMo M 24 (E 12: blocks of 32). M7's review deletes the M6 branch.
+            _m7_mimo_path(24, 32) if _M7 else _DEDUP_PATHS["dd4"],
             "all",
             id="dd4_all",
         ),
@@ -5162,7 +5468,7 @@ def test_fused_moe_shared_expert_id():
             2,
             False,
             {"block_m": 64},
-            ["moe_sorting_opus"] + _prefill_path(256),
+            [_PREFILL_SORT_H512] + _prefill_path(256),
             (8, 299),
             id="prefill_opus_h512",
         ),
@@ -5172,7 +5478,7 @@ def test_fused_moe_shared_expert_id():
             2,
             False,
             {"block_m": 64},
-            ["moe_sorting_opus"] + _prefill_path(256),
+            [_PREFILL_SORT_H512] + _prefill_path(256),
             "all",
             id="prefill_opus_all",
         ),
@@ -5190,7 +5496,8 @@ def test_masked_routes(monkeypatch, weights, tokens, topk, fused, options, path,
     prefill Down a8w4_route_sum is asserted (_ROUTE_SUMS), behind the streaming Down its absence. The ``_all``
     cases mask every route: the dedup plan has no leader, the sortings no row (num_valid 0), and the output is all
     zero. The H 5120 decode limit is pinned to pyhip M17's 32 tokens, so that the wide case (M 24) masks the H 5120
-    dedup decode whatever the default limit (the other H 5120 cases run M 3 or more than 32 tokens).
+    dedup decode whatever the default limit (the other H 5120 cases run M 3 or more than 32 tokens). M7 runs the Qwen
+    pp case and the MiMo M 24 cases on its streaming kernels and MiMo M 5 per route.
 
     The basic test masks the per-route decode (np) only; the benchmark never masks.
     """
@@ -5310,7 +5617,8 @@ def test_masked_gateup_reads_no_weights(case):
     """The per-route decode Gate/Up reads no weights of a masked route: launched on poisoned weights (expert -1, where
     a masked route would read, is real data), every masked route's f32 row is exactly 0 and every other row has the bits
     of the launch without masks; the form that writes the dedup plan (dd2) also gives each masked route the entry
-    [0, route] and still zeroes the output. DeepSeek M 3 (x quantized in the kernel, the SwiGLU limit), MiMo M 5 (PLAN).
+    [0, route] and still zeroes the output. DeepSeek M 3 (x quantized in the kernel, the SwiGLU limit), MiMo M 5 (PLAN;
+    M7, which has no plan Gate/Up, runs its per-route Gate/Up there, whose launcher takes no plan and no output).
 
     End to end a read would not show (the Down kernels drop masked routes by a select, the dedup Down never sees them).
     """
@@ -5336,7 +5644,8 @@ def test_masked_gateup_reads_no_weights(case):
     )
     _, masked = mask_routes(topk_weight, topk_ids, seed=851, full=(1,))
     I, device = view.inter_padded, x.device.index
-    if case == "ds_m3":
+    if case == "ds_m3" or _M7:
+        # M7 has no plan Gate/Up: MiMo M 5 takes the per-route one. M7's review deletes the M6 branch.
         kernel = _routed_decode_kernels(
             2 * I, hidden, I, topk, False, False, limit, device
         )[0]
@@ -5349,6 +5658,8 @@ def test_masked_gateup_reads_no_weights(case):
         mid = torch.full((tokens, topk, I), float("nan"))
         plan = torch.full((tokens * topk, 4), -7, dtype=torch.int32)
         y = torch.full((tokens, hidden), float("nan"), dtype=torch.bfloat16)
+        # M7's per-route Gate/Up launcher takes no plan and no output. M7's review deletes the M6 branch.
+        outs = (mid,) if _M7 else (mid, plan, y)
         moe_a8w4._launch(
             "a8w4_gateup_decode",
             kernel,
@@ -5358,9 +5669,7 @@ def test_masked_gateup_reads_no_weights(case):
             view.w1,
             view.w1_delta,
             view.w1_scale,
-            mid,
-            plan,
-            y,
+            *outs,
             tokens,
         )
         return mid, plan, y
@@ -5371,7 +5680,8 @@ def test_masked_gateup_reads_no_weights(case):
     assert 0 < int((~live).sum()) < live.numel()
     assert bool((mid1[~live] == 0).all())
     assert torch.equal(mid1[live].view(torch.int32), mid0[live].view(torch.int32))
-    if case == "mimo_m5_plan":
+    if case == "mimo_m5_plan" and not _M7:
+        # The plan Gate/Up's plan and output (M6 only). M7's review deletes this branch.
         entries = plan.tolist()
         for r in (~live).flatten().nonzero().flatten().tolist():
             assert entries[r][:2] == [0, r], (r, entries[r])
@@ -5384,7 +5694,8 @@ def test_entry_checks(monkeypatch):
       tier (M 300, many rows per expert) and with block_m 64 (M 40), at H 4096 past the 28 rows per expert where
       I >= 512 stops streaming (M 100, 40 rows: prefill), and with a shared expert (H 5120, block_m 64: no
       shared-expert kernel either); block_m 128 with I 576 (DeepSeek). Streaming (H 512, M 48, blocks of 32) still
-      runs I 1088 (graded; decode in test_shape_fallbacks).
+      runs I 1088 (graded; decode in test_shape_fallbacks). M7 streams the two calls without a tile option instead
+      (blocks of 64, graded).
     - with DEBUG_CHECKS (AITER_MOE_A8W4_DEBUG=1, a host synchronization): a token's routed id repeated, an id of E or
       -2; -1, repeated or not, passes. Without it a repeated id runs (test_duplicate_ids_keep_every_route).
     The 32-bit offset limit M * topk * I_pad * 4 < 2**31 is checked by test_rejects_bad_inputs and, with a shared
@@ -5406,8 +5717,15 @@ def test_entry_checks(monkeypatch):
         (512, 40, {"block_m": 64}),
         (4096, 100, {}),
     ):
-        _, prepared = _small_weights(hidden, 1088)
+        w, prepared = _small_weights(hidden, 1088)
         x, topk_weight, topk_ids = make_inputs(tokens, hidden, 5, 2, seed=860)
+        if _M7 and not options:
+            # M7 streams, when no tile option is given, the shapes whose padded I the prefill Down cannot stage. M7's
+            # review deletes the M6 branch.
+            out, ref = _a8w4_run(w, prepared, x, topk_weight, topk_ids)
+            _assert_path(_stream_path(64, False))
+            assert_close(out, ref)
+            continue
         rejects(prepared, x, topk_weight, topk_ids, "padded I 1088", **options)
     w, prepared = _small_weights(512, 1088)
     x, topk_weight, topk_ids = make_inputs(48, 512, 5, 2, seed=861)
@@ -5455,16 +5773,12 @@ def test_entry_checks(monkeypatch):
 
 def _assert_mixed():
     """The last call ran the shared expert inside the two decode kernels: its A8W4 kernels are one decode Gate/Up and
-    one decode Down (a8w4_gateup_decode / a8w4_down_decode, "_mixed" appended while the mixed kernels are a family of
-    their own; M6 names them as the routed ones, its review drops the suffix), moe_a8w4.last_path holds the
+    one decode Down (a8w4_gateup_decode / a8w4_down_decode, named as the routed ones), moe_a8w4.last_path holds the
     "shared_mixed" marker, and no other step ran the shared expert (no folded GEMM, no side stream).
     """
     path = moe_a8w4.last_path
     kernels = [name for name in path if name.startswith(("a8w4_gateup", "a8w4_down"))]
-    assert [name.removesuffix("_mixed") for name in kernels] == [
-        "a8w4_gateup_decode",
-        "a8w4_down_decode",
-    ], path
+    assert kernels == ["a8w4_gateup_decode", "a8w4_down_decode"], path
     assert "shared_mixed" in path, path
     assert all("_mixed" in name for name in path if name.startswith("shared")), path
 
@@ -5606,7 +5920,7 @@ def test_mixed_decode_quant_bitexact():
     those of launches on the reference's bytes: the per-route Gate/Up quantizing x (one correction) and the mixed
     Gate/Up's routed rows have the bits of the per-route Gate/Up reading x pre-quantized by _ieee_quant, one launch per
     x row with the routed channel factors times 2**k (so that tiny or huge rows give normal f32 results); the
-    single-slot Down and the mixed Down quantizing the intermediate (two corrections) have the bits of the single-slot
+    per-route Down and the mixed Down quantizing the intermediate (two corrections) have the bits of the per-route
     Down on the reference's FP8 values (row abs-max 240: its row scale 1 and its quantization exact; the reference's
     scale moves into the routing weight, the same product in the same order), one token per row, each with one live
     route (expert t, a different column each; 2**k split between its channel factors, 2**(k // 2) for k > 0, and its
@@ -5643,6 +5957,9 @@ def test_mixed_decode_quant_bitexact():
         mid = torch.full((1, topk + 1, I), float("nan"))
         got = torch.full((1, topk, I), float("nan"))
         want = torch.full_like(got, float("nan"))
+        # M7's per-route Gate/Up launchers take no plan and no output after ``out``. M7's review deletes the M6
+        # branch.
+        got_outs, want_outs = ((got,), (want,)) if _M7 else ((got,) * 3, (want,) * 3)
         moe_a8w4._launch(
             "a8w4_gateup_decode_mixed",
             mixed_gateup,
@@ -5661,9 +5978,7 @@ def test_mixed_decode_quant_bitexact():
             routed_weight,
             routed_ids,
             *w,
-            got,
-            got,
-            got,
+            *got_outs,
             1,
         )
         moe_a8w4._launch(
@@ -5673,9 +5988,7 @@ def test_mixed_decode_quant_bitexact():
             xs.view(-1),
             routed_ids,
             *w,
-            want,
-            want,
-            want,
+            *want_outs,
             1,
         )
         assert bool(want.isfinite().all()) and bool((want != 0).any()) == (r != 6), r
@@ -5808,14 +6121,16 @@ def test_mixed_gateup_reads_no_weights():
         (8, 1, 512, 64, 3, True),
         (20, 16, 2560, 192, 3, False),
         (12, 8, 4096, 256, 2, True),
-        (12, 8, 4096, 256, 8, False),
+        # M 7 (was 8, the same M6 kernels: work 14336 still folds) stays within M7's decode limit from H 4096 on
+        # (DECODE_MAX_M = 7).
+        (12, 8, 4096, 256, 7, False),
     ],
     ids=[
         "topk15_h2560",
         "topk1_h512",
         "topk16_not_mixed",
         "mimo_h4096_m2_mixed",
-        "mimo_h4096_m8_fold",
+        "mimo_h4096_m7_fold",
     ],
 )
 def test_mixed_decode_shapes(experts, topk, hidden, inter, tokens, mixed):
@@ -5824,8 +6139,8 @@ def test_mixed_decode_shapes(experts, topk, hidden, inter, tokens, mixed):
     one packed alone) and I 192 (the shared Down's K padded to 256), M 3; topk 1 + the shared expert (2 waves) at H 512
     (one x pair per thread) and I 64, M 3; the MiMo shape (H 4096, topk 8, I 256, E 12) at M 2, where routed-only calls
     deduplicate experts. Past it the fold, on the decode tier's slot-pair Down at any M: topk 16 + the shared expert
-    (17 columns) does not fit the mixed Down and folds at M 3 (where routed-only calls take the single-slot Down); the
-    MiMo shape at M 8 (work 16384) folds with the per-route Gate/Up on pre-quantized rows (the deduplicated decode has
+    (17 columns) does not fit the mixed Down and folds at M 3 (where routed-only calls take the Down without it); the
+    MiMo shape at M 7 (work 14336) folds with the per-route Gate/Up on pre-quantized rows (the deduplicated decode has
     no fold). Graded against reference_layer, the mixed kernels or the fold's decode kernels asserted.
 
     The basic tests and the benchmark run the mixed decode and the fold at H 5120, topk 3 or 6 + 1 and I 320 or 576
@@ -5994,7 +6309,7 @@ def test_layer_fold_tiers(monkeypatch, case):
     exact = not _path_atomic(moe_a8w4.last_path)
     if case.startswith("stream_bm64"):
         assert "a8w4_down_stream_bm64" in moe_a8w4.last_path, moe_a8w4.last_path
-    if case.startswith("prefill_opus"):
+    if case.startswith("prefill_opus") and _OPUS_PREFILL:
         assert "moe_sorting_opus" in moe_a8w4.last_path, moe_a8w4.last_path
     assert_close(out, ref(x, topk_weight, topk_ids))
     dead = (topk_ids[:, :-1] < 0).all(dim=1).nonzero().flatten().tolist()
@@ -6222,7 +6537,7 @@ def test_layer_fold_fallback(case):
     the buffer before it untouched).
 
     The basic tests and the benchmark run the layers' shapes only, far from these limits; routed-only calls of these
-    shapes decode with the single-slot Down (test_shape_fallbacks, test_decode_down_fallback_w2_4gib).
+    shapes decode with the Down that quantizes its rows (test_shape_fallbacks, test_decode_down_fallback_w2_4gib).
     """
     import dataclasses
 
@@ -6302,19 +6617,34 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
         (576, 640, 7, 384, 0.0, False, 0),
     ):
         assert moe_a8w4._shared_mid_kernel(*args) is not first, args
-    # The slot-pair Down's wave count while the builders take one (M6 drops it; its review deletes this).
-    waves = (3,) if hasattr(moe_a8w4, "DECODE_DOWN_PQ_WAVES") else ()
     variants = (
         (
             "_decode_kernels",
-            (1152, 5120, 576, 6, True, True, 10.0, *waves, 0),
+            (1152, 5120, 576, 6, True, True, 10.0, 0),
             "shared",
             True,
         ),
-        ("_gateup_dd_kernel", (1152, 5120, 6, 2, 4, 10.0, 0), "shared", True),
-        ("_row_quant_plan", (5120, 6, 2, 32, False, 0), "shared", True),
-        ("_down_pq_kernel", (5120, 576, 6, *waves, 0), "shared", True),
-        ("_stream_prep_kernel", (5120, 7, 128, 16, False, 4, 0), "shared", True),
+        # M7 drops the group and waves of _gateup_dd_kernel and the group and zeroing of _row_quant_plan. M7's review
+        # deletes the M6 branch.
+        (
+            "_gateup_dd_kernel",
+            (1152, 5120, 6, 10.0, 0) if _M7 else (1152, 5120, 6, 2, 4, 10.0, 0),
+            "shared",
+            True,
+        ),
+        (
+            "_row_quant_plan",
+            (5120, 6, 32, 0) if _M7 else (5120, 6, 2, 32, False, 0),
+            "shared",
+            True,
+        ),
+        ("_down_pq_kernel", (5120, 576, 6, 0), "shared", True),
+        (
+            "_stream_prep_kernel",
+            (5120, 7, 128, 16, False, *((4,) if _PREP_QW else ()), 0),
+            "shared",
+            True,
+        ),
         (
             "_down_kernel",
             (5120, 576, 3, 64, 128, 1, True, 0, 0, moe_a8w4._trace_constants()),
@@ -6364,9 +6694,10 @@ def test_layer_fold_compile_cache_keys(monkeypatch):
 # LAYER_SHAPES shape, with the shared expert), "routed:<shape>" (its routed experts alone), "small" (_fold_small_weights:
 # E 8, H 512, I 64, routed topk 2, with the shared expert; a tile option prefills with Opus below H 2560), "mimo"
 # (_mimo_small_weights(256): E 12, H 4096, topk 8). Routing "converted": int64 ids and strided weights (the copies
-# into contiguous int32 / float32 are kernels too); "unaligned": an output 8 bytes past a 16-byte boundary.
+# into contiguous int32 / float32 are kernels too); "unaligned": an output 8 bytes past a 16-byte boundary; "odd": 2
+# bytes past a 4-byte boundary.
 _LAUNCH_CASES = {
-    # Per-route decode: Gate/Up reading x and the single-slot Down.
+    # Per-route decode: Gate/Up reading x and the Down that quantizes its rows.
     "decode_route": ("routed:mtp_layer_tp8", 2, {}, {}, "converted"),
     # Expert-deduplicated decode: the plan Gate/Up and the atomic Down; then the plan kernel, the deduplicated Gate/Up,
     # the row quantization and the atomic Down.
@@ -6385,6 +6716,8 @@ _LAUNCH_CASES = {
     "fold_stream_fused_quant": ("small", 60, {}, {}, None),
     # Folded into an unaligned output: the shared Down GEMM writes an aligned buffer, one more kernel copies it.
     "fold_decode_unaligned": ("layer:ds_layer_tp4", 6, {}, {}, "unaligned"),
+    # Into an output 2 bytes past a 4-byte boundary: the call writes an aligned buffer, then output_copy.
+    "decode_dedup_two_odd": ("mimo", 5, {}, {}, "odd"),
     # Folded, serial (the prefill tier): sorted by the prep (I 576 past 28 rows per expert, and I 320 from 4096
     # routes), sorted by Opus (four phases from 2048 tokens; the routed columns copied out for it), and past the
     # GEMM's 65536 rows each shared GEMM in two chunks (one launch each, the weight's bytes counted on the first).
@@ -6442,6 +6775,11 @@ def _launch_call(monkeypatch, case):
     if routing == "unaligned":
         out = torch.empty(x.numel() + 4, dtype=x.dtype)[4:].view_as(x)
         assert out.data_ptr() % 16 == 8
+    if routing == "odd":
+        if not _copies_odd_outputs():
+            pytest.skip("this op writes such an output directly (before M6)")
+        out = torch.empty(x.numel() + 1, dtype=x.dtype)[1:].view_as(x)
+        assert out.data_ptr() % 4 == 2
 
     def call():
         return flydsl_moe_a8w4_ptpc(
@@ -6487,7 +6825,7 @@ def _profiled_streams(call, expected, calls=3, attempts=5):
 def test_launch_records(monkeypatch, case):
     """``moe_a8w4.last_launches`` of one call of each kind (_LAUNCH_CASES: every tier, both streaming Gate/Up kernels
     and the three streaming Downs, the mixed and the folded shared expert on and off the side stream, the fold's GEMMs
-    in row chunks and the copy into an unaligned output, Opus in one, two and four kernels, routing tensors converted
+    in row chunks and the copies into unaligned outputs, Opus in one, two and four kernels, routing tensors converted
     first) inside ``moe_a8w4.recording_launches()`` holds exactly the device kernels the profiler sees per call on
     each stream when calls run outside it (the main / side labels onto the profiler's streams); its FLOPs sum to
     6 * M * H * (topk * I_pad + I_shared); every kernel moves bytes, the shared expert's weights count once and the

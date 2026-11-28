@@ -98,11 +98,10 @@ _MAX_BYTES = 1 << 31
 # Token counts up to this use the decode kernels (no sorting, one workgroup per route / token).
 DECODE_MAX_M = 32
 # The decode path quantizes activations in separate row kernels instead of inside every workgroup:
-# Down's intermediate rows from DECODE_PREQUANT_MIN_M tokens on, Gate/Up's token rows from
+# Down's intermediate rows from DECODE_PREQUANT_MIN_M tokens on (the slot-pair Down), Gate/Up's token rows from
 # DECODE_GATEUP_PREQUANT_MIN_WGS Gate/Up workgroups (M * topk * I / 16) on.
 DECODE_PREQUANT_MIN_M = 4
 DECODE_GATEUP_PREQUANT_MIN_WGS = 2560
-DECODE_DOWN_PQ_WAVES = 3
 # Hidden sizes above 4096 that take the decode kernels (the Gate/Up decode then stages the FP8 token row in two
 # rounds of 16-byte pieces); measured: DeepSeek-V4.1 TP4 (H5120). Other hidden sizes above 4096 take prefill.
 DECODE_WIDE_HIDDEN = (5120,)
@@ -270,7 +269,7 @@ DEBUG_CHECKS = os.environ.get("AITER_MOE_A8W4_DEBUG", "0") == "1"
 # Kernels launched by the most recent ``flydsl_moe_a8w4_ptpc`` call, in order (host-side record; tests and the
 # benchmark read it). With a shared expert it also holds steps named ``shared*``: the fold's (``shared_fold_*``, with a
 # side stream between the markers ``shared_fork`` and ``shared_join``), or ``shared_mixed`` after the two kernels
-# (``*_mixed``) of the mixed decode, which runs the shared expert inside them.
+# of the mixed decode (``a8w4_gateup_decode``, ``a8w4_down_decode``), which runs the shared expert inside them.
 last_path = []
 
 # The device kernels of the most recent ``flydsl_moe_a8w4_ptpc`` call made inside ``recording_launches()``, in launch
@@ -1030,47 +1029,48 @@ def _down_split(tokens, topk, experts, hidden, inter, block_m):
     return nsplit
 
 
-def _decode_waves(topk, paired):
-    """Waves of the Down decode kernel: few tokens (latency bound) one per routing slot; pre-quantized
-    rows (``paired``) DECODE_DOWN_PQ_WAVES waves with slot pairs in rounds."""
-    return (
-        min((topk + 1) // 2, DECODE_DOWN_PQ_WAVES)
-        if paired
-        else (topk if topk <= 16 else 4)
-    )
+def _decode_gateup_fits(H):
+    """Whether the decode Gate/Up supports hidden size ``H`` and it was measured to take it (hidden <= 4096 or in
+    DECODE_WIDE_HIDDEN)."""
+    return (H <= 4096 or H in DECODE_WIDE_HIDDEN) and decode_a8w4.gateup_decode_fits(H)
 
 
 def _decode_fits(H, I, topk, paired):
-    """Whether the decode kernels support this shape (Gate/Up and the single-slot or slot-pair Down) and it was
-    measured to take them (hidden <= 4096 or in DECODE_WIDE_HIDDEN)."""
-    return (
-        (H <= 4096 or H in DECODE_WIDE_HIDDEN)
-        and decode_a8w4.gateup_decode_fits(H)
-        and decode_a8w4.down_decode_fits(I, topk, _decode_waves(topk, paired), paired)
+    """Whether the decode kernels support this shape: the Gate/Up (``_decode_gateup_fits``) and the slot-pair Down
+    (``paired``) or the Down that quantizes its rows (one wave per routing slot, topk <= 16)."""
+    return _decode_gateup_fits(H) and (
+        decode_a8w4.down_decode_pq_fits(I, topk)
+        if paired
+        else decode_a8w4.down_decode_mixed_fits(I, topk, SHARED=False)
     )
 
 
 @functools.cache
-def _decode_kernels(
-    N1, H, I, topk, gateup_pq, down_pq, limit, waves, device, *, shared=False
-):
-    """Decode Gate/Up and Down launchers. ``waves`` (``_decode_waves(topk, down_pq)``, it reads
-    DECODE_DOWN_PQ_WAVES) and ``device`` (a compiled handle runs on one GPU) key the cache; with ``shared`` both
-    read routing tensors of topk + 1 columns (the folded shared expert's last, unread) and the slot-pair Down adds the
-    shared expert's output it finds in ``out`` (``_SharedFold``).
+def _decode_kernels(N1, H, I, topk, gateup_pq, down_pq, limit, device, *, shared=False):
+    """Decode Gate/Up and Down launchers of the routed experts: the per-route Gate/Up (x quantized in the kernel, or
+    pre-quantized with ``gateup_pq``) and the slot-pair Down (``down_pq``) or the Down that quantizes its rows.
+    ``device`` (a compiled handle runs on one GPU) keys the cache; with ``shared`` both read routing tensors of
+    topk + 1 columns (the folded shared expert's last, unread) and the slot-pair Down adds the shared expert's output it
+    finds in ``out`` (``_SharedFold``).
     """
     extra = {"ID_COLS": topk + 1} if shared else {}
-    gateup = decode_a8w4.compile_a8w4_gateup_decode(
-        N=N1, K=H, TOPK=topk, PREQUANT=gateup_pq, SWIGLU_LIMIT=limit, **extra
+    gateup = decode_a8w4.compile_a8w4_gateup_decode_mixed(
+        N=N1,
+        K=H,
+        TOPK=topk,
+        SWIGLU_LIMIT=limit,
+        SHARED=False,
+        PREQUANT=gateup_pq,
+        **extra,
     )
     if down_pq:
         # More tokens: 16-byte loads of slot pairs.
         return gateup, decode_a8w4.compile_a8w4_down_decode_pq(
-            N=H, K=I, TOPK=topk, WAVES=waves, SHARED=shared, **extra
+            N=H, K=I, TOPK=topk, SHARED=shared, **extra
         )
     assert not shared
-    return gateup, decode_a8w4.compile_a8w4_down_decode(
-        N=H, K=I, TOPK=topk, WAVES=waves
+    return gateup, decode_a8w4.compile_a8w4_down_decode_mixed(
+        N=H, K=I, TOPK=topk, SHARED=False
     )
 
 
@@ -1079,10 +1079,10 @@ def _decode_mixed_kernels(N1, H, I, KP, topk, experts, limit, device):
     """Mixed decode Gate/Up and Down launchers (a shared FP8 expert, id ``experts``, in the last of ``topk`` columns;
     its Down weight's K padded to ``KP``). ``device`` only keys the cache."""
     gateup = decode_a8w4.compile_a8w4_gateup_decode_mixed(
-        N=N1, K=H, TOPK=topk, E=experts, SWIGLU_LIMIT=limit
+        N=N1, K=H, TOPK=topk, E=experts, SWIGLU_LIMIT=limit, SHARED=True
     )
     down = decode_a8w4.compile_a8w4_down_decode_mixed(
-        N=H, K=I, KP=KP, TOPK=topk, E=experts
+        N=H, K=I, KP=KP, TOPK=topk, E=experts, SHARED=True
     )
     return gateup, down
 
@@ -1091,13 +1091,14 @@ def _decode_mixed_kernels(N1, H, I, KP, topk, experts, limit, device):
 def _gateup_plan_kernel(N1, H, topk, gateup_pq, group, limit, max_m, device):
     """Per-route decode Gate/Up that also writes the dedup plan and zeroes the output (``PLAN``). ``max_m``
     (DECODE_MAX_M, the plan's token limit) and ``device`` key the cache."""
-    return decode_a8w4.compile_a8w4_gateup_decode(
+    return decode_a8w4.compile_a8w4_gateup_decode_mixed(
         N=N1,
         K=H,
         TOPK=topk,
+        SWIGLU_LIMIT=limit,
+        SHARED=False,
         PREQUANT=gateup_pq,
         PLAN=(group, max_m, H),
-        SWIGLU_LIMIT=limit,
     )
 
 
@@ -1138,16 +1139,14 @@ def _row_quant_plan(cols, topk, group, max_m, zero, device, *, shared=False):
 
 
 @functools.cache
-def _down_pq_kernel(H, I, topk, waves, device, *, shared=False):
-    """Slot-pair decode Down of the deduplicated Gate/Up of the DECODE_WIDE_HIDDEN sizes. ``waves``
-    (``_decode_waves(topk, True)``, it reads DECODE_DOWN_PQ_WAVES) and ``device`` key the cache; ``shared`` as in
-    ``_decode_kernels``.
+def _down_pq_kernel(H, I, topk, device, *, shared=False):
+    """Slot-pair decode Down of the deduplicated Gate/Up of the DECODE_WIDE_HIDDEN sizes. ``device`` only keys the
+    cache; ``shared`` as in ``_decode_kernels``.
     """
     return decode_a8w4.compile_a8w4_down_decode_pq(
         N=H,
         K=I,
         TOPK=topk,
-        WAVES=waves,
         SHARED=shared,
         **({"ID_COLS": topk + 1} if shared else {}),
     )
@@ -1376,7 +1375,7 @@ def _fused_moe_decode_wide_dd(
         shared.join()
     _launch(
         "a8w4_down_decode_pq" + ("" if shared is None else "_shared"),
-        _down_pq_kernel(H, I, topk, _decode_waves(topk, True), device.index, **on),
+        _down_pq_kernel(H, I, topk, device.index, **on),
         mq,
         ms,
         topk_ids,
@@ -1416,8 +1415,8 @@ def _fused_moe_decode(
     ``output`` (or the expert-deduplicated variants); ``topk_ids`` / ``topk_weight`` are contiguous int32 /
     float32. A folded shared expert (``shared``, ``_SharedFold``; only where ``_decode_fold`` holds) keeps its column
     in them, the last, which the decode kernels skip; the routed experts then take the slot-pair Down at any M (not
-    the single-slot or the deduplicated Down) and, unless the H 5120 Gate/Up deduplicates, the pre-quantized per-route
-    Gate/Up. The chain takes the FP8 input of the routed Gate/Up (from the plan kernel of the deduplicated Gate/Up, else
+    the Down that quantizes its rows or the deduplicated Down) and, unless the H 5120 Gate/Up deduplicates, the
+    per-route Gate/Up on pre-quantized rows. The chain takes the FP8 input of the routed Gate/Up (from the plan kernel of the deduplicated Gate/Up, else
     from the row kernel), writes ``output`` and the slot-pair Down adds the routes onto it.
     """
     M, H = hidden_states.shape
@@ -1448,14 +1447,22 @@ def _fused_moe_decode(
     gateup_pq = (
         shared is not None or M * topk * (I // 16) >= DECODE_GATEUP_PREQUANT_MIN_WGS
     )
-    # The pre-quantized Down addresses all experts' weights with 32-bit byte offsets; larger weights or
-    # shapes the slot-pair kernel does not support take the single-slot Down.
+    # The slot-pair Down on pre-quantized rows from DECODE_PREQUANT_MIN_M tokens on (at any M with a folded shared
+    # expert, or where only it holds the shape); it addresses all experts' weights with 32-bit byte offsets, so larger
+    # weights take the Down that quantizes its rows (one wave per slot) at any M.
+    single = shared is None and _decode_fits(H, I, topk, False)
     down_pq = (
-        (shared is not None or M >= DECODE_PREQUANT_MIN_M)
+        (not single or M >= DECODE_PREQUANT_MIN_M)
         and _slot_pair_offsets_fit(weight)
         and _decode_fits(H, I, topk, True)
     )
     assert shared is None or down_pq
+    if not (down_pq or single):
+        # Neither Down holds this shape with this weight (w2 past the slot-pair Down's offsets and more slots than the
+        # other takes): the streaming kernels, which take any M and padded I.
+        return _fused_moe_stream(
+            hidden_states, weight, topk_weight, topk_ids, output, limit
+        )
     gateup, down = _decode_kernels(
         2 * I,
         H,
@@ -1464,7 +1471,6 @@ def _fused_moe_decode(
         gateup_pq,
         down_pq,
         limit,
-        _decode_waves(topk, down_pq),
         hidden_states.device.index,
         **({} if shared is None else {"shared": True}),
     )
@@ -1522,7 +1528,7 @@ def _fused_moe_decode(
         M,
     )
     if _recording:
-        # The single-slot Down quantizes the f32 intermediate itself (ms is the routing weight); the SHARED variant
+        # The Down that quantizes its rows reads the f32 intermediate (ms is the routing weight); the SHARED variant
         # reads the shared expert's output from ``output`` before writing it.
         _cost(
             _down_cost(
@@ -1562,7 +1568,7 @@ def _fused_moe_decode_mixed(
     )
     mid = torch.empty((M, topk, I), dtype=torch.float32, device=hidden_states.device)
     _launch(
-        "a8w4_gateup_decode_mixed",
+        "a8w4_gateup_decode",
         gateup,
         hidden_states,
         topk_ids,
@@ -1585,7 +1591,7 @@ def _fused_moe_decode_mixed(
             )
         )
     _launch(
-        "a8w4_down_decode_mixed",
+        "a8w4_down_decode",
         down,
         mid,
         topk_ids,
@@ -1607,7 +1613,8 @@ def _fused_moe_decode_mixed(
                 shared_rows=M,
             )
         )
-    # The shared expert ran inside the two kernels: a marker, named as the fold's steps are.
+    # The shared expert ran inside the two kernels (their SHARED variants, named as the per-route ones): a marker,
+    # named as the fold's steps are.
     last_path.append("shared_mixed")
     return output
 
@@ -2146,7 +2153,8 @@ def flydsl_moe_a8w4_ptpc(
     bias; ``M * topk * I_padded * 4`` and ``M * H * 2`` below ``2**31``; a call on the prefill tier needs
     ``block_m * I_padded <= 64 KiB`` (I_padded <= 1024 by default; the decode and streaming tiers take any). Both raise
     ``ValueError`` before any kernel runs. ``output`` may be a caller's contiguous
-    BF16 [M, H] tensor, ``hidden_states`` itself included. Issues no host synchronization; compile a shape
+    BF16 [M, H] tensor, ``hidden_states`` itself included (one off a 4-byte boundary gets the result through one more
+    copy, ``output_copy`` in ``last_path``). Issues no host synchronization; compile a shape
     outside a CUDA graph capture before capturing it. Raises ``RuntimeError`` off gfx942.
 
     Unless a tile option is given, M <= ``DECODE_MAX_M`` (``DECODE_WIDE_MAX_M`` for the ``DECODE_WIDE_HIDDEN`` sizes)
@@ -2208,27 +2216,38 @@ def flydsl_moe_a8w4_ptpc(
     )
     if DEBUG_CHECKS:
         _check_routing(topk_ids, weight.experts, weight.has_shared)
+    # The BF16x2 atomics of the streaming and the deduplicated decode Down add pairs of output elements at 4-byte
+    # boundaries: an output off one (a view starting at an odd element) gets the result from an aligned buffer through
+    # one copy.
+    dst = output if output.data_ptr() % 4 == 0 else torch.empty_like(output)
     if weight.has_shared:
-        return _moe_shared(
+        _moe_shared(
             hidden_states,
             weight,
             topk_weight,
             topk_ids,
-            output,
+            dst,
             limit,
             (block_m, block_n, tile_k),
         )
-    return _moe_routed(
-        hidden_states,
-        weight,
-        topk_weight,
-        topk_ids,
-        output,
-        limit,
-        block_m,
-        block_n,
-        tile_k,
-    )
+    else:
+        _moe_routed(
+            hidden_states,
+            weight,
+            topk_weight,
+            topk_ids,
+            dst,
+            limit,
+            block_m,
+            block_n,
+            tile_k,
+        )
+    if dst is not output:
+        output.copy_(dst)
+        last_path.append("output_copy")
+        if _recording:
+            _record(output.device, "output_copy", _Cost(fixed=2 * _nbytes(output)))
+    return output
 
 
 def _side_stream(device):
@@ -2547,13 +2566,16 @@ def _decode_max_m(H):
 
 def _routed_tier(M, H, I, topk, E, block_m, block_n, tile_k):
     """Tier of the routed experts of a call (M > 0): "decode", "stream" or "prefill". Chosen before the prefill tile
-    defaults are filled in: any tile option selects prefill."""
+    defaults are filled in: any tile option selects prefill. Within the decode tier's token counts a shape whose hidden
+    size the decode Gate/Up takes but neither decode Down (``_decode_fits``) streams: the streaming kernels take any M
+    and padded I."""
     if block_m is None and block_n is None and tile_k is None:
         decode_max = _decode_max_m(H)
-        if (
-            M <= decode_max or _dedup_beyond_decode(M, H, I, topk, E)
-        ) and _decode_fits(H, I, topk, False):
-            return "decode"
+        if M <= decode_max or _dedup_beyond_decode(M, H, I, topk, E):
+            if _decode_fits(H, I, topk, False) or _decode_fits(H, I, topk, True):
+                return "decode"
+            if _decode_gateup_fits(H):
+                return "stream"
         if M > decode_max and not _many_rows(M, H, I, topk, E):
             return "stream"
     return "prefill"

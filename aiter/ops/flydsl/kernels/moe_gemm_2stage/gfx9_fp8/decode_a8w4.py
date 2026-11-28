@@ -3,23 +3,25 @@
 
 """A8W4 MoE decode kernels for small token counts (gfx942): no moe_sorting, one workgroup per route / token.
 
-``aiter.ops.flydsl.moe_a8w4`` runs them up to ``DECODE_MAX_M`` tokens. Both kernels read the ``common_a8w4``
+``aiter.ops.flydsl.moe_a8w4`` runs them up to ``DECODE_MAX_M`` tokens. The kernels read the ``common_a8w4``
 weight layout, decode MXFP4 to FP8 in registers and run MFMA 16x16x32 FP8 with the activation of one token
-broadcast to all 16 rows of the A operand.
+broadcast to all 16 rows of the A operand. One Gate/Up kernel and two Down kernels:
 
-* Gate/Up (``compile_a8w4_gateup_decode``): grid ``(I / 16, M * TOPK)``. A workgroup owns 16
-  channels of one route ``(token, slot)``: wave ``w`` reduces 16 gate (``w`` even) or up rows over
-  one half of K. The token row is quantized per row to FP8 inside the workgroup (``scale =
-  amax / 240``, round to nearest even, the FP8 bytes of ``quant_a8w4``'s IEEE division: one reciprocal per row and
-  one FMA correction per value, ``_quant_fast``); the per-channel factor and
-  the activation scale are applied in the epilogue, which writes ``SiLU(gate) * up`` as float32
-  (with a SwiGLU limit, gate and up clamped first: ``common_a8w4.swiglu_clamp``).
-* Down (``compile_a8w4_down_decode``): grid ``(H / 32, M)``. A workgroup owns 32 output channels (a
-  row-block pair, see below) of one token and sums all its ``TOPK`` experts: wave ``w`` takes slots
-  ``w, w + WAVES, ...``, quantizes those intermediate rows to FP8 (same bytes, two corrections) and
-  scales by the channel factor, the row scale and the routing weight. The waves' partial sums are added
-  in LDS and written as BF16, so the output needs no clearing and no separate reduction. With
-  pre-quantized rows (``compile_a8w4_down_decode_pq``, more tokens) the waves take slot pairs (see below).
+* Gate/Up (``compile_a8w4_gateup_decode_mixed``, kernel ``a8w4_gateup_decode``): grid ``(I / 16, M * SLOTS)``. A
+  workgroup owns 16 channels of one routing column of one token: for a routed expert wave ``w`` reduces 16 gate
+  (``w`` even) or up rows over one half of K. The token row is quantized per row to FP8 inside the workgroup
+  (``scale = amax / 240``, round to nearest even, the FP8 bytes of ``quant_a8w4``'s IEEE division: one reciprocal per
+  row and one FMA correction per value, ``_quant_fast``) or read pre-quantized (``PREQUANT``, more tokens); the
+  per-channel factor and the activation scale are applied in the epilogue, which writes ``SiLU(gate) * up`` as float32
+  (with a SwiGLU limit, gate and up clamped first: ``common_a8w4.swiglu_clamp``). With ``SHARED`` the last column is
+  a shared FP8 expert's (DeepSeek-V4.1, the "mixed" decode below), else every column is routed (SLOTS = TOPK).
+* Down that quantizes its rows (``compile_a8w4_down_decode_mixed``, kernel ``a8w4_down_decode``): grid ``(H / 32, M)``.
+  A workgroup owns 32 output channels (a row-block pair, see below) of one token and sums all its routing columns,
+  one wave each: the wave quantizes its intermediate row to FP8 (same bytes, two corrections) and scales by the channel
+  factor, the row scale and the routing weight. The waves' partial sums are added in LDS and written as BF16, so the
+  output needs no clearing and no separate reduction. With ``SHARED`` the last wave runs the shared FP8 expert.
+* Down on pre-quantized rows (``compile_a8w4_down_decode_pq``, kernel ``a8w4_down_decode_pq``, more tokens and the
+  folded shared expert): the waves take slot pairs (see below).
 
 Block pairs (Gate/Up): one 16-byte load per lane covers two adjacent 64-K blocks, which issues half
 as many memory instructions as 8-byte loads of single blocks (the decode kernels are bound by
@@ -37,7 +39,7 @@ tensor), with the lane mapping above. The two slots need separate sums (their ch
 differ), so the A operand of lane ``l`` is zero unless ``l % 2`` equals its slot's half: output rows
 0 / 8 then sum the lower slot and rows 1 / 9 the upper one, from one MFMA.
 
-Row-block pairs (single-slot Down, the routed columns of the mixed Down): the 16-byte loads cover
+Row-block pairs (the routed columns of the Down that quantizes its rows): the 16-byte loads cover
 the same 64-K block of two neighbouring 16-row blocks of one slot. Lane ``16 g + n`` loads the 16
 bytes of rows ``2 (n % 8)`` and ``2 (n % 8) + 1``, K group ``g``, of 16-row block ``n // 8`` of the
 pair (layout lanes ``16 g + 2 (n % 8)`` and ``+ 1``), so lane ``16 g + n`` sits in MFMA lane group
@@ -47,9 +49,9 @@ pair (layout lanes ``16 g + 2 (n % 8)`` and ``+ 1``), so lane ``16 g + n`` sits 
 output channel therefore gets the bits of 8-byte loads of single blocks, from half as many load
 instructions, and a workgroup quantizes each intermediate row once for 32 channels.
 
-Masked routes (id -1): no kernel reads their weights, codes, deltas or channel factors. Gate/Up and the single-slot
-Down load through zero-byte buffer views of the expert (``common_a8w4.expert_bytes(masked=True)``: the hardware range
-check, which counts the SGPR offset too, returns 0 without a memory access) and skip the factor loads, so a masked
+Masked routes (id -1): no kernel reads their weights, codes, deltas or channel factors. Gate/Up and the Down that
+quantizes its rows load through zero-byte buffer views of the expert (the hardware range check, which counts the SGPR
+offset too, returns 0 without a memory access) and skip the factor loads, so a masked
 route's intermediate row is 0; the slot-pair Down's whole-tensor views end one expert's bytes below 2**32, where the
 32-bit offsets of expert -1 fall. Down drops a masked slot's product with a select (whatever its routing weight and
 intermediate row), so a token whose slots are all masked gets BF16 +0.
@@ -74,45 +76,47 @@ _MAX_DELTA = (
 _LUT_BYTES = 8 * (_MAX_DELTA + 1)
 
 
-# Block pairs per wave whose loads the Gate/Up decode kernels that quantize the token row themselves (the per-route
-# kernel without PREQUANT, the mixed one) issue before that quantization; each further pair's loads go out as the MFMA
-# loop consumes one. Fewer registers in flight (85 VGPRs instead of 153 at H 5120: 5 waves per SIMD instead of 3) let
-# more waves hide the loads: measured per launch (eager) at DeepSeek-V4.1 TP4 (H 5120, I 576, topk 6), per-route
-# kernel M 1 / 2 / 4 0.88x / 0.88x / 0.93x the time of all 20 pairs first; Qwen TP2 (H 2560, 10 pairs) 0.97x / 0.94x /
-# 0.97x. The pre-quantized per-route kernel gains nothing from it (Qwen TP2 M 16 / 32 within 1%) and keeps all pairs
-# first; decode_dedup_a8w4's deduplicated kernel takes it where moe_a8w4.DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I says.
+# Block pairs per wave whose loads the Gate/Up decode kernel issues before it quantizes the token row itself (without
+# PREQUANT); each further pair's loads go out as the MFMA loop consumes one. Fewer registers in flight (85 VGPRs instead
+# of 153 at H 5120: 5 waves per SIMD instead of 3) let more waves hide the loads: measured per launch (eager) at
+# DeepSeek-V4.1 TP4 (H 5120, I 576, topk 6), per-route kernel M 1 / 2 / 4 0.88x / 0.88x / 0.93x the time of all 20
+# pairs first; Qwen TP2 (H 2560, 10 pairs) 0.97x / 0.94x / 0.97x. With PREQUANT it gains nothing (Qwen TP2 M 16 / 32
+# within 1%) and keeps all pairs first; decode_dedup_a8w4's deduplicated kernel takes it where
+# moe_a8w4.DECODE_DD_GATEUP_PREFETCH_MIN_TOPK_I says.
 GATEUP_PREFETCH_PAIRS = 6
 
 
-# 64-K blocks (per wave, over its rounds in order) whose loads the Down decode kernels issue before staging their
+# 64-K blocks (per wave, over its rounds in order) whose loads the slot-pair Down issues before staging its
 # intermediate rows; each further block's loads go out as the MFMA loop consumes one. Measured per launch (eager) at
-# DeepSeek-V4.1 TP4 (H 5120, I 576, topk 6): single-slot Down (DOWN_PREFETCH_BLOCKS) M 1 / 2 / 3 0.92x / 0.86x / 0.83x
-# the time of all 9 blocks first; slot-pair Down (DOWN_PQ_PREFETCH_BLOCKS) M 4 / 8 / 16 / 32 0.99x / 0.99x / 0.94x /
-# 0.95x, Qwen TP2 (I 320, two rounds of 5 blocks) M 4 / 8 / 16 / 32 0.97x / 0.95x / 0.95x / 0.98x.
-DOWN_PREFETCH_BLOCKS = 3
+# DeepSeek-V4.1 TP4 (H 5120, I 576, topk 6) M 4 / 8 / 16 / 32 0.99x / 0.99x / 0.94x / 0.95x the time of all blocks
+# first, Qwen TP2 (I 320, two rounds of 5 blocks) M 4 / 8 / 16 / 32 0.97x / 0.95x / 0.95x / 0.98x. (The Down that
+# quantizes its rows itself: ``compile_a8w4_down_decode_mixed``'s PREFETCH.)
 DOWN_PQ_PREFETCH_BLOCKS = 6
 
 
 def gateup_decode_fits(K):
-    """Whether ``compile_a8w4_gateup_decode`` supports hidden size ``K`` (4 waves; the threads stage the FP8 token
-    row's 16-byte pieces in as many rounds as needed)."""
+    """Whether the Gate/Up decode kernel (``compile_a8w4_gateup_decode_mixed``) supports hidden size ``K`` (4 waves; the
+    threads stage the FP8 token row's 16-byte pieces in as many rounds as needed)."""
     return K % 512 == 0
 
 
-def down_decode_fits(K, TOPK, WAVES, paired):
-    """Whether the Down decode kernel (``paired``: ``compile_a8w4_down_decode_pq``) supports padded I
-    ``K`` with ``WAVES`` waves: the staged intermediate rows fit in LDS (``SharedStorage`` of the
-    kernel) and, for slot pairs, the 16-byte pieces of one row fit in the waves' lanes.
+def _down_pq_waves(TOPK):
+    """Waves of the slot-pair Down by default: one per slot pair, at most 3 (pairs in rounds). Measured in one process
+    against 2 / 4 waves: Qwen TP2 / TP4 (H 2560, topk 11) 1.008-1.022x / 1.056-1.071x the time, DeepSeek-V4.1 TP4
+    (H 5120, topk 6) 1.060-1.077x / 0.995-1.000x, the DeepSeek-V4.1 main TP4 layer under CUDA graph replay
+    1.073-1.074x / 1.008-1.032x."""
+    return min((TOPK + 1) // 2, 3)
+
+
+def down_decode_pq_fits(K, TOPK):
+    """Whether the slot-pair Down (``compile_a8w4_down_decode_pq`` with its default waves) supports padded I ``K``: the
+    staged intermediate rows fit in LDS (``SharedStorage`` of the kernel) and the 16-byte pieces of one row fit in the
+    waves' lanes.
     """
-    if paired:
-        rows = 2 * WAVES * (((TOPK + 1) // 2 + WAVES - 1) // WAVES)
-        lds, pieces_ok = (rows + 1) * K + WAVES * 32 * 4, K // 16 <= 64 * WAVES
-    else:
-        lds, pieces_ok = (
-            WAVES * ((TOPK + WAVES - 1) // WAVES) * K + WAVES * 32 * 4,
-            True,
-        )
-    return K % 64 == 0 and pieces_ok and lds + _LUT_BYTES <= a8w4.LDS_BYTES
+    WAVES = _down_pq_waves(TOPK)
+    rows = 2 * WAVES * (((TOPK + 1) // 2 + WAVES - 1) // WAVES)
+    lds = (rows + 1) * K + WAVES * 32 * 4
+    return K % 64 == 0 and K // 16 <= 64 * WAVES and lds + _LUT_BYTES <= a8w4.LDS_BYTES
 
 
 def _lds_ptr(base, byte_off, elem, align):
@@ -287,301 +291,6 @@ def _wave_index(tid):
     return fx.Int32(rocdl.readfirstlane(T.i32, _raw(tid // 64)))
 
 
-def compile_a8w4_gateup_decode(
-    *, N, K, TOPK, PREQUANT=False, PLAN=None, SWIGLU_LIMIT=0.0, ID_COLS=None
-):
-    """Launcher ``(x, x_scale, topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``.
-
-    ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``).
-    x BF16 [M, K] quantized per row inside the kernel (``x_scale`` unused), or with ``PREQUANT``
-    FP8 [M, K] with x_scale f32 [M]; topk_ids int32 [M, TOPK] (-1: a masked route, its out row 0, no weight
-    read; [M, ID_COLS] with ``ID_COLS`` > TOPK, the columns past TOPK unread: a fused shared expert's, see
-    ``common_a8w4.id_index``); w / w_delta in the ``common_a8w4`` layout; w_scale f32 [E, N]; out f32
-    [M, TOPK, I].
-    ``PLAN = (GROUP, MAX_M, ZERO_COLS)``: the workgroups of channel block 0 also write the expert-dedup plan entry of
-    their route (``decode_dedup_a8w4``, plan int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its
-    share of its token's row of y BF16 [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without
-    ``PLAN`` plan / y are unused.
-    ``SWIGLU_LIMIT`` > 0 clamps gate and up before SiLU (``common_a8w4.swiglu_clamp``).
-    """
-    I = N // 2
-    ID_COLS = TOPK if ID_COLS is None else ID_COLS
-    assert ID_COLS >= TOPK and (PLAN is None or ID_COLS == TOPK)
-    assert I % 16 == 0 and K % 512 == 0, f"unsupported Gate/Up decode shape N={N} K={K}"
-    KB = K // 64
-    KQ = a8w4.delta_dwords(K)
-    KB_HALF = KB // 2
-    PAIRS = KB_HALF // 2
-    NJ = I // 16
-    X_DWORDS = K // 2 // 256  # bf16 pairs per thread
-    X_CHUNKS = K // 16  # 16-byte pieces of an FP8 row
-    X_LOADS = (X_CHUNKS + 255) // 256  # of them per thread (pieces tid + 256 u)
-    W_BYTES = a8w4.weight_bytes(N, K)
-    D_BYTES = a8w4.delta_bytes(N, K)
-    PREFETCH = PAIRS if PREQUANT else min(PAIRS, GATEUP_PREFETCH_PAIRS)
-    if PLAN is not None:
-        from .decode_dedup_a8w4 import _plan_route
-        from .stream_a8w4 import _address, _rsrc
-
-        GROUP, MAX_M, ZERO_COLS = PLAN
-        SEGS = (MAX_M * TOPK + 63) // 64
-        ZERO_PIECES = ZERO_COLS // 8  # 16-byte pieces of a y row
-        ZPW = (ZERO_PIECES + NJ * TOPK - 1) // (
-            NJ * TOPK
-        )  # of them zeroed per workgroup
-        assert ZERO_COLS % 8 == 0 and ZPW <= 256
-
-    @fx.struct
-    class SharedStorage:
-        xq: fx.Array[fx.Uint8, K, 16]
-        part: fx.Array[fx.Float32, 128, 16]
-        red: fx.Array[fx.Float32, 4, 16]
-        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
-
-    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode", SWIGLU_LIMIT))
-    def a8w4_gateup_decode(
-        p_x: fx.Pointer,
-        p_x_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        p_plan: fx.Pointer,
-        p_y: fx.Pointer,
-        M: fx.Int32,
-    ):
-        tid = gpu.thread_idx.x
-        lane = tid % 64
-        wave = _wave_index(tid)
-        j = gpu.block_idx.x
-        route = gpu.block_idx.y
-        token = route // TOPK
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        xq_base = fx.recast_iter(fx.Uint8, lds.xq.ptr)
-        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
-        red_base = fx.recast_iter(fx.Uint8, lds.red.ptr)
-        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
-        _lut_table_init(lut_base, tid)
-
-        expert = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))[
-            a8w4.id_index(route, TOPK, ID_COLS)
-        ]
-        rb = (wave & 1) * NJ + j
-        kb0 = (wave >> 1) * KB_HALF
-        # 16-byte loads of block pairs (see "Block pairs" in the module docstring): lane l holds rows
-        # 2 (l % 8) and 2 (l % 8) + 1, K group (l % 32) // 8 of block l // 32 of the pair.
-        x_off = (lane // 32) * 64 + ((lane % 32) // 8) * 16
-        # The token row does not depend on the expert id: issue it first.
-        if const_expr(PREQUANT):
-            # Coalesced 16-byte pieces tid + 256 u, staged in LDS (MFMA operands are broadcast reads);
-            # threads past the row issue no load (whole waves skip it).
-            x_row = _global_ptr(p_x, fx.Int64, 16) + fx.Int64(token) * (K // 8)
-            x_pieces = []
-            for u in range_constexpr(X_LOADS):
-                piece = tid
-                if const_expr(u > 0):
-                    piece = tid + 256 * u
-                x_piece = fx.full(2, 0, fx.Int64)
-                if piece < X_CHUNKS:
-                    x_piece = fx.ptr_load(
-                        x_row + piece * 2, result_type=Vec.make_type(2, fx.Int64)
-                    )
-                x_pieces.append(x_piece)
-            scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_x_scale))[token]
-        else:
-            x_row = fx.make_view(
-                _global_ptr(p_x, fx.Uint32, 4) + fx.Int64(token) * (K // 2),
-                fx.make_layout(K // 2, 1),
-            )
-            xbits = [fx.Uint32(x_row[tid + 256 * m]) for m in range_constexpr(X_DWORDS)]
-        w_buf = a8w4.expert_bytes(p_weight, expert, W_BYTES, masked=True)
-        d_buf = a8w4.expert_bytes(p_w_delta, expert, D_BYTES, masked=True)
-        w_voff = fx.Int32(lane * 16)
-        d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
-        d_shift = fx.Uint32((lane // 32) * 8)
-        # Each delta load (both rows, 4 blocks) right before the two block pairs it covers (the
-        # scheduler would otherwise group it after all weight loads), so the first pairs do not wait
-        # for every load.
-        raws, deltas = [], []
-
-        def issue(p):
-            # Trace-time helper: the loads of block pair p (and of its delta dwords for an even p).
-            if const_expr(p % 2 == 0):
-                rocdl.sched_barrier(0)
-                deltas.append(
-                    a8w4.load_dwordx2(
-                        d_buf,
-                        d_voff,
-                        fx.Int32((rb * KQ + kb0 // 4 + p // 2) * a8w4.D_BLOCK_BYTES),
-                    )
-                )
-            raws.append(
-                _load_dwordx4(
-                    w_buf,
-                    w_voff,
-                    fx.Int32((rb * KB + kb0 + 2 * p) * a8w4.W_BLOCK_BYTES),
-                )
-            )
-
-        # The first PREFETCH pairs now; the MFMA loop issues each further pair as one is consumed (see
-        # GATEUP_PREFETCH_PAIRS).
-        for p in range_constexpr(PREFETCH):
-            issue(p)
-        rocdl.sched_barrier(0)
-        # Channel factors of the epilogue (thread t < 16 owns channel j * 16 + t), loaded now so that
-        # the epilogue does not wait for another memory round trip; only wave 0 issues these loads. A masked route
-        # (id -1) reads no weights: its zero-byte buffer views above load 0 and it skips these loads (factors 0), so
-        # its intermediate row is 0.
-        channel = j * 16 + tid
-        ws_gate = fx.Float32(0.0)
-        ws_up = fx.Float32(0.0)
-        if (tid < 16) & (expert >= 0):
-            # The id zero-extended, as in expert_bytes(masked=True).
-            ws = fx.make_view(
-                fxh._as_ptr(p_w_scale, fx.Float32) + fx.Int64(fx.Uint32(expert)) * N,
-                fx.make_layout(N, 1),
-            )
-            ws_gate = ws[channel]
-            ws_up = ws[I + channel]
-        rocdl.sched_barrier(0)
-
-        if const_expr(PREQUANT):
-            for u in range_constexpr(X_LOADS):
-                piece = tid
-                if const_expr(u > 0):
-                    piece = tid + 256 * u
-                if piece < X_CHUNKS:
-                    _lds_store(xq_base, piece * 16, x_pieces[u], fx.Int64, 16)
-            gpu.barrier()
-        else:
-            # Quantize the token row: thread `tid` owns bf16 pairs tid + 256 * m.
-            values = []
-            for bits in xbits:
-                values.append((bits << 16).bitcast(fx.Float32))
-                values.append((bits & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
-            amax = _wave_max(_abs_max(values))
-            if lane == 0:
-                _lds_store(
-                    red_base,
-                    wave * 4,
-                    Vec.from_elements([amax], fx.Float32),
-                    fx.Float32,
-                    4,
-                )
-            gpu.barrier()
-            red = _lds_load(red_base, 0, fx.Float32, 4, 16)
-            row_max = fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
-            scale = _row_scale(row_max)
-            # One correction: the bytes of the IEEE division for BF16 values (see _quant_fast).
-            if _fast_div_ok(row_max):
-                _stage_x_fast(xq_base, tid, values, scale, 1)
-            else:
-                _stage_x_ieee(xq_base, tid, values, scale)
-            gpu.barrier()
-
-        # accs[h]: rows 2m + h of the block in columns m and m + 8 (m = 0..7), each with half of the K groups.
-        accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-        for p in range_constexpr(PAIRS):
-            if const_expr(0 < p and p + PREFETCH - 1 < PAIRS):
-                issue(p + PREFETCH - 1)
-            xop = _lds_load(xq_base, (kb0 + 2 * p) * 64 + x_off, fx.Int64, 2, 16)
-            shift = d_shift + fx.Uint32(16 * (p % 2))
-            ops = [
-                _decode_block(
-                    Vec.from_elements([raws[p][2 * h], raws[p][2 * h + 1]], fx.Uint32),
-                    _lut_at(lut_base, deltas[p // 2][h], shift),
-                )
-                for h in range_constexpr(2)
-            ]
-            for c in range_constexpr(2):
-                for h in range_constexpr(2):
-                    accs[h] = _mfma(xop[c], ops[h][c], accs[h])
-
-        # Output row m multiplies the A operand of lanes 16 g + m, whose K group matches the B
-        # columns n with n // 8 == m // 8: columns 0..7 are read from row 0 (lane n), columns 8..15
-        # from row 8 (lane 32 + n).
-        if (lane < 8) | ((lane >= 40) & (lane < 48)):
-            for h in range_constexpr(2):
-                _lds_store(
-                    part_base,
-                    ((wave * 2 + h) * 16 + lane % 16) * 4,
-                    Vec.from_elements([Vec(accs[h])[0]], fx.Float32),
-                    fx.Float32,
-                    4,
-                )
-        gpu.barrier()
-        if tid < 16:
-            # Channel row tid = 2m + h: columns m and m + 8 of accumulator h.
-            col = (tid & 1) * 16 + tid // 2
-            parts = [
-                _lds_load(part_base, (w * 32 + col) * 4, fx.Float32, 1, 4)[0]
-                + _lds_load(part_base, (w * 32 + col + 8) * 4, fx.Float32, 1, 4)[0]
-                for w in range_constexpr(4)
-            ]
-            gate = (parts[0] + parts[2]) * ws_gate * scale
-            up = (parts[1] + parts[3]) * ws_up * scale
-            gate, up = a8w4.swiglu_clamp(gate, up, SWIGLU_LIMIT)
-            # Bare v_exp_f32 / v_rcp_f32 (raw rocdl): fx.math.exp2 and the f32 division lower to the
-            # denormal-scaled exp and the correctly rounded divide, several VALU ops more per element; the
-            # SiLU tolerance is met with the approximations.
-            tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
-            out = fx.make_view(
-                fxh._as_ptr(p_out, fx.Float32) + fx.Int64(route) * I,
-                fx.make_layout(I, 1),
-            )
-            out[channel] = (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
-        if const_expr(PLAN is not None):
-            # This workgroup's share of the token's y row, then (channel block 0, wave 0) the route's plan entry.
-            y_row = _global_ptr(p_y, fx.Int64, 16) + fx.Int64(token) * (ZERO_COLS // 4)
-            piece = (fx.Int32(route % TOPK) * NJ + fx.Int32(j)) * ZPW + fx.Int32(tid)
-            if (fx.Int32(tid) < ZPW) & (piece < ZERO_PIECES):
-                fx.ptr_store(fx.full(2, 0, fx.Int64), y_row + piece * 2)
-            if (fx.Int32(j) == 0) & (wave == 0):
-                routes = M * TOPK
-                _plan_route(
-                    fx.Int32(route),
-                    fx.Int32(lane),
-                    routes,
-                    _rsrc(_address(p_ids), routes * 4),
-                    fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids)),
-                    _rsrc(_address(p_plan), routes * 16),
-                    SEGS,
-                    GROUP,
-                )
-
-    @flyc.jit
-    def launch(
-        p_x: fx.Pointer,
-        p_x_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        p_plan: fx.Pointer,
-        p_y: fx.Pointer,
-        M: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        a8w4_gateup_decode(
-            p_x,
-            p_x_scale,
-            p_ids,
-            p_weight,
-            p_w_delta,
-            p_w_scale,
-            p_out,
-            p_plan,
-            p_y,
-            M,
-        ).launch(grid=(NJ, M * TOPK, 1), block=(256, 1, 1), stream=stream)
-
-    return launch
-
-
 def _row_block_pair_offsets(lane, KB, KQ):
     """Per-lane byte offsets ``(weight, delta, channel factor)`` of the row-block pairs (see "Row-block pairs" in the
     module docstring): lane ``16 g + n`` reads rows ``2 (n % 8)`` and ``2 (n % 8) + 1`` of the pair's 16-row block
@@ -618,213 +327,20 @@ def _pair_channel(lane, h):
     return (lane // 8) * 16 + (lane % 8) * 2 + h
 
 
-def compile_a8w4_down_decode(*, N, K, TOPK, WAVES=None):
-    """Launcher ``(mid, mid_scale, topk_ids, topk_weight, w, w_delta, w_scale, out, M, stream)``.
-
-    ``N`` = hidden (``N % 32 == 0``), ``K`` = padded I (``K % 64 == 0``). mid f32 [M, TOPK, K] is
-    quantized per row inside the kernel (``mid_scale`` unused); topk_ids int32 / topk_weight f32
-    [M, TOPK] (id -1: a masked route, adds nothing, no weight read); w_scale f32 [E, N]; out BF16 [M, N]. ``WAVES``
-    waves per workgroup (default one per slot), slots in rounds. Grid ``(N / 32, M)``: a workgroup owns 32 output
-    channels (two 16-row blocks read with 16-byte loads, see "Row-block pairs" in the module docstring).
-    """
-    assert N % 32 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
-    KB = K // 64
-    KQ = a8w4.delta_dwords(K)
-    NB2 = N // 32
-    WAVES = TOPK if WAVES is None else WAVES
-    ROUNDS = (TOPK + WAVES - 1) // WAVES
-    PREFETCH = min(ROUNDS * KB, DOWN_PREFETCH_BLOCKS)
-    K_PER_LANE = K // 64
-    W_BYTES = a8w4.weight_bytes(N, K)
-    D_BYTES = a8w4.delta_bytes(N, K)
-
-    @fx.struct
-    class SharedStorage:
-        mq: fx.Array[fx.Uint8, WAVES * ROUNDS * K, 16]
-        part: fx.Array[fx.Float32, WAVES * 32, 16]
-        lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
-
-    @flyc.kernel
-    def a8w4_down_decode(
-        p_mid: fx.Pointer,
-        p_mid_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_topk_weight: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-    ):
-        tid = gpu.thread_idx.x
-        lane = tid % 64
-        wave = _wave_index(tid)
-        j = gpu.block_idx.x  # 16-row blocks 2 j and 2 j + 1
-        token = gpu.block_idx.y
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        mq_base = fx.recast_iter(fx.Uint8, lds.mq.ptr)
-        part_base = fx.recast_iter(fx.Uint8, lds.part.ptr)
-        lut_base = fx.recast_iter(fx.Uint8, lds.lut.ptr)
-        _lut_table_init(lut_base, tid)
-
-        ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
-        tws = fx.recast_iter(fx.Float32, fxh._as_ptr(p_topk_weight))
-        w_voff, d_voff, s_voff = _row_block_pair_offsets(lane, KB, KQ)
-
-        slots, valid = [], []
-        for r in range_constexpr(ROUNDS):
-            slot = wave + WAVES * r
-            ok = slot < TOPK
-            slots.append(ok.select(slot, fx.Int32(TOPK - 1)))
-            valid.append(ok)
-        experts = [ids[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
-        weights = [tws[token * TOPK + slots[r]] for r in range_constexpr(ROUNDS)]
-        x_off = (lane // 16) * 16
-        # Intermediate rows do not depend on the expert ids: issue them first.
-        mids = []
-        for r in range_constexpr(ROUNDS):
-            mid = fx.make_view(
-                fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(token * TOPK + slots[r]) * K,
-                fx.make_layout(K, 1),
-            )
-            mids.append([mid[lane + 64 * u] for u in range_constexpr(K_PER_LANE)])
-        w_bufs = [
-            a8w4.expert_bytes(p_weight, experts[r], W_BYTES, masked=True)
-            for r in range_constexpr(ROUNDS)
-        ]
-        d_bufs = [
-            a8w4.expert_bytes(p_w_delta, experts[r], D_BYTES, masked=True)
-            for r in range_constexpr(ROUNDS)
-        ]
-        raws = [[] for _ in range_constexpr(ROUNDS)]
-        deltas = [[] for _ in range_constexpr(ROUNDS)]
-
-        def issue(step):
-            # Trace-time helper: the loads of block step % KB of round step // KB, each delta load (both rows, 4
-            # blocks) right before the weight blocks it covers.
-            r, i = divmod(step, KB)
-            if const_expr(i % 4 == 0):
-                deltas[r].append(
-                    a8w4.load_dwordx2(
-                        d_bufs[r],
-                        d_voff,
-                        fx.Int32((2 * j * KQ + i // 4) * a8w4.D_BLOCK_BYTES),
-                    )
-                )
-            raws[r].append(
-                _load_dwordx4(
-                    w_bufs[r], w_voff, fx.Int32((2 * j * KB + i) * a8w4.W_BLOCK_BYTES)
-                )
-            )
-
-        # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
-        for step in range_constexpr(PREFETCH):
-            issue(step)
-        chan_scale = []
-        for r in range_constexpr(ROUNDS):
-            # Channel factors of the lane's two rows, through the expert's factor row (zero bytes when masked).
-            s_buf = a8w4.expert_bytes(p_w_scale, experts[r], N * 4, masked=True)
-            factors = a8w4.load_dwordx2(s_buf, s_voff, fx.Int32(j * 128))
-            chan_scale.append(
-                [fx.Uint32(factors[h]).bitcast(fx.Float32) for h in range_constexpr(2)]
-            )
-        rocdl.sched_barrier(0)
-
-        # Quantize this wave's intermediate rows into its LDS slots (two corrections: the bytes of the division).
-        row_scale = []
-        for r in range_constexpr(ROUNDS):
-            amax, scale = _row_amax_scale(mids[r])
-            row_scale.append(scale)
-            base = (wave * ROUNDS + r) * K
-            if _fast_div_ok(amax):
-                _stage_row_fast(mq_base, base, lane, mids[r], scale, 2)
-            else:
-                _stage_row_ieee(mq_base, base, lane, mids[r], scale)
-        gpu.barrier()
-
-        totals = [fx.Float32(0.0), fx.Float32(0.0)]
-        for r in range_constexpr(ROUNDS):
-            base = (wave * ROUNDS + r) * K
-            accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
-            for i in range_constexpr(KB):
-                step = r * KB + i
-                if const_expr(0 < step and step + PREFETCH - 1 < ROUNDS * KB):
-                    issue(step + PREFETCH - 1)
-                xop = _lds_load(mq_base, base + i * 64 + x_off, fx.Int64, 2, 16)
-                accs = _row_block_pair_mfmas(
-                    xop, raws[r][i], deltas[r][i // 4], lut_base, fx.Uint32(8 * (i % 4)), accs
-                )
-            # A masked route (id -1) adds nothing (its weight may be anything) and read no weights above.
-            live = valid[r] & (experts[r] >= 0)
-            for h in range_constexpr(2):
-                contrib = Vec(accs[h])[0] * chan_scale[r][h] * row_scale[r] * weights[r]
-                totals[h] = totals[h] + live.select(contrib, fx.Float32(0.0))
-
-        if lane < 16:
-            for h in range_constexpr(2):
-                _lds_store(
-                    part_base,
-                    (wave * 32 + _pair_channel(lane, h)) * 4,
-                    Vec.from_elements([totals[h]], fx.Float32),
-                    fx.Float32,
-                    4,
-                )
-        gpu.barrier()
-        if tid < 32:
-            parts = [
-                _lds_load(part_base, (w * 32 + tid) * 4, fx.Float32, 1, 4)[0]
-                for w in range_constexpr(WAVES)
-            ]
-            y = _tree_sum(parts)
-            out = fx.make_view(
-                fxh._as_ptr(p_out, fx.BFloat16) + fx.Int64(token) * N,
-                fx.make_layout(N, 1),
-            )
-            out[j * 32 + tid] = fxh._f32_to_bf16(y)
-
-    @flyc.jit
-    def launch(
-        p_mid: fx.Pointer,
-        p_mid_scale: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_topk_weight: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        a8w4_down_decode(
-            p_mid,
-            p_mid_scale,
-            p_ids,
-            p_topk_weight,
-            p_weight,
-            p_w_delta,
-            p_w_scale,
-            p_out,
-            M,
-        ).launch(grid=(NB2, M, 1), block=(64 * WAVES, 1, 1), stream=stream)
-
-    return launch
-
-
 def compile_a8w4_down_decode_pq(
     *, N, K, TOPK, WAVES=None, SHARED=False, ID_COLS=None, PREFETCH=None
 ):
     """Launcher ``(mid, mid_scale, topk_ids, topk_weight, w, w_delta, w_scale, out, M, stream)``.
 
-    Down of ``compile_a8w4_down_decode`` for pre-quantized rows (mid FP8 [M, TOPK, K], mid_scale
-    f32 [M, TOPK]) with 16-byte loads of slot pairs (see "Slot pairs" in the module docstring).
-    ``WAVES`` waves per workgroup (default one per slot pair), pairs in rounds. Every expert's w2 bytes plus one
-    expert's must fit in 2**32 (32-bit offsets, the range check ending below expert -1's). With ``SHARED`` ``out``
-    holds BF16 values on entry (a fused shared expert's output, ``moe_a8w4._SharedFold``) and each output element is
-    the f32 sum of the routes plus that value, rounded to BF16 once (each workgroup reads its 16 elements with its
-    first loads). topk_ids / topk_weight have ``ID_COLS`` (default TOPK) columns per token, those past TOPK unread
-    (``common_a8w4.id_index``).
+    The Down decode kernel for pre-quantized rows (mid FP8 [M, TOPK, K], mid_scale f32 [M, TOPK]; topk_ids int32 /
+    topk_weight f32 [M, TOPK], -1 masked; w_scale f32 [E, N]; out BF16 [M, N]) with 16-byte loads of slot pairs (see
+    "Slot pairs" in the module docstring): grid ``(N / 16, M)``, a workgroup sums 16 output channels of one token over
+    all its routes. ``WAVES`` waves per workgroup (default ``_down_pq_waves``), pairs in rounds. Every expert's w2 bytes
+    plus one expert's must fit in 2**32 (32-bit offsets, the range check ending below expert -1's). With ``SHARED``
+    ``out`` holds BF16 values on entry (a fused shared expert's output, ``moe_a8w4._SharedFold``) and each output
+    element is the f32 sum of the routes plus that value, rounded to BF16 once (each workgroup reads its 16 elements
+    with its first loads). topk_ids / topk_weight have ``ID_COLS`` (default TOPK) columns per token, those past TOPK
+    unread (``common_a8w4.id_index``).
     """
     assert N % 16 == 0 and K % 64 == 0, f"unsupported Down decode shape N={N} K={K}"
     ID_COLS = TOPK if ID_COLS is None else ID_COLS
@@ -833,7 +349,7 @@ def compile_a8w4_down_decode_pq(
     KQ = a8w4.delta_dwords(K)
     NB = N // 16
     PAIRS = (TOPK + 1) // 2
-    WAVES = PAIRS if WAVES is None else WAVES
+    WAVES = _down_pq_waves(TOPK) if WAVES is None else WAVES
     ROUNDS = (PAIRS + WAVES - 1) // WAVES
     ROWS = 2 * WAVES * ROUNDS  # staged intermediate rows, followed by one all-zero row
     PIECES = K // 16  # 16-byte pieces of an FP8 row
@@ -950,7 +466,7 @@ def compile_a8w4_down_decode_pq(
                 )
             )
 
-        # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PREFETCH_BLOCKS).
+        # The first PREFETCH blocks now, each further one as the MFMA loop consumes one (DOWN_PQ_PREFETCH_BLOCKS).
         for step in range_constexpr(PREFETCH):
             issue(step)
         chan_scale = []
@@ -1172,23 +688,25 @@ def compile_a8w4_row_quant(*, COLS, BF16):
     return launch
 
 
-# -- Mixed decode: a shared FP8 expert (DeepSeek-V4.1) as one more routing column ------------------------------------
-# compile_a8w4_gateup_decode_mixed / compile_a8w4_down_decode_mixed run a shared FP8 expert with per-row scales as one
-# more routing column of the two per-route decode launches. Its weights are FP8 E4M3FNUZ in 16-row x 64-K blocks of 1024
-# bytes ([N / 16][K / 64][4][16 rows][16 B], twice a routed block's bytes, K in order: the layout
-# aiter.ops.shuffle.shuffle_weight(layout=(16, 16)) gives an FP8 [N, K] with K % 64 == 0), so lane 16 g + n of a wave
-# loads K group g of row n with one 16-byte load per block and feeds the bytes to the MFMA with no delta and no LUT; the
-# row scale takes the place of the channel factor. Gate/Up gives the shared expert two workgroups per channel block (8
-# gate and the same 8 up rows each, K split over the 4 waves), so that every workgroup reads as many bytes with as many
-# loads as a routed one; Down gives it the last of its TOPK waves.
+# -- Gate/Up and the Down that quantizes its rows; with SHARED a shared FP8 expert (DeepSeek-V4.1) as one more column --
+# compile_a8w4_gateup_decode_mixed / compile_a8w4_down_decode_mixed with SHARED (the mixed decode) run a shared FP8
+# expert with per-row scales as one more routing column of the two decode launches. Its weights are FP8 E4M3FNUZ in
+# 16-row x 64-K blocks of 1024 bytes ([N / 16][K / 64][4][16 rows][16 B], twice a routed block's bytes, K in order: the
+# layout aiter.ops.shuffle.shuffle_weight(layout=(16, 16)) gives an FP8 [N, K] with K % 64 == 0), so lane 16 g + n of a
+# wave loads K group g of row n with one 16-byte load per block and feeds the bytes to the MFMA with no delta and no
+# LUT; the row scale takes the place of the channel factor. Gate/Up gives the shared expert two workgroups per channel
+# block (8 gate and the same 8 up rows each, K split over the 4 waves), so that every workgroup reads as many bytes with
+# as many loads as a routed one; Down gives it the last of its TOPK waves.
 # Both kernels are bound by the VALU work of their waves (with two or more workgroups per CU), a third of which was the
-# IEEE division of the row quantization in the per-route kernels (one per value). The mixed kernels divide once per row
-# (the reciprocal) and correct each product with FMAs (``_quant_fast``): the same FP8 bytes as the division, for the
-# routed columns too (rows outside ``_fast_div_ok`` keep the division).
+# IEEE division of the row quantization (one per value). They divide once per row (the reciprocal) and correct each
+# product with FMAs (``_quant_fast``): the same FP8 bytes as the division (rows outside ``_fast_div_ok`` keep the
+# division).
 
 
 def _silu_mul(gate, up):
-    """``SiLU(gate) * up`` as the Gate/Up decode epilogue computes it (bare v_exp_f32 / v_rcp_f32, see there)."""
+    """``SiLU(gate) * up`` as the Gate/Up decode epilogue computes it: bare v_exp_f32 / v_rcp_f32 (raw rocdl;
+    fx.math.exp2 and the f32 division lower to the denormal-scaled exp and the correctly rounded divide, several VALU
+    ops more per element; the SiLU tolerance is met with the approximations)."""
     tmp = rocdl.exp2(T.f32, _raw(gate * (-_LOG2E)))
     return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * up
 
@@ -1345,44 +863,83 @@ def _wave_fence():
     )
 
 
-def down_decode_mixed_fits(K, TOPK):
+def down_decode_mixed_fits(K, TOPK, SHARED=True):
     """Whether ``compile_a8w4_down_decode_mixed`` supports padded I ``K`` with ``TOPK`` routing columns (one wave
-    each, at most 16): every wave's intermediate row, partial sums and LUT copy fit in LDS.
+    each, at most 16; at least 2 with ``SHARED``): every wave's intermediate row, partial sums and LUT copy fit in LDS.
     """
     return (
         K % 64 == 0
-        and 2 <= TOPK <= 16
+        and (2 if SHARED else 1) <= TOPK <= 16
         and TOPK * (K + 32 * 4 + _LUT_BYTES) <= a8w4.LDS_BYTES
     )
 
 
-def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
-    """Launcher ``(x, topk_ids, w, w_delta, w_scale, shared_w, shared_scale, out, M, stream)``: the Gate/Up of
-    ``compile_a8w4_gateup_decode`` (x BF16, quantized in the kernel) with a shared FP8 expert in the last of the
-    ``TOPK`` routing columns (``topk_ids`` / out rows [M, TOPK]).
+def _never():
+    # A condition that is constant false once traced: the kernel variant without a shared expert keeps the shared
+    # expert's branches out (they fold away), so its code is the routed columns' alone.
+    return fx.Int32(1) == fx.Int32(0)
 
-    The ``TOPK - 1`` routed columns run as there (MXFP4 codes decoded through the LUT; -1 masked, no weight read). The
-    shared expert, id ``E``, is live when the last column holds ``E`` and the token's first id is not -1 (ATOM's rule;
-    otherwise it reads no weight and its out row is 0). It takes two more workgroups per channel block and token, 8 of
-    the 16 channels each, so that every workgroup reads the bytes of a routed one: shared_w FP8 E4M3FNUZ [N, K] in the
-    16-row x 64-K block layout ``[N / 16][K / 64][4][16 rows][16 B]`` (K in order within the 16 bytes;
-    ``aiter.ops.shuffle.shuffle_weight(layout=(16, 16))`` of an FP8 [N, K] with K % 64 == 0) and shared_scale f32 [N]
-    per row, applied in place of the channel factor. Lane ``16 g + n`` loads K group ``g`` of gate row ``8 h + n``
-    (``n < 8``) or up row ``8 h + n - 8`` of the half ``h``, wave ``w`` reduces K quarter ``w`` (the FP8 bytes feed the
-    MFMA directly), and the epilogue writes SiLU(gate) * up (clamped as there) of the 8 channels. The routed
-    workgroups' loads are the same instructions as the shared ones' (the descriptor and offsets selected per
-    workgroup). Grid ``(I / 16, M * (TOPK + 1))``: row ``t * (TOPK + 1) + s`` is the route ``(t, s)`` for
-    ``s < TOPK - 1``, then the shared expert's halves. Every workgroup quantizes its token row with ``_quant_fast``
-    (one correction; the FP8 bytes of the per-route kernel's division).
+
+def compile_a8w4_gateup_decode_mixed(
+    *,
+    N,
+    K,
+    TOPK,
+    E=None,
+    SWIGLU_LIMIT=0.0,
+    SHARED=True,
+    PREQUANT=False,
+    ID_COLS=None,
+    PLAN=None,
+):
+    """The Gate/Up decode kernel: grid ``(I / 16, M * SLOTS)``, a workgroup per 16 channels of one routing column of
+    one token. ``N`` = 2 * I (padded I, ``I % 16 == 0``; rows ``[0, I)`` gate), ``K`` = hidden (``K % 512 == 0``);
+    w / w_delta in the ``common_a8w4`` layout, w_scale f32 [E, N]; out f32 [M, TOPK, I]. ``SWIGLU_LIMIT`` > 0 clamps
+    gate and up before SiLU (``common_a8w4.swiglu_clamp``).
+
+    Without ``SHARED`` (the per-route Gate/Up) every column is a routed expert's and the launcher is ``(x, x_scale,
+    topk_ids, w, w_delta, w_scale, out, plan, y, M, stream)``, grid rows ``M * TOPK`` (row = route = token * TOPK +
+    slot). x BF16 [M, K] is quantized per row inside every workgroup (``x_scale`` unused), or with ``PREQUANT`` x is
+    FP8 [M, K] with x_scale f32 [M] (the row kernel's) and every block pair's loads go out first. topk_ids int32
+    [M, TOPK] (-1: a masked route, its out row 0, no weight read), or [M, ID_COLS] with ``ID_COLS`` > TOPK, the columns
+    past TOPK unread (a folded shared expert's, see ``common_a8w4.id_index``). ``PLAN = (GROUP, MAX_M, ZERO_COLS)``:
+    the workgroups of channel block 0 also write the expert-dedup plan entry of their route (``decode_dedup_a8w4``,
+    plan int32 [M * TOPK, 4], ``M <= MAX_M``) and every workgroup zeroes its share of its token's row of y BF16
+    [M, ZERO_COLS], for ``decode_dedup_a8w4.compile_a8w4_down_decode_dd``; without ``PLAN`` plan / y are unused.
+
+    With ``SHARED`` (the mixed Gate/Up) the launcher is ``(x, topk_ids, w, w_delta, w_scale, shared_w, shared_scale,
+    out, M, stream)`` (x BF16, quantized in the kernel): a shared FP8 expert in the last of the ``TOPK`` routing columns
+    (``topk_ids`` / out rows [M, TOPK]). The ``TOPK - 1`` routed columns run as above. The shared expert, id ``E``, is
+    live when the last column holds ``E`` and the token's first id is not -1 (ATOM's rule; otherwise it reads no weight
+    and its out row is 0). It takes two more workgroups per channel block and token, 8 of the 16 channels each, so that
+    every workgroup reads the bytes of a routed one: shared_w FP8 E4M3FNUZ [N, K] in the 16-row x 64-K block layout
+    ``[N / 16][K / 64][4][16 rows][16 B]`` (K in order within the 16 bytes; ``aiter.ops.shuffle.shuffle_weight(layout=
+    (16, 16))`` of an FP8 [N, K] with K % 64 == 0) and shared_scale f32 [N] per row, applied in place of the channel
+    factor. Lane ``16 g + n`` loads K group ``g`` of gate row ``8 h + n`` (``n < 8``) or up row ``8 h + n - 8`` of the
+    half ``h``, wave ``w`` reduces K quarter ``w`` (the FP8 bytes feed the MFMA directly), and the epilogue writes
+    SiLU(gate) * up (clamped as above) of the 8 channels. The routed workgroups' loads are the same instructions as the
+    shared ones' (the descriptor and offsets selected per workgroup). Grid rows ``M * (TOPK + 1)``: row
+    ``t * (TOPK + 1) + s`` is the route ``(t, s)`` for ``s < TOPK - 1``, then the shared expert's halves.
+
+    A routed workgroup: wave ``w`` reduces 16 gate (``w`` even) or up rows over one half of K with 16-byte loads of
+    block pairs (see "Block pairs" in the module docstring). A workgroup that quantizes its token row does it with
+    ``_quant_fast`` (one correction: the FP8 bytes of ``quant_a8w4``'s IEEE division).
     """
     from .stream_a8w4 import _address, _load, _rsrc
 
     I = N // 2
+    ID_COLS = TOPK if ID_COLS is None else ID_COLS
     assert (
-        I % 16 == 0 and K % 512 == 0 and TOPK >= 2
-    ), f"unsupported mixed Gate/Up decode shape N={N} K={K} TOPK={TOPK}"
-    R = TOPK - 1  # routed columns
-    SLOTS = TOPK + 1  # grid rows per token
+        I % 16 == 0 and K % 512 == 0 and TOPK >= (2 if SHARED else 1)
+    ), f"unsupported {'mixed ' if SHARED else ''}Gate/Up decode shape N={N} K={K} TOPK={TOPK}"
+    assert ID_COLS >= TOPK and (PLAN is None or ID_COLS == TOPK)
+    # The mixed kernel quantizes its token rows itself and reads ids of TOPK columns.
+    assert not SHARED or (
+        E is not None and not PREQUANT and PLAN is None and ID_COLS == TOPK
+    )
+    E = 0 if E is None else E  # traced in the folded-away shared branches only
+    R = TOPK - 1 if SHARED else TOPK  # routed columns
+    SLOTS = TOPK + 1 if SHARED else TOPK  # grid rows per token
     KB = K // 64
     KQ = a8w4.delta_dwords(K)
     KB_HALF = KB // 2
@@ -1390,11 +947,23 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
     PAIRS = KB_HALF // 2
     NJ = I // 16
     X_DWORDS = K // 2 // 256  # bf16 pairs per thread
+    X_CHUNKS = K // 16  # 16-byte pieces of an FP8 row
+    X_LOADS = (X_CHUNKS + 255) // 256  # of them per thread (pieces tid + 256 u)
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     S_BLOCK = 2 * a8w4.W_BLOCK_BYTES  # one 16-row x 64-K FP8 block
     S_UP = NJ * KB * S_BLOCK  # from a gate row's block to the same up row's block
-    PREFETCH = min(PAIRS, GATEUP_PREFETCH_PAIRS)
+    PREFETCH = PAIRS if PREQUANT else min(PAIRS, GATEUP_PREFETCH_PAIRS)
+    if PLAN is not None:
+        from .decode_dedup_a8w4 import _plan_route
+
+        GROUP, MAX_M, ZERO_COLS = PLAN
+        SEGS = (MAX_M * TOPK + 63) // 64
+        ZERO_PIECES = ZERO_COLS // 8  # 16-byte pieces of a y row
+        ZPW = (ZERO_PIECES + NJ * TOPK - 1) // (
+            NJ * TOPK
+        )  # of them zeroed per workgroup
+        assert ZERO_COLS % 8 == 0 and ZPW <= 256
 
     @fx.struct
     class SharedStorage:
@@ -1403,18 +972,27 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
         red: fx.Array[fx.Float32, 4, 16]
         lut: fx.Array[fx.Uint8, _LUT_BYTES, 16]
 
-    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode_mixed", SWIGLU_LIMIT))
-    def a8w4_gateup_decode_mixed(
+    # The pointers a variant reads lie at the start of the kernel arguments (one scalar load fetches them): the shared
+    # FP8 expert's weight and scales (SHARED) or x_scale and the plan (without SHARED) take the slots p_aux0 .. 2.
+    @flyc.kernel(name=a8w4.swiglu_kernel_name("a8w4_gateup_decode", SWIGLU_LIMIT))
+    def a8w4_gateup_decode(
         p_x: fx.Pointer,
         p_ids: fx.Pointer,
         p_weight: fx.Pointer,
         p_w_delta: fx.Pointer,
         p_w_scale: fx.Pointer,
-        p_shared: fx.Pointer,
-        p_shared_scale: fx.Pointer,
         p_out: fx.Pointer,
+        p_aux0: fx.Pointer,
+        p_aux1: fx.Pointer,
+        p_aux2: fx.Pointer,
         M: fx.Int32,
     ):
+        if const_expr(SHARED):
+            p_shared, p_shared_scale = p_aux0, p_aux1
+            p_x_scale = p_plan = p_y = p_aux0  # unread
+        else:
+            p_x_scale, p_plan, p_y = p_aux0, p_aux1, p_aux2
+            p_shared, p_shared_scale = p_weight, p_w_scale  # traced in the folded-away shared branches only
         tid = gpu.thread_idx.x
         lane = tid % 64
         wave = _wave_index(tid)
@@ -1422,7 +1000,7 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
         y = fx.Int32(gpu.block_idx.y)
         token = y // SLOTS
         s = y - token * SLOTS
-        shared = s >= R
+        shared = (s >= R) if SHARED else _never()
         half = s - R
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1433,11 +1011,30 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
         _lut_table_init(lut_base, tid)
 
         # The token row does not depend on the ids: issue it first.
-        x_row = fx.make_view(
-            _global_ptr(p_x, fx.Uint32, 4) + fx.Int64(token) * (K // 2),
-            fx.make_layout(K // 2, 1),
-        )
-        xbits = [fx.Uint32(x_row[tid + 256 * m]) for m in range_constexpr(X_DWORDS)]
+        if const_expr(PREQUANT):
+            # Coalesced 16-byte pieces tid + 256 u of the FP8 row, staged in LDS (MFMA operands are broadcast reads);
+            # threads past the row issue no load (whole waves skip it).
+            x_prow = _global_ptr(p_x, fx.Int64, 16) + fx.Int64(token) * (K // 8)
+            x_pieces = []
+            for u in range_constexpr(X_LOADS):
+                piece = tid
+                if const_expr(u > 0):
+                    piece = tid + 256 * u
+                x_piece = fx.full(2, 0, fx.Int64)
+                if piece < X_CHUNKS:
+                    x_piece = fx.ptr_load(
+                        x_prow + piece * 2, result_type=Vec.make_type(2, fx.Int64)
+                    )
+                x_pieces.append(x_piece)
+            scale = fx.recast_iter(fx.Float32, fxh._as_ptr(p_x_scale))[token]
+        else:
+            x_row = fx.make_view(
+                _global_ptr(p_x, fx.Uint32, 4) + fx.Int64(token) * (K // 2),
+                fx.make_layout(K // 2, 1),
+            )
+            xbits = [
+                fx.Uint32(x_row[tid + 256 * m]) for m in range_constexpr(X_DWORDS)
+            ]
         ids = fx.recast_iter(fx.Int32, fxh._as_ptr(p_ids))
         row = token * TOPK
         # The weight, delta and factor bytes of the workgroup's route: the routed expert's codes (the id zero-extended,
@@ -1459,7 +1056,7 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
             f_addr = _address(p_shared_scale) + fx.Int64(j * 16 + half * 8) * 4
             alive = ok.select(fx.Int32(1), fx.Int32(0))
         else:
-            expert = ids[row + s]
+            expert = ids[token * ID_COLS + s]
             ok = expert >= 0
             expert64 = fx.Int64(fx.Uint32(expert))
             w_addr = _address(p_weight) + expert64 * W_BYTES
@@ -1486,8 +1083,9 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
         )
         d_voff = fx.Int32(((lane % 32) // 16) * 64 + (lane % 8) * 8)
         d_soff = (rb * KQ + kb0 // 4) * a8w4.D_BLOCK_BYTES
-        # Each delta load right before the two block pairs it covers (see compile_a8w4_gateup_decode); the first
-        # PREFETCH pairs now, each further one as the MFMA loop consumes one (GATEUP_PREFETCH_PAIRS).
+        # Each delta load right before the two block pairs it covers (the scheduler would otherwise group it after all
+        # weight loads, so that the first pairs wait for every load); the first PREFETCH pairs now, each further one as
+        # the MFMA loop consumes one (GATEUP_PREFETCH_PAIRS).
         raws, deltas = [], []
 
         def issue(p, raws, deltas):
@@ -1514,26 +1112,39 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
             ws_up = _load(f_rsrc, tid * 4, I * 4, 1)[0].bitcast(fx.Float32)
         rocdl.sched_barrier(0)
 
-        # Quantize the token row: thread `tid` owns bf16 pairs tid + 256 * m.
-        values = []
-        for bits in xbits:
-            values.append((bits << 16).bitcast(fx.Float32))
-            values.append((bits & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
-        amax = _wave_max(_abs_max(values))
-        if lane == 0:
-            _lds_store(
-                red_base, wave * 4, Vec.from_elements([amax], fx.Float32), fx.Float32, 4
-            )
-        gpu.barrier()
-        red = _lds_load(red_base, 0, fx.Float32, 4, 16)
-        row_max = fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
-        scale = _row_scale(row_max)
-        # One correction: exact at the FP8 level for BF16 values (see _quant_fast).
-        if _fast_div_ok(row_max):
-            _stage_x_fast(xq_base, tid, values, scale, 1)
+        if const_expr(PREQUANT):
+            for u in range_constexpr(X_LOADS):
+                piece = tid
+                if const_expr(u > 0):
+                    piece = tid + 256 * u
+                if piece < X_CHUNKS:
+                    _lds_store(xq_base, piece * 16, x_pieces[u], fx.Int64, 16)
+            gpu.barrier()
         else:
-            _stage_x_ieee(xq_base, tid, values, scale)
-        gpu.barrier()
+            # Quantize the token row: thread `tid` owns bf16 pairs tid + 256 * m.
+            values = []
+            for bits in xbits:
+                values.append((bits << 16).bitcast(fx.Float32))
+                values.append((bits & fx.Uint32(0xFFFF0000)).bitcast(fx.Float32))
+            amax = _wave_max(_abs_max(values))
+            if lane == 0:
+                _lds_store(
+                    red_base,
+                    wave * 4,
+                    Vec.from_elements([amax], fx.Float32),
+                    fx.Float32,
+                    4,
+                )
+            gpu.barrier()
+            red = _lds_load(red_base, 0, fx.Float32, 4, 16)
+            row_max = fx.maxnumf(fx.maxnumf(red[0], red[1]), fx.maxnumf(red[2], red[3]))
+            scale = _row_scale(row_max)
+            # One correction: exact at the FP8 level for BF16 values (see _quant_fast).
+            if _fast_div_ok(row_max):
+                _stage_x_fast(xq_base, tid, values, scale, 1)
+            else:
+                _stage_x_ieee(xq_base, tid, values, scale)
+            gpu.barrier()
 
         accs = [fx.full(4, 0.0, fx.Float32), fx.full(4, 0.0, fx.Float32)]
         if shared:
@@ -1550,7 +1161,7 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
                 for c in range_constexpr(2):
                     accs[0] = _mfma(xop[c], weight[c], accs[0])
         else:
-            # The routed loop of compile_a8w4_gateup_decode (block pairs, accs[h] rows 2 m + h).
+            # The routed loop (block pairs, accs[h] rows 2 m + h).
             x_off = (lane // 32) * 64 + ((lane % 32) // 8) * 16
             d_shift = fx.Uint32((lane // 32) * 8)
             r_raws, r_deltas = list(raws), list(deltas)
@@ -1634,69 +1245,141 @@ def compile_a8w4_gateup_decode_mixed(*, N, K, TOPK, E, SWIGLU_LIMIT=0.0):
                     fx.make_layout(I, 1),
                 )
                 out[j * 16 + tid] = _silu_mul(gate, up)
+        if const_expr(PLAN is not None):
+            # This workgroup's share of the token's y row, then (channel block 0, wave 0) the route's plan entry.
+            y_row = _global_ptr(p_y, fx.Int64, 16) + fx.Int64(token) * (ZERO_COLS // 4)
+            piece = (s * NJ + j) * ZPW + fx.Int32(tid)
+            if (fx.Int32(tid) < ZPW) & (piece < ZERO_PIECES):
+                fx.ptr_store(fx.full(2, 0, fx.Int64), y_row + piece * 2)
+            if (j == 0) & (wave == 0):
+                routes = M * TOPK
+                _plan_route(
+                    y,
+                    fx.Int32(lane),
+                    routes,
+                    _rsrc(_address(p_ids), routes * 4),
+                    ids,
+                    _rsrc(_address(p_plan), routes * 16),
+                    SEGS,
+                    GROUP,
+                )
 
-    @flyc.jit
-    def launch(
-        p_x: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_shared: fx.Pointer,
-        p_shared_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        a8w4_gateup_decode_mixed(
-            p_x,
-            p_ids,
-            p_weight,
-            p_w_delta,
-            p_w_scale,
-            p_shared,
-            p_shared_scale,
-            p_out,
-            M,
-        ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
+    if SHARED:
+
+        @flyc.jit
+        def launch(
+            p_x: fx.Pointer,
+            p_ids: fx.Pointer,
+            p_weight: fx.Pointer,
+            p_w_delta: fx.Pointer,
+            p_w_scale: fx.Pointer,
+            p_shared: fx.Pointer,
+            p_shared_scale: fx.Pointer,
+            p_out: fx.Pointer,
+            M: fx.Int32,
+            stream: fx.Stream,
+        ):
+            CompilationContext.get_current()
+            a8w4_gateup_decode(
+                p_x,
+                p_ids,
+                p_weight,
+                p_w_delta,
+                p_w_scale,
+                p_out,
+                p_shared,
+                p_shared_scale,
+                p_out,  # unread
+                M,
+            ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch(
+            p_x: fx.Pointer,
+            p_x_scale: fx.Pointer,
+            p_ids: fx.Pointer,
+            p_weight: fx.Pointer,
+            p_w_delta: fx.Pointer,
+            p_w_scale: fx.Pointer,
+            p_out: fx.Pointer,
+            p_plan: fx.Pointer,
+            p_y: fx.Pointer,
+            M: fx.Int32,
+            stream: fx.Stream,
+        ):
+            CompilationContext.get_current()
+            a8w4_gateup_decode(
+                p_x,
+                p_ids,
+                p_weight,
+                p_w_delta,
+                p_w_scale,
+                p_out,
+                p_x_scale,
+                p_plan,
+                p_y,
+                M,
+            ).launch(grid=(NJ, M * SLOTS, 1), block=(256, 1, 1), stream=stream)
 
     return launch
 
 
-def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
-    """Launcher ``(mid, topk_ids, topk_weight, w, w_delta, w_scale, shared_w, shared_scale, out, M, stream)``: the Down
-    of ``compile_a8w4_down_decode`` with one wave per routing column (``TOPK`` waves) and a shared FP8 expert in the
-    last column (``compile_a8w4_gateup_decode_mixed``'s rule: it adds only when the last id is ``E`` and the token's
-    first id is not -1).
+def compile_a8w4_down_decode_mixed(
+    *, N, K, KP=None, TOPK, E=None, SHARED=True, PREFETCH=None
+):
+    """The Down decode kernel that quantizes its intermediate rows itself: one wave per routing column (``TOPK``
+    waves, at most 16), grid ``(N / 32, M)``, 32 output channels of one token per workgroup (two 16-row blocks read with
+    16-byte loads, see "Row-block pairs" in the module docstring). ``N`` = hidden (``N % 32 == 0``), ``K`` = padded I
+    (``K % 64 == 0``); mid f32 [M, TOPK, K]; topk_ids int32 / topk_weight f32 [M, TOPK]; w_scale f32 [E, N]; out BF16
+    [M, N].
 
-    The routed columns' waves run as there (mid f32 [M, TOPK, K] quantized per row in the kernel, MXFP4 codes decoded
-    through the LUT with 16-byte loads of row-block pairs, -1 masked); the last wave reads the shared expert's FP8 Down
-    weight directly: shared_w FP8 E4M3FNUZ [N, KP] (K zero-padded to ``KP``, a multiple of 64) in the 16-row x 64-K
-    block layout of the Gate/Up (lane ``16 g + n`` holds K group ``g`` of row ``n``, one 16-byte load per block and
-    16-row block, both blocks of the workgroup), scaled by shared_scale f32 [N] per row. Every wave runs its column on
-    its own (its own LUT copy and LDS row, a wavefront fence between staging and its MFMAs), so all of them issue their
-    weight loads first and the workgroup meets only before the sum of their partials, which is written as BF16 (out
-    [M, N]); grid ``(N / 32, M)``, 32 output channels per workgroup. The intermediate rows are quantized with
-    ``_quant_fast`` (two corrections: the correctly rounded quotient, the FP8 bytes of the per-route kernel's
-    division).
+    Without ``SHARED`` (the per-route Down of few tokens) every column is a routed expert's and the launcher is ``(mid,
+    mid_scale, topk_ids, topk_weight, w, w_delta, w_scale, out, M, stream)`` (``mid_scale`` unused). With ``SHARED``
+    (the mixed Down) the launcher is ``(mid, topk_ids, topk_weight, w, w_delta, w_scale, shared_w, shared_scale, out, M,
+    stream)`` and the last column is a shared FP8 expert (``compile_a8w4_gateup_decode_mixed``'s rule: it adds only when
+    the last id is ``E`` and the token's first id is not -1), whose wave reads its FP8 Down weight directly: shared_w
+    FP8 E4M3FNUZ [N, KP] (K zero-padded to ``KP``, a multiple of 64) in the 16-row x 64-K block layout of the Gate/Up
+    (lane ``16 g + n`` holds K group ``g`` of row ``n``, one 16-byte load per block and 16-row block, both blocks of the
+    workgroup), scaled by shared_scale f32 [N] per row.
+
+    A routed column's wave quantizes its intermediate row to FP8 (``_quant_fast``, two corrections: the bytes of the
+    correctly rounded division), decodes its expert's MXFP4 codes through its LUT copy and scales by the channel
+    factor, the row scale and the routing weight (-1 masked: no weight read, nothing added). Every wave runs its column
+    on its own (its own LUT copy and LDS row, a wavefront fence between staging and its MFMAs), so all of them issue
+    their weight loads first and the workgroup meets only before the sum of their partials (``_tree_sum`` over the
+    columns), which is written as BF16, so the output needs no clearing and no separate reduction. ``PREFETCH``: the
+    64-K blocks whose loads each wave issues before staging its row (default: all with ``SHARED``, else 3), each
+    further one as the MFMA loop consumes one.
     """
     from .stream_a8w4 import _address, _load, _rsrc
 
+    KP = K if KP is None else KP
     assert (
-        N % 32 == 0 and KP % 64 == 0 and KP >= K and down_decode_mixed_fits(K, TOPK)
-    ), f"unsupported mixed Down decode shape N={N} K={K} KP={KP} TOPK={TOPK}"
+        N % 32 == 0
+        and KP % 64 == 0
+        and KP >= K
+        and down_decode_mixed_fits(K, TOPK, SHARED)
+        and (E is not None or not SHARED)
+    ), f"unsupported {'mixed ' if SHARED else ''}Down decode shape N={N} K={K} KP={KP} TOPK={TOPK}"
+    E = 0 if E is None else E  # traced in the folded-away shared branch only
     KB = K // 64
     KBP = KP // 64
     KQ = a8w4.delta_dwords(K)
     NB2 = N // 32
-    R = TOPK - 1
+    R = TOPK - 1 if SHARED else TOPK  # routed columns
     W_BYTES = a8w4.weight_bytes(N, K)
     D_BYTES = a8w4.delta_bytes(N, K)
     S_BLOCK = 2 * a8w4.W_BLOCK_BYTES
-    # All blocks' loads first (unlike the single-slot Down's DOWN_PREFETCH_BLOCKS): measured in one process under CUDA
-    # graph replay at the DeepSeek-V4.1 layers M 1-4, 3 blocks first took 1.00-1.03x the time.
-    PREFETCH = KB
+    if PREFETCH is None:
+        # The mixed Down issues all blocks first: measured in one process under CUDA graph replay at the
+        # DeepSeek-V4.1 layers M 1-4 (9 blocks), 3 first took 1.00-1.03x the time. The per-route Down issues 3 first:
+        # measured per launch (eager) at DeepSeek-V4.1 TP4 (H 5120, I 576, topk 6), M 1 / 2 / 3 0.92x / 0.86x / 0.83x
+        # the time of all 9 first (under graph replay 1.01x / 0.97x / 1.00x; Qwen TP2 / TP4, MiMo TP8 / TP4 M 1-3
+        # 0.99-1.02x).
+        PREFETCH = KB if SHARED else 3
+    PREFETCH = min(KB, PREFETCH)
 
     @fx.struct
     class SharedStorage:
@@ -1704,8 +1387,10 @@ def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
         part: fx.Array[fx.Float32, TOPK * 32, 16]
         lut: fx.Array[fx.Uint8, TOPK * _LUT_BYTES, 16]
 
+    # The pointers the waves read first lie at the start of the kernel arguments (one scalar load fetches them); the
+    # output, written last, follows.
     @flyc.kernel
-    def a8w4_down_decode_mixed(
+    def a8w4_down_decode(
         p_mid: fx.Pointer,
         p_ids: fx.Pointer,
         p_topk_weight: fx.Pointer,
@@ -1742,7 +1427,8 @@ def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
         # Each branch loads its own intermediate row (first: it does not depend on the expert id) and the shared
         # expert's wave addresses its row with constants: code common to both branches would be hoisted above the
         # branch, where its wait for the intermediate row would hold back the weight loads.
-        if wave == R:
+        shared = (wave == R) if SHARED else _never()
+        if shared:
             mid = fx.make_view(
                 fxh._as_ptr(p_mid, fx.Float32) + fx.Int64(row + R) * K,
                 fx.make_layout(K, 1),
@@ -1885,32 +1571,64 @@ def compile_a8w4_down_decode_mixed(*, N, K, KP, TOPK, E):
             )
             out[j * 32 + tid] = fxh._f32_to_bf16(y)
 
-    @flyc.jit
-    def launch(
-        p_mid: fx.Pointer,
-        p_ids: fx.Pointer,
-        p_topk_weight: fx.Pointer,
-        p_weight: fx.Pointer,
-        p_w_delta: fx.Pointer,
-        p_w_scale: fx.Pointer,
-        p_shared: fx.Pointer,
-        p_shared_scale: fx.Pointer,
-        p_out: fx.Pointer,
-        M: fx.Int32,
-        stream: fx.Stream,
-    ):
-        CompilationContext.get_current()
-        a8w4_down_decode_mixed(
-            p_mid,
-            p_ids,
-            p_topk_weight,
-            p_weight,
-            p_w_delta,
-            p_w_scale,
-            p_shared,
-            p_shared_scale,
-            p_out,
-            M,
-        ).launch(grid=(NB2, M, 1), block=(64 * TOPK, 1, 1), stream=stream)
+    if SHARED:
+
+        @flyc.jit
+        def launch(
+            p_mid: fx.Pointer,
+            p_ids: fx.Pointer,
+            p_topk_weight: fx.Pointer,
+            p_weight: fx.Pointer,
+            p_w_delta: fx.Pointer,
+            p_w_scale: fx.Pointer,
+            p_shared: fx.Pointer,
+            p_shared_scale: fx.Pointer,
+            p_out: fx.Pointer,
+            M: fx.Int32,
+            stream: fx.Stream,
+        ):
+            CompilationContext.get_current()
+            a8w4_down_decode(
+                p_mid,
+                p_ids,
+                p_topk_weight,
+                p_weight,
+                p_w_delta,
+                p_w_scale,
+                p_shared,
+                p_shared_scale,
+                p_out,
+                M,
+            ).launch(grid=(NB2, M, 1), block=(64 * TOPK, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch(
+            p_mid: fx.Pointer,
+            p_mid_scale: fx.Pointer,
+            p_ids: fx.Pointer,
+            p_topk_weight: fx.Pointer,
+            p_weight: fx.Pointer,
+            p_w_delta: fx.Pointer,
+            p_w_scale: fx.Pointer,
+            p_out: fx.Pointer,
+            M: fx.Int32,
+            stream: fx.Stream,
+        ):
+            CompilationContext.get_current()
+            # mid_scale: unread (the routed rows are quantized in the kernel); the shared pointers: unread.
+            a8w4_down_decode(
+                p_mid,
+                p_ids,
+                p_topk_weight,
+                p_weight,
+                p_w_delta,
+                p_w_scale,
+                p_weight,
+                p_w_scale,
+                p_out,
+                M,
+            ).launch(grid=(NB2, M, 1), block=(64 * TOPK, 1, 1), stream=stream)
 
     return launch
